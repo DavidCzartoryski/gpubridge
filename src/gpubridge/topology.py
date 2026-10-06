@@ -109,13 +109,19 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
         )
     # CUDA and ROCm builds of one release differ only in the local version
     # suffix, e.g. 2.5.1+cu124 and 2.5.1+rocm6.2.
-    releases = sorted({peer.torch_version.split("+")[0] for peer in peers})
+    releases = sorted({peer.torch_version.split("+")[0] for peer in peers}, key=_release_key)
     if warn and len(releases) > 1:
         warnings.warn(
-            f"Ranks run different PyTorch releases ({', '.join(releases)}). Mixed-vendor "
-            "jobs are only expected to work when every rank runs the same release.",
+            f"Ranks run different PyTorch releases ({', '.join(releases)}). Mixed releases "
+            "passed gpubridge's CPU-only tests (2.9.1 to 2.14.1) but are untested on GPUs; "
+            "prefer the same release on every rank.",
             stacklevel=2,
         )
+
+
+def _release_key(release: str) -> tuple[tuple[int, int | str], ...]:
+    """Sort key that orders 2.9.1 before 2.14.1."""
+    return tuple((0, int(part)) if part.isdigit() else (1, part) for part in release.split("."))
 
 
 @dataclass(frozen=True)

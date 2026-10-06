@@ -32,6 +32,17 @@ RUN --mount=type=cache,target=/wheels \
     && uv venv -q /envs/rocm-2.14.1 && uv pip install --python /envs/rocm-2.14.1/bin/python \
         --index-url https://download.pytorch.org/whl/rocm7.2 "$wheel" numpy
 
+# Older and neighbouring releases, for the version-matrix experiments.
+RUN uv venv -q /envs/cu-2.13.0 && uv pip install -q --python /envs/cu-2.13.0/bin/python \
+        --index-url https://download.pytorch.org/whl/cu130 "torch==2.13.0+cu130" numpy
+RUN uv venv -q /envs/cu-2.9.1 && uv pip install -q --python /envs/cu-2.9.1/bin/python \
+        --index-url https://download.pytorch.org/whl/cu128 "torch==2.9.1+cu128" numpy
+RUN --mount=type=cache,target=/wheels \
+    wheel=$(fetch_wheel https://download-r2.pytorch.org/whl/rocm6.4/torch-2.9.1%2Brocm6.4-cp312-cp312-manylinux_2_28_x86_64.whl \
+        43471c9e4520402b5feeebd6c6d180e8bf2314402925798fe219c32fecd1ef95 /wheels) \
+    && uv venv -q /envs/rocm-2.9.1 && uv pip install --python /envs/rocm-2.9.1/bin/python \
+        --index-url https://download.pytorch.org/whl/rocm6.4 "$wheel" numpy
+
 # gpubridge, editable in every venv. The repo is mounted over /gpubridge at run
 # time, so code changes apply without rebuilding.
 COPY pyproject.toml README.md LICENSE /gpubridge/

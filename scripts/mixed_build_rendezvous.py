@@ -9,6 +9,11 @@ and summary.md.
     python scripts/mixed_build_rendezvous.py                 # every experiment
     python scripts/mixed_build_rendezvous.py --group 2.14.1  # one group
     python scripts/mixed_build_rendezvous.py --env-report    # versions and sizes only
+
+To find the layer a failure is in, rerun it with --rdzv static (torchrun's
+static rendezvous, no elastic state shared between nodes) and/or --bare (plain
+torch.distributed, no gpubridge). Each variant is stored under its own key,
+e.g. "minor-1+1@static@bare".
 """
 
 from __future__ import annotations
@@ -109,22 +114,34 @@ def wait_for_port(port: int, proc: subprocess.Popen, timeout: float) -> bool:
     return False
 
 
+def variant_key(exp: Experiment, args) -> str:
+    """Experiment id plus the variant flags, used for result directories and summary keys."""
+    return exp.id + ("@static" if args.rdzv == "static" else "") + ("@bare" if args.bare else "")
+
+
 def launch(exp: Experiment, node: Node, is_host: bool, port: int, out: Path, args) -> tuple:
     role = "host" if is_host else "guest"
-    cmd = [
-        str(ENVS_DIR / node.env / "bin" / "torchrun"),
-        "--nnodes=2",
-        f"--nproc-per-node={node.nproc}",
-        "--rdzv-backend=c10d",
-        f"--rdzv-endpoint=127.0.0.1:{port}",
-        f"--rdzv-id={exp.id}",
-        f"--rdzv-conf=is_host={int(is_host)},join_timeout={int(args.timeout)}",
-        "--max-restarts=0",
+    cmd = [str(ENVS_DIR / node.env / "bin" / "torchrun"), "--nnodes=2",
+           f"--nproc-per-node={node.nproc}", "--max-restarts=0"]
+    if args.rdzv == "static":
+        # Node 0 hosts the store at the master address; nothing elastic is exchanged.
+        cmd += [f"--node-rank={0 if is_host else 1}", "--master-addr=127.0.0.1",
+                f"--master-port={port}"]
+    else:
+        cmd += [
+            "--rdzv-backend=c10d",
+            f"--rdzv-endpoint=127.0.0.1:{port}",
+            f"--rdzv-id={exp.id}",
+            f"--rdzv-conf=is_host={int(is_host)},join_timeout={int(args.timeout)}",
+        ]
+    cmd += [
         str(PROBE),
         "--out", str(out / "ranks"),
         "--timeout", str(int(args.timeout * 0.6)),
         "--hang-dump", str(int(args.timeout * 0.5)),
     ]
+    if args.bare:
+        cmd.append("--bare")
     env = {k: v for k, v in os.environ.items() if k != "GPUBRIDGE_VENDOR"}
     env |= {"GPUBRIDGE_CPU_ONLY": "1", "OMP_NUM_THREADS": "1", "PROBE_ENV": node.env}
     log = open(out / f"{role}-{node.env}.log", "w")  # noqa: SIM115
@@ -255,21 +272,23 @@ def evaluate(exp: Experiment, raw: dict, out: Path) -> dict:
 
 
 def run_experiment(exp: Experiment, port: int, args) -> dict:
-    out = RESULTS / exp.id
+    key = variant_key(exp, args)
+    out = RESULTS / key
     attempts = []
     timeout = args.timeout
     for attempt in (1, 2):
-        print(f"[{exp.id}] attempt {attempt}, timeout {timeout:.0f}s ...", flush=True)
+        print(f"[{key}] attempt {attempt}, timeout {timeout:.0f}s ...", flush=True)
         args_for_attempt = argparse.Namespace(**{**vars(args), "timeout": timeout})
         raw = run_once(exp, port + attempt - 1, out, args_for_attempt)
         result = evaluate(exp, raw, out)
         attempts.append({"timeout": timeout, **raw, "verdict": result["verdict"]})
-        print(f"[{exp.id}] {result['verdict']} in {raw['seconds']}s", flush=True)
+        print(f"[{key}] {result['verdict']} in {raw['seconds']}s", flush=True)
         # Emulation is slow: a timeout gets one rerun with double the limit.
         if not raw["timed_out"]:
             break
         timeout *= 2
-    return {"experiment": asdict(exp), "attempts": attempts, **result}
+    return {"key": key, "rdzv": args.rdzv, "bare": args.bare, "experiment": asdict(exp),
+            "attempts": attempts, **result}
 
 
 def env_report() -> dict:
@@ -346,7 +365,7 @@ def write_summary(new_results: list[dict]) -> None:
     summary_path = RESULTS / "summary.json"
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
     for result in new_results:
-        summary[result["experiment"]["id"]] = result
+        summary[result["key"]] = result
     summary_path.write_text(json.dumps(summary, indent=2, default=str))
 
     order = [e.id for e in EXPERIMENTS]
@@ -355,7 +374,11 @@ def write_summary(new_results: list[dict]) -> None:
         "| all_reduce | broadcast | Shutdown | Wall time | Attempts |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
-    for exp_id in sorted(summary, key=lambda i: order.index(i) if i in order else len(order)):
+    def sort_key(key: str) -> tuple[int, str]:
+        base = key.split("@")[0]
+        return (order.index(base) if base in order else len(order), key)
+
+    for exp_id in sorted(summary, key=sort_key):
         r = summary[exp_id]
         e = r["experiment"]
         mark = {True: "ok", False: "FAIL"}
@@ -382,6 +405,10 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=29400)
     parser.add_argument("--env-report", action="store_true", help="only report the venvs")
     parser.add_argument("--results", type=Path, default=RESULTS, help="output directory")
+    parser.add_argument("--rdzv", choices=["c10d", "static"], default="c10d",
+                        help="torchrun rendezvous: elastic c10d (default) or static")
+    parser.add_argument("--bare", action="store_true",
+                        help="probe with plain torch.distributed instead of gpubridge")
     args = parser.parse_args()
     RESULTS = args.results.resolve()
     RESULTS.mkdir(parents=True, exist_ok=True)
@@ -405,6 +432,9 @@ def main() -> int:
         missing = [n.env for n in (exp.host, exp.guest) if not env_python(n.env).exists()]
         if missing:
             print(f"[{exp.id}] skipped: venv(s) not in the image: {', '.join(missing)}")
+            continue
+        if args.rdzv == "static" and exp.host.nproc != exp.guest.nproc:
+            print(f"[{exp.id}] skipped: static rendezvous needs the same nproc on both nodes")
             continue
         results.append(run_experiment(exp, args.port + 10 * i, args))
         write_summary(results)

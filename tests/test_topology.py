@@ -70,6 +70,11 @@ def test_different_torch_releases_warn():
         validate_peers([_peer(torch_version="2.5.1+cu124"), _peer(torch_version="2.4.0+rocm6.1")])
 
 
+def test_releases_in_the_warning_are_in_version_order():
+    with pytest.warns(UserWarning, match=r"\(2\.9\.1, 2\.14\.1\)"):
+        validate_peers([_peer(torch_version="2.14.1+cu130"), _peer(torch_version="2.9.1+rocm6.4")])
+
+
 def test_same_release_on_both_builds_is_quiet(recwarn):
     validate_peers([_peer(torch_version="2.5.1+cu124"), _peer(torch_version="2.5.1+rocm6.2")])
     assert len(recwarn) == 0

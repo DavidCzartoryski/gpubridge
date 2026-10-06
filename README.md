@@ -13,8 +13,10 @@ gpubridge writes no CUDA or HIP code. It composes collectives that PyTorch
 already provides.
 
 > **Status: v0.1, correctness first.** All orchestration logic is tested in CPU
-> simulation mode. It has not yet run on a real mixed cluster; see
-> [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for what still needs checking.
+> simulation mode. Without GPUs, real CUDA and ROCm builds of PyTorch (2.9.1 to
+> 2.14.1) were shown to join one job and complete the bridge. It has not yet run
+> on a real mixed cluster; see [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)
+> for the results and what still needs checking.
 
 ## How it works
 

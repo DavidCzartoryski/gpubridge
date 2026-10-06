@@ -87,16 +87,51 @@ def rank_tensor(shape: tuple[int, ...], dtype: torch.dtype, rank: int) -> torch.
 CASES = [((3, 4), torch.float32), ((5,), torch.float16)]
 
 
+def init_gpubridge(rec: Recorder, timeout: float) -> int:
+    """Join through gpubridge.init and record the topology. Returns the world size."""
+    with rec.stage("init"):
+        topology = gpubridge.init(timeout=timedelta(seconds=timeout))
+    rec.data["topology"] = {
+        "vendor": topology.vendor,
+        "is_leader": topology.is_leader,
+        "simulated": topology.simulated,
+        "islands": [
+            {"vendor": i.vendor, "ranks": list(i.ranks), "leader": i.leader}
+            for i in topology.layout.islands
+        ],
+        "peers": [
+            {"vendor": p.vendor, "torch": p.torch_version, "simulated": p.simulated}
+            for p in topology.peers
+        ],
+    }
+    return topology.world_size
+
+
+def init_bare(rec: Recorder, timeout: float) -> int:
+    """Join with plain torch.distributed: Gloo world group plus an all_gather_object."""
+    with rec.stage("init"):
+        dist.init_process_group("gloo", timeout=timedelta(seconds=timeout))
+        peers: list[Any] = [None] * dist.get_world_size()
+        local = {"vendor": build_vendor(), "torch": torch.__version__, "simulated": True}
+        dist.all_gather_object(peers, local)
+    rec.data["topology"] = {"peers": peers}
+    return dist.get_world_size()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--timeout", type=float, default=600, help="gpubridge group timeout (s)")
+    parser.add_argument("--timeout", type=float, default=600, help="group timeout (s)")
     parser.add_argument("--hang-dump", type=float, default=300, help="dump stacks after (s)")
+    parser.add_argument("--bare", action="store_true",
+                        help="use plain torch.distributed instead of gpubridge, to tell "
+                        "PyTorch-level failures from gpubridge ones")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
     rank = int(os.environ["RANK"])
     rec = Recorder(args.out, rank, args.hang_dump)
+    rec.data["mode"] = "bare" if args.bare else "gpubridge"
     rec.data["process"] = {
         "env": os.environ.get("PROBE_ENV"),
         "local_rank": int(os.environ["LOCAL_RANK"]),
@@ -116,29 +151,21 @@ def main() -> int:
     }
     rec.write()
 
+    if args.bare:
+        all_reduce, broadcast = dist.all_reduce, dist.broadcast
+        barrier, destroy = dist.barrier, dist.destroy_process_group
+    else:
+        all_reduce, broadcast = gpubridge.all_reduce, gpubridge.broadcast
+        barrier, destroy = gpubridge.barrier, gpubridge.destroy
+
     try:
-        with rec.stage("init"):
-            topology = gpubridge.init(timeout=timedelta(seconds=args.timeout))
-        rec.data["topology"] = {
-            "vendor": topology.vendor,
-            "is_leader": topology.is_leader,
-            "simulated": topology.simulated,
-            "islands": [
-                {"vendor": i.vendor, "ranks": list(i.ranks), "leader": i.leader}
-                for i in topology.layout.islands
-            ],
-            "peers": [
-                {"vendor": p.vendor, "torch": p.torch_version, "simulated": p.simulated}
-                for p in topology.peers
-            ],
-        }
-        world = topology.world_size
+        world = (init_bare if args.bare else init_gpubridge)(rec, args.timeout)
 
         with rec.stage("all_reduce") as entry:
             entry["cases"] = []
             for shape, dtype in CASES:
                 tensor = rank_tensor(shape, dtype, rank)
-                gpubridge.all_reduce(tensor)
+                all_reduce(tensor)
                 expected = sum(rank_tensor(shape, torch.float64, r) for r in range(world))
                 ok = torch.equal(tensor, torch.as_tensor(expected).to(dtype))
                 entry["cases"].append({"shape": list(shape), "dtype": str(dtype), "ok": ok})
@@ -151,17 +178,17 @@ def main() -> int:
             for src in range(world):
                 for shape, dtype in CASES:
                     tensor = rank_tensor(shape, dtype, rank)
-                    gpubridge.broadcast(tensor, src)
+                    broadcast(tensor, src)
                     if not torch.equal(tensor, rank_tensor(shape, dtype, src)):
                         entry["ok"] = False
                         entry["bad"].append({"src": src, "dtype": str(dtype)})
             entry["sources"] = world
 
         with rec.stage("barrier"):
-            gpubridge.barrier()
+            barrier()
 
         with rec.stage("destroy"):
-            gpubridge.destroy()
+            destroy()
     except BaseException:
         traceback.print_exc()
         return 1
