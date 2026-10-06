@@ -13,7 +13,7 @@ jobs:
         python-version: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0  # setup-uv publishes no moving major tags since v8
         with:
           python-version: ${{ matrix.python-version }}
           activate-environment: true
