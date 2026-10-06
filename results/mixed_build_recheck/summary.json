@@ -1,0 +1,390 @@
+{
+  "2.14.1-1+1": {
+    "key": "2.14.1-1+1",
+    "rdzv": "c10d",
+    "bare": false,
+    "experiment": {
+      "id": "2.14.1-1+1",
+      "group": "2.14.1",
+      "title": "matched 2.14.1, 1 CUDA + 1 ROCm",
+      "host": {
+        "env": "cu-2.14.1",
+        "nproc": 1
+      },
+      "guest": {
+        "env": "rocm-2.14.1",
+        "nproc": 1
+      }
+    },
+    "attempts": [
+      {
+        "timeout": 900,
+        "seconds": 8.0,
+        "timed_out": false,
+        "host_exit": 0,
+        "guest_exit": 0,
+        "guest_started": true,
+        "killed": [],
+        "verdict": "PASS"
+      }
+    ],
+    "verdict": "PASS",
+    "checks": {
+      "rendezvous": true,
+      "init": true,
+      "vendor_map": true,
+      "all_reduce": true,
+      "broadcast": true,
+      "shutdown": true
+    },
+    "vendor_map": [
+      "nvidia",
+      "amd"
+    ],
+    "stage_seconds": {
+      "0": {
+        "init": 0.27,
+        "all_reduce": 0.01,
+        "broadcast": 0.001,
+        "barrier": 0.002,
+        "destroy": 0.049
+      },
+      "1": {
+        "init": 0.055,
+        "all_reduce": 0.014,
+        "broadcast": 0.002,
+        "barrier": 0.002,
+        "destroy": 0.048
+      }
+    },
+    "processes": {
+      "0": {
+        "env": "cu-2.14.1",
+        "local_rank": 0,
+        "node_rank": 0,
+        "world_size_env": 2,
+        "pid": 39,
+        "hostname": "8bdb9c462325",
+        "python": "3.12.12",
+        "torch": "2.14.1+cu130",
+        "torch_version_cuda": "13.0",
+        "torch_version_hip": null,
+        "build_vendor": "nvidia",
+        "cuda_available": false,
+        "gloo_available": true,
+        "master": "8bdb9c462325:40443",
+        "agent_store": "True"
+      },
+      "1": {
+        "env": "rocm-2.14.1",
+        "local_rank": 0,
+        "node_rank": 1,
+        "world_size_env": 2,
+        "pid": 40,
+        "hostname": "8bdb9c462325",
+        "python": "3.12.12",
+        "torch": "2.14.1+rocm7.2",
+        "torch_version_cuda": null,
+        "torch_version_hip": "7.2.53211",
+        "build_vendor": "amd",
+        "cuda_available": false,
+        "gloo_available": true,
+        "master": "8bdb9c462325:40443",
+        "agent_store": "True"
+      }
+    },
+    "errors": {}
+  },
+  "2.14.1-2+2": {
+    "key": "2.14.1-2+2",
+    "rdzv": "c10d",
+    "bare": false,
+    "experiment": {
+      "id": "2.14.1-2+2",
+      "group": "2.14.1",
+      "title": "matched 2.14.1, 2 CUDA + 2 ROCm, ROCm hosts store",
+      "host": {
+        "env": "rocm-2.14.1",
+        "nproc": 2
+      },
+      "guest": {
+        "env": "cu-2.14.1",
+        "nproc": 2
+      }
+    },
+    "attempts": [
+      {
+        "timeout": 900,
+        "seconds": 8.0,
+        "timed_out": false,
+        "host_exit": 0,
+        "guest_exit": 0,
+        "guest_started": true,
+        "killed": [],
+        "verdict": "PASS"
+      }
+    ],
+    "verdict": "PASS",
+    "checks": {
+      "rendezvous": true,
+      "init": true,
+      "vendor_map": true,
+      "all_reduce": true,
+      "broadcast": true,
+      "shutdown": true
+    },
+    "vendor_map": [
+      "amd",
+      "amd",
+      "nvidia",
+      "nvidia"
+    ],
+    "stage_seconds": {
+      "0": {
+        "init": 0.106,
+        "all_reduce": 0.014,
+        "broadcast": 0.004,
+        "barrier": 0.005,
+        "destroy": 0.053
+      },
+      "1": {
+        "init": 0.061,
+        "all_reduce": 0.01,
+        "broadcast": 0.003,
+        "barrier": 0.003,
+        "destroy": 0.041
+      },
+      "2": {
+        "init": 0.325,
+        "all_reduce": 0.014,
+        "broadcast": 0.003,
+        "barrier": 0.002,
+        "destroy": 0.063
+      },
+      "3": {
+        "init": 0.318,
+        "all_reduce": 0.018,
+        "broadcast": 0.004,
+        "barrier": 0.004,
+        "destroy": 0.054
+      }
+    },
+    "processes": {
+      "0": {
+        "env": "rocm-2.14.1",
+        "local_rank": 0,
+        "node_rank": 0,
+        "world_size_env": 4,
+        "pid": 80,
+        "hostname": "8bdb9c462325",
+        "python": "3.12.12",
+        "torch": "2.14.1+rocm7.2",
+        "torch_version_cuda": null,
+        "torch_version_hip": "7.2.53211",
+        "build_vendor": "amd",
+        "cuda_available": false,
+        "gloo_available": true,
+        "master": "8bdb9c462325:36089",
+        "agent_store": "True"
+      },
+      "1": {
+        "env": "rocm-2.14.1",
+        "local_rank": 1,
+        "node_rank": 0,
+        "world_size_env": 4,
+        "pid": 82,
+        "hostname": "8bdb9c462325",
+        "python": "3.12.12",
+        "torch": "2.14.1+rocm7.2",
+        "torch_version_cuda": null,
+        "torch_version_hip": "7.2.53211",
+        "build_vendor": "amd",
+        "cuda_available": false,
+        "gloo_available": true,
+        "master": "8bdb9c462325:36089",
+        "agent_store": "True"
+      },
+      "2": {
+        "env": "cu-2.14.1",
+        "local_rank": 0,
+        "node_rank": 1,
+        "world_size_env": 4,
+        "pid": 79,
+        "hostname": "8bdb9c462325",
+        "python": "3.12.12",
+        "torch": "2.14.1+cu130",
+        "torch_version_cuda": "13.0",
+        "torch_version_hip": null,
+        "build_vendor": "nvidia",
+        "cuda_available": false,
+        "gloo_available": true,
+        "master": "8bdb9c462325:36089",
+        "agent_store": "True"
+      },
+      "3": {
+        "env": "cu-2.14.1",
+        "local_rank": 1,
+        "node_rank": 1,
+        "world_size_env": 4,
+        "pid": 81,
+        "hostname": "8bdb9c462325",
+        "python": "3.12.12",
+        "torch": "2.14.1+cu130",
+        "torch_version_cuda": "13.0",
+        "torch_version_hip": null,
+        "build_vendor": "nvidia",
+        "cuda_available": false,
+        "gloo_available": true,
+        "master": "8bdb9c462325:36089",
+        "agent_store": "True"
+      }
+    },
+    "errors": {}
+  },
+  "2.14.1-3+1": {
+    "key": "2.14.1-3+1",
+    "rdzv": "c10d",
+    "bare": false,
+    "experiment": {
+      "id": "2.14.1-3+1",
+      "group": "2.14.1",
+      "title": "matched 2.14.1, 3 CUDA + 1 ROCm",
+      "host": {
+        "env": "cu-2.14.1",
+        "nproc": 3
+      },
+      "guest": {
+        "env": "rocm-2.14.1",
+        "nproc": 1
+      }
+    },
+    "attempts": [
+      {
+        "timeout": 900,
+        "seconds": 8.0,
+        "timed_out": false,
+        "host_exit": 0,
+        "guest_exit": 0,
+        "guest_started": true,
+        "killed": [],
+        "verdict": "PASS"
+      }
+    ],
+    "verdict": "PASS",
+    "checks": {
+      "rendezvous": true,
+      "init": true,
+      "vendor_map": true,
+      "all_reduce": true,
+      "broadcast": true,
+      "shutdown": true
+    },
+    "vendor_map": [
+      "nvidia",
+      "nvidia",
+      "nvidia",
+      "amd"
+    ],
+    "stage_seconds": {
+      "0": {
+        "init": 0.238,
+        "all_reduce": 0.014,
+        "broadcast": 0.003,
+        "barrier": 0.003,
+        "destroy": 0.053
+      },
+      "1": {
+        "init": 0.278,
+        "all_reduce": 0.017,
+        "broadcast": 0.004,
+        "barrier": 0.002,
+        "destroy": 0.054
+      },
+      "2": {
+        "init": 0.226,
+        "all_reduce": 0.018,
+        "broadcast": 0.004,
+        "barrier": 0.002,
+        "destroy": 0.055
+      },
+      "3": {
+        "init": 0.062,
+        "all_reduce": 0.011,
+        "broadcast": 0.003,
+        "barrier": 0.001,
+        "destroy": 0.055
+      }
+    },
+    "processes": {
+      "0": {
+        "env": "cu-2.14.1",
+        "local_rank": 0,
+        "node_rank": 0,
+        "world_size_env": 4,
+        "pid": 145,
+        "hostname": "8bdb9c462325",
+        "python": "3.12.12",
+        "torch": "2.14.1+cu130",
+        "torch_version_cuda": "13.0",
+        "torch_version_hip": null,
+        "build_vendor": "nvidia",
+        "cuda_available": false,
+        "gloo_available": true,
+        "master": "8bdb9c462325:33049",
+        "agent_store": "True"
+      },
+      "1": {
+        "env": "cu-2.14.1",
+        "local_rank": 1,
+        "node_rank": 0,
+        "world_size_env": 4,
+        "pid": 147,
+        "hostname": "8bdb9c462325",
+        "python": "3.12.12",
+        "torch": "2.14.1+cu130",
+        "torch_version_cuda": "13.0",
+        "torch_version_hip": null,
+        "build_vendor": "nvidia",
+        "cuda_available": false,
+        "gloo_available": true,
+        "master": "8bdb9c462325:33049",
+        "agent_store": "True"
+      },
+      "2": {
+        "env": "cu-2.14.1",
+        "local_rank": 2,
+        "node_rank": 0,
+        "world_size_env": 4,
+        "pid": 148,
+        "hostname": "8bdb9c462325",
+        "python": "3.12.12",
+        "torch": "2.14.1+cu130",
+        "torch_version_cuda": "13.0",
+        "torch_version_hip": null,
+        "build_vendor": "nvidia",
+        "cuda_available": false,
+        "gloo_available": true,
+        "master": "8bdb9c462325:33049",
+        "agent_store": "True"
+      },
+      "3": {
+        "env": "rocm-2.14.1",
+        "local_rank": 0,
+        "node_rank": 1,
+        "world_size_env": 4,
+        "pid": 146,
+        "hostname": "8bdb9c462325",
+        "python": "3.12.12",
+        "torch": "2.14.1+rocm7.2",
+        "torch_version_cuda": null,
+        "torch_version_hip": "7.2.53211",
+        "build_vendor": "amd",
+        "cuda_available": false,
+        "gloo_available": true,
+        "master": "8bdb9c462325:33049",
+        "agent_store": "True"
+      }
+    },
+    "errors": {}
+  }
+}

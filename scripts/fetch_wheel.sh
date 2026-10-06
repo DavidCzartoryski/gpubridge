@@ -9,13 +9,18 @@ url=$1 sha=$2 dir=$3
 mkdir -p "$dir"
 dest="$dir/$(basename "$url" | sed 's/%2B/+/g')"
 
-sha_ok() {
-    [ -f "$dest" ] || return 1
-    if command -v sha256sum >/dev/null 2>&1; then
-        echo "$sha  $dest" | sha256sum -c --status
+# Compare digests as text: macOS now ships a BSD sha256sum without --status,
+# so prefer shasum (macOS, most Linux) and fall back to GNU sha256sum.
+digest() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
     else
-        echo "$sha  $dest" | shasum -a 256 -c --status
+        sha256sum "$1" | cut -d' ' -f1
     fi
+}
+
+sha_ok() {
+    [ -f "$dest" ] && [ "$(digest "$dest")" = "$sha" ]
 }
 
 for attempt in 1 2 3; do

@@ -7,3 +7,4 @@ build/
 dist/
 # Raw per-experiment logs from scripts/mixed_build_rendezvous.sh; summaries are committed.
 results/mixed_build/*/
+results/mixed_build_recheck/*/

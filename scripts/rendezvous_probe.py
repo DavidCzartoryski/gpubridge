@@ -19,6 +19,7 @@ import sys
 import time
 import traceback
 from collections.abc import Iterator
+from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -100,7 +101,14 @@ def init_gpubridge(rec: Recorder, timeout: float) -> int:
             for i in topology.layout.islands
         ],
         "peers": [
-            {"vendor": p.vendor, "torch": p.torch_version, "simulated": p.simulated}
+            {
+                "vendor": p.vendor,
+                "torch": p.torch_version,
+                "simulated": p.simulated,
+                # The full probe record each peer sent during discovery, if this
+                # gpubridge version exchanges one.
+                "probe": asdict(p.probe) if hasattr(p, "probe") else None,
+            }
             for p in topology.peers
         ],
     }

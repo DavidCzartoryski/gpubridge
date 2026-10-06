@@ -17,8 +17,10 @@ answered for the CPU side by running real builds without GPUs; see
 
    **Status: works on CPU.** CUDA-build and ROCm-build processes rendezvoused
    through torchrun's c10d backend and completed discovery, all_reduce and
-   broadcast in every run, with either build hosting the store. Still open:
-   separate hosts on a real network, and the same with GPUs attached.
+   broadcast in every run, with either build hosting the store. Rechecked on
+   `main` after discovery started sending each rank's full probe record; see
+   [Recheck on current main](#recheck-on-current-main-nested-probe-record).
+   Still open: separate hosts on a real network, and the same with GPUs attached.
 2. **Version matching between builds.** Use the same PyTorch release on both
    sides, e.g. `2.x.y+cu12x` and `2.x.y+rocm6.x`, and the same Python minor
    version, since discovery pickles objects with `all_gather_object`.
@@ -123,6 +125,48 @@ Layouts are CUDA ranks + ROCm ranks; the build in brackets hosted the store.
 Every run passed on its first attempt, with no timeouts and so no reruns.
 Each took 8 to 9 seconds end to end, emulation included.
 
+### Recheck on current main (nested probe record)
+
+Run on 2026-10-06 against `main` at `3a815c0` (after #3). Discovery there sends
+each rank's full `probe()` record nested inside its `PeerInfo`, which the
+earlier runs above did not. Same setup, 2.14.1 pair only, with the wheels
+installed offline from the host cache:
+
+```
+GPUBRIDGE_ENVS=2.14.1 scripts/mixed_build_rendezvous.sh --group 2.14.1 \
+    --results /gpubridge/results/mixed_build_recheck
+```
+
+Raw results:
+[`results/mixed_build_recheck/summary.md`](results/mixed_build_recheck/summary.md)
+and [`summary.json`](results/mixed_build_recheck/summary.json).
+
+| CUDA build | ROCm build | Layout (store host) | Result |
+| --- | --- | --- | --- |
+| 2.14.1+cu130 | 2.14.1+rocm7.2 | 1+1 (CUDA) | **PASS** |
+| 2.14.1+cu130 | 2.14.1+rocm7.2 | 2+2 (ROCm) | **PASS** |
+| 2.14.1+cu130 | 2.14.1+rocm7.2 | 3+1 (CUDA) | **PASS** |
+
+Every check passed (rendezvous, init, vendor map, all_reduce, broadcast,
+shutdown), each run on its first attempt, in 8 seconds.
+
+**The nested record crosses builds intact.** Every rank received every peer's
+probe record, and all ranks held identical tables. A CUDA rank saw the ROCm
+rank as:
+
+```
+build_vendor="amd", torch_version="2.14.1+rocm7.2", cuda_version=None,
+hip_version="7.2.53211", gpu_count=0, nccl_available=True,
+gloo_available=True, errors=()
+```
+
+The ROCm ranks saw the mirror image (`build_vendor="nvidia"`,
+`cuda_version="13.0"`). No rank reported problems.
+
+`nccl_available` is True on both builds even without GPUs, because it reports
+whether the backend is compiled into the build. `gpu_count` is what shows the
+missing hardware.
+
 ### What this means for the design
 
 - **The bridge design stands.** The parts of a mixed job that both builds must
@@ -160,5 +204,9 @@ Each took 8 to 9 seconds end to end, emulation included.
   installs offline from it.
 - ROCm builds of torch need `libatomic.so.1`, which slim Debian images lack
   (package `libatomic1`).
+- Recent macOS ships a BSD `sha256sum` that has no `--status` flag. An early
+  version of `fetch_wheel.sh` used it, mistook the usage error for a checksum
+  mismatch, and deleted a complete 6.2 GB wheel. The script now compares
+  digests as text, preferring `shasum`.
 - `download-r2.pytorch.org` answers 403 to Python's default `urllib`
   User-Agent; set one when scripting against it.
