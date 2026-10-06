@@ -22,7 +22,7 @@ def all_reduce(tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM) -> N
 
     Args:
         tensor: Input and output. Must be contiguous and on this rank's device
-            (CPU in simulation mode).
+            (CPU in simulation and CPU-only mode).
         op: Only ``ReduceOp.SUM`` is supported in v1.
 
     Raises:
@@ -105,7 +105,9 @@ def _check_tensor(tensor: torch.Tensor, topology: Topology) -> None:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"expected a torch.Tensor, got {type(tensor).__name__}")
     if tensor.device != topology.device:
-        hint = " (simulation mode keeps tensors on CPU)" if topology.simulated else ""
+        hint = ""
+        if topology.simulated:
+            hint = " (tensors stay on CPU in simulation and CPU-only mode)"
         raise ValueError(
             f"tensor is on {tensor.device} but this rank communicates on {topology.device}{hint}"
         )

@@ -1,13 +1,14 @@
 import pytest
 import torch
 
-from gpubridge.config import VENDOR_ENV, is_simulated, resolve_config
+from gpubridge.config import CPU_ONLY_ENV, VENDOR_ENV, is_cpu_only, is_simulated, resolve_config
 from gpubridge.detect import detect_hardware_vendor, detect_vendor, vendor_override
 
 
 @pytest.fixture(autouse=True)
 def no_override(monkeypatch):
     monkeypatch.delenv(VENDOR_ENV, raising=False)
+    monkeypatch.delenv(CPU_ONLY_ENV, raising=False)
     monkeypatch.delenv("LOCAL_RANK", raising=False)
 
 
@@ -79,3 +80,52 @@ def test_real_mode_without_gpu_points_at_simulation_mode(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match=VENDOR_ENV):
         resolve_config()
+
+
+@pytest.mark.parametrize(
+    ("hip", "cuda", "expected"),
+    [("7.2.26015", None, "amd"), (None, "13.0", "nvidia")],
+)
+def test_cpu_only_keeps_the_build_vendor(monkeypatch, hip, cuda, expected):
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(torch.version, "cuda", cuda)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv(CPU_ONLY_ENV, "1")
+    assert detect_vendor() == expected
+    config = resolve_config()
+    assert config.simulated
+    assert config.island_backend == "gloo"
+    assert config.device == torch.device("cpu")
+
+
+def test_cpu_only_on_a_cpu_build_cannot_detect_a_vendor(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.version, "cuda", None)
+    monkeypatch.setenv(CPU_ONLY_ENV, "1")
+    with pytest.raises(RuntimeError, match=CPU_ONLY_ENV):
+        detect_vendor()
+
+
+def test_vendor_override_wins_over_cpu_only(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.version, "cuda", "13.0")
+    monkeypatch.setenv(CPU_ONLY_ENV, "1")
+    monkeypatch.setenv(VENDOR_ENV, "amd")
+    assert detect_vendor() == "amd"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1", True), ("true", True), (" YES ", True), ("on", True),
+     ("0", False), ("false", False), ("no", False), ("", False)],
+)
+def test_cpu_only_flag_values(monkeypatch, value, expected):
+    monkeypatch.setenv(CPU_ONLY_ENV, value)
+    assert is_cpu_only() is expected
+    assert is_simulated() is expected
+
+
+def test_cpu_only_rejects_non_boolean(monkeypatch):
+    monkeypatch.setenv(CPU_ONLY_ENV, "maybe")
+    with pytest.raises(ValueError, match="maybe"):
+        is_cpu_only()

@@ -63,7 +63,7 @@ def test_shapes_and_dtypes(vendors, tmp_path):
 def _check_rejects_bad_calls(topology):
     with pytest.raises(ValueError, match="SUM"):
         gpubridge.all_reduce(torch.ones(3), op=gpubridge.ReduceOp.MAX)
-    with pytest.raises(ValueError, match="simulation mode keeps tensors on CPU"):
+    with pytest.raises(ValueError, match="tensors stay on CPU"):
         gpubridge.all_reduce(torch.ones(3, device="meta"))
     with pytest.raises(ValueError, match="contiguous"):
         gpubridge.all_reduce(torch.ones(4, 4).t())

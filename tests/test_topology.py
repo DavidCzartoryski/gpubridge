@@ -59,14 +59,20 @@ def _peer(simulated: bool = True, torch_version: str = "2.5.1") -> PeerInfo:
     return PeerInfo("nvidia", simulated, torch_version, "node0")
 
 
-def test_mixed_simulation_modes_are_rejected():
-    with pytest.raises(RuntimeError, match=r"ranks \[0, 2\] but not on ranks \[1\]"):
+def test_mixed_cpu_and_gpu_ranks_are_rejected():
+    match = r"ranks \[0, 2\] run on CPU .* but ranks \[1\] run on GPUs"
+    with pytest.raises(RuntimeError, match=match):
         validate_peers([_peer(simulated=True), _peer(simulated=False), _peer(simulated=True)])
 
 
 def test_different_torch_releases_warn():
     with pytest.warns(UserWarning, match="2.4.0, 2.5.1"):
         validate_peers([_peer(torch_version="2.5.1+cu124"), _peer(torch_version="2.4.0+rocm6.1")])
+
+
+def test_releases_in_the_warning_are_in_version_order():
+    with pytest.warns(UserWarning, match=r"\(2\.9\.1, 2\.14\.1\)"):
+        validate_peers([_peer(torch_version="2.14.1+cu130"), _peer(torch_version="2.9.1+rocm6.4")])
 
 
 def test_same_release_on_both_builds_is_quiet(recwarn):
