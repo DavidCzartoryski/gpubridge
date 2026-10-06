@@ -39,7 +39,8 @@ import gpubridge
 
 UNITS = {"K": 2**10, "M": 2**20, "G": 2**30}
 DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
-FIELDS = ["op", "run_kind", "split_test", "islands", "world_size", "bytes", "dtype", "trials",
+FIELDS = ["op", "policy", "run_kind", "split_test", "islands", "world_size", "bytes", "dtype",
+          "trials",
           "median_us", "p90_us", "min_us", "algbw_GBps", "busbw_GBps"]
 
 
@@ -93,7 +94,8 @@ def row(op: str, info: dict[str, Any], nbytes: int, dtype: str, lat: list[float]
     p90 = sorted(lat)[max(0, int(round(0.9 * len(lat))) - 1)]
     algbw = nbytes / median / 1e9
     return {
-        "op": op, "run_kind": info["kind"], "split_test": info["split_test"] or "",
+        "op": op, "policy": info["policy"] if op == "gpubridge" else "",
+        "run_kind": info["kind"], "split_test": info["split_test"] or "",
         "islands": len(info["islands"]), "world_size": world, "bytes": nbytes, "dtype": dtype,
         "trials": len(lat), "median_us": round(median * 1e6, 2), "p90_us": round(p90 * 1e6, 2),
         "min_us": round(min(lat) * 1e6, 2), "algbw_GBps": round(algbw, 4),
@@ -106,7 +108,8 @@ def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
     if info["split_test"]:
         lines += ["> **SPLIT TEST - not a mixed-vendor result.** Islands were faked from a "
                   "single-vendor job with `GPUBRIDGE_SPLIT_TEST`.", ""]
-    lines += [f"Run kind `{info['kind']}`, {info['world_size']} ranks, "
+    lines += [f"Run kind `{info['kind']}`, gpubridge policy `{info['policy']}`, "
+              f"{info['world_size']} ranks, "
               f"{len(info['islands'])} island(s). Latency is the median of the slowest rank.",
               "", "| size | native median (us) | native busbw (GB/s) | gpubridge median (us) "
               "| gpubridge busbw (GB/s) | gpubridge / native |",
@@ -139,10 +142,12 @@ def main() -> int:
     parser.add_argument("--max-seconds", type=float, default=20.0,
                         help="stop timing a size after this much measured time (min 3 trials)")
     parser.add_argument("--ops", default="native,gpubridge", help="which to measure")
+    parser.add_argument("--policy", default="auto",
+                        help="collective policy for the gpubridge op, e.g. flat-gloo")
     parser.add_argument("--timeout", type=float, default=1800)
     args = parser.parse_args()
 
-    topology = gpubridge.init(timeout=timedelta(seconds=args.timeout))
+    topology = gpubridge.init(timeout=timedelta(seconds=args.timeout), policy=args.policy)
     info = run_info(topology)
     device, dtype = topology.device, DTYPES[args.dtype]
     if topology.split_test and topology.rank == 0:

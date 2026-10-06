@@ -23,6 +23,7 @@ from gpubridge.config import (
     split_test_mode,
 )
 from gpubridge.detect import Probe, detect_vendor, probe
+from gpubridge.policies import AUTO, CollectivePolicy, choose_policy
 from gpubridge.split_test import SplitTestWarning, banner, split_labels
 from gpubridge.transport import BridgeTransport
 
@@ -110,6 +111,8 @@ class PeerInfo:
     """Why this rank cannot take part. A problem on any rank fails init() on every rank."""
     split_test: str = ""
     """This rank's ``GPUBRIDGE_SPLIT_TEST`` mode, or empty when off. TEST ONLY."""
+    policy: str = AUTO
+    """Name of the collective policy this rank was asked to use (``auto`` by default)."""
 
     @property
     def torch_version(self) -> str:
@@ -128,7 +131,7 @@ class PeerInfo:
         return cls(probe=Probe(**probe_data), **data)
 
 
-def describe_local(bridge: str) -> tuple[PeerInfo, Config]:
+def describe_local(bridge: str, policy: str = AUTO) -> tuple[PeerInfo, Config]:
     """Work out this rank's vendor, configuration and capabilities.
 
     Anything that would stop this rank from joining (no detectable vendor, no
@@ -169,6 +172,7 @@ def describe_local(bridge: str) -> tuple[PeerInfo, Config]:
         probe=local_probe,
         problems=tuple(problems),
         split_test=split,
+        policy=policy,
     )
     return local, config
 
@@ -180,8 +184,8 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
 
     Raises:
         RuntimeError: if any rank reported problems, if some ranks run on CPU and
-            others on GPUs, or if ranks picked different bridge transports or
-            split-test modes.
+            others on GPUs, or if ranks picked different bridge transports,
+            collective policies or split-test modes.
     """
     failing = [(rank, peer) for rank, peer in enumerate(peers) if peer.problems]
     if failing:
@@ -209,6 +213,15 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
         detail = "; ".join(f"{name!r} on ranks {ranks}" for name, ranks in bridges.items())
         raise RuntimeError(
             f"Ranks picked different bridge transports: {detail}. Pass the same bridge "
+            "to gpubridge.init() on every rank."
+        )
+    policies: dict[str, list[int]] = {}
+    for rank, peer in enumerate(peers):
+        policies.setdefault(peer.policy, []).append(rank)
+    if len(policies) > 1:
+        detail = "; ".join(f"{name!r} on ranks {ranks}" for name, ranks in policies.items())
+        raise RuntimeError(
+            f"Ranks picked different collective policies: {detail}. Pass the same policy "
             "to gpubridge.init() on every rank."
         )
     splits: dict[str, list[int]] = {}
@@ -250,6 +263,13 @@ class Topology:
     """This rank's island, on the native backend (Gloo when running on CPU)."""
     bridge: BridgeTransport | None
     """The transport linking island leaders. None on non-leaders and in single-vendor clusters."""
+    policy: CollectivePolicy
+    """The collective policy every rank runs (``auto`` already resolved)."""
+
+    @property
+    def policy_name(self) -> str:
+        """Name of the active collective policy, e.g. ``"reduce-bridge-broadcast"``."""
+        return self.policy.name
 
     @property
     def bridge_group(self) -> ProcessGroup | None:
@@ -312,6 +332,7 @@ def build_topology(
     config: Config,
     *,
     transport: type[BridgeTransport],
+    policy: str | type[CollectivePolicy] = AUTO,
     timeout: timedelta | None = None,
 ) -> Topology:
     """Exchange every rank's :class:`PeerInfo`, then create the island groups and the bridge.
@@ -322,10 +343,13 @@ def build_topology(
         local: What this rank reports, from :func:`describe_local`.
         config: This rank's resolved configuration.
         transport: The bridge transport class; its name must match ``local.bridge``.
+        policy: ``"auto"`` or the collective policy class; its name must match
+            ``local.policy``.
         timeout: Timeout for the new groups' collectives. None keeps PyTorch's default.
 
     Raises:
-        RuntimeError: from :func:`validate_peers`, on every rank alike.
+        RuntimeError: from :func:`validate_peers`, or if the policy doesn't apply
+            to the layout, on every rank alike.
     """
     rank = dist.get_rank()
     gathered: list[Any] = [None] * dist.get_world_size()
@@ -339,6 +363,9 @@ def build_topology(
         labels = split_labels(vendors, [peer.hostname for peer in peers], local.split_test)
         warnings.warn(banner(local.split_test, vendors, labels), SplitTestWarning, stacklevel=3)
     layout = plan_topology(labels)
+    # Every rank sees the same layout, so every rank picks (or rejects) the same
+    # policy, before any group is created.
+    policy_cls = choose_policy(policy, layout)
 
     # new_group is collective over the whole world: every rank creates every
     # group, in the same order, including groups it is not a member of.
@@ -357,14 +384,17 @@ def build_topology(
             )
     assert island_group is not None
 
-    return Topology(
+    topology = Topology(
         rank=rank,
         layout=layout,
         peers=peers,
         config=config,
         island_group=island_group,
         bridge=bridge,
+        policy=policy_cls(),
     )
+    topology.policy.setup(topology)
+    return topology
 
 
 _current: Topology | None = None

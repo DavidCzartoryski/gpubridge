@@ -5,8 +5,8 @@ item each one closes):
 
 1. init: gpubridge.init(), discovery, islands, bridge, new_group on non-members (item 3)
 2. device: which GPU this rank drives, by index and PCI bus id (item 5)
-3. dtypes: all_reduce of integer-valued data in float32, float16, bfloat16 and
-   int64, checked for exact results (item 7)
+3. dtypes: all_reduce of integer-valued data in every dtype gpubridge supports
+   (gpubridge.collectives.SUPPORTED_DTYPES), checked for exact results (item 7)
 4. busy_gpu: a large tensor reduced right behind queued GPU work, so the
    bridge's device-to-host copy must wait for it (items 6 and 9)
 5. broadcast: from every rank
@@ -16,6 +16,8 @@ item each one closes):
 Writes OUT/rank<N>.json. Run scripts/gpu/summarize.py OUT afterwards.
 
     torchrun --nproc-per-node=4 scripts/gpu/check.py --out results/explorer/04_split_4gpu
+
+--policy picks the collective policy (default auto), so runs can compare them.
 """
 
 from __future__ import annotations
@@ -31,24 +33,27 @@ import torch
 from gpukit import Record, rank_from_env, run_info, sync
 
 import gpubridge
+from gpubridge.collectives import SUPPORTED_DTYPES
 
-DTYPES = {
-    "float32": torch.float32,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "int64": torch.int64,
-}
+DTYPES = {str(dtype).removeprefix("torch."): dtype for dtype in SUPPORTED_DTYPES}
+
+
+def _values64(shape: tuple[int, ...], dtype: torch.dtype, rank: int) -> torch.Tensor:
+    """Small integers that differ per rank and element, kept small enough that
+    every partial sum is exact: at most 16 per element (bfloat16 stays exact up
+    to 16 ranks) and at most 3 for 8-bit types (int8 stays exact up to 42 ranks)."""
+    index = torch.arange(int(torch.Size(shape).numel()), dtype=torch.float64).reshape(shape)
+    if dtype in (torch.int8, torch.uint8):
+        return index % 2 + rank % 2 + 1
+    return index % 8 + rank % 8 + 1
 
 
 def rank_values(shape: tuple[int, ...], dtype: torch.dtype, rank: int, device) -> torch.Tensor:
-    """Small integers that differ per rank and element, so sums are exact in every dtype."""
-    numel = int(torch.Size(shape).numel())
-    base = (torch.arange(numel, dtype=torch.float64) % 64).reshape(shape)
-    return (base + rank + 1).to(dtype).to(device)
+    return _values64(shape, dtype, rank).to(dtype).to(device)
 
 
 def expected_sum(shape, dtype, world, device) -> torch.Tensor:
-    total = sum(rank_values(shape, torch.float64, r, "cpu") for r in range(world))
+    total = sum(_values64(shape, dtype, r) for r in range(world))
     return torch.as_tensor(total).to(dtype).to(device)
 
 
@@ -57,6 +62,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True, help="directory for rank JSON")
     parser.add_argument("--timeout", type=float, default=600, help="group timeout (s)")
     parser.add_argument("--dtypes", default=",".join(DTYPES), help="comma-separated")
+    parser.add_argument("--policy", default="auto", help="collective policy for gpubridge.init")
     parser.add_argument("--large-numel", type=int, default=None,
                         help="elements in the busy-GPU tensor (default: 64M on GPU, 1M on CPU)")
     parser.add_argument("--busy-iters", type=int, default=20,
@@ -68,7 +74,8 @@ def main() -> int:
                  hang_dump_seconds=args.timeout * 0.8)
     try:
         with rec.stage("init"):
-            topology = gpubridge.init(timeout=timedelta(seconds=args.timeout))
+            topology = gpubridge.init(timeout=timedelta(seconds=args.timeout),
+                                      policy=args.policy)
         rec.data["run"] = run_info(topology)
         rec.write()
         if topology.split_test and rank == 0:

@@ -127,6 +127,7 @@ def run_info(topology: gpubridge.Topology) -> dict[str, Any]:
             for island in topology.layout.islands
         ],
         "bridge": topology.peers[topology.rank].bridge,
+        "policy": topology.policy_name,
     }
     if topology.split_test:
         info["warning"] = (

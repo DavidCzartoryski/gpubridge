@@ -78,6 +78,7 @@ def summarize_checks(directory: Path, partial: bool = False) -> tuple[dict[str, 
         "directory": str(directory),
         "ok": ok,
         "run_kind": kind,
+        "policy": runs[0].get("policy") if runs else None,
         "split_test": split,
         "real_mixed_vendor": kind == "gpu-mixed",
         "ranks_reported": sorted(records),
@@ -101,7 +102,9 @@ def summarize_checks(directory: Path, partial: bool = False) -> tuple[dict[str, 
     lines = [f"# {directory.name}: {'PASS' if ok else 'FAIL'}", ""]
     if split:
         lines += [SPLIT_BANNER, ""]
-    lines += [f"Run kind: `{kind}`; split test: `{split or 'off'}`; ranks reported "
+    policy = runs[0].get("policy", "unknown") if runs else "unknown"
+    lines += [f"Run kind: `{kind}`; policy: `{policy}`; split test: `{split or 'off'}`; "
+              "ranks reported "
               f"{len(records)}{f' of {expected}' if expected else ''}.", ""]
     if missing and partial:
         lines += [f"Ranks {missing} ran on another machine (partial summary).", ""]
