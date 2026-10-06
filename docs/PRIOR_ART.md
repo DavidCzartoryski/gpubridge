@@ -1,11 +1,26 @@
-# Prior art: Modular MAX `comm` and RAJA
+# Prior art: Modular MAX `comm`, RAJA, Triton and Triton-distributed
 
-Notes comparing gpubridge with two projects that also promise "write it once,
-run it on NVIDIA or AMD". Read on 2026-10-06 at Modular
-[`85356f6`](https://github.com/modular/modular/tree/85356f6562ed57bab8762fde38448ba5b50b69c9)
-and RAJA [`09626e8`](https://github.com/llnl/RAJA/tree/09626e855db5005357eb1dac7cc4db0546cf0f53)
-(`develop`; RAJA has no `main`). All links point at those commits. Statements
-marked *(reading)* are conclusions from reading the code, not from running it.
+Notes comparing gpubridge with four projects that also promise "write it once,
+run it on NVIDIA or AMD". Each repo was read on 2026-10-06 at a fixed commit,
+and every code link points at that commit:
+
+- Modular [`85356f6`](https://github.com/modular/modular/tree/85356f6562ed57bab8762fde38448ba5b50b69c9)
+- RAJA [`09626e8`](https://github.com/llnl/RAJA/tree/09626e855db5005357eb1dac7cc4db0546cf0f53)
+  (`develop`; RAJA has no `main`)
+- Triton [`4a5147d`](https://github.com/triton-lang/triton/tree/4a5147d919defd3064388d4cdd202fb5e9403b61)
+- Triton-distributed [`7908e4e`](https://github.com/ByteDance-Seed/Triton-distributed/tree/7908e4ea9010bb2238f9f05b28c904fd4b71c60a)
+  (`main` as of 2026-09-18)
+
+Statements marked *(reading)* are conclusions from reading the code, not from
+running it.
+
+| Project | Compute or communication | Vendors supported | Vendor chosen | Mixed vendors in one job |
+| --- | --- | --- | --- | --- |
+| Modular MAX `comm` | communication (vendor libraries or its own kernels) | NVIDIA, AMD | compile time, per target | no (its README says so) |
+| RAJA | compute (loops and kernels) | CUDA, HIP, SYCL, OpenMP, CPU | compile time, by policy type | no |
+| Triton | compute (kernel language and compiler) | NVIDIA (compute capability 8.0+), AMD (ROCm 6.2+) | run time, one driver per process; compiled per GPU architecture | no: exactly one active driver per process |
+| Triton-distributed | communication inside kernels, overlapped with compute | NVIDIA (NVSHMEM), AMD (rocSHMEM or MORI, single node), MetaX | run time, per process (`nvidia-smi` / `rocm-smi` on PATH) | no: one SHMEM library over one NCCL group |
+| **gpubridge** | communication (no kernels) | NVIDIA, AMD | run time, per process (from the PyTorch build) | **yes**: one island per vendor, joined by a CPU bridge |
 
 ## Modular MAX: `comm` and `comm/vendor/ccl`
 
@@ -47,10 +62,19 @@ Serving sets it from the `MAX_SERVE_USE_VENDOR_CCL` env var, which defaults to `
 - `is_allreduce_available()`, `is_allgather_available()` and
   `is_broadcast_available()` resolve a symbol without calling it
   ([L452-498](https://github.com/modular/modular/blob/85356f6562ed57bab8762fde38448ba5b50b69c9/max/kernels/src/comm/vendor/ccl.mojo#L452-L498)).
-- Their docstrings say they return `False` when the library is absent. *(reading)*
-  They load it through `_find_dylib`, whose `abort_on_failure` defaults to `True`
-  ([ffi](https://github.com/modular/modular/blob/85356f6562ed57bab8762fde38448ba5b50b69c9/Mojo/stdlib/std/ffi/__init__.mojo#L947-L973)),
-  so a missing library probably aborts the process rather than returning `False`.
+- Their docstrings say they return `False` when the library is absent, but
+  they load it through `_find_dylib`, whose `abort_on_failure` defaults to `True`
+  ([ffi](https://github.com/modular/modular/blob/85356f6562ed57bab8762fde38448ba5b50b69c9/Mojo/stdlib/std/ffi/__init__.mojo#L947-L973)).
+  **Confirmed by reproduction** on 2026-10-06:
+  - A five-line Mojo program that calls `is_allreduce_available()` on a machine
+    without NCCL aborts the whole process, with `ABORT: ... Failed to load NCCL
+    from libnccl.so ...` and exit code 133 (SIGTRAP), and never returns.
+  - It aborted on macOS 27 arm64 and Debian 13 aarch64, with the shipped
+    nightly package (`max 26.7.0.dev2026100605`) and with `main`'s `ccl.mojo`
+    compiled from source.
+  - A patch that checks the library through the raising `_try_find_dylib`
+    first returns `False` without NCCL, and still returns `True` with a stub
+    `libnccl.so`. A draft issue with the patch is pending.
 - The graph op does not probe; it calls the vendor path directly.
 
 **How collectives are structured.**
@@ -68,7 +92,7 @@ Serving sets it from the `MAX_SERVE_USE_VENDOR_CCL` env var, which defaults to `
   in replacement)"
   ([`sync.mojo`](https://github.com/modular/modular/blob/85356f6562ed57bab8762fde38448ba5b50b69c9/max/kernels/src/comm/sync.mojo#L36-L60)).
 
-**Mixing NVIDIA and AMD: not supported.** You were right about this.
+**Mixing NVIDIA and AMD: not supported.**
 - The vendor README says "Mixed‑vendor hosts are not explicitly supported"
   ([README L73-74](https://github.com/modular/modular/blob/85356f6562ed57bab8762fde38448ba5b50b69c9/max/kernels/src/comm/vendor/README.md#L73-L74)).
 - The design assumes one vendor throughout. One library is chosen per compile
@@ -105,7 +129,7 @@ Serving sets it from the `MAX_SERVE_USE_VENDOR_CCL` env var, which defaults to `
 ### Ideas worth adopting
 
 1. **Probes that never crash, plus one capability report.** Modular's probes
-   have the right shape but probably abort when the library is missing.
+   have the right shape but abort the process when the library is missing.
    *Status: implemented as `gpubridge.probe()` and discovery-time problem
    reports.*
    - Add `detect.probe()`, which never raises. It returns this rank's build
@@ -127,6 +151,7 @@ Serving sets it from the `MAX_SERVE_USE_VENDOR_CCL` env var, which defaults to `
 3. **Check dtype and op support up front.** Modular rejects unsupported dtypes
    by name before calling the library. Today gpubridge leaves dtype errors to
    torch, which can fail on the bridge after the island step has already run.
+   *Status: not implemented yet.*
    - Keep one table of dtypes that both the island backend and Gloo support.
    - Check it in `collectives._check_tensor`, so every rank raises the same
      error before any communication.
@@ -199,6 +224,7 @@ with per-backend policy lists kept in one header
 
 1. **Collective policies: separate what a collective computes from how it is
    composed.** Today `collectives.py` hard-codes reduce-bridge-broadcast.
+   *Status: not implemented yet.*
    - Make the composition a policy object chosen at `init()`, with an
      optional per-call override:
      - `ReduceBridgeBroadcast`: the current behaviour.
@@ -214,6 +240,7 @@ with per-backend policy lists kept in one header
 2. **A vendor registry, so a new vendor is one entry.** Vendor knowledge is
    currently spread out: `Vendor` and `GPU_BACKEND` live in `config.py`, and
    the `torch.version` checks live in `detect.py`.
+   *Status: not implemented yet.*
    - Collect each vendor's details into one `VendorSpec` table in a new
      `vendors.py`. Each entry gives its name, how to detect it from the build,
      its island backend, and how to map a local rank to a device.
@@ -225,10 +252,295 @@ with per-backend policy lists kept in one header
    checks in several modes: simulated vendors, faked builds under
    `GPUBRIDGE_CPU_ONLY`, real mixed builds in `scripts/`, and eventually real
    GPUs.
+   *Status: not implemented yet. The GPU validation kit (`scripts/gpu/`) runs
+   one check script in every mode, but the pytest suite is not yet
+   parametrized over modes.*
    - List the modes once in `tests/_harness.py` and parametrize the collective
      tests over them.
    - Enable the GPU modes automatically when hardware is present, so a
      self-hosted GPU runner later needs no new tests.
+
+## Triton
+
+### What it does
+
+Triton is "a language and compiler for writing highly efficient custom
+Deep-Learning primitives" ([`README.md`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/README.md#L25)): kernels written in
+Python, compiled through MLIR and LLVM. It is MIT-licensed
+([`setup.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/setup.py#L612)). The README lists Linux, "NVIDIA GPUs (Compute
+Capability 8.0+)", "AMD GPUs (ROCm 6.2+)" and CPUs as under development
+([`README.md` L292-302](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/README.md#L292-L302)).
+
+**Below compute capability 8.0 (e.g. V100).**
+- Not supported, but not blocked either: the NVIDIA backend only checks
+  `target.backend == 'cuda'`
+  ([`compiler.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/third_party/nvidia/backend/compiler.py#L186-L188)).
+- Matrix multiplies on compute capability 7.x fall back from tensor cores to
+  the FMA path, with a deprecation remark
+  ([`AccelerateMatmul.cpp`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp#L503-L510)).
+- The Volta tensor-core layout is rejected as "deprecated and no longer
+  supported" ([`Dialect.cpp`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/lib/Dialect/TritonGPU/IR/Dialect.cpp#L1574-L1577)).
+- *(reading)* So kernels may still compile and run on a V100, slowly and
+  untested.
+
+**Communication: none shipped.**
+- Core Triton has no collectives and no NVSHMEM or NCCL/RCCL bindings.
+  Searches for allreduce, nvshmem, rocshmem, multimem, nccl and IPC calls
+  found nothing in the language, `tl.extra`, the tutorials or `third_party/`.
+- It does have building blocks:
+  - atomics, loads and stores that take `scope="sys"`
+    ([`core.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/python/triton/language/core.py#L2598-L2619));
+  - raw pointers, which may point at another GPU's memory. A test signals a
+    peer GPU with a system-scope atomic and then reads its buffer
+    ([`test_symmetric_memory.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/python/test/gsan/test_symmetric_memory.py#L74-L85)).
+- Two adjacent pieces live in the same repo:
+  - an experimental, CUDA-only data-race sanitizer (GSan) with its own
+    symmetric-memory rendezvous
+    ([`gsan/README.md`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/python/triton/experimental/gsan/README.md#L5-L12));
+  - the separate `triton_kernels` package, which uses PyTorch's symmetric
+    memory to dispatch mixture-of-experts tokens within one node
+    ([`mesh.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/python/triton_kernels/triton_kernels/distributed_details/mesh.py#L127-L131),
+    [`distributed.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/python/triton_kernels/triton_kernels/distributed.py#L135-L171)).
+
+**How a backend is found, chosen and compiled for.**
+- **Discovery.** Backends are discovered through Python entry points in the
+  `triton.backends` group
+  ([`backends/__init__.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/python/triton/backends/__init__.py#L38-L66)).
+- **What a backend is.** One compiler class (`BaseBackend`: `supports_target`,
+  `hash`, `parse_options`, `add_stages`, ...,
+  [`compiler.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/python/triton/backends/compiler.py#L23-L73)) plus one
+  driver class (`DriverBase`: `is_active`, `get_current_target`,
+  `get_active_torch_device`, ...,
+  [`driver.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/python/triton/backends/driver.py#L114-L147)).
+- **Packaging.** Both the NVIDIA and AMD backends ship in every wheel
+  ([`setup.py` L401](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/setup.py#L401)). Out-of-tree backends come in
+  through `TRITON_PLUGIN_DIRS` at build time
+  ([`setup.py` L113-126](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/setup.py#L113-L126)), or as any package that
+  registers the entry point.
+- **One driver per process.** Exactly one driver may be active, or
+  `_create_driver()` raises "There should only be one", unless
+  `TRITON_DEFAULT_BACKEND` names one
+  ([`runtime/driver.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/python/triton/runtime/driver.py#L8-L21)).
+  The AMD driver is active when
+  `torch.cuda.is_available() and (torch.version.hip is not None)`
+  ([AMD `driver.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/third_party/amd/backend/driver.py#L360-L366)).
+- **Compilation.** Kernels compile on first launch for a
+  `GPUTarget(backend, arch, warp_size)`
+  ([`compiler.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/python/triton/backends/compiler.py#L8-L14)). The
+  pipeline is `ttir -> ttgir -> llir -> ptx -> cubin` on NVIDIA
+  ([L651-668](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/third_party/nvidia/backend/compiler.py#L651-L668)) and
+  `... -> llir -> amdgcn -> hsaco` on AMD
+  ([L829-844](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/third_party/amd/backend/compiler.py#L829-L844)).
+- **Cache.** The on-disk cache key includes the backend's hash, which contains
+  the GPU architecture
+  ([`cache.py`](https://github.com/triton-lang/triton/blob/4a5147d919defd3064388d4cdd202fb5e9403b61/python/triton/runtime/cache.py#L321-L323)).
+
+### Overlap with gpubridge
+
+- **The same split.** One codebase covers both vendors, and the vendor is
+  chosen per process at run time from the environment. In Triton that's the
+  active driver; in gpubridge it's the PyTorch build.
+- **The same invariant.** One vendor per process, which is exactly how
+  gpubridge's islands work.
+- **The same registry shape.** Triton's backend table (a name mapped to a
+  compiler, a driver, an `is_active()` check and a target) is close to the
+  `VendorSpec` registry proposed above under RAJA.
+
+### Where gpubridge is different
+
+- **Compute versus communication.** Triton writes kernels for one GPU;
+  gpubridge writes none and moves data between processes.
+- **Two vendors in one job.** Triton never needs this; it is gpubridge's
+  purpose.
+- **A caveat for gpubridge users who run Triton kernels.** *(reading)* On a
+  host with both vendors' drivers installed, a ROCm-PyTorch process can see
+  both the HIP and CUDA drivers as active, and Triton raises "There should
+  only be one" unless `TRITON_DEFAULT_BACKEND=amd` is set. A CUDA-PyTorch
+  process is unaffected, because the HIP check needs `torch.version.hip`.
+
+### Ideas worth adopting
+
+1. **Model the vendor registry on Triton's backend table.** This extends the
+   RAJA idea above with Triton's details.
+   *Status: not implemented yet.*
+   - In a new `vendors.py`, each `VendorSpec` carries: a name, an `is_active()`
+     check against the PyTorch build, the island backend, the device for a
+     local rank, and a target description.
+   - Discover third-party vendors through a `gpubridge.vendors` entry point,
+     so adding one (e.g. Intel XPU) is a package, not a patch to `detect.py`
+     and `config.py`.
+   - Keep Triton's strict rule: exactly one active vendor per process, and a
+     clear error otherwise.
+2. **Handle `TRITON_DEFAULT_BACKEND` on hosts with both vendors.** After
+   detection gpubridge knows each rank's vendor.
+   *Status: not implemented yet; it only matters once both vendors share a
+   host.*
+   - Document the caveat above.
+   - Optionally set the variable when it is unset, before user code launches
+     Triton kernels. This would go in `detect.py` / `config.py`, opt-in to
+     avoid surprises.
+
+## Triton-distributed
+
+### What it does
+
+Triton-distributed is ByteDance Seed's extension of Triton for "programming
+overlapping kernels on distributed AI systems"
+([arXiv 2504.19442](https://arxiv.org/abs/2504.19442)).
+- It adds "communication primitives compliant with the OpenSHMEM standard" to
+  the compiler.
+- On NVIDIA these are lowered to NVSHMEM. On AMD they go to rocSHMEM or AMD's
+  MORI SHMEM, picked with `TRITON_DIST_SHMEM_BACKEND`
+  ([`utils.py`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/utils.py#L83-L94)).
+- MIT-licensed. It is now an out-of-tree plugin built against Triton v3.7.1,
+  with two small hook patches
+  ([`build_triton.sh`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/scripts/build_triton.sh#L2-L38)).
+
+**How the vendor is chosen.**
+- Per process, at run time: `is_cuda()` is
+  `bool(shutil.which("nvidia-smi"))`, and `is_hip()` checks for `rocm-smi`
+  ([`utils.py`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/utils.py#L52-L70)).
+- `setup.py` picks its pip dependencies the same way: NVSHMEM wheels only
+  when `nvidia-smi` exists
+  ([`setup.py`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/setup.py#L473-L481)).
+- The compiler plugin always builds both the NVIDIA and AMD lowerings: "There
+  are no per-pass / per-backend build toggles"
+  ([`plugin/CMakeLists.txt`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/plugin/CMakeLists.txt#L149-L157)).
+
+**How SHMEM is loaded.**
+- NVSHMEM comes from its pip wheel. Its device bitcode is linked into every
+  kernel that uses it, and a hook initializes each loaded module
+  ([`jit.py`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/jit.py#L110-L227)).
+- rocSHMEM is built from source in a single-node configuration
+  ([`build_rshm_ipc_single.sh`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/shmem/rocshmem_bind/scripts/build_rshm_ipc_single.sh#L31)).
+
+**Bootstrap: through PyTorch.**
+- `initialize_distributed` calls `init_process_group` with Gloo and NCCL,
+  creates an NCCL group over all ranks, and initializes SHMEM over that group
+  ([`utils.py`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/utils.py#L339-L370)).
+- The NVSHMEM unique ID is shared with `broadcast_object_list`
+  ([L221-237](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/utils.py#L221-L237)).
+- Symmetric-heap buffers are wrapped as torch tensors.
+
+**How it overlaps compute and communication.**
+- **AllGather + GEMM, NVIDIA**
+  ([`allgather_gemm.py`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/kernels/nvidia/allgather_gemm.py#L622-L720)).
+  - Copy engines pull each peer's shard on high-priority side streams.
+  - `cuStreamWriteValue` raises a per-rank "ready" flag
+    ([`common_ops.py`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/kernels/nvidia/common_ops.py#L364-L406)).
+  - A persistent GEMM starts on the local shard, then waits for each peer's
+    flag (`dl.wait` + `consume_token`) before using that shard.
+- **GEMM + ReduceScatter**
+  ([`gemm_reduce_scatter.py`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/kernels/nvidia/gemm_reduce_scatter.py#L320-L331)).
+  GEMM tiles bump a per-destination counter, the last tile notifies, and the
+  scatter and reduce run on a separate stream.
+- **AllReduce, NVIDIA, single node.**
+  - One-shot (push everything, reduce locally) or two-shot (reduce-scatter,
+    then all-gather), chosen by message size
+    ([`allreduce.py`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/kernels/nvidia/allreduce.py#L1112-L1127)).
+    For example, with NVLink multimem: two-shot above 64 KB.
+  - Inputs larger than the workspace run chunk by chunk
+    ([L1180-1207](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/kernels/nvidia/allreduce.py#L1180-L1207)).
+- **AMD.**
+  - Data moves in 1024-row chunks with `hipMemcpyAsync(... DeviceToDeviceNoCU)`,
+    one stream per peer.
+  - The ready flags are 4-byte memcpys, "Because driver API(waitValue/writeValue)
+    on AMD will affect the perf of gemm"
+    ([`amd/allgather_gemm.py`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/kernels/amd/allgather_gemm.py#L337-L357)).
+- **A straggler test hook.** `straggler_option=(rank, ns)` makes one rank call
+  `torch.cuda._sleep` before the AllGather + GEMM, to stress the signalling
+  ([L662-663](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/kernels/nvidia/allgather_gemm.py#L662-L663)).
+  This is relevant to the planned straggler detector.
+
+**Results (paper).**
+- Speedups of "1.09× to 44.97×" over PyTorch + NCCL/RCCL.
+- The largest numbers are against a Python-loop GroupGEMM that the paper
+  itself calls "a weak baseline".
+- For the fused AllGather + GEMM and GEMM + ReduceScatter kernels:
+  - 1.28-1.42× over PyTorch + NCCL on H800, within and across nodes;
+  - 1.09-1.16× over PyTorch + RCCL on MI308X;
+  - about 95-96% of FLUX across nodes.
+
+**Mixed vendors: not supported.**
+- Searches of the code, issues and PRs for heterogeneous, mixed-vendor,
+  cross-vendor and interoperability turned up nothing about putting NVIDIA
+  and AMD in one job. The paper's "heterogeneous communication" means NVLink
+  plus InfiniBand.
+- By design, each process runs one SHMEM library over one NCCL world group,
+  with one vendor's bitcode linked into its kernels. *(reading)* NVSHMEM and
+  rocSHMEM have separate bootstraps and no shared transport.
+
+**Maturity.**
+- AMD is single-node only. A maintainer in
+  [#108](https://github.com/ByteDance-Seed/Triton-distributed/issues/108):
+  "rocshmem does not post the inter-node communication features, and we are
+  waiting for it too."
+- Only pre-releases exist.
+- [#132](https://github.com/ByteDance-Seed/Triton-distributed/issues/132)
+  (initializing NVSHMEM on a tensor-parallel subgroup fails) is open.
+
+### Overlap with gpubridge
+
+- **Bootstrap.** Both start through `torch.distributed` and exchange setup data
+  over a process group: gpubridge gathers `PeerInfo`, Triton-distributed
+  broadcasts the SHMEM unique ID.
+- **Vendor choice.** Both support NVIDIA and AMD from one codebase, choosing
+  per process at run time.
+- **The copy path.** Both care about moving data between GPU memory and the
+  network. Triton-distributed optimizes it; gpubridge so far only gets it
+  right.
+
+### Where gpubridge is different
+
+- **Level.** Triton-distributed is GPU-initiated communication inside
+  kernels: one vendor, symmetric memory, GPU to GPU. gpubridge composes
+  host-initiated collectives across vendors, and its bridge goes through CPU
+  memory.
+- **Mixed vendors.** Triton-distributed has none; that is gpubridge's purpose.
+- **Who could host whom.** *(reading)*
+  - NVSHMEM's init uses group-relative rank and size, so it could likely run
+    on a gpubridge NVIDIA island's process group, giving that island fused
+    kernels.
+  - Caveats: only one SHMEM world per process; the rocSHMEM and MORI inits
+    assume global rank 0 is in the group; issue #132 is open.
+  - The reverse doesn't apply, because Triton-distributed has no notion of a
+    second vendor.
+
+### Ideas worth adopting
+
+Each idea below can be measured with `scripts/gpu/bench_all_reduce.py`. It
+reports the bridged/native latency ratio from 1 KB to 1 GB, in one split-test
+job.
+
+1. **A chunked, pipelined bridge**, from the chunked all-reduce, per-chunk
+   flags and copy-engine streams.
+   *Status: not implemented yet.*
+   - Split the leaders' bridge step into chunks. On a side stream, copy chunk
+     k+1 from GPU to pinned CPU memory while Gloo all-reduces chunk k and
+     chunk k-1 is copied back.
+   - This belongs in a collective policy (`PipelinedReduceBridgeBroadcast` in
+     the proposed `policies.py`), not in `BridgeTransport`. The transport only
+     sees CPU tensors, while the GPU-to-CPU staging happens in
+     `collectives.py`. Allocate the pinned staging buffers once per size.
+   - Success: the bridged/native ratio drops for large tensors without hurting
+     small ones.
+2. **Choose the algorithm by size.** Triton-distributed picks one-shot or
+   two-shot by byte count, and falls back to NCCL for small inputs.
+   *Status: not implemented yet.*
+   - For gpubridge: small tensors take one Gloo all_reduce across all ranks
+     (the `FlatGloo` policy), which avoids three serialized steps. Large
+     tensors take the pipelined bridge.
+   - Thresholds come from each cluster's benchmark CSV.
+   - Where: a `select_policy(nbytes)` in `policies.py`.
+3. **Order copies on the GPU, not with host syncs.** Triton-distributed orders
+   copies with stream wait/write-value on CUDA, and tiny memcpys on AMD,
+   instead of blocking the host.
+   *Status: not implemented yet.*
+   - In gpubridge, the leader's `tensor.cpu()` blocks the host. Replace it
+     with non-blocking copies into pinned memory, ordered by events, and block
+     only where Gloo needs the data. This pairs with idea 1.
+   - The AMD lesson, that the signalling mechanism is vendor-specific, puts
+     that choice in the proposed `VendorSpec`.
 
 ## Positioning (proposed README paragraph)
 
