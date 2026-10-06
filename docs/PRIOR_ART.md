@@ -106,6 +106,8 @@ Serving sets it from the `MAX_SERVE_USE_VENDOR_CCL` env var, which defaults to `
 
 1. **Probes that never crash, plus one capability report.** Modular's probes
    have the right shape but probably abort when the library is missing.
+   *Status: implemented as `gpubridge.probe()` and discovery-time problem
+   reports.*
    - Add `detect.probe()`, which never raises. It returns this rank's build
      vendor, `dist.is_nccl_available()`, `dist.is_gloo_available()`, whether a
      GPU is visible, and the torch version.
@@ -115,6 +117,7 @@ Serving sets it from the `MAX_SERVE_USE_VENDOR_CCL` env var, which defaults to `
    - The straggler detector also gets a per-rank capability snapshot for free.
 2. **A bridge transport with a fixed signature.** Modular keeps the vendor and
    native paths call-compatible so a flag can switch them.
+   *Status: implemented in `transport.py`, with Gloo as the default.*
    - Wrap what collectives need from the bridge (all_reduce and broadcast on
      CPU tensors) in a small `BridgeTransport` in a new `transport.py`.
      Gloo is the first implementation; `topology.bridge_group` becomes a
@@ -234,7 +237,7 @@ with per-backend policy lists kept in one header
 > already solved: PyTorch's `"nccl"` backend runs NCCL on CUDA builds and RCCL
 > on ROCm builds, and Modular's MAX loads NCCL or RCCL to match the GPU it
 > was built for.
-> None of these connect the two, because an NCCL communicator and an RCCL
+> Neither connects the two, because an NCCL communicator and an RCCL
 > communicator cannot exchange data, and Modular states that mixed-vendor
 > hosts are not supported. gpubridge keeps each vendor on its native library
 > inside an island and joins the islands with a CPU bridge. One `all_reduce`,

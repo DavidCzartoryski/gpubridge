@@ -1,22 +1,26 @@
 # gpubridge
 
-Write your distributed communication code once and run it on a cluster that
-mixes NVIDIA and AMD GPUs.
-
-NVIDIA GPUs talk through NCCL and AMD GPUs through RCCL, and the two cannot
-join the same communicator. Teams with both end up maintaining two training
-setups, or leaving half their hardware idle. gpubridge sits on top of
-`torch.distributed` and gives every process the same small API (`all_reduce`,
-`broadcast`, `barrier`) whatever GPU it runs on.
+gpubridge lets one distributed PyTorch job span NVIDIA and AMD GPUs at the
+same time. Choosing between NCCL and RCCL on a single-vendor machine is already
+solved: PyTorch's `"nccl"` backend runs NCCL on CUDA builds and RCCL on ROCm
+builds, and Modular's MAX loads NCCL or RCCL to match the GPU it was built for.
+Neither connects the two, because an NCCL communicator and an RCCL
+communicator cannot exchange data, and Modular states that mixed-vendor hosts
+are not supported. gpubridge keeps each vendor on its native library inside an
+island and joins the islands with a CPU bridge. One `all_reduce`, `broadcast`
+or `barrier` call then covers every GPU in the job, from the same code on every
+node. CUDA and ROCm builds of PyTorch, from 2.9.1 to 2.14.1, have been shown to
+join one job and complete the bridge on CPU; validation on real GPUs is next.
 
 gpubridge writes no CUDA or HIP code. It composes collectives that PyTorch
-already provides.
+already provides. For how it relates to Modular and RAJA, see
+[docs/PRIOR_ART.md](docs/PRIOR_ART.md).
 
 > **Status: v0.1, correctness first.** All orchestration logic is tested in CPU
-> simulation mode. Without GPUs, real CUDA and ROCm builds of PyTorch (2.9.1 to
-> 2.14.1) were shown to join one job and complete the bridge. It has not yet run
-> on a real mixed cluster; see [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)
-> for the results and what still needs checking.
+> simulation mode, and the CPU side of a mixed job has been checked with real
+> CUDA and ROCm builds. It has not yet run on a real mixed cluster; see
+> [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the results and what
+> still needs checking.
 
 ## How it works
 
@@ -26,8 +30,9 @@ belongs to exactly one vendor. gpubridge groups processes by vendor:
 - **Island:** every rank of one vendor, in a process group on the native
   backend. That is NCCL on NVIDIA, and RCCL on AMD, which ROCm builds of
   PyTorch still call `"nccl"`.
-- **Bridge:** a CPU process group on Gloo with one **leader** per island. The
-  leader is the island's lowest global rank.
+- **Bridge:** a CPU link between one **leader** per island, where the leader
+  is the island's lowest global rank. By default it is a Gloo process group;
+  the transport can be swapped (see [Bridge transports](#bridge-transports)).
 
 ```
         NVIDIA island (NCCL)                   AMD island (RCCL)
@@ -58,12 +63,19 @@ straight to the native collective.
 1. Creates the default process group on **Gloo** across all ranks. NCCL cannot
    span both vendors, so this CPU group handles discovery and `barrier`.
 2. Each rank detects its vendor from `torch.version.hip` (AMD) or
-   `torch.version.cuda` (NVIDIA).
-3. Every rank shares its vendor, PyTorch version and hostname with
-   `all_gather_object`.
+   `torch.version.cuda` (NVIDIA), and runs `gpubridge.probe()`, which never
+   raises: build, visible GPUs, and whether the NCCL and Gloo backends exist.
+   Anything that would stop the rank (no vendor, no GPU, no NCCL/RCCL) is
+   recorded as a problem instead of being raised on that rank alone.
+3. Every rank shares its vendor, probe, problems, hostname and chosen bridge
+   transport with `all_gather_object`. If any rank reported a problem, or the
+   ranks disagree on CPU versus GPU mode or on the bridge transport, `init()`
+   raises the same error on every rank, listing every problem. Nobody is left
+   waiting for a rank that already gave up.
 4. Each rank computes the same islands, leaders and bridge from that shared
    map. Every rank calls `new_group` for every group in the same order, as
-   `torch.distributed` requires.
+   `torch.distributed` requires, and the bridge transport is created the same
+   way.
 
 ## Install
 
@@ -144,21 +156,54 @@ The API follows `torch.distributed`, always on the world group.
 
 | Function | Description |
 | --- | --- |
-| `init(init_method=None, *, rank=None, world_size=None, timeout=None) -> Topology` | Join the cluster and build the islands and bridge. Same arguments as `init_process_group`. |
+| `init(init_method=None, *, rank=None, world_size=None, timeout=None, bridge="gloo") -> Topology` | Join the cluster and build the islands and bridge. Same arguments as `init_process_group`, plus the bridge transport (a registered name or a `BridgeTransport` subclass). |
 | `all_reduce(tensor, op=ReduceOp.SUM)` | In-place sum across all ranks. Only SUM is supported in v1. |
 | `broadcast(tensor, src)` | In-place copy from global rank `src` to all ranks. |
 | `barrier()` | Wait for all ranks. On GPUs, first waits for this rank's queued GPU work. |
 | `destroy()` | Tear down every group `init` created. |
 | `get_topology() -> Topology` | This rank's view of the cluster (see below). |
 | `is_initialized() -> bool` | True between `init` and `destroy`. |
+| `probe() -> Probe` | This process's build vendor, CUDA/HIP versions, visible GPU count, and NCCL/Gloo availability. Never raises; failed checks are listed in `Probe.errors`. Works before `init`. |
 
 Tensors must be contiguous and on `topology.device`: the rank's GPU, or CPU in
 simulation mode.
 
 `Topology` exposes `rank`, `world_size`, `vendor`, `device`, `simulated`,
-`island`, `is_leader`, `layout` (every island, its ranks and leader),
-`peers` (each rank's vendor, PyTorch version and hostname), and the
-`island_group` / `bridge_group` process groups.
+`island`, `is_leader`, `layout` (every island, its ranks and leader), `peers`
+(each rank's vendor, hostname, bridge transport and `probe` results),
+`island_group`, and `bridge`, the transport linking island leaders.
+`bridge_group` is the bridge's process group when the transport has one, as
+the default Gloo transport does.
+
+### Bridge transports
+
+The bridge only moves CPU tensors between island leaders, so it can be swapped
+without touching how collectives are composed. Gloo is the default. To use
+something else, subclass `BridgeTransport`, register it, and pass it to `init()`
+on every rank:
+
+```python
+from gpubridge import BridgeTransport, init, register_transport
+
+@register_transport
+class MyTransport(BridgeTransport):
+    name = "my-transport"
+
+    @classmethod
+    def create(cls, ranks, *, timeout=None):
+        # Called on every rank; return an instance on the leaders in `ranks`, None elsewhere.
+        ...
+
+    def all_reduce(self, tensor): ...          # in-place SUM of a CPU tensor
+    def broadcast(self, tensor, src): ...      # in-place copy from global rank `src`
+
+init(bridge="my-transport")  # or init(bridge=MyTransport)
+```
+
+Every rank reports its transport's name during discovery, so a job where ranks
+picked different transports fails at `init()` instead of hanging.
+`tests/_transports.py` has a working example that carries the bridge over a
+c10d `FileStore`.
 
 ## Building on gpubridge
 

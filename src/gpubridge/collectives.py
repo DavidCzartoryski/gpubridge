@@ -1,4 +1,4 @@
-"""Cluster-wide collectives built from native island collectives and a Gloo bridge."""
+"""Cluster-wide collectives built from native island collectives and the bridge transport."""
 
 from __future__ import annotations
 
@@ -39,8 +39,9 @@ def all_reduce(tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM) -> N
     if not topology.layout.needs_bridge:
         return
     if topology.is_leader:
+        assert topology.bridge is not None
         staged = tensor.cpu()  # the same tensor in simulation mode
-        dist.all_reduce(staged, group=topology.bridge_group)
+        topology.bridge.all_reduce(staged)
         if staged is not tensor:
             tensor.copy_(staged)
     dist.broadcast(tensor, src=topology.island.leader, group=topology.island_group)
@@ -78,8 +79,9 @@ def broadcast(tensor: torch.Tensor, src: int) -> None:
     if not topology.layout.needs_bridge:
         return
     if topology.is_leader:
+        assert topology.bridge is not None
         staged = tensor.cpu()  # the same tensor in simulation mode
-        dist.broadcast(staged, src=src_island.leader, group=topology.bridge_group)
+        topology.bridge.broadcast(staged, src=src_island.leader)
         if not in_src_island and staged is not tensor:
             tensor.copy_(staged)
     if not in_src_island:
