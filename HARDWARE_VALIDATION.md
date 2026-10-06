@@ -149,9 +149,15 @@ Each took 8 to 9 seconds end to end, emulation included.
 - Installing the 6.2 GB ROCm wheel straight from the index with uv failed once
   with "Failed to read from zip file". Downloading it with `curl` and checking
   the index's sha256 worked, and uv then installed the file without trouble.
-  The image now does that ([`scripts/fetch_wheel.sh`](scripts/fetch_wheel.sh)).
   Whether the first download was cut off or uv mishandled the large file was
-  not pinned down.
+  not pinned down. ROCm wheels are now always fetched that way
+  ([`scripts/fetch_wheel.sh`](scripts/fetch_wheel.sh)).
+- The wheels first lived in a BuildKit cache mount, but Docker Desktop's
+  BuildKit garbage collection caps cache mounts at about 2.76 GiB, so the 6+ GB
+  ROCm wheels were evicted. They now live in a permanent cache on the host
+  (`~/.cache/gpubridge/wheels`, filled by
+  [`scripts/fetch_wheels.sh`](scripts/fetch_wheels.sh)), and the image
+  installs offline from it.
 - ROCm builds of torch need `libatomic.so.1`, which slim Debian images lack
   (package `libatomic1`).
 - `download-r2.pytorch.org` answers 403 to Python's default `urllib`
