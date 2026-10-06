@@ -13,8 +13,8 @@ node. CUDA and ROCm builds of PyTorch, from 2.9.1 to 2.14.1, have been shown to
 join one job and complete the bridge on CPU; validation on real GPUs is next.
 
 gpubridge writes no CUDA or HIP code. It composes collectives that PyTorch
-already provides. For how it relates to Modular and RAJA, see
-[docs/PRIOR_ART.md](docs/PRIOR_ART.md).
+already provides. For how it relates to Modular MAX, RAJA, Triton and
+Triton-distributed, see [docs/PRIOR_ART.md](docs/PRIOR_ART.md).
 
 > **Status: v0.1, correctness first.** All orchestration logic is tested in CPU
 > simulation mode, and the CPU side of a mixed job has been checked with real
