@@ -2,49 +2,54 @@
 # for testing whether CUDA-build and ROCm-build processes can join one job.
 # No GPU is needed: every process runs on CPU with GPUBRIDGE_CPU_ONLY=1.
 #
-# Built by scripts/mixed_build_rendezvous.sh. Each venv is its own layer and
-# does not depend on the repo, so editing gpubridge never re-downloads torch.
+# Built by scripts/mixed_build_rendezvous.sh. Nothing is downloaded here. Each
+# venv installs offline from its directory in the host's permanent wheel cache
+# (~/.cache/gpubridge/wheels by default, filled by scripts/fetch_wheels.sh),
+# passed in as a `wheels-<venv>` build context. BuildKit's own cache mounts
+# can't hold those wheels: Docker Desktop caps them at about 2.76 GiB, and the
+# ROCm torch wheels alone are 6+ GB.
+#
+# --build-arg ENVS=2.14.1 builds only the 2.14.1 pair; the default builds all
+# five venvs. Each venv is its own layer and does not depend on the repo, so
+# editing gpubridge never reinstalls torch.
 
-FROM --platform=linux/amd64 ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+ARG ENVS=all
 
-# The torch layers skip uv's cache so each multi-GB wheel is stored only once.
+# The platform (linux/amd64) comes from `docker build --platform`.
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS base
+
 ENV UV_NO_CACHE=1 \
     UV_PYTHON_DOWNLOADS=never \
     PYTHONUNBUFFERED=1
 
-# Each line: <venv name> <exact torch version> <PyTorch wheel index>.
-# Versions and index URLs were checked against https://download.pytorch.org/whl/torch/.
-RUN uv venv -q /envs/cu-2.14.1 && uv pip install -q --python /envs/cu-2.14.1/bin/python \
-        --index-url https://download.pytorch.org/whl/cu130 "torch==2.14.1+cu130" numpy
-
-# ROCm wheels are 6+ GB. Installing one straight from the index failed once
-# with uv's "Failed to read from zip file" (a cut-off stream or uv's streaming
-# unzip; not pinned down). Instead, fetch it with curl (resumable, kept in a
-# BuildKit cache across failed builds), check the index's sha256, and install
-# the verified file.
-# The ROCm build of torch also links against libatomic, which the slim image lacks.
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libatomic1 \
+# The ROCm build of torch links against libatomic, which the slim image lacks.
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
     && rm -rf /var/lib/apt/lists/*
-COPY scripts/fetch_wheel.sh /usr/local/bin/fetch_wheel
-RUN --mount=type=cache,target=/wheels \
-    wheel=$(fetch_wheel https://download-r2.pytorch.org/whl/rocm7.2/torch-2.14.1%2Brocm7.2-cp312-cp312-manylinux_2_28_x86_64.whl \
-        fc35e48fd83329f5d60ab925951d138edb5a6fce84323600703637fbc693541c /wheels) \
-    && uv venv -q /envs/rocm-2.14.1 && uv pip install --python /envs/rocm-2.14.1/bin/python \
-        --index-url https://download.pytorch.org/whl/rocm7.2 "$wheel" numpy
+
+# Each RUN: <venv>, with the exact torch version that scripts/fetch_wheels.sh cached.
+FROM base AS envs-2.14.1
+RUN --mount=type=bind,from=wheels-cu-2.14.1,target=/wheels \
+    uv venv -q /envs/cu-2.14.1 && uv pip install -q --python /envs/cu-2.14.1/bin/python \
+        --no-index --find-links /wheels "torch==2.14.1+cu130" numpy
+RUN --mount=type=bind,from=wheels-rocm-2.14.1,target=/wheels \
+    uv venv -q /envs/rocm-2.14.1 && uv pip install -q --python /envs/rocm-2.14.1/bin/python \
+        --no-index --find-links /wheels "torch==2.14.1+rocm7.2" numpy
 
 # Older and neighbouring releases, for the version-matrix experiments.
-RUN uv venv -q /envs/cu-2.13.0 && uv pip install -q --python /envs/cu-2.13.0/bin/python \
-        --index-url https://download.pytorch.org/whl/cu130 "torch==2.13.0+cu130" numpy
-RUN uv venv -q /envs/cu-2.9.1 && uv pip install -q --python /envs/cu-2.9.1/bin/python \
-        --index-url https://download.pytorch.org/whl/cu128 "torch==2.9.1+cu128" numpy
-RUN --mount=type=cache,target=/wheels \
-    wheel=$(fetch_wheel https://download-r2.pytorch.org/whl/rocm6.4/torch-2.9.1%2Brocm6.4-cp312-cp312-manylinux_2_28_x86_64.whl \
-        43471c9e4520402b5feeebd6c6d180e8bf2314402925798fe219c32fecd1ef95 /wheels) \
-    && uv venv -q /envs/rocm-2.9.1 && uv pip install --python /envs/rocm-2.9.1/bin/python \
-        --index-url https://download.pytorch.org/whl/rocm6.4 "$wheel" numpy
+FROM envs-2.14.1 AS envs-all
+RUN --mount=type=bind,from=wheels-cu-2.13.0,target=/wheels \
+    uv venv -q /envs/cu-2.13.0 && uv pip install -q --python /envs/cu-2.13.0/bin/python \
+        --no-index --find-links /wheels "torch==2.13.0+cu130" numpy
+RUN --mount=type=bind,from=wheels-cu-2.9.1,target=/wheels \
+    uv venv -q /envs/cu-2.9.1 && uv pip install -q --python /envs/cu-2.9.1/bin/python \
+        --no-index --find-links /wheels "torch==2.9.1+cu128" numpy
+RUN --mount=type=bind,from=wheels-rocm-2.9.1,target=/wheels \
+    uv venv -q /envs/rocm-2.9.1 && uv pip install -q --python /envs/rocm-2.9.1/bin/python \
+        --no-index --find-links /wheels "torch==2.9.1+rocm6.4" numpy
 
 # gpubridge, editable in every venv. The repo is mounted over /gpubridge at run
 # time, so code changes apply without rebuilding.
+FROM envs-${ENVS} AS final
 COPY pyproject.toml README.md LICENSE /gpubridge/
 COPY src /gpubridge/src
 RUN for env in /envs/*/; do \

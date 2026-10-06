@@ -1,0 +1,40 @@
+{
+  "cu-2.14.1": {
+    "torch": "2.14.1+cu130",
+    "cuda": "13.0",
+    "hip": null,
+    "cuda_available": false,
+    "python": "3.12.12",
+    "expected_torch": "2.14.1+cu130",
+    "index": "https://download.pytorch.org/whl/cu130",
+    "installed_bytes": 5569976602,
+    "download_bytes": 3024307483,
+    "largest_downloads": {
+      "torch": 554621169,
+      "nvidia-cudnn-cu13": 553099438,
+      "nvidia-cublas": 423138758,
+      "triton": 246842756,
+      "nvidia-nccl-cu13": 215965170,
+      "nvidia-cufft": 214085489
+    }
+  },
+  "rocm-2.14.1": {
+    "torch": "2.14.1+rocm7.2",
+    "cuda": null,
+    "hip": "7.2.53211",
+    "cuda_available": false,
+    "python": "3.12.12",
+    "expected_torch": "2.14.1+rocm7.2",
+    "index": "https://download.pytorch.org/whl/rocm7.2",
+    "installed_bytes": 15738994543,
+    "download_bytes": 6614042614,
+    "largest_downloads": {
+      "torch": 6224872823,
+      "triton-rocm": 361609034,
+      "numpy": 16891693,
+      "sympy": 6299353,
+      "networkx": 2068504,
+      "setuptools": 1256108
+    }
+  }
+}
