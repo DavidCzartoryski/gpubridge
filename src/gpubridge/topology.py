@@ -13,8 +13,17 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from gpubridge.config import CPU_ONLY_ENV, GPU_BACKEND, VENDOR_ENV, Config, resolve_config
+from gpubridge.config import (
+    CPU_ONLY_ENV,
+    GPU_BACKEND,
+    SPLIT_TEST_ENV,
+    VENDOR_ENV,
+    Config,
+    resolve_config,
+    split_test_mode,
+)
 from gpubridge.detect import Probe, detect_vendor, probe
+from gpubridge.split_test import SplitTestWarning, banner, split_labels
 from gpubridge.transport import BridgeTransport
 
 
@@ -99,6 +108,8 @@ class PeerInfo:
     """The rank's build, GPUs and backends, from :func:`gpubridge.probe`."""
     problems: tuple[str, ...] = ()
     """Why this rank cannot take part. A problem on any rank fails init() on every rank."""
+    split_test: str = ""
+    """This rank's ``GPUBRIDGE_SPLIT_TEST`` mode, or empty when off. TEST ONLY."""
 
     @property
     def torch_version(self) -> str:
@@ -126,9 +137,11 @@ def describe_local(bridge: str) -> tuple[PeerInfo, Config]:
     rank, instead of one rank exiting and the others hanging until a timeout.
 
     Raises:
-        ValueError: for invalid ``GPUBRIDGE_VENDOR`` or ``GPUBRIDGE_CPU_ONLY`` values,
-            which are configuration mistakes rather than properties of the machine.
+        ValueError: for invalid ``GPUBRIDGE_VENDOR``, ``GPUBRIDGE_CPU_ONLY`` or
+            ``GPUBRIDGE_SPLIT_TEST`` values, which are configuration mistakes rather
+            than properties of the machine.
     """
+    split = split_test_mode() or ""
     local_probe = probe()
     problems: list[str] = []
     vendor: str | None
@@ -155,6 +168,7 @@ def describe_local(bridge: str) -> tuple[PeerInfo, Config]:
         bridge=bridge,
         probe=local_probe,
         problems=tuple(problems),
+        split_test=split,
     )
     return local, config
 
@@ -166,7 +180,8 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
 
     Raises:
         RuntimeError: if any rank reported problems, if some ranks run on CPU and
-            others on GPUs, or if ranks picked different bridge transports.
+            others on GPUs, or if ranks picked different bridge transports or
+            split-test modes.
     """
     failing = [(rank, peer) for rank, peer in enumerate(peers) if peer.problems]
     if failing:
@@ -195,6 +210,15 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
         raise RuntimeError(
             f"Ranks picked different bridge transports: {detail}. Pass the same bridge "
             "to gpubridge.init() on every rank."
+        )
+    splits: dict[str, list[int]] = {}
+    for rank, peer in enumerate(peers):
+        splits.setdefault(peer.split_test or "off", []).append(rank)
+    if len(splits) > 1:
+        detail = "; ".join(f"{mode} on ranks {ranks}" for mode, ranks in splits.items())
+        raise RuntimeError(
+            f"Ranks disagree on {SPLIT_TEST_ENV}: {detail}. Set it to the same value on "
+            "every rank, or on none."
         )
     # CUDA and ROCm builds of one release differ only in the local version
     # suffix, e.g. 2.5.1+cu124 and 2.5.1+rocm6.2.
@@ -238,7 +262,32 @@ class Topology:
 
     @property
     def vendor(self) -> str:
+        """This rank's island label. Differs from :attr:`detected_vendor` only in a split test."""
         return self.layout.vendors[self.rank]
+
+    @property
+    def detected_vendor(self) -> str:
+        """The vendor this rank detected (or was told by ``GPUBRIDGE_VENDOR``)."""
+        return cast(str, self.peers[self.rank].vendor)
+
+    @property
+    def split_test(self) -> str | None:
+        """The ``GPUBRIDGE_SPLIT_TEST`` mode of this run, or None. TEST ONLY."""
+        return self.peers[self.rank].split_test or None
+
+    @property
+    def run_kind(self) -> str:
+        """What kind of run this is, for results and logs.
+
+        ``"split-test"`` (islands faked from one vendor), ``"cpu"`` (simulation or
+        CPU-only mode), ``"gpu-mixed"`` (real GPUs of both vendors) or
+        ``"gpu-single-vendor"``.
+        """
+        if self.split_test:
+            return "split-test"
+        if self.config.simulated:
+            return "cpu"
+        return "gpu-mixed" if self.layout.needs_bridge else "gpu-single-vendor"
 
     @property
     def island(self) -> Island:
@@ -284,7 +333,12 @@ def build_topology(
     peers = tuple(PeerInfo.from_wire(info) for info in gathered)
     validate_peers(peers, warn=rank == 0)
     # validate_peers has ruled out ranks without a vendor.
-    layout = plan_topology([cast(str, peer.vendor) for peer in peers])
+    vendors = [cast(str, peer.vendor) for peer in peers]
+    labels = vendors
+    if local.split_test:
+        labels = split_labels(vendors, [peer.hostname for peer in peers], local.split_test)
+        warnings.warn(banner(local.split_test, vendors, labels), SplitTestWarning, stacklevel=3)
+    layout = plan_topology(labels)
 
     # new_group is collective over the whole world: every rank creates every
     # group, in the same order, including groups it is not a member of.

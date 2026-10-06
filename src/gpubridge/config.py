@@ -16,6 +16,11 @@ VENDOR_ENV = "GPUBRIDGE_VENDOR"
 #: Set to ``1`` to run on CPU with Gloo islands while still detecting the vendor
 #: from the PyTorch build, e.g. to test real CUDA and ROCm builds without GPUs.
 CPU_ONLY_ENV = "GPUBRIDGE_CPU_ONLY"
+#: TEST ONLY. Set to ``half``, ``alternate`` or ``node`` (``1`` means ``half``) to
+#: label some ranks of a single-vendor job as the other vendor, so one cluster
+#: can exercise two islands and the bridge. See :mod:`gpubridge.split_test`.
+SPLIT_TEST_ENV = "GPUBRIDGE_SPLIT_TEST"
+SPLIT_TEST_MODES = ("half", "alternate", "node")
 
 #: Backend of the global discovery group and the cross-vendor bridge. Both run on CPU.
 CPU_BACKEND = "gloo"
@@ -35,6 +40,27 @@ def is_cpu_only() -> bool:
     if value in ("1", "true", "yes", "on"):
         return True
     raise ValueError(f"{CPU_ONLY_ENV}={os.environ[CPU_ONLY_ENV]!r} is not a boolean; use 1 or 0")
+
+
+def split_test_mode() -> str | None:
+    """Return the ``GPUBRIDGE_SPLIT_TEST`` mode, or None when split-test mode is off.
+
+    This environment variable is the only way to turn split-test mode on.
+
+    Raises:
+        ValueError: for a value that is neither off, ``1`` nor a known mode.
+    """
+    value = os.environ.get(SPLIT_TEST_ENV, "").strip().lower()
+    if value in ("", "0", "false", "no", "off"):
+        return None
+    if value in ("1", "true", "yes", "on"):
+        return "half"
+    if value in SPLIT_TEST_MODES:
+        return value
+    raise ValueError(
+        f"{SPLIT_TEST_ENV}={os.environ[SPLIT_TEST_ENV]!r} is not valid; use one of "
+        f"{', '.join(SPLIT_TEST_MODES)}, 1 (half) or 0 (off)"
+    )
 
 
 def is_simulated() -> bool:
@@ -62,7 +88,8 @@ def resolve_config() -> Config:
     In simulation and CPU-only mode islands use Gloo and tensors stay on CPU. Otherwise
     islands use the native backend on ``cuda:$LOCAL_RANK``, or on the current
     CUDA device when ``LOCAL_RANK`` is unset. ROCm builds expose AMD GPUs
-    through the same ``torch.cuda`` API.
+    through the same ``torch.cuda`` API. In split-test mode only, a local rank
+    beyond the visible GPU count wraps around, so ranks can share a GPU.
 
     Raises:
         RuntimeError: if not simulating and no GPU is visible to this process.
@@ -77,4 +104,9 @@ def resolve_config() -> Config:
         )
     local_rank = os.environ.get("LOCAL_RANK")
     index = int(local_rank) if local_rank is not None else torch.cuda.current_device()
+    if split_test_mode() is not None:
+        # Test only: lets two islands share GPUs, e.g. two ranks on one GPU.
+        count = torch.cuda.device_count()
+        if count and index >= count:
+            index %= count
     return Config(simulated=False, island_backend=GPU_BACKEND, device=torch.device("cuda", index))

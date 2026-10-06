@@ -6,6 +6,10 @@ real CUDA and ROCm builds of PyTorch running side by side. Items 1 and 2 are now
 answered for the CPU side by running real builds without GPUs; see
 [Mixed build results](#mixed-build-results) below.
 
+**On GPUs:** [docs/GPU_VALIDATION_RUNBOOK.md](docs/GPU_VALIDATION_RUNBOOK.md)
+maps every item below to a scripted step: Explorer (Slurm) for NVIDIA, a rented
+AMD machine, and a real mixed job between two cloud machines.
+
 ## Blocking: can the job start at all?
 
 1. **CUDA-PyTorch and ROCm-PyTorch processes rendezvous in one job.** Both

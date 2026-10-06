@@ -19,6 +19,7 @@ from gpubridge import topology as _topology
 from gpubridge.collectives import all_reduce, barrier, broadcast
 from gpubridge.config import CPU_BACKEND
 from gpubridge.detect import Probe, probe
+from gpubridge.split_test import SplitTestWarning
 from gpubridge.topology import Island, Layout, PeerInfo, Topology, get_topology, is_initialized
 from gpubridge.transport import (
     DEFAULT_TRANSPORT,
@@ -38,6 +39,7 @@ __all__ = [
     "PeerInfo",
     "Probe",
     "ReduceOp",
+    "SplitTestWarning",
     "Topology",
     "all_reduce",
     "barrier",

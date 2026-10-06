@@ -106,6 +106,15 @@ gpubridge.destroy()
 Launch the same script on every node with `torchrun`; each node detects its
 own vendor. See [`examples/all_reduce_torchrun.py`](examples/all_reduce_torchrun.py).
 
+For a fuller demo, [`examples/train_synthetic.py`](examples/train_synthetic.py)
+trains a small model with data parallelism and syncs its gradients with
+`gpubridge.all_reduce`. It reports samples/sec and checks that every rank ends
+with identical parameters:
+
+```bash
+GPUBRIDGE_VENDOR=nvidia torchrun --nproc-per-node=2 examples/train_synthetic.py  # on CPU
+```
+
 ## Simulation mode (no GPUs needed)
 
 Set `GPUBRIDGE_VENDOR=nvidia` or `GPUBRIDGE_VENDOR=amd` on a process to fake
@@ -150,6 +159,22 @@ that CUDA-build and ROCm-build processes can share one job. If both variables
 are set, `GPUBRIDGE_VENDOR` wins. As with simulation mode, `init()` refuses a
 job where some ranks run on CPU and others on GPUs.
 
+### Split-test mode (test only)
+
+`GPUBRIDGE_SPLIT_TEST=half|alternate|node` (`1` means `half`) labels some ranks
+of a single-vendor job as the other vendor. They keep their real GPUs and real
+NCCL/RCCL, so one NVIDIA (or AMD) cluster can run two islands and the bridge on
+device tensors. Only NCCL talking to RCCL goes untested.
+
+The environment variable is the only switch, and split runs can't pass for
+mixed-vendor ones:
+
+- every rank logs a `SplitTestWarning`;
+- `Topology.split_test` and `Topology.run_kind` (`"split-test"`) mark the run;
+- the GPU validation kit flags these runs in every JSON record and summary.
+
+`node` mode splits by machine. In split-test mode only, ranks may share a GPU.
+
 ## API
 
 The API follows `torch.distributed`, always on the world group.
@@ -168,8 +193,10 @@ The API follows `torch.distributed`, always on the world group.
 Tensors must be contiguous and on `topology.device`: the rank's GPU, or CPU in
 simulation mode.
 
-`Topology` exposes `rank`, `world_size`, `vendor`, `device`, `simulated`,
-`island`, `is_leader`, `layout` (every island, its ranks and leader), `peers`
+`Topology` exposes `rank`, `world_size`, `vendor` (the island label),
+`detected_vendor`, `run_kind` (`gpu-mixed`, `gpu-single-vendor`, `split-test` or
+`cpu`), `split_test`, `device`, `simulated`, `island`, `is_leader`, `layout`
+(every island, its ranks and leader), `peers`
 (each rank's vendor, hostname, bridge transport and `probe` results),
 `island_group`, and `bridge`, the transport linking island leaders.
 `bridge_group` is the bridge's process group when the transport has one, as
@@ -236,6 +263,11 @@ The tests start real multi-process clusters on CPU with
 `torch.multiprocessing`, using simulation mode. They cover mixed, uneven and
 single-vendor clusters, leader election, several shapes and dtypes, and
 `broadcast` from every rank.
+
+To validate on real GPUs (a Slurm cluster, a rented AMD machine, and a real
+mixed NVIDIA + AMD job), follow
+[docs/GPU_VALIDATION_RUNBOOK.md](docs/GPU_VALIDATION_RUNBOOK.md). Every step is
+a script under [`scripts/gpu/`](scripts/gpu) with a `--dry-run` flag.
 
 ## License
 

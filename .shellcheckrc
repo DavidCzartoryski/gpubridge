@@ -1,0 +1,3 @@
+# Let shellcheck follow `source` lines relative to each script.
+source-path=SCRIPTDIR
+external-sources=true

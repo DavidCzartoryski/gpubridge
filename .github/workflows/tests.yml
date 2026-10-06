@@ -20,5 +20,7 @@ jobs:
       # CPU wheels keep the job small; the tests run in simulation mode.
       - run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: uv pip install -e ".[test]"
+      # shellcheck ships with ubuntu-latest; the kit's tests also run it when present.
+      - run: shellcheck scripts/*.sh scripts/gpu/*.sh scripts/gpu/*/*.sh scripts/gpu/explorer/*.sbatch
       - run: pytest
       - run: python examples/simulate_two_islands.py
