@@ -7,7 +7,7 @@ from typing import cast
 
 import torch
 
-from gpubridge.config import VENDOR_ENV, VENDORS, Vendor
+from gpubridge.config import CPU_ONLY_ENV, VENDOR_ENV, VENDORS, Vendor
 
 
 def vendor_override() -> Vendor | None:
@@ -41,7 +41,8 @@ def detect_hardware_vendor() -> Vendor:
     if getattr(torch.version, "cuda", None):
         return "nvidia"
     raise RuntimeError(
-        "This PyTorch build has neither CUDA nor ROCm support. To develop without "
+        "This PyTorch build has neither CUDA nor ROCm support, so the vendor cannot be "
+        f"detected ({CPU_ONLY_ENV} still needs a CUDA or ROCm build). To develop without "
         f"GPUs, set {VENDOR_ENV}=nvidia or {VENDOR_ENV}=amd to run in CPU simulation mode."
     )
 

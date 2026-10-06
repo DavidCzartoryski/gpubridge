@@ -102,7 +102,7 @@ its vendor. With the variable set:
 
 Everything else is the code path used on real GPUs: discovery, leader
 election, group creation, and reduce-bridge-broadcast. Set the variable on
-every rank or on none; `init()` refuses a mix of simulated and real ranks.
+every rank or on none; `init()` refuses a mix of CPU and GPU ranks.
 
 Run the four-rank demo (2 NVIDIA + 2 AMD):
 
@@ -125,6 +125,16 @@ expected 10.0 on every rank: all ranks match
 
 Or act as two nodes of different vendors with `torchrun`, using two terminals.
 The commands are in the docstring of `examples/all_reduce_torchrun.py`.
+
+### CPU-only mode (real builds, no GPUs)
+
+`GPUBRIDGE_CPU_ONLY=1` also runs on CPU with Gloo islands, but keeps the real
+vendor detection: a CUDA build of PyTorch reports NVIDIA and a ROCm build
+reports AMD, even on a machine with no GPU. This is how
+[`scripts/mixed_build_rendezvous.sh`](scripts/mixed_build_rendezvous.sh) checks
+that CUDA-build and ROCm-build processes can share one job. If both variables
+are set, `GPUBRIDGE_VENDOR` wins. As with simulation mode, `init()` refuses a
+job where some ranks run on CPU and others on GPUs.
 
 ## API
 

@@ -12,22 +12,33 @@ import torch
 import torch.multiprocessing as mp
 
 import gpubridge
-from gpubridge.config import VENDOR_ENV
+from gpubridge.config import CPU_ONLY_ENV, VENDOR_ENV
 
 # Fail a deadlocked test instead of hanging the suite.
 TIMEOUT = timedelta(seconds=60)
 
 
 def run_ranks(
-    vendors: Sequence[str], fn: Callable[[gpubridge.Topology], None], tmp_path: Path
+    vendors: Sequence[str],
+    fn: Callable[[gpubridge.Topology], None],
+    tmp_path: Path,
+    *,
+    fake_builds: bool = False,
 ) -> None:
-    """Run ``fn(topology)`` on one simulated process per entry in ``vendors``.
+    """Run ``fn(topology)`` on one CPU process per entry in ``vendors``.
+
+    By default each process fakes its vendor with ``GPUBRIDGE_VENDOR``. With
+    ``fake_builds`` it instead patches ``torch.version`` to look like a CUDA or
+    ROCm build and sets ``GPUBRIDGE_CPU_ONLY``, so the vendor comes from build
+    detection.
 
     ``fn`` must be picklable: a module-level function or a ``functools.partial``
     of one. A failure on any rank is re-raised in the calling process.
     """
     init_file = tmp_path / "rendezvous"
-    mp.spawn(_rank_main, args=(tuple(vendors), fn, str(init_file)), nprocs=len(vendors))
+    mp.spawn(
+        _rank_main, args=(tuple(vendors), fn, str(init_file), fake_builds), nprocs=len(vendors)
+    )
 
 
 def _rank_main(
@@ -35,8 +46,14 @@ def _rank_main(
     vendors: tuple[str, ...],
     fn: Callable[[gpubridge.Topology], None],
     init_file: str,
+    fake_builds: bool,
 ) -> None:
-    os.environ[VENDOR_ENV] = vendors[rank]
+    if fake_builds:
+        os.environ[CPU_ONLY_ENV] = "1"
+        torch.version.cuda = "13.0" if vendors[rank] == "nvidia" else None
+        torch.version.hip = "7.2.26015" if vendors[rank] == "amd" else None
+    else:
+        os.environ[VENDOR_ENV] = vendors[rank]
     torch.set_num_threads(1)
     topology = gpubridge.init(
         init_method=f"file://{init_file}", rank=rank, world_size=len(vendors), timeout=TIMEOUT

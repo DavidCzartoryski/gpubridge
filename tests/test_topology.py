@@ -59,8 +59,9 @@ def _peer(simulated: bool = True, torch_version: str = "2.5.1") -> PeerInfo:
     return PeerInfo("nvidia", simulated, torch_version, "node0")
 
 
-def test_mixed_simulation_modes_are_rejected():
-    with pytest.raises(RuntimeError, match=r"ranks \[0, 2\] but not on ranks \[1\]"):
+def test_mixed_cpu_and_gpu_ranks_are_rejected():
+    match = r"ranks \[0, 2\] run on CPU .* but ranks \[1\] run on GPUs"
+    with pytest.raises(RuntimeError, match=match):
         validate_peers([_peer(simulated=True), _peer(simulated=False), _peer(simulated=True)])
 
 

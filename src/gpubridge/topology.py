@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from gpubridge.config import CPU_BACKEND, VENDOR_ENV, Config
+from gpubridge.config import CPU_BACKEND, CPU_ONLY_ENV, VENDOR_ENV, Config
 
 
 @dataclass(frozen=True)
@@ -94,17 +94,18 @@ class PeerInfo:
 
 
 def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
-    """Fail if ranks disagree on simulation mode; warn if their PyTorch releases differ.
+    """Fail if some ranks run on CPU and others on GPUs; warn if PyTorch releases differ.
 
     Raises:
-        RuntimeError: if some ranks are simulated and others are not.
+        RuntimeError: if some ranks are in simulation or CPU-only mode and others are not.
     """
-    simulated = [rank for rank, peer in enumerate(peers) if peer.simulated]
-    if simulated and len(simulated) != len(peers):
-        real = [rank for rank, peer in enumerate(peers) if not peer.simulated]
+    on_cpu = [rank for rank, peer in enumerate(peers) if peer.simulated]
+    if on_cpu and len(on_cpu) != len(peers):
+        on_gpu = [rank for rank, peer in enumerate(peers) if not peer.simulated]
         raise RuntimeError(
-            f"Ranks disagree on simulation mode: {VENDOR_ENV} is set on ranks {simulated} "
-            f"but not on ranks {real}. Set it on every rank or on none."
+            f"Ranks disagree on where to run: ranks {on_cpu} run on CPU ({VENDOR_ENV} or "
+            f"{CPU_ONLY_ENV} is set) but ranks {on_gpu} run on GPUs. Use the same mode "
+            "on every rank."
         )
     # CUDA and ROCm builds of one release differ only in the local version
     # suffix, e.g. 2.5.1+cu124 and 2.5.1+rocm6.2.
@@ -127,7 +128,7 @@ class Topology:
     """What every rank reported during discovery, indexed by global rank."""
     config: Config
     island_group: ProcessGroup
-    """This rank's island, on the native backend (Gloo in simulation mode)."""
+    """This rank's island, on the native backend (Gloo when running on CPU)."""
     bridge_group: ProcessGroup | None
     """The Gloo group of island leaders. None on non-leaders and in single-vendor clusters."""
 
@@ -153,7 +154,7 @@ class Topology:
 
     @property
     def device(self) -> torch.device:
-        """Where this rank's tensors must live: its GPU, or CPU in simulation mode."""
+        """Where this rank's tensors must live: its GPU, or CPU in simulation and CPU-only mode."""
         return self.config.device
 
 
