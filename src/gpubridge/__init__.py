@@ -1,8 +1,9 @@
 """gpubridge: write collective communication once, run it on mixed NVIDIA and AMD clusters.
 
 Ranks are grouped into one island per vendor, each using its native backend
-(NCCL on NVIDIA, RCCL on AMD). Island leaders are linked by a CPU Gloo bridge,
-and cluster-wide collectives are composed from island collectives and the bridge.
+(NCCL on NVIDIA, RCCL on AMD). Island leaders are linked by a CPU bridge (Gloo by
+default, swappable via :mod:`gpubridge.transport`), and cluster-wide collectives
+are composed from island collectives and the bridge.
 """
 
 from __future__ import annotations
@@ -16,16 +17,26 @@ from torch.distributed import ReduceOp
 
 from gpubridge import topology as _topology
 from gpubridge.collectives import all_reduce, barrier, broadcast
-from gpubridge.config import CPU_BACKEND, resolve_config
-from gpubridge.detect import detect_vendor
+from gpubridge.config import CPU_BACKEND
+from gpubridge.detect import Probe, probe
 from gpubridge.topology import Island, Layout, PeerInfo, Topology, get_topology, is_initialized
+from gpubridge.transport import (
+    DEFAULT_TRANSPORT,
+    BridgeTransport,
+    GlooTransport,
+    register_transport,
+    resolve_transport,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "BridgeTransport",
+    "GlooTransport",
     "Island",
     "Layout",
     "PeerInfo",
+    "Probe",
     "ReduceOp",
     "Topology",
     "all_reduce",
@@ -35,6 +46,8 @@ __all__ = [
     "get_topology",
     "init",
     "is_initialized",
+    "probe",
+    "register_transport",
 ]
 
 
@@ -44,6 +57,7 @@ def init(
     rank: int | None = None,
     world_size: int | None = None,
     timeout: timedelta | None = None,
+    bridge: str | type[BridgeTransport] = DEFAULT_TRANSPORT,
 ) -> Topology:
     """Join the cluster and build the island and bridge groups.
 
@@ -52,20 +66,27 @@ def init(
     variables set by torchrun are used (MASTER_ADDR, MASTER_PORT, RANK, WORLD_SIZE).
 
     gpubridge owns the default process group: it is a Gloo group over all
-    ranks, used for discovery and :func:`barrier`.
+    ranks, used for discovery and :func:`barrier`. During discovery every rank
+    shares its :func:`probe` results and any problems that would stop it from
+    joining, so a rank without a GPU or a vendor fails ``init()`` on every rank
+    with one message instead of leaving the others waiting.
 
     Args:
         init_method: Rendezvous URL, e.g. ``env://``, ``tcp://host:port`` or ``file:///path``.
         rank: This process's global rank. Read from the environment if omitted.
         world_size: Total number of ranks. Read from the environment if omitted.
         timeout: Timeout for every group gpubridge creates. None keeps PyTorch's default.
+        bridge: Transport between island leaders: a registered name or a
+            :class:`BridgeTransport` subclass. Must be the same on every rank.
 
     Returns:
         This rank's :class:`Topology`.
 
     Raises:
         RuntimeError: if gpubridge or torch.distributed is already initialized,
-            if no vendor can be detected, or if ranks disagree on simulation mode.
+            if any rank reported a problem (no vendor, no GPU, no NCCL/RCCL
+            backend), or if ranks disagree on CPU mode or the bridge transport.
+        ValueError: for an unknown bridge name or invalid gpubridge env vars.
     """
     if is_initialized():
         raise RuntimeError("gpubridge is already initialized")
@@ -74,9 +95,9 @@ def init(
             "torch.distributed is already initialized; gpubridge.init() creates the "
             "default process group itself"
         )
-    vendor = detect_vendor()
-    config = resolve_config()
-    if not config.simulated:
+    transport = resolve_transport(bridge)
+    local, config = _topology.describe_local(transport.name)
+    if not config.simulated and not local.problems:
         torch.cuda.set_device(config.device)
 
     kwargs: dict[str, Any] = {}
@@ -88,7 +109,7 @@ def init(
         kwargs["timeout"] = timeout
     dist.init_process_group(backend=CPU_BACKEND, init_method=init_method, **kwargs)
     try:
-        topology = _topology.build_topology(vendor, config, timeout=timeout)
+        topology = _topology.build_topology(local, config, transport=transport, timeout=timeout)
     except BaseException:
         dist.destroy_process_group()
         raise
@@ -103,5 +124,10 @@ def destroy() -> None:
     """
     if not is_initialized():
         return
+    topology = get_topology()
     _topology._set_topology(None)
-    dist.destroy_process_group()
+    try:
+        if topology.bridge is not None:
+            topology.bridge.close()
+    finally:
+        dist.destroy_process_group()

@@ -4,6 +4,7 @@ import pytest
 import torch.distributed as dist
 from _harness import run_ranks
 
+from gpubridge.detect import Probe
 from gpubridge.topology import Island, PeerInfo, plan_topology, validate_peers
 
 
@@ -55,8 +56,23 @@ def test_empty_cluster_is_rejected():
         plan_topology([])
 
 
-def _peer(simulated: bool = True, torch_version: str = "2.5.1") -> PeerInfo:
-    return PeerInfo("nvidia", simulated, torch_version, "node0")
+def _peer(
+    simulated: bool = True,
+    torch_version: str = "2.5.1",
+    bridge: str = "gloo",
+    problems: tuple[str, ...] = (),
+    hostname: str = "node0",
+) -> PeerInfo:
+    probe = Probe(
+        build_vendor=None,
+        torch_version=torch_version,
+        cuda_version=None,
+        hip_version=None,
+        gpu_count=0,
+        nccl_available=False,
+        gloo_available=True,
+    )
+    return PeerInfo("nvidia", simulated, hostname, bridge, probe, problems)
 
 
 def test_mixed_cpu_and_gpu_ranks_are_rejected():
