@@ -16,6 +16,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python-version }}
+          activate-environment: true
       # CPU wheels keep the job small; the tests run in simulation mode.
       - run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: uv pip install -e ".[test]"
