@@ -207,9 +207,10 @@ def test_bench_measures_native_and_bridged_in_one_split_run(tmp_path):
     assert result.returncode == 0, result.stderr[-3000:]
     rows = json.loads((out / "bench.json").read_text())["rows"]
     assert {r["op"] for r in rows} == {"native", "gpubridge"}
+    assert {r["policy"] for r in rows if r["op"] == "gpubridge"} == {"reduce-bridge-broadcast"}
     assert {r["bytes"] for r in rows} == {1024, 4096, 16384}
     assert all(r["split_test"] == "half" and r["islands"] == 2 for r in rows)
-    assert (out / "bench.csv").read_text().startswith("op,run_kind,split_test,")
+    assert (out / "bench.csv").read_text().startswith("op,policy,run_kind,split_test,")
     assert "SPLIT TEST" in (out / "summary.md").read_text()
 
 
@@ -218,9 +219,11 @@ def test_bench_size_helpers():
     assert bench_all_reduce.parse_size("1GB") == 2**30
     steps = bench_all_reduce.sizes(1024, 2**30, 4)
     assert steps[0] == 1024 and steps[-1] == 2**30 and len(steps) == 11
-    info = {"kind": "gpu-mixed", "split_test": None, "islands": [1, 2], "world_size": 4}
+    info = {"kind": "gpu-mixed", "split_test": None, "islands": [1, 2], "world_size": 4,
+            "policy": "reduce-bridge-broadcast"}
     r = bench_all_reduce.row("gpubridge", info, 2**20, "float32", [0.001, 0.002, 0.003])
     assert r["median_us"] == 2000.0
+    assert r["policy"] == "reduce-bridge-broadcast"
     assert r["busbw_GBps"] == pytest.approx(r["algbw_GBps"] * 1.5, rel=1e-3)
 
 
@@ -360,3 +363,23 @@ def test_amd_script_keeps_going_after_failures_and_packages_results(tmp_path):
             "summarize"} <= {name for name, code in codes.items() if code == 0}
     assert (tmp_path / "sim.tgz").exists()
     assert "Download it before stopping this machine" in result.stderr
+
+
+def test_check_and_bench_take_a_policy(tmp_path):
+    check = torchrun(4, KIT / "check.py", "--out", str(tmp_path / "check"), "--policy",
+                     "flat-gloo", GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
+    assert check.returncode == 0, check.stderr[-3000:]
+    for record in read_ranks(tmp_path / "check"):
+        assert record["ok"] and record["run"]["policy"] == "flat-gloo"
+        dtypes = next(s for s in record["stages"] if s["name"] == "dtypes")
+        assert [c["dtype"] for c in dtypes["cases"]] == [
+            "float16", "bfloat16", "float32", "float64", "int8", "uint8", "int32", "int64"]
+    summarize.main([str(tmp_path / "check")])
+    assert "policy: `flat-gloo`" in (tmp_path / "check" / "summary.md").read_text()
+
+    bench = torchrun(2, KIT / "bench_all_reduce.py", "--out", str(tmp_path / "bench"),
+                     "--max-bytes", "4K", "--warmup", "1", "--trials", "2", "--policy",
+                     "flat-gloo", GPUBRIDGE_VENDOR="amd")
+    assert bench.returncode == 0, bench.stderr[-3000:]
+    rows = json.loads((tmp_path / "bench" / "bench.json").read_text())["rows"]
+    assert {r["policy"] for r in rows if r["op"] == "gpubridge"} == {"flat-gloo"}

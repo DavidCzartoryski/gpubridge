@@ -55,6 +55,7 @@ from each leader to the rest of its island.
 
 If the cluster has only one vendor there is no bridge, and every call goes
 straight to the native collective.
+These paths are the default [collective policies](#collective-policies).
 
 ### Initialization
 
@@ -181,7 +182,7 @@ The API follows `torch.distributed`, always on the world group.
 
 | Function | Description |
 | --- | --- |
-| `init(init_method=None, *, rank=None, world_size=None, timeout=None, bridge="gloo") -> Topology` | Join the cluster and build the islands and bridge. Same arguments as `init_process_group`, plus the bridge transport (a registered name or a `BridgeTransport` subclass). |
+| `init(init_method=None, *, rank=None, world_size=None, timeout=None, bridge="gloo", policy="auto") -> Topology` | Join the cluster and build the islands and bridge. Same arguments as `init_process_group`, plus the bridge transport (a registered name or a `BridgeTransport` subclass) and the [collective policy](#collective-policies) (`"auto"`, a registered name, or a `CollectivePolicy` subclass). Both must be the same on every rank. |
 | `all_reduce(tensor, op=ReduceOp.SUM)` | In-place sum across all ranks. Only SUM is supported in v1. |
 | `broadcast(tensor, src)` | In-place copy from global rank `src` to all ranks. |
 | `barrier()` | Wait for all ranks. On GPUs, first waits for this rank's queued GPU work. |
@@ -191,16 +192,47 @@ The API follows `torch.distributed`, always on the world group.
 | `probe() -> Probe` | This process's build vendor, CUDA/HIP versions, visible GPU count, and NCCL/Gloo availability. Never raises; failed checks are listed in `Probe.errors`. Works before `init`. |
 
 Tensors must be contiguous and on `topology.device`: the rank's GPU, or CPU in
-simulation mode.
+simulation mode. Their dtype must be one that both the island backend and Gloo
+support (`gpubridge.collectives.SUPPORTED_DTYPES`): float16, bfloat16, float32,
+float64, int8, uint8, int32 or int64. Anything else is rejected on every rank
+before any communication. `bool` is excluded because a SUM of bools is a
+logical OR on both backends.
 
 `Topology` exposes `rank`, `world_size`, `vendor` (the island label),
 `detected_vendor`, `run_kind` (`gpu-mixed`, `gpu-single-vendor`, `split-test` or
 `cpu`), `split_test`, `device`, `simulated`, `island`, `is_leader`, `layout`
 (every island, its ranks and leader), `peers`
 (each rank's vendor, hostname, bridge transport and `probe` results),
-`island_group`, and `bridge`, the transport linking island leaders.
-`bridge_group` is the bridge's process group when the transport has one, as
-the default Gloo transport does.
+`island_group`, `bridge` (the transport linking island leaders), and `policy`
+/ `policy_name` (the active collective policy). `bridge_group` is the bridge's
+process group when the transport has one, as the default Gloo transport does.
+
+### Collective policies
+
+A policy decides how a collective travels: which process groups carry the
+data, and in which order. It never changes what the collective computes.
+Every rank must use the same policy; `init()` fails on every rank otherwise,
+or if the policy doesn't fit the cluster.
+
+| Policy | Applies to | What it does |
+| --- | --- | --- |
+| `reduce-bridge-broadcast` | 2+ islands | island collective, island leaders over the bridge, island broadcast |
+| `native-only` | 1 island | one native NCCL/RCCL (or CPU Gloo) collective |
+| `flat-gloo` | any | every rank copies to CPU and uses the world Gloo group: slow but obviously correct, so it's the test reference and a debugging fallback that never touches NCCL/RCCL |
+| `auto` (default) | any | `native-only` for one island, `reduce-bridge-broadcast` otherwise; today's behaviour |
+
+```python
+gpubridge.init(policy="flat-gloo")     # e.g. to rule out NCCL/RCCL while debugging
+```
+
+A custom policy subclasses `CollectivePolicy`, implements `applies_to`,
+`all_reduce` and `broadcast`, and registers with `register_policy`. Optional
+hooks leave room for performance work without changing the public API:
+- `setup()` and `close()`, for staging buffers or streams;
+- `select_policy(nbytes)`, to choose a path by message size.
+
+The GPU kit's `check.py` and `bench_all_reduce.py` take `--policy`, so runs can
+compare policies.
 
 ### Bridge transports
 

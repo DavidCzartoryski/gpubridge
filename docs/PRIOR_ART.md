@@ -149,9 +149,13 @@ Serving sets it from the `MAX_SERVE_USE_VENDOR_CCL` env var, which defaults to `
    - MPI, UCX, or an RDMA path can then replace Gloo later without touching
      the reduce-bridge-broadcast logic in `collectives.py`.
 3. **Check dtype and op support up front.** Modular rejects unsupported dtypes
-   by name before calling the library. Today gpubridge leaves dtype errors to
-   torch, which can fail on the bridge after the island step has already run.
-   *Status: not implemented yet.*
+   by name before calling the library. Before this, gpubridge left dtype errors
+   to torch, which could fail on the bridge after the island step had already
+   run.
+   *Status: implemented as `gpubridge.collectives.SUPPORTED_DTYPES`, checked in
+   `_check_tensor`. Every dtype in it passes Gloo all_reduce and broadcast on
+   torch 2.3.1, 2.6.0, 2.9.1 and 2.14.1 (including the 2.14.1 CUDA and ROCm
+   builds); the NCCL/RCCL side is checked by `scripts/gpu/check.py` on GPUs.*
    - Keep one table of dtypes that both the island backend and Gloo support.
    - Check it in `collectives._check_tensor`, so every rank raises the same
      error before any communication.
@@ -223,8 +227,11 @@ with per-backend policy lists kept in one header
 ### Ideas worth adopting
 
 1. **Collective policies: separate what a collective computes from how it is
-   composed.** Today `collectives.py` hard-codes reduce-bridge-broadcast.
-   *Status: not implemented yet.*
+   composed.** `collectives.py` used to hard-code reduce-bridge-broadcast.
+   *Status: implemented as a scaffold in `policies.py`, with
+   `reduce-bridge-broadcast`, `native-only`, `flat-gloo` and `auto` (the
+   default, which keeps the earlier behaviour). There is no per-call override:
+   a mismatch between ranks there would hang with no cheap way to detect it.*
    - Make the composition a policy object chosen at `init()`, with an
      optional per-call override:
      - `ReduceBridgeBroadcast`: the current behaviour.
@@ -514,7 +521,9 @@ job.
 
 1. **A chunked, pipelined bridge**, from the chunked all-reduce, per-chunk
    flags and copy-engine streams.
-   *Status: not implemented yet.*
+   *Status: not implemented yet. The hooks it needs exist: a marked place in
+   `policies.py`, plus `CollectivePolicy.setup()` / `close()` for pinned buffers
+   and streams.*
    - Split the leaders' bridge step into chunks. On a side stream, copy chunk
      k+1 from GPU to pinned CPU memory while Gloo all-reduces chunk k and
      chunk k-1 is copied back.
@@ -526,7 +535,11 @@ job.
      small ones.
 2. **Choose the algorithm by size.** Triton-distributed picks one-shot or
    two-shot by byte count, and falls back to NCCL for small inputs.
-   *Status: not implemented yet.*
+   *Status: not implemented yet. The hook exists:
+   `CollectivePolicy.select_policy(nbytes)`, which every collective goes
+   through, and which a test policy already uses to route small messages
+   through `flat-gloo`. Thresholds wait for real GPU benchmark data
+   (`bench_all_reduce.py --policy`).*
    - For gpubridge: small tensors take one Gloo all_reduce across all ranks
      (the `FlatGloo` policy), which avoids three serialized steps. Large
      tensors take the pipelined bridge.
