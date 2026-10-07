@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gpubridge"
-version = "0.1.0"
+version = "0.1.0a0"
 description = "Write collective communication once and run it across mixed NVIDIA and AMD GPU clusters."
 readme = "README.md"
 requires-python = ">=3.10"
