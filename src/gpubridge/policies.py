@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 import torch.distributed as dist
 
+from gpubridge.observe import phase
+
 if TYPE_CHECKING:
     from gpubridge.topology import Layout, Topology
 
@@ -104,28 +106,34 @@ class ReduceBridgeBroadcast(CollectivePolicy):
         return layout.needs_bridge
 
     def all_reduce(self, tensor: torch.Tensor, topology: Topology) -> None:
-        dist.all_reduce(tensor, group=topology.island_group)
+        with phase("island-reduce"):
+            dist.all_reduce(tensor, group=topology.island_group)
         if topology.is_leader:
             assert topology.bridge is not None
-            staged = _stage_to_host(tensor)
-            topology.bridge.all_reduce(staged)
-            if staged is not tensor:
-                tensor.copy_(staged)
-        dist.broadcast(tensor, src=topology.island.leader, group=topology.island_group)
+            with phase("bridge"):
+                staged = _stage_to_host(tensor)
+                topology.bridge.all_reduce(staged)
+                if staged is not tensor:
+                    tensor.copy_(staged)
+        with phase("island-broadcast"):
+            dist.broadcast(tensor, src=topology.island.leader, group=topology.island_group)
 
     def broadcast(self, tensor: torch.Tensor, src: int, topology: Topology) -> None:
         src_island = topology.layout.island_of(src)
         in_src_island = topology.island == src_island
         if in_src_island:
-            dist.broadcast(tensor, src=src, group=topology.island_group)
+            with phase("island-broadcast"):
+                dist.broadcast(tensor, src=src, group=topology.island_group)
         if topology.is_leader:
             assert topology.bridge is not None
-            staged = _stage_to_host(tensor)
-            topology.bridge.broadcast(staged, src=src_island.leader)
-            if not in_src_island and staged is not tensor:
-                tensor.copy_(staged)
+            with phase("bridge"):
+                staged = _stage_to_host(tensor)
+                topology.bridge.broadcast(staged, src=src_island.leader)
+                if not in_src_island and staged is not tensor:
+                    tensor.copy_(staged)
         if not in_src_island:
-            dist.broadcast(tensor, src=topology.island.leader, group=topology.island_group)
+            with phase("island-broadcast"):
+                dist.broadcast(tensor, src=topology.island.leader, group=topology.island_group)
 
 
 class NativeOnly(CollectivePolicy):

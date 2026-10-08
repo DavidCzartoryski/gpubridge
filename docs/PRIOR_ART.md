@@ -138,7 +138,8 @@ Serving sets it from the `MAX_SERVE_USE_VENDOR_CCL` env var, which defaults to `
    - Send it in `PeerInfo` during discovery (`topology.py`). Then `init()` can
      fail with one message naming every rank that lacks its island backend,
      instead of some ranks hanging in `new_group`.
-   - The straggler detector also gets a per-rank capability snapshot for free.
+   - Monitoring or profiling tools also get a per-rank capability snapshot for
+     free.
 2. **A bridge transport with a fixed signature.** Modular keeps the vendor and
    native paths call-compatible so a flag can switch them.
    *Status: implemented in `transport.py`, with Gloo as the default.*
@@ -454,10 +455,6 @@ overlapping kernels on distributed AI systems"
   - The ready flags are 4-byte memcpys, "Because driver API(waitValue/writeValue)
     on AMD will affect the perf of gemm"
     ([`amd/allgather_gemm.py`](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/kernels/amd/allgather_gemm.py#L337-L357)).
-- **A straggler test hook.** `straggler_option=(rank, ns)` makes one rank call
-  `torch.cuda._sleep` before the AllGather + GEMM, to stress the signalling
-  ([L662-663](https://github.com/ByteDance-Seed/Triton-distributed/blob/7908e4ea9010bb2238f9f05b28c904fd4b71c60a/python/triton_dist/kernels/nvidia/allgather_gemm.py#L662-L663)).
-  This is relevant to the planned straggler detector.
 
 **Results (paper).**
 - Speedups of "1.09× to 44.97×" over PyTorch + NCCL/RCCL.

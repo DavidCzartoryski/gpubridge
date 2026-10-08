@@ -4,7 +4,8 @@ Ranks are grouped into one island per vendor, each using its native backend
 (NCCL on NVIDIA, RCCL on AMD). Island leaders are linked by a CPU bridge (Gloo by
 default, swappable via :mod:`gpubridge.transport`), and cluster-wide collectives
 are composed from island collectives and the bridge by a collective policy
-(:mod:`gpubridge.policies`).
+(:mod:`gpubridge.policies`). Monitoring or profiling tools can watch every
+collective through observers (:mod:`gpubridge.observe`).
 """
 
 from __future__ import annotations
@@ -16,10 +17,20 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp
 
+from gpubridge import observe as _observe
 from gpubridge import topology as _topology
 from gpubridge.collectives import all_reduce, barrier, broadcast
 from gpubridge.config import CPU_BACKEND
 from gpubridge.detect import Probe, probe
+from gpubridge.observe import (
+    CollectiveObserver,
+    CollectiveRecord,
+    Mark,
+    Phase,
+    add_observer,
+    elapsed_ms,
+    remove_observer,
+)
 from gpubridge.policies import (
     DEFAULT_POLICY,
     CollectivePolicy,
@@ -41,25 +52,32 @@ __version__ = "0.1.0a0"
 
 __all__ = [
     "BridgeTransport",
+    "CollectiveObserver",
     "CollectivePolicy",
+    "CollectiveRecord",
     "GlooTransport",
     "Island",
     "Layout",
+    "Mark",
     "PeerInfo",
+    "Phase",
     "Probe",
     "ReduceOp",
     "SplitTestWarning",
     "Topology",
+    "add_observer",
     "all_reduce",
     "barrier",
     "broadcast",
     "destroy",
+    "elapsed_ms",
     "get_topology",
     "init",
     "is_initialized",
     "probe",
     "register_policy",
     "register_transport",
+    "remove_observer",
 ]
 
 
@@ -135,6 +153,7 @@ def init(
     except BaseException:
         dist.destroy_process_group()
         raise
+    _observe._reset()
     _topology._set_topology(topology)
     return topology
 
@@ -148,6 +167,7 @@ def destroy() -> None:
         return
     topology = get_topology()
     _topology._set_topology(None)
+    _observe._reset()
     try:
         topology.policy.close()
         if topology.bridge is not None:
