@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp
 
+from gpubridge import observe
 from gpubridge.topology import Topology, get_topology
 
 #: Dtypes every built-in path supports: Gloo (world group, bridge, CPU islands)
@@ -54,7 +55,9 @@ def all_reduce(tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM) -> N
     if op != ReduceOp.SUM:
         raise ValueError(f"gpubridge.all_reduce only supports ReduceOp.SUM, got {op}")
     _check_tensor(tensor, topology)
-    topology.policy.select_policy(tensor.nbytes).all_reduce(tensor, topology)
+    policy = topology.policy.select_policy(tensor.nbytes)
+    with observe.collective(topology, "all_reduce", tensor, policy=policy.name):
+        policy.all_reduce(tensor, topology)
 
 
 def broadcast(tensor: torch.Tensor, src: int) -> None:
@@ -83,7 +86,9 @@ def broadcast(tensor: torch.Tensor, src: int) -> None:
     if not 0 <= src < topology.world_size:
         raise ValueError(f"src must be a rank in [0, {topology.world_size}), got {src}")
     _check_tensor(tensor, topology)
-    topology.policy.select_policy(tensor.nbytes).broadcast(tensor, src, topology)
+    policy = topology.policy.select_policy(tensor.nbytes)
+    with observe.collective(topology, "broadcast", tensor, src=src, policy=policy.name):
+        policy.broadcast(tensor, src, topology)
 
 
 def barrier() -> None:
@@ -96,9 +101,10 @@ def barrier() -> None:
         RuntimeError: if gpubridge is not initialized.
     """
     topology = get_topology()
-    if not topology.simulated:
-        torch.cuda.synchronize(topology.device)
-    dist.barrier()
+    with observe.collective(topology, "barrier"):
+        if not topology.simulated:
+            torch.cuda.synchronize(topology.device)
+        dist.barrier()
 
 
 def _check_tensor(tensor: torch.Tensor, topology: Topology) -> None:

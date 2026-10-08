@@ -190,6 +190,7 @@ The API follows `torch.distributed`, always on the world group.
 | `get_topology() -> Topology` | This rank's view of the cluster (see below). |
 | `is_initialized() -> bool` | True between `init` and `destroy`. |
 | `probe() -> Probe` | This process's build vendor, CUDA/HIP versions, visible GPU count, and NCCL/Gloo availability. Never raises; failed checks are listed in `Probe.errors`. Works before `init`. |
+| `add_observer(observer)` / `remove_observer(observer)` | Start or stop sending this rank's collective records to a `CollectiveObserver` (see [Observing collectives](#observing-collectives)). |
 
 Tensors must be contiguous and on `topology.device`: the rank's GPU, or CPU in
 simulation mode. Their dtype must be one that both the island backend and Gloo
@@ -264,16 +265,65 @@ picked different transports fails at `init()` instead of hanging.
 `tests/_transports.py` has a working example that carries the bridge over a
 c10d `FileStore`.
 
+### Observing collectives
+
+Monitoring or profiling tools can watch every collective on a rank. After each
+`all_reduce`, `broadcast` and `barrier`, an observer gets a `CollectiveRecord`:
+
+- `seq`: the collective's number since `init()`, the same on every rank, so
+  records from different ranks line up;
+- `op`, `nbytes`, `dtype`, `src` and `policy`;
+- `start` and `end` marks, and `phases`. Reduce-bridge-broadcast marks
+  `island-reduce`, `bridge` (leaders only) and `island-broadcast`.
+
+```python
+import gpubridge
+
+class Timings(gpubridge.CollectiveObserver):
+    def __init__(self):
+        self.records = []
+
+    def on_collective(self, record):
+        self.records.append(record)  # keep it cheap; read the times later
+
+gpubridge.init()
+timings = Timings()
+gpubridge.add_observer(timings)
+# ... training ...
+for rec in timings.records:
+    if rec.ready():
+        phases = {p.name: round(p.elapsed_ms(), 3) for p in rec.phases}
+        print(rec.seq, rec.op, rec.policy, round(rec.elapsed_ms(), 3), phases)
+```
+
+The rules keep observers from changing what any rank communicates:
+
+- **Observers never communicate.** `on_collective` must not call gpubridge or
+  `torch.distributed`; gpubridge refuses its own collectives from inside a
+  callback. A tool that needs other ranks' data exchanges it outside the
+  callback.
+- **Observers are local.** Sequence numbers count every collective, observed
+  or not, so ranks can attach observers at different times.
+- **A failing observer is detached on its own rank**, with a `RuntimeWarning`
+  and a call to its `on_detach` hook. Collectives carry on on every rank.
+- **Timing never syncs the GPU.** On GPUs a mark is a CUDA event recorded on
+  the current stream, so check `record.ready()` before reading times. On CPU a
+  mark is a `perf_counter_ns` reading. With no observers attached, gpubridge
+  creates no events at all.
+
+A custom policy can mark its own steps with `gpubridge.observe.phase("name")`.
+
 ## Building on gpubridge
 
 gpubridge is meant to be a base for cluster tooling that has to understand
-mixed hardware, such as per-vendor straggler detection:
+mixed hardware, such as monitoring or profiling tools:
 
-- `get_topology()` tells each rank which vendor, island and host every other
-  rank belongs to, so measurements can be grouped and compared per vendor.
-- The default process group is a CPU Gloo group over all ranks. It works the
-  same on both vendors and does not touch GPU streams, so it can carry
-  monitoring data without disturbing training traffic.
+- `get_topology()` tells each rank the vendor, island and host of every rank.
+- [Observers](#observing-collectives) give every rank a timing record for
+  each collective, with sequence numbers that match across ranks.
+- Gloo works the same on both vendors and does not touch GPU streams. A tool
+  can create its own Gloo group after `init()` (on every rank, in the same
+  order) to carry monitoring data without disturbing training traffic.
 
 ## Limitations in v1
 
