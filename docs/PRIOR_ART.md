@@ -1,8 +1,8 @@
-# Prior art: Modular MAX `comm`, RAJA, Triton and Triton-distributed
+# Prior art: Modular MAX `comm`, RAJA, Triton, Triton-distributed and torchcomms
 
-Notes comparing gpubridge with four projects that also promise "write it once,
-run it on NVIDIA or AMD". Each repo was read on 2026-10-06 at a fixed commit,
-and every code link points at that commit:
+Notes comparing gpubridge with five projects that also promise "write it once,
+run it on NVIDIA or AMD". Each repo was read at a fixed commit (on 2026-10-06,
+torchcomms on 2026-10-07), and every code link points at that commit:
 
 - Modular [`85356f6`](https://github.com/modular/modular/tree/85356f6562ed57bab8762fde38448ba5b50b69c9)
 - RAJA [`09626e8`](https://github.com/llnl/RAJA/tree/09626e855db5005357eb1dac7cc4db0546cf0f53)
@@ -10,6 +10,8 @@ and every code link points at that commit:
 - Triton [`4a5147d`](https://github.com/triton-lang/triton/tree/4a5147d919defd3064388d4cdd202fb5e9403b61)
 - Triton-distributed [`7908e4e`](https://github.com/ByteDance-Seed/Triton-distributed/tree/7908e4ea9010bb2238f9f05b28c904fd4b71c60a)
   (`main` as of 2026-09-18)
+- torchcomms [`a61f9ad`](https://github.com/meta-pytorch/torchcomms/tree/a61f9adc18384160079d533b53cc5bcd663acf85)
+  (`main` as of 2026-10-07)
 
 Statements marked *(reading)* are conclusions from reading the code, not from
 running it.
@@ -20,6 +22,7 @@ running it.
 | RAJA | compute (loops and kernels) | CUDA, HIP, SYCL, OpenMP, CPU | compile time, by policy type | no |
 | Triton | compute (kernel language and compiler) | NVIDIA (compute capability 8.0+), AMD (ROCm 6.2+) | run time, one driver per process; compiled per GPU architecture | no: exactly one active driver per process |
 | Triton-distributed | communication inside kernels, overlapped with compute | NVIDIA (NVSHMEM), AMD (rocSHMEM or MORI, single node), MetaX | run time, per process (`nvidia-smi` / `rocm-smi` on PATH) | no: one SHMEM library over one NCCL group |
+| torchcomms (Meta) | communication (collectives, plus one-sided windows) | NVIDIA (NCCL, NCCLX), AMD (RCCL, RCCLX), Intel XPU, CPU (Gloo) | build time (a CUDA or a ROCm build), then a backend per communicator | no: one vendor library per communicator; listed as a design goal |
 | **gpubridge** | communication (no kernels) | NVIDIA, AMD | run time, per process (from the PyTorch build) | **yes**: one island per vendor, joined by a CPU bridge |
 
 ## Modular MAX: `comm` and `comm/vendor/ccl`
@@ -552,7 +555,128 @@ job.
    - The AMD lesson, that the signalling mechanism is vendor-specific, puts
      that choice in the proposed `VendorSpec`.
 
+## torchcomms
+
+### What it does
+
+torchcomms is Meta's "new experimental communications API for PyTorch"
+([README](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/README.md#L9-L12)), announced on the
+[PyTorch blog](https://pytorch.org/blog/torchcomms/) on 2025-10-22.
+- BSD-3-licensed ([LICENSE](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/LICENSE#L1)), version 0.3.0
+  ([`version.txt`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/version.txt#L1)). The blog warns the API "may undergo
+  breaking changes as it matures".
+- Needs Python 3.10+ and PyTorch 2.8+ ([README](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/README.md#L19-L24)). The
+  wheel pins the exact torch release it was built against
+  ([`setup.py`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/setup.py#L122-L124)).
+- It sits on top of c10d. Rendezvous goes through a c10d `TCPStore` built from
+  `MASTER_ADDR` / `MASTER_PORT`
+  ([`StoreManager.cpp`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/torchcomms/utils/StoreManager.cpp#L11-L34)),
+  and a wrapper exposes a communicator as a `c10d::Backend`, so DeviceMesh and
+  FSDP2 can use it
+  ([`BackendWrapper.hpp`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/torchcomms/BackendWrapper.hpp#L49),
+  [`device_mesh.py`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/torchcomms/device_mesh.py#L59-L75)).
+- The blog's long-term plan is to "deprecate the old c10d::Backend interface
+  and adopt torchcomms as the underlying implementation for PyTorch
+  Distributed".
+
+**API.** `new_comm(backend, device, name)` creates a communicator eagerly,
+bound to one device and one backend
+([`TorchComm.hpp`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/torchcomms/TorchComm.hpp#L353-L374)). Every op
+takes `async_op`, ranks are relative to the communicator, and `split` makes
+sub-communicators. There are also batched send/recv and experimental one-sided
+windows.
+
+**Backends**, each a directory under `comms/torchcomms/`:
+- `nccl`, and `ncclx` (Meta's NCCL fork with its CTran transport), for NVIDIA;
+- `rccl` and `rcclx` for AMD. `rccl` compiles against `ATen/hip` and puts its
+  tensors on HIP devices
+  ([`TorchCommRCCL.cpp`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/torchcomms/rccl/TorchCommRCCL.cpp#L13-L31));
+- `gloo` for CPU. GPU tensors are copied to the host, reduced over Gloo and
+  copied back
+  ([`TorchCommGloo.cpp`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/torchcomms/gloo/TorchCommGloo.cpp#L724-L767));
+- `xccl` for Intel XPU.
+
+**How the vendor is chosen.**
+- At build time. `setup.py` turns on NCCL and NCCLX, and turns off RCCL,
+  unless the installed torch is a ROCm build
+  ([`setup.py`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/setup.py#L79-L85)).
+- The stable wheels on download.pytorch.org are CUDA-only. ROCm wheels exist
+  only in the nightly index (checked 2026-10-07).
+- Then per communicator, at run time: the backend name passed to `new_comm`.
+
+**Mixed vendors: a goal, not implemented.**
+- The blog lists "Heterogeneous Hardware Support" as a project goal: "we're
+  designing for heterogeneous systems from the ground up—enabling mixed
+  deployments that span multiple hardware generations and vendors within a
+  single training job."
+- Its "native multi-vendor GPU support from Day 1" refers to the new RCCL
+  backend: the same API on either vendor, not both vendors in one job.
+- *(reading)* Each communicator wraps one vendor library. The NCCL and RCCL
+  backends each share their own `ncclUniqueId` through the store and call
+  their own init
+  ([NCCL](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/torchcomms/nccl/TorchCommNCCLBootstrap.cpp#L102-L128),
+  [RCCL](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/torchcomms/rccl/TorchCommRCCLBootstrap.cpp#L95-L121)).
+  No backend combines two others. The only mention of composite backends is a
+  comment on how they would rank abort reports
+  ([`TorchComm.hpp`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/torchcomms/TorchComm.hpp#L274-L277)).
+- UniFlow, in the same repo, is a "Unified Transport for Heterogeneous LLM
+  Systems" ([`ONBOARDING.md`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/uniflow/docs/ONBOARDING.md#L6-L8)), but
+  it moves data point to point, with no collectives, and also picks its
+  vendor at build time
+  ([`AMD_BUILD.md`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/uniflow/amd/AMD_BUILD.md#L5-L9)).
+
+**Hooks and fault tolerance.**
+- Pre-, post-, abort-, reconfigure- and graph-replay hooks on every
+  communicator ([`TorchComm.hpp`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/torchcomms/TorchComm.hpp#L299-L317)).
+- Planned: a fault-tolerant backend built on CTran (blog).
+
+### Overlap with gpubridge
+
+- **Layer.** Both sit above NCCL and RCCL, rendezvous through c10d stores,
+  and use Gloo to move GPU data through the host.
+- **Hooks.** torchcomms has per-communicator pre/post hooks. gpubridge has
+  collective observers (`gpubridge.observe`), which give each cluster-wide
+  collective a record with matching sequence numbers on every rank.
+- **Goal.** Both name one job across vendors as a goal.
+
+### Where gpubridge is different
+
+- **Mixed vendors work today.** gpubridge runs each vendor's library in its
+  own island and joins the islands with a CPU bridge, using stock PyTorch
+  builds (2.3 or later). In torchcomms, each communicator is still one
+  vendor's library.
+- **No custom build.** gpubridge is pure Python over `torch.distributed`.
+  torchcomms is a C++ extension pinned to one torch release, and its ROCm
+  wheels are nightly-only.
+- **Scope.** torchcomms is a whole communications stack: new collective
+  semantics, one-sided windows, fault tolerance, scaling to 100,000+ GPUs.
+  gpubridge offers three cluster-wide collectives and the cross-vendor
+  composition.
+- **Who could host whom.** *(reading)*
+  - gpubridge's islands could run on torchcomms `nccl` and `rccl`
+    communicators.
+  - gpubridge could register as a torchcomms backend from Python
+    ([`register_backend`](https://github.com/meta-pytorch/torchcomms/blob/a61f9adc18384160079d533b53cc5bcd663acf85/comms/torchcomms/TorchCommBackendPy.cpp#L282-L300)),
+    so DeviceMesh and FSDP2 code could run on a mixed cluster.
+  - If torchcomms adds mixed-vendor jobs, a host bridge like gpubridge's is
+    one way to build them.
+
+### Ideas worth adopting
+
+1. **Per-collective hooks.**
+   *Status: implemented as collective observers (`gpubridge.observe`).*
+   Unlike torchcomms' hooks, which see one communicator, an observer sees the
+   whole cross-vendor collective, with its phases: island-reduce, bridge,
+   island-broadcast.
+2. **Become a torchcomms backend**, so code written for DeviceMesh or FSDP2
+   runs on a mixed cluster unchanged.
+   *Status: not implemented. Worth revisiting when torchcomms' API stabilizes
+   and its ROCm wheels leave the nightly index.*
+
 ## Positioning (proposed README paragraph)
+
+Updated 2026-10-07 with the torchcomms sentence, which the README doesn't have
+yet.
 
 > gpubridge lets one distributed PyTorch job span NVIDIA and AMD GPUs at the
 > same time. Choosing between NCCL and RCCL on a single-vendor machine is
@@ -561,9 +685,12 @@ job.
 > was built for.
 > Neither connects the two, because an NCCL communicator and an RCCL
 > communicator cannot exchange data, and Modular states that mixed-vendor
-> hosts are not supported. gpubridge keeps each vendor on its native library
-> inside an island and joins the islands with a CPU bridge. One `all_reduce`,
-> `broadcast` or `barrier` call then covers every GPU in the job, from the
-> same code on every node. CUDA and ROCm builds of PyTorch, from 2.9.1 to
+> hosts are not supported. Meta's torchcomms, planned as the future
+> implementation of PyTorch Distributed, lists mixed-vendor jobs as a design
+> goal, but each of its communicators still runs one vendor's library.
+> gpubridge keeps each vendor on its native library inside an island and
+> joins the islands with a CPU bridge. One `all_reduce`, `broadcast` or
+> `barrier` call then covers every GPU in the job, from the same code on
+> every node. CUDA and ROCm builds of PyTorch, from 2.9.1 to
 > 2.14.1, have been shown to join one job and complete the bridge on CPU;
 > validation on real GPUs is next.
