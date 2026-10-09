@@ -10,8 +10,15 @@ item each one closes):
 4. busy_gpu: a large tensor reduced right behind queued GPU work, so the
    bridge's device-to-host copy must wait for it (items 6 and 9)
 5. broadcast: from every rank
-6. barrier: includes torch.cuda.synchronize on GPUs (item 10)
-7. destroy
+6. reductions: all_reduce with MAX, MIN and AVG in every dtype (item 15)
+7. all_gather: all_gather_into_tensor, rows in global rank order (item 15)
+8. reduce_scatter: reduce_scatter_tensor with SUM and AVG (item 15)
+9. async: an async all_reduce queued right behind GPU work, read after wait()
+   on the caller's stream with no host sync in between (item 16)
+10. reduction_agreement: informational. Whether the island backend and Gloo
+    agree on PRODUCT in every dtype, and on MAX/MIN with NaN (item 14)
+11. barrier: includes torch.cuda.synchronize on GPUs (item 10)
+12. destroy
 
 Writes OUT/rank<N>.json. Run scripts/gpu/summarize.py OUT afterwards.
 
@@ -62,6 +69,27 @@ def rank_values(shape: tuple[int, ...], dtype: torch.dtype, rank: int, device) -
 def expected_sum(shape, dtype, world, device) -> torch.Tensor:
     total = sum(_values64(shape, dtype, r) for r in range(world))
     return torch.as_tensor(total).to(dtype).to(device)
+
+
+def expected_reduce(shape, dtype, world, device, op: str) -> torch.Tensor:
+    """The exact answer for rank_values reduced with op ("sum", "avg", "max", "min")."""
+    if op in ("sum", "avg"):
+        total = expected_sum(shape, dtype, world, device)
+        return total.div(world) if op == "avg" else total
+    stacked = torch.stack([_values64(shape, dtype, r) for r in range(world)])
+    picked = stacked.amax(0) if op == "max" else stacked.amin(0)
+    return picked.to(dtype).to(device)
+
+
+OPS = {"sum": gpubridge.ReduceOp.SUM, "avg": gpubridge.ReduceOp.AVG,
+       "max": gpubridge.ReduceOp.MAX, "min": gpubridge.ReduceOp.MIN}
+
+
+def mismatch(tensor: torch.Tensor, expected: torch.Tensor) -> dict | None:
+    if torch.equal(tensor, expected):
+        return None
+    diff = (tensor.double() - expected.double()).abs()
+    return {"max_abs_error": float(diff.max()), "wrong_elements": int((diff > 0).sum())}
 
 
 def main() -> int:
@@ -151,6 +179,65 @@ def main() -> int:
                     entry["bad_sources"].append(src)
             entry["ok"] = not entry["bad_sources"]
 
+        with rec.stage("reductions") as entry:
+            entry["cases"] = []
+            for name in args.dtypes.split(","):
+                dtype = DTYPES[name]
+                for op in ("max", "min") + (("avg",) if dtype.is_floating_point else ()):
+                    tensor = rank_values((1024, 3), dtype, rank, device)
+                    gpubridge.all_reduce(tensor, op=OPS[op])
+                    bad = mismatch(tensor, expected_reduce((1024, 3), dtype, world, device, op))
+                    entry["cases"].append({"dtype": name, "op": op, "ok": bad is None,
+                                           **(bad or {})})
+            entry["ok"] = all(case["ok"] for case in entry["cases"])
+
+        with rec.stage("all_gather") as entry:
+            entry["cases"] = []
+            for name in args.dtypes.split(","):
+                dtype = DTYPES[name]
+                piece = rank_values((257, 2), dtype, rank, device)
+                output = torch.empty((world * 257, 2), dtype=dtype, device=device)
+                gpubridge.all_gather_into_tensor(output, piece)
+                want = torch.cat([rank_values((257, 2), dtype, r, device) for r in range(world)])
+                bad = mismatch(output, want)
+                entry["cases"].append({"dtype": name, "ok": bad is None, **(bad or {})})
+            entry["ok"] = all(case["ok"] for case in entry["cases"])
+
+        with rec.stage("reduce_scatter") as entry:
+            entry["cases"] = []
+            for name in args.dtypes.split(","):
+                dtype = DTYPES[name]
+                for op in ("sum",) + (("avg",) if dtype.is_floating_point else ()):
+                    full = rank_values((world * 129,), dtype, rank, device)
+                    output = torch.empty(129, dtype=dtype, device=device)
+                    gpubridge.reduce_scatter_tensor(output, full, op=OPS[op])
+                    want = expected_reduce((world * 129,), dtype, world, device, op)
+                    bad = mismatch(output, want[rank * 129:(rank + 1) * 129])
+                    entry["cases"].append({"dtype": name, "op": op, "ok": bad is None,
+                                           **(bad or {})})
+            entry["ok"] = all(case["ok"] for case in entry["cases"])
+
+        with rec.stage("async") as entry:
+            numel = 4 * 2**20 if device.type == "cuda" else 2**16
+            tensor = torch.full((numel,), float(rank + 1), device=device)
+            if device.type == "cuda":
+                # Queue real work on this stream and make the tensor depend on it: the
+                # worker's stream must wait for it before the all_reduce reads the tensor.
+                work_matrix = torch.randn(2048, 2048, device=device)
+                for _ in range(args.busy_iters):
+                    work_matrix = torch.tanh(work_matrix @ work_matrix)
+                tensor.add_(work_matrix.sum() * 0)
+            work = gpubridge.all_reduce(tensor, async_op=True)
+            work.wait()  # orders this stream after the collective; no host sync
+            correct = tensor == world * (world + 1) / 2  # queued after wait() on this stream
+            entry["ok"] = bool(correct.all())
+            entry["is_completed"] = work.is_completed()
+            if not entry["ok"]:
+                entry["wrong_elements"] = int((~correct).sum())
+
+        with rec.stage("reduction_agreement") as entry:
+            entry.update(reduction_agreement(topology, rank, device))
+
         with rec.stage("barrier"):
             gpubridge.barrier()
 
@@ -160,6 +247,49 @@ def main() -> int:
         traceback.print_exc()
         rec.failed = True
     return rec.finish()
+
+
+def reduction_agreement(topology: gpubridge.Topology, rank: int, device) -> dict:
+    """Informational (item 14): does the island backend agree with Gloo where gpubridge can't
+    yet promise it does? PRODUCT in every dtype, including 8-bit overflow, and MAX/MIN with
+    a NaN on one rank. Uses raw torch.distributed calls, not gpubridge."""
+    import torch.distributed as dist
+
+    groups = {}
+    for island in topology.layout.islands:  # collective: every rank, in the same order
+        groups[island.ranks] = dist.new_group(list(island.ranks), backend="gloo")
+    gloo = groups[topology.island.ranks]
+
+    def both(tensor: torch.Tensor, op) -> tuple[torch.Tensor, torch.Tensor]:
+        native = tensor.clone()
+        dist.all_reduce(native, op=op, group=topology.island_group)
+        on_cpu = tensor.cpu()
+        dist.all_reduce(on_cpu, op=op, group=gloo)
+        return native.cpu(), on_cpu
+
+    product, nan = {}, {}
+    for name, dtype in DTYPES.items():
+        if dtype in (torch.int8, torch.uint8):
+            base = torch.tensor([3.0, 7.0, 2.0, 1.0])  # 7 ** ranks overflows quickly
+        else:
+            base = torch.tensor([1.0, 2.0, -1.0, 0.5]) if dtype.is_floating_point else (
+                torch.tensor([1.0, 2.0, -1.0, 3.0]))
+        tensor = (base + (rank % 2)).to(dtype).to(device)
+        native, on_cpu = both(tensor, dist.ReduceOp.PRODUCT)
+        product[name] = bool(torch.equal(native, on_cpu))
+        if dtype.is_floating_point:
+            values = torch.tensor([1.0, -2.0, 3.0]).to(dtype)
+            if rank == topology.island.leader:
+                values[0] = float("nan")
+            for op_name, op in (("max", dist.ReduceOp.MAX), ("min", dist.ReduceOp.MIN)):
+                native, on_cpu = both(values.to(device), op)
+                nan[f"{name}/{op_name}"] = {
+                    "agree": bool(torch.equal(native.isnan(), on_cpu.isnan())
+                                  and torch.equal(native.nan_to_num(), on_cpu.nan_to_num())),
+                    "native_first": str(native[0].item()), "gloo_first": str(on_cpu[0].item())}
+    return {"ok": True, "backend": topology.config.island_backend,
+            "product_agree": product, "all_product_agree": all(product.values()),
+            "nan_max_min": nan}
 
 
 def expect_init_error(rec: Record, args: argparse.Namespace) -> int:

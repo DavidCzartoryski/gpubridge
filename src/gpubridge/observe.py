@@ -1,10 +1,11 @@
 """Collective observers: a timing record for every collective, for tools built on gpubridge.
 
-An observer sees each ``all_reduce``, ``broadcast`` and ``barrier`` this rank
-runs, as a :class:`CollectiveRecord`: a sequence number that matches across
-ranks, the call's op, size and policy, and timing marks for the whole call and
-for each phase the policy marked (reduce-bridge-broadcast marks island-reduce,
-bridge and island-broadcast).
+An observer sees each collective this rank runs (``all_reduce``, ``broadcast``,
+``all_gather_into_tensor``, ``reduce_scatter_tensor``, ``barrier``), as a
+:class:`CollectiveRecord`: a sequence number that matches across ranks, the
+call's op, size and policy, and timing marks for the whole call and for each
+phase the policy marked (reduce-bridge-broadcast marks island-reduce, bridge
+and island-broadcast).
 
 Rules that keep observers from ever changing what any rank communicates:
 
@@ -23,11 +24,15 @@ Rules that keep observers from ever changing what any rank communicates:
   mark is a ``perf_counter_ns`` reading and records are ready at once.
 - **No observers, no cost.** Without observers, gpubridge creates no events and
   no records; each collective only bumps the sequence counter.
+- **Async collectives are observed when they run.** With ``async_op=True`` a
+  collective runs on gpubridge's worker thread, so its record is delivered on
+  that thread, in submission order.
 """
 
 from __future__ import annotations
 
 import abc
+import threading
 import time
 import warnings
 from dataclasses import dataclass
@@ -82,9 +87,10 @@ class CollectiveRecord:
     seq: int
     """Collectives this rank ran before this one since ``init()``. The same on every rank."""
     op: str
-    """``"all_reduce"``, ``"broadcast"`` or ``"barrier"``."""
+    """``"all_reduce"``, ``"broadcast"``, ``"all_gather_into_tensor"``,
+    ``"reduce_scatter_tensor"`` or ``"barrier"``."""
     nbytes: int
-    """Size of the tensor; 0 for a barrier."""
+    """Size of the input tensor; 0 for a barrier."""
     dtype: torch.dtype | None
     src: int | None
     """The source rank of a broadcast; None otherwise."""
@@ -94,6 +100,8 @@ class CollectiveRecord:
     end: Mark
     phases: tuple[Phase, ...] = ()
     """The steps this rank took part in. A non-leader has no ``bridge`` phase."""
+    reduce_op: str | None = None
+    """``"sum"``, ``"avg"``, ``"max"`` or ``"min"`` for a reduction; None otherwise."""
 
     def ready(self) -> bool:
         """Whether every mark has been reached, so times can be read. Never blocks."""
@@ -127,8 +135,17 @@ class CollectiveObserver(abc.ABC):
 
 _observers: list[CollectiveObserver] = []
 _seq = 0
-_in_callback = False
-_recording: _Recording | None = None
+_seq_lock = threading.Lock()
+
+
+class _ThreadState(threading.local):
+    """Per thread, because async collectives run (and are observed) on a worker thread."""
+
+    in_callback = False
+    recording: _Recording | None = None
+
+
+_state = _ThreadState()
 
 
 def add_observer(observer: CollectiveObserver) -> None:
@@ -157,11 +174,29 @@ def remove_observer(observer: CollectiveObserver) -> None:
 
 def _reset() -> None:
     """Forget every observer and restart the sequence. Called by init() and destroy()."""
-    global _seq, _in_callback, _recording
+    global _seq
     _observers.clear()
-    _seq = 0
-    _in_callback = False
-    _recording = None
+    with _seq_lock:
+        _seq = 0
+    _state.in_callback = False
+    _state.recording = None
+
+
+def refuse_in_callback(op: str) -> None:
+    """Raise if called from inside an observer callback on this thread.
+
+    The public collectives call this after validating their arguments and
+    before queueing or running anything, so a refused call never takes a
+    sequence number and never waits for the async queue.
+
+    Raises:
+        RuntimeError: when an observer's ``on_collective`` is running on this thread.
+    """
+    if _state.in_callback:
+        raise RuntimeError(
+            f"gpubridge.{op}() called from inside a collective observer; observers "
+            "must not communicate"
+        )
 
 
 def _event_device(topology: Topology) -> torch.device | None:
@@ -192,19 +227,18 @@ _NOT_RECORDING = _NoRecording()
 
 class _Recording:
     def __init__(self, topology: Topology, op: str, seq: int, tensor: torch.Tensor | None,
-                 src: int | None, policy: str | None) -> None:
+                 src: int | None, policy: str | None, reduce_op: str | None) -> None:
         self.device = _event_device(topology)
         self.op, self.seq, self.tensor, self.src, self.policy = op, seq, tensor, src, policy
+        self.reduce_op = reduce_op
         self.phases: list[Phase] = []
 
     def __enter__(self) -> None:
-        global _recording
         self.start = _new_mark(self.device)
-        _recording = self
+        _state.recording = self
 
     def __exit__(self, exc_type: type[BaseException] | None, *exc: object) -> None:
-        global _recording
-        _recording = None
+        _state.recording = None
         if exc_type is not None:
             return
         tensor = self.tensor
@@ -218,6 +252,7 @@ class _Recording:
             start=self.start,
             end=_new_mark(self.device),
             phases=tuple(self.phases),
+            reduce_op=self.reduce_op,
         )
         _deliver(record)
 
@@ -242,25 +277,25 @@ def collective(
     *,
     src: int | None = None,
     policy: str | None = None,
+    reduce_op: str | None = None,
 ) -> _Recording | _NoRecording:
     """Wrap one validated collective: count it, and record it if anyone is watching.
 
     Use as ``with collective(topology, "all_reduce", tensor, policy=name):``.
+    Called on the thread that runs the collective (the worker thread for
+    ``async_op=True``), in the order collectives run.
 
     Raises:
         RuntimeError: if called from inside an observer callback.
     """
     global _seq
-    if _in_callback:
-        raise RuntimeError(
-            f"gpubridge.{op}() called from inside a collective observer; observers "
-            "must not communicate"
-        )
-    seq = _seq
-    _seq += 1
+    refuse_in_callback(op)
+    with _seq_lock:
+        seq = _seq
+        _seq += 1
     if not _observers:
         return _NOT_RECORDING
-    return _Recording(topology, op, seq, tensor, src, policy)
+    return _Recording(topology, op, seq, tensor, src, policy, reduce_op)
 
 
 def phase(name: str) -> _PhaseRecording | _NoRecording:
@@ -272,16 +307,15 @@ def phase(name: str) -> _PhaseRecording | _NoRecording:
         with phase("bridge"):
             topology.bridge.all_reduce(staged)
     """
-    recording = _recording
+    recording = _state.recording
     if recording is None:
         return _NOT_RECORDING
     return _PhaseRecording(recording, name)
 
 
 def _deliver(record: CollectiveRecord) -> None:
-    global _in_callback
     for observer in tuple(_observers):
-        _in_callback = True
+        _state.in_callback = True
         try:
             observer.on_collective(record)
         except Exception as error:  # noqa: BLE001 - any observer failure detaches it
@@ -297,4 +331,4 @@ def _deliver(record: CollectiveRecord) -> None:
             except Exception:  # noqa: BLE001, S110 - a failing hook mustn't stop the others
                 pass
         finally:
-            _in_callback = False
+            _state.in_callback = False

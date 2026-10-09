@@ -265,6 +265,8 @@ class Topology:
     """The transport linking island leaders. None on non-leaders and in single-vendor clusters."""
     policy: CollectivePolicy
     """The collective policy every rank runs (``auto`` already resolved)."""
+    transport: type[BridgeTransport] | None = None
+    """The bridge transport class every rank chose, on every rank (leaders or not)."""
 
     @property
     def policy_name(self) -> str:
@@ -396,6 +398,7 @@ def build_topology(
         island_group=island_group,
         bridge=bridge,
         policy=policy_cls(),
+        transport=transport,
     )
     topology.policy.setup(topology)
     return topology
