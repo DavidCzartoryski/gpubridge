@@ -24,11 +24,16 @@ import summarize  # noqa: E402
 SHELL_SCRIPTS = sorted(
     [*KIT.glob("*.sh"), *KIT.glob("*/*.sh"), *KIT.glob("explorer/*.sbatch")]
 )
+FAKE_PROJECT = "/projects/example-lab"
+OWN_SETTINGS = ("PROJECT_DIR", "WORK_DIR", "VENV", "VENV_ROCM", "ROCM_INDEX", "ROCM_INDEX_URL",
+                "ROCM_TORCH_VERSION", "TORCH_VERSION", "TORCH_INDEX_URL")
 
 
 def clean_env(**extra: str) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GPUBRIDGE_")}
-    env.update(OMP_NUM_THREADS="1", **extra)
+    # A developer's own settings, including an explorer/local.env, must not leak in.
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("GPUBRIDGE_") and k not in OWN_SETTINGS}
+    env.update({"OMP_NUM_THREADS": "1", "EXPLORER_LOCAL_ENV": os.devnull, **extra})
     return env
 
 
@@ -42,8 +47,8 @@ def torchrun(nproc: int, script: Path, *args: str, **env: str) -> subprocess.Com
 
 
 def dry_run(script: Path, *args: str, **env: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["bash", str(script), "--dry-run", *args],
-                          env=clean_env(GPUBRIDGE_REPO=str(REPO), **env),
+    env = {"GPUBRIDGE_REPO": str(REPO), "PROJECT_DIR": FAKE_PROJECT, **env}
+    return subprocess.run(["bash", str(script), "--dry-run", *args], env=clean_env(**env),
                           capture_output=True, text=True, timeout=60)
 
 
@@ -136,27 +141,78 @@ def test_setup_job_loads_the_explorer_module_before_installing(flavor, venv, whe
     assert result.returncode == 0, result.stderr
     out = result.stdout
     assert out.index("+ module load explorer") < out.index("+ uv venv") < out.index(wheel)
-    assert f"/projects/jon-bell-research-group/alice{venv}" in out
+    assert f"{FAKE_PROJECT}/alice{venv}" in out
+
+
+def test_setup_rocm_uses_the_configured_build_and_checks_the_gpu():
+    result = dry_run(KIT / "explorer" / "setup.sbatch", TORCH_FLAVOR="rocm",
+                     ROCM_TORCH_VERSION="2.9.1", ROCM_INDEX="rocm6.4")
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert "--index-url https://download.pytorch.org/whl/rocm6.4 torch==2.9.1+rocm6.4" in out
+    assert out.index("torch==2.9.1+rocm6.4") < out.index("probe.py")
+    assert "/setup_rocm" in out
+    url = "https://mirror.example/whl/rocm6.4"
+    out = dry_run(KIT / "explorer" / "setup.sbatch", TORCH_FLAVOR="rocm", ROCM_INDEX="rocm6.4",
+                  ROCM_INDEX_URL=url).stdout
+    assert f"--index-url {url} torch==2.14.1+rocm6.4" in out
+    assert "probe.py" not in dry_run(KIT / "explorer" / "setup.sbatch").stdout  # CUDA: CPU job
+
+
+def test_setup_env_takes_an_index_url(tmp_path):
+    out = dry_run(KIT / "setup_env.sh", "--flavor", "cuda", "--venv", str(tmp_path / "v"),
+                  TORCH_INDEX_URL="https://mirror.example/whl/cu126").stdout
+    assert "--index-url https://mirror.example/whl/cu126 torch==2.14.1+cu126" in out
 
 
 def test_setup_job_needs_a_slurm_job_and_can_skip_the_module():
     result = subprocess.run(["bash", str(KIT / "explorer" / "setup.sbatch")],
-                            env=clean_env(GPUBRIDGE_REPO=str(REPO)), capture_output=True,
-                            text=True, timeout=60)
+                            env=clean_env(GPUBRIDGE_REPO=str(REPO), PROJECT_DIR=FAKE_PROJECT),
+                            capture_output=True, text=True, timeout=60)
     assert result.returncode == 1
     assert "not in a Slurm job" in result.stderr
     assert "module load" not in dry_run(KIT / "explorer" / "setup.sbatch",
                                         SETUP_MODULES="").stdout
 
 
-def test_work_dir_defaults_to_the_group_project_space():
-    project = "/projects/jon-bell-research-group/alice/gpubridge-gpu"
+def test_work_dir_comes_from_project_dir():
+    work = f"{FAKE_PROJECT}/alice/gpubridge-gpu"
     out = dry_run(KIT / "explorer" / "submit.sh", "01", USER="alice").stdout
-    assert f"--output={project}/logs/%x-%j.out" in out
+    assert f"--output={work}/logs/%x-%j.out" in out
     out = dry_run(KIT / "explorer" / "01_probe.sbatch", USER="alice").stdout
-    assert f"source {project}/venv/bin/activate" in out
-    out = dry_run(KIT / "explorer" / "submit.sh", "01", WORK_DIR="/scratch/w").stdout
+    assert f"source {work}/venv/bin/activate" in out
+    out = dry_run(KIT / "explorer" / "submit.sh", "01", PROJECT_DIR="",
+                  WORK_DIR="/scratch/w").stdout
     assert "--output=/scratch/w/logs/%x-%j.out" in out and "/projects/" not in out
+
+
+@pytest.mark.parametrize(("script", "args"), [("submit.sh", ["01"]), ("submit.sh", ["setup"]),
+                                              ("01_probe.sbatch", []), ("setup.sbatch", [])])
+def test_explorer_scripts_need_a_project_dir(script, args):
+    result = dry_run(KIT / "explorer" / script, *args, PROJECT_DIR="")
+    assert result.returncode == 1
+    assert "set PROJECT_DIR" in result.stderr and "local.env" in result.stderr
+    assert "/projects/<your-project>" in result.stderr
+    assert "+ sbatch" not in result.stdout
+
+
+def test_project_dir_from_local_env_and_the_environment_wins(tmp_path):
+    local = tmp_path / "local.env"
+    local.write_text(f'# my settings\nPROJECT_DIR="/projects/from-file"\n'
+                     f"touch {tmp_path}/ran\nACCOUNT=$(touch {tmp_path}/ran2)\n")
+    out = dry_run(KIT / "explorer" / "submit.sh", "01", PROJECT_DIR="", USER="alice",
+                  EXPLORER_LOCAL_ENV=str(local)).stdout
+    assert "--output=/projects/from-file/alice/gpubridge-gpu/logs/" in out
+    assert not (tmp_path / "ran").exists() and not (tmp_path / "ran2").exists(), "parsed, not run"
+    out = dry_run(KIT / "explorer" / "submit.sh", "01", PROJECT_DIR="/projects/from-env",
+                  USER="alice", EXPLORER_LOCAL_ENV=str(local)).stdout
+    assert "--output=/projects/from-env/alice/gpubridge-gpu/logs/" in out
+
+
+def test_local_env_is_gitignored():
+    result = subprocess.run(["git", "check-ignore", "-q", "scripts/gpu/explorer/local.env"],
+                            cwd=REPO)
+    assert result.returncode == 0
 
 
 FAKE_SINFO = r"""
@@ -240,6 +296,15 @@ def test_submit_07_is_one_heterogeneous_job_on_gpu_and_sharing():
     assert amd.rstrip().endswith("07_mixed_hetjob.sbatch")
 
 
+def test_submit_07_can_put_the_nvidia_side_on_multigpu():
+    out = dry_run(KIT / "explorer" / "submit.sh", "07", PARTITION_MIXED_NVIDIA="multigpu",
+                  GPUS_MIXED_NVIDIA="2", GPUS_MIXED_AMD="2").stdout
+    nvidia, amd = next(line for line in out.splitlines() if line.startswith("+ sbatch ")).split(
+        " : ")
+    assert "--partition=multigpu " in nvidia and "--gres=gpu:2 " in nvidia
+    assert "--partition=sharing " in amd and ":2 " in amd
+
+
 def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w")
     assert result.returncode == 0, result.stderr
@@ -254,6 +319,8 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     assert "probe_nvidia" in sruns[0] and "probe_amd" in sruns[0]
     assert out.index("preflight.py") < out.index("torchrun")
     assert "check.py" in sruns[2] and "bench_all_reduce.py" in sruns[3]
+    nvidia_bench, amd_bench = sruns[3].replace("\\", "").split(" : ")  # undo printf %q
+    assert "--ops island,gpubridge" in nvidia_bench and "--ops island,gpubridge" in amd_bench
     assert "srun --het-group=1 --ntasks=1 rocm-smi" in out
 
 
@@ -377,6 +444,21 @@ def test_bench_measures_native_and_bridged_in_one_split_run(tmp_path):
     assert "SPLIT TEST" in (out / "summary.md").read_text()
 
 
+def test_bench_times_each_island_natively_in_the_same_job(tmp_path):
+    out = tmp_path / "bench"
+    result = torchrun(4, KIT / "bench_all_reduce.py", "--out", str(out), "--max-bytes", "4K",
+                      "--warmup", "1", "--trials", "3", "--ops", "island,gpubridge",
+                      GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode == 0, result.stderr[-3000:]
+    rows = json.loads((out / "bench.json").read_text())["rows"]
+    assert {(r["op"], r["world_size"]) for r in rows} == {
+        ("island:nvidia", 2), ("island:amd", 2), ("gpubridge", 4)}
+    assert {r["bytes"] for r in rows} == {1024, 4096}
+    summary = (out / "summary.md").read_text()
+    assert "island:amd median (us)" in summary and "island:nvidia median (us)" in summary
+    assert "gpubridge / slowest island" in summary and "gpubridge / native" not in summary
+
+
 def test_bench_size_helpers():
     assert bench_all_reduce.parse_size("1K") == 1024
     assert bench_all_reduce.parse_size("1GB") == 2**30
@@ -388,6 +470,11 @@ def test_bench_size_helpers():
     assert r["median_us"] == 2000.0
     assert r["policy"] == "reduce-bridge-broadcast"
     assert r["busbw_GBps"] == pytest.approx(r["algbw_GBps"] * 1.5, rel=1e-3)
+    island = bench_all_reduce.row("island:amd", info, 2**20, "float32", [0.001], world=2)
+    assert island["world_size"] == 2 and island["busbw_GBps"] == island["algbw_GBps"]
+    trials = [[0.1, 0.4, 0.2, 0.3], [0.5, 0.1, 0.1, 0.2]]
+    assert bench_all_reduce.slowest(trials) == [0.4, 0.5]
+    assert bench_all_reduce.slowest(trials, (2, 3)) == [0.3, 0.2]
 
 
 def test_training_demo_keeps_ranks_in_sync_and_learns(tmp_path):
@@ -493,7 +580,7 @@ def test_probe_reports_a_missing_gpu(tmp_path):
 def run_script(script: Path, **env: str) -> subprocess.CompletedProcess:
     return subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=600,
                           env=clean_env(GPUBRIDGE_REPO=str(REPO), VENV=str(Path(sys.prefix)),
-                                        **env))
+                                        PROJECT_DIR=FAKE_PROJECT, **env))
 
 
 def steps(results: Path) -> dict[str, int]:
