@@ -8,7 +8,9 @@ answered for the CPU side by running real builds without GPUs; see
 
 **On GPUs:** [docs/GPU_VALIDATION_RUNBOOK.md](docs/GPU_VALIDATION_RUNBOOK.md)
 maps every item below to a scripted step: Explorer (Slurm) for NVIDIA, a rented
-AMD machine, and a real mixed job between two cloud machines.
+AMD machine, and a real mixed job between two cloud machines. If Explorer's
+`sharing` partition turns out to have AMD GPUs, the mixed job can instead run
+inside Explorer as one heterogeneous Slurm job.
 
 ## Blocking: can the job start at all?
 

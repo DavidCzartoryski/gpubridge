@@ -59,7 +59,8 @@ def test_shellcheck_is_clean():
 def test_every_shell_script_is_covered():
     names = {p.name for p in SHELL_SCRIPTS}
     assert {"common.sh", "setup_env.sh", "submit.sh", "run_all.sh", "node.sh",
-            "01_probe.sbatch", "06_scaling.sbatch"} <= names
+            "00_partitions.sh", "setup.sbatch", "01_probe.sbatch", "06_scaling.sbatch",
+            "07_mixed_hetjob.sbatch"} <= names
 
 
 @pytest.mark.parametrize("flavor", ["cuda", "rocm", "system"])
@@ -95,6 +96,167 @@ def test_submit_dry_run(step, expected):
     assert "--account" not in result.stdout
 
 
+def fake_command(directory: Path, name: str, body: str) -> str:
+    """Put an executable NAME on a PATH that starts with DIRECTORY; returns that PATH."""
+    directory.mkdir(exist_ok=True)
+    path = directory / name
+    path.write_text("#!/usr/bin/env bash\n" + body)
+    path.chmod(0o755)
+    return f"{directory}{os.pathsep}{os.environ['PATH']}"
+
+
+def test_setup_refuses_to_run_on_a_slurm_login_node(tmp_path):
+    path = fake_command(tmp_path / "bin", "sbatch", "exit 0\n")
+    result = subprocess.run(["bash", str(KIT / "setup_env.sh"), "--flavor", "cuda", "--venv",
+                             str(tmp_path / "v")], env=clean_env(PATH=path),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1
+    assert "login node" in result.stderr and "submit.sh setup" in result.stderr
+    assert not (tmp_path / "v").exists()
+
+
+def test_submit_setup_is_a_short_cpu_job_not_a_login_node_install():
+    result = dry_run(KIT / "explorer" / "submit.sh", "setup", USER="alice")
+    assert result.returncode == 0, result.stderr
+    sbatch = [line for line in result.stdout.splitlines() if line.startswith("+ sbatch ")]
+    assert len(sbatch) == 1, result.stdout
+    for text in ["--partition=short", "--time=01:00:00", "--cpus-per-task=4", "--mem=16G",
+                 "explorer/setup.sbatch"]:
+        assert text in sbatch[0], text
+    assert "--gres" not in sbatch[0]
+    assert "uv pip install" not in result.stdout, "nothing may be installed on the login node"
+
+
+@pytest.mark.parametrize(("flavor", "venv", "wheel"), [
+    ("cuda", "/gpubridge-gpu/venv ", "torch==2.14.1+cu126"),
+    ("rocm", "/gpubridge-gpu/venv-rocm ", "torch==2.14.1+rocm7.2"),
+])
+def test_setup_job_loads_the_explorer_module_before_installing(flavor, venv, wheel):
+    result = dry_run(KIT / "explorer" / "setup.sbatch", USER="alice", TORCH_FLAVOR=flavor)
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert out.index("+ module load explorer") < out.index("+ uv venv") < out.index(wheel)
+    assert f"/projects/jon-bell-research-group/alice{venv}" in out
+
+
+def test_setup_job_needs_a_slurm_job_and_can_skip_the_module():
+    result = subprocess.run(["bash", str(KIT / "explorer" / "setup.sbatch")],
+                            env=clean_env(GPUBRIDGE_REPO=str(REPO)), capture_output=True,
+                            text=True, timeout=60)
+    assert result.returncode == 1
+    assert "not in a Slurm job" in result.stderr
+    assert "module load" not in dry_run(KIT / "explorer" / "setup.sbatch",
+                                        SETUP_MODULES="").stdout
+
+
+def test_work_dir_defaults_to_the_group_project_space():
+    project = "/projects/jon-bell-research-group/alice/gpubridge-gpu"
+    out = dry_run(KIT / "explorer" / "submit.sh", "01", USER="alice").stdout
+    assert f"--output={project}/logs/%x-%j.out" in out
+    out = dry_run(KIT / "explorer" / "01_probe.sbatch", USER="alice").stdout
+    assert f"source {project}/venv/bin/activate" in out
+    out = dry_run(KIT / "explorer" / "submit.sh", "01", WORK_DIR="/scratch/w").stdout
+    assert "--output=/scratch/w/logs/%x-%j.out" in out and "/projects/" not in out
+
+
+FAKE_SINFO = r"""
+part="" nodes=0 fmt=""
+while [ $# -gt 0 ]; do
+    case $1 in
+    -p) part=$2; shift 2 ;;
+    -o) fmt=$2; shift 2 ;;
+    -N) nodes=1; shift ;;
+    *) shift ;;
+    esac
+done
+if [ "$nodes" = 0 ]; then echo "format=[$fmt] partition=$part"; exit 0; fi
+case $part in
+sharing) printf '%s\n' "${SHARING_GRES[@]}" ;;
+gpu) printf 'd1001 gpu:v100-sxm2:4(S:0-1)\nd1002 gpu:v100-pcie:2\nd1003 gpu:2\n' ;;
+*) echo "sinfo: error: invalid partition specified: $part" >&2; exit 1 ;;
+esac
+"""
+
+
+def partitions_step(tmp_path, sharing: list[str]) -> tuple[subprocess.CompletedProcess, Path]:
+    gres = " ".join(f"'{line}'" for line in sharing)
+    path = fake_command(tmp_path / "bin", "sinfo", f"SHARING_GRES=({gres})\n" + FAKE_SINFO)
+    result = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), "00"],
+                            env=clean_env(PATH=path, RESULTS_ROOT=str(tmp_path / "results")),
+                            capture_output=True, text=True, timeout=60)
+    return result, tmp_path / "results" / "00_partitions"
+
+
+def test_step_00_records_sinfo_and_finds_amd_gpus_in_sharing(tmp_path):
+    result, out = partitions_step(tmp_path, [
+        "c0101 gpu:mi100:4(S:0-1)", "c0102 gpu:mi100:4(S:0,1)", "c0103 gpu:a100:2,gpu:t4:1",
+        "c0104 (null)",
+    ])
+    assert result.returncode == 0, result.stderr
+    fmt = "format=[%20N %10c %10m %25f %10G %10t]"
+    assert (out / "sinfo-sharing.txt").read_text() == f"{fmt} partition=sharing\n"
+    assert (out / "sinfo-gpu.txt").read_text() == f"{fmt} partition=gpu\n"
+    rows = [line.split() for line in (out / "gpu-types.txt").read_text().splitlines()]
+    assert ["sharing", "mi100", "amd", "2", "8"] in rows
+    assert ["sharing", "a100", "nvidia", "1", "2"] in rows
+    assert ["sharing", "t4", "nvidia", "1", "1"] in rows
+    assert ["gpu", "v100-sxm2", "nvidia", "1", "4"] in rows
+    assert ["gpu", "(untyped)", "unknown", "1", "2"] in rows
+    assert "AMD GPUs in sharing: mi100." in result.stdout
+
+
+def test_step_00_says_when_sharing_has_no_amd_gpus(tmp_path):
+    result, out = partitions_step(tmp_path, ["c0103 gpu:a100:2"])
+    assert result.returncode == 0, result.stderr
+    assert "No AMD GPU type found in sharing" in (out / "gpu-types.txt").read_text()
+
+
+def test_step_00_dry_run_prints_the_sinfo_commands():
+    out = dry_run(KIT / "explorer" / "submit.sh", "00").stdout
+    for partition in ("sharing", "gpu", "multigpu"):
+        assert f"+ sinfo -p {partition} -o %20N\\ %10c" in out, out
+
+
+@pytest.mark.parametrize("step", ["setup-rocm", "07"])
+def test_explorer_mixed_path_is_dry_run_only_until_amd_gpus_are_confirmed(step, tmp_path):
+    path = fake_command(tmp_path / "bin", "sbatch", "echo SUBMITTED\n")
+    result = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), step],
+                            env=clean_env(GPUBRIDGE_REPO=str(REPO), PATH=path,
+                                          GPU_TYPE_AMD="mi100", WORK_DIR=str(tmp_path)),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1
+    assert "dry-run only until step 00" in result.stderr
+    assert "SUBMITTED" not in result.stdout
+
+
+def test_submit_07_is_one_heterogeneous_job_on_gpu_and_sharing():
+    out = dry_run(KIT / "explorer" / "submit.sh", "07", GPU_TYPE_AMD="mi100").stdout
+    sbatch = [line for line in out.splitlines() if line.startswith("+ sbatch ")]
+    assert len(sbatch) == 1, out
+    nvidia, amd = sbatch[0].split(" : ")
+    assert "--partition=gpu " in nvidia and "--gres=gpu:1 " in nvidia
+    assert "--job-name=gpubridge-07_mixed_hetjob" in nvidia
+    assert "--partition=sharing " in amd and "--gres=gpu:mi100:1 " in amd
+    assert amd.rstrip().endswith("07_mixed_hetjob.sbatch")
+
+
+def test_mixed_hetjob_runs_each_side_in_its_own_venv():
+    result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w")
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    sruns = [line for line in out.splitlines() if line.startswith("+ srun --het-group=0")]
+    assert len(sruns) == 4  # probe, preflight, check, bench
+    for line in sruns:
+        nvidia, amd = line.split(" : ")
+        assert "/w/venv/bin/" in nvidia and "/w/venv-rocm/" not in nvidia
+        assert amd.startswith("--het-group=1 ") and "/w/venv-rocm/bin/" in amd
+    assert "--role master" in sruns[1] and "--role worker" in sruns[1]
+    assert "probe_nvidia" in sruns[0] and "probe_amd" in sruns[0]
+    assert out.index("preflight.py") < out.index("torchrun")
+    assert "check.py" in sruns[2] and "bench_all_reduce.py" in sruns[3]
+    assert "srun --het-group=1 --ntasks=1 rocm-smi" in out
+
+
 def test_submit_uses_site_settings_from_the_environment():
     result = dry_run(KIT / "explorer" / "submit.sh", "05", ACCOUNT="lab",
                      PARTITION_MULTI="bigq", GPU_TYPE_MULTI="h100", TIME_05="00:05:00")
@@ -121,6 +283,7 @@ def test_submit_free_and_multi_submit_every_step():
         ("04_split_4gpu.sbatch", ["check_half", "check_alternate", "bench_all_reduce.py"]),
         ("05_multinode.sbatch", ["srun", "--rdzv-backend=c10d", "check_split_by_node"]),
         ("06_scaling.sbatch", ["--nproc-per-node=4", "train_synthetic.py", "summarize.py"]),
+        ("07_mixed_hetjob.sbatch", ["--het-group=1", "--rdzv-backend=c10d", "summarize.py"]),
     ],
 )
 def test_explorer_jobs_dry_run(job, expected):
