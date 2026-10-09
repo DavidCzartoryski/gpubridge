@@ -13,6 +13,7 @@
 #                    $RESULTS/steps.jsonl and carry on, so one failure doesn't
 #                    waste the rest of a paid session
 #   finish      print the step table; exit non-zero if any step failed
+#   load_env_file F  read NAME=value settings from file F, if it exists
 
 KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$KIT_DIR/../.." && pwd)"
@@ -27,6 +28,22 @@ export DRY_RUN
 
 FAILED_STEPS=()
 PASSED_STEPS=()
+
+# load_env_file FILE: read NAME=value lines from FILE (if it exists) for settings
+# not already set, so the environment wins. The file is parsed, not run: other
+# lines are ignored, and a value may be wrapped in double quotes.
+load_env_file() {
+    local line name value
+    [ -f "$1" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ $line =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+        name=${BASH_REMATCH[1]}
+        value=${BASH_REMATCH[2]}
+        value=${value#\"}
+        value=${value%\"}
+        [ -n "${!name:-}" ] || printf -v "$name" '%s' "$value"
+    done <"$1"
+}
 
 log() { printf '[gpubridge-kit %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }

@@ -8,3 +8,5 @@ dist/
 # Raw per-experiment logs from scripts/mixed_build_rendezvous.sh; summaries are committed.
 results/mixed_build/*/
 results/mixed_build_recheck/*/
+# Personal Explorer settings, e.g. PROJECT_DIR (see docs/GPU_VALIDATION_RUNBOOK.md).
+scripts/gpu/explorer/local.env

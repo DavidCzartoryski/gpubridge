@@ -7,7 +7,8 @@
 # confirms AMD GPUs in sharing.
 # A REAL mixed-vendor job inside Explorer: NCCL on one node, RCCL on the other,
 # joined by the Gloo bridge over the cluster network. Items 1 and 2 on GPUs,
-# 3 with real RCCL ranks, 8 between nodes.
+# 3 with real RCCL ranks, 8 between nodes. The benchmark times each island's
+# native all_reduce (NCCL, RCCL) in the same job as the bridged one (item 11).
 set -euo pipefail
 REPO="${GPUBRIDGE_REPO:?submit with scripts/gpu/explorer/submit.sh}"
 # shellcheck source=../common.sh
@@ -82,5 +83,5 @@ fi
 step check mixed_torchrun check "$KIT_DIR/check.py" --out "$RESULTS/check"
 step summarize python "$KIT_DIR/summarize.py" "$RESULTS/check"
 step bench mixed_torchrun bench "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" \
-    --max-bytes "$BENCH_MAX_BYTES"
+    --ops island,gpubridge --max-bytes "$BENCH_MAX_BYTES"
 finish

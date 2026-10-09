@@ -8,10 +8,15 @@ For each tensor size (1 KB to 1 GB by default) it times:
   island backend (NCCL/RCCL on GPUs, Gloo on CPU). Only possible when every
   rank has the same detected vendor, which includes split tests, so a split
   test measures native and bridged in the same job.
+- ``island`` (opt in with --ops): every island all_reduces on its own native
+  group at the same time (NCCL on NVIDIA, RCCL on AMD): one row per island,
+  ``island:<vendor>``. These are the per-island baselines for a real mixed
+  job, where ``native`` is impossible.
 
 Each size gets warmup runs, then timed trials until --trials or --max-seconds.
-A trial's latency is the slowest rank's. Bandwidth follows nccl-tests:
-algbw = bytes / time and busbw = algbw * 2(n-1)/n.
+A trial's latency is the slowest rank's (for ``island``, the slowest rank of
+that island). Bandwidth follows nccl-tests: algbw = bytes / time and
+busbw = algbw * 2(n-1)/n, with n the ranks taking part.
 
 Rank 0 writes OUT/bench.csv, OUT/bench.json and OUT/summary.md. Runs on CPU in
 simulation mode too (use a smaller --max-bytes):
@@ -66,30 +71,40 @@ def sizes(lo: int, hi: int, factor: int) -> list[int]:
     return out
 
 
-def time_op(op, tensor, device, *, warmup: int, trials: int, max_seconds: float) -> list[float]:
-    """Slowest-rank latency in seconds for each timed trial."""
+def time_op(op, tensor, device, *, warmup: int, trials: int,
+            max_seconds: float) -> list[list[float]]:
+    """Every rank's latency in seconds, for each timed trial."""
     for _ in range(warmup):
         op(tensor)
     sync(device)
-    latencies: list[float] = []
+    world = dist.get_world_size()
+    per_trial: list[list[float]] = []
     spent = 0.0
-    while len(latencies) < trials:
+    while len(per_trial) < trials:
         dist.barrier()
         start = time.perf_counter()
         op(tensor)
         sync(device)
         elapsed = torch.tensor([time.perf_counter() - start], dtype=torch.float64)
-        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)  # world group is Gloo, on CPU
-        latencies.append(float(elapsed))
-        spent += float(elapsed)
-        # Every rank sees the same maxima, so every rank stops at the same trial.
-        if spent > max_seconds and len(latencies) >= 3:
+        gathered = [torch.zeros(1, dtype=torch.float64) for _ in range(world)]
+        dist.all_gather(gathered, elapsed)  # world group is Gloo, on CPU
+        per_trial.append([float(t) for t in gathered])
+        spent += max(per_trial[-1])
+        # Every rank sees the same values, so every rank stops at the same trial.
+        if spent > max_seconds and len(per_trial) >= 3:
             break
-    return latencies
+    return per_trial
 
 
-def row(op: str, info: dict[str, Any], nbytes: int, dtype: str, lat: list[float]) -> dict:
-    world = info["world_size"]
+def slowest(per_trial: list[list[float]], ranks=None) -> list[float]:
+    """Each trial's latency: the slowest of ``ranks`` (default: every rank)."""
+    return [max(t if ranks is None else [t[r] for r in ranks]) for t in per_trial]
+
+
+def row(op: str, info: dict[str, Any], nbytes: int, dtype: str, lat: list[float],
+        world: int | None = None) -> dict:
+    """One result row. ``world`` is the ranks taking part (default: all)."""
+    world = world or info["world_size"]
     median = statistics.median(lat)
     p90 = sorted(lat)[max(0, int(round(0.9 * len(lat))) - 1)]
     algbw = nbytes / median / 1e9
@@ -111,22 +126,39 @@ def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
     lines += [f"Run kind `{info['kind']}`, gpubridge policy `{info['policy']}`, "
               f"{info['world_size']} ranks, "
               f"{len(info['islands'])} island(s). Latency is the median of the slowest rank.",
-              "", "| size | native median (us) | native busbw (GB/s) | gpubridge median (us) "
-              "| gpubridge busbw (GB/s) | gpubridge / native |",
-              "| --- | --- | --- | --- | --- | --- |"]
+              ""]
+    present = {r["op"] for r in rows}
+    islands = sorted(op for op in present if op.startswith("island:"))
+    ops = [op for op in ("native", *islands, "gpubridge") if op in present]
+    ratios = []
+    if "gpubridge" in present and "native" in present:
+        ratios.append("gpubridge / native")
+    if "gpubridge" in present and islands:
+        ratios.append("gpubridge / slowest island")
+    header = ["size"] + [f"{op} {what}" for op in ops
+                         for what in ("median (us)", "busbw (GB/s)")] + ratios
+    lines += ["| " + " | ".join(header) + " |", "|" + " --- |" * len(header)]
     by_size: dict[int, dict[str, dict]] = {}
     for r in rows:
         by_size.setdefault(r["bytes"], {})[r["op"]] = r
-    for nbytes, ops in sorted(by_size.items()):
-        native, bridge = ops.get("native"), ops.get("gpubridge")
-        ratio = (f"{bridge['median_us'] / native['median_us']:.2f}x"
-                 if native and bridge and native["median_us"] else "-")
 
-        def cell(r, key):
-            return "-" if r is None or r[key] is None else f"{r[key]}"
-        lines.append(f"| {human(nbytes)} | {cell(native, 'median_us')} | "
-                     f"{cell(native, 'busbw_GBps')} | {cell(bridge, 'median_us')} | "
-                     f"{cell(bridge, 'busbw_GBps')} | {ratio} |")
+    def cell(r, key):
+        return "-" if r is None or r[key] is None else f"{r[key]}"
+
+    def ratio(bridge, base_us):
+        return f"{bridge['median_us'] / base_us:.2f}x" if bridge and base_us else "-"
+
+    for nbytes, by_op in sorted(by_size.items()):
+        cells = [human(nbytes)]
+        for op in ops:
+            cells += [cell(by_op.get(op), "median_us"), cell(by_op.get(op), "busbw_GBps")]
+        bridge = by_op.get("gpubridge")
+        if "gpubridge / native" in ratios:
+            cells.append(ratio(bridge, by_op.get("native", {}).get("median_us")))
+        if "gpubridge / slowest island" in ratios:
+            island_us = [by_op[op]["median_us"] for op in islands if op in by_op]
+            cells.append(ratio(bridge, max(island_us, default=None)))
+        lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"
 
 
@@ -141,7 +173,8 @@ def main() -> int:
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument("--max-seconds", type=float, default=20.0,
                         help="stop timing a size after this much measured time (min 3 trials)")
-    parser.add_argument("--ops", default="native,gpubridge", help="which to measure")
+    parser.add_argument("--ops", default="native,gpubridge",
+                        help="which to measure: native, island, gpubridge")
     parser.add_argument("--policy", default="auto",
                         help="collective policy for the gpubridge op, e.g. flat-gloo")
     parser.add_argument("--timeout", type=float, default=1800)
@@ -165,6 +198,8 @@ def main() -> int:
             ops["native"] = lambda t: dist.all_reduce(t, group=group)
         elif topology.rank == 0:
             print("native: skipped, ranks have different real vendors", file=sys.stderr)
+    if "island" in wanted:
+        ops["island"] = lambda t: dist.all_reduce(t, group=topology.island_group)
     if "gpubridge" in wanted:
         ops["gpubridge"] = gpubridge.all_reduce
 
@@ -173,13 +208,19 @@ def main() -> int:
     for nbytes in sizes(args.min_bytes, args.max_bytes, args.factor):
         tensor = torch.ones(max(1, nbytes // element), dtype=dtype, device=device)
         for name, op in ops.items():
-            lat = time_op(op, tensor, device, warmup=args.warmup, trials=args.trials,
-                          max_seconds=args.max_seconds)
-            rows.append(row(name, info, tensor.numel() * element, args.dtype, lat))
+            per_trial = time_op(op, tensor, device, warmup=args.warmup, trials=args.trials,
+                                max_seconds=args.max_seconds)
+            if name == "island":
+                new = [row(f"island:{island.vendor}", info, tensor.numel() * element,
+                           args.dtype, slowest(per_trial, island.ranks), world=len(island.ranks))
+                       for island in topology.layout.islands]
+            else:
+                new = [row(name, info, tensor.numel() * element, args.dtype, slowest(per_trial))]
+            rows += new
             if topology.rank == 0:
-                r = rows[-1]
-                print(f"{name:>9} {human(r['bytes']):>6}: median {r['median_us']:>12} us  "
-                      f"busbw {r['busbw_GBps']} GB/s  ({r['trials']} trials)", flush=True)
+                for r in new:
+                    print(f"{r['op']:>14} {human(r['bytes']):>6}: median {r['median_us']:>12} us  "
+                          f"busbw {r['busbw_GBps']} GB/s  ({r['trials']} trials)", flush=True)
         del tensor
 
     if topology.rank == 0:

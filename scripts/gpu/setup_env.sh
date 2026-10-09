@@ -21,6 +21,8 @@ TORCH_VERSION="${TORCH_VERSION:-2.14.1}"
 # a mixed V100/A100/H100 fleet. probe.py reports if the build can't run your GPU.
 CUDA_INDEX="${CUDA_INDEX:-cu126}"
 ROCM_INDEX="${ROCM_INDEX:-rocm7.2}"
+# Where the torch wheel comes from; default: the PyTorch index for CUDA_INDEX/ROCM_INDEX.
+TORCH_INDEX_URL="${TORCH_INDEX_URL:-}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 VENV="${VENV:-${WORK_DIR:-$HOME/gpubridge-gpu}/venv}"
 SYSTEM_PYTHON="${SYSTEM_PYTHON:-python3}"
@@ -41,6 +43,7 @@ rocm) index_tag=$ROCM_INDEX ;;
 system) index_tag="" ;;
 *) die "--flavor must be cuda, rocm or system" ;;
 esac
+index_url=${TORCH_INDEX_URL:-https://download.pytorch.org/whl/$index_tag}
 
 # sbatch on the PATH but no job: this is a cluster's login node.
 if [ "$DRY_RUN" = 0 ] && [ -z "${SLURM_JOB_ID:-}" ] && command -v sbatch >/dev/null 2>&1; then
@@ -85,7 +88,7 @@ else
     log "installing torch $TORCH_VERSION+$index_tag (current: ${current:-none})"
     for attempt in 1 2 3; do
         if run uv pip install --python "$VENV/bin/python" \
-            --index-url "https://download.pytorch.org/whl/$index_tag" \
+            --index-url "$index_url" \
             "torch==$TORCH_VERSION+$index_tag" numpy; then
             break
         fi

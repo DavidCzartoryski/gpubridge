@@ -37,7 +37,7 @@ real mixed-vendor result:
 | 6 | Explorer, 4 GPUs | `submit.sh 06` | training throughput and scaling 1 to 4 GPUs (table for the multigpu request) | - | ~10 min | free* |
 | 7 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11 | 20-30 min | ~0.5 h of the hourly rate |
 | 8 | NVIDIA + AMD cloud | `mixed/node.sh` on both | the real mixed-vendor job | **1, 2** on GPUs, **8** across networks | 30-45 min | ~0.75 h of each machine's rate |
-| 8 alt | Explorer `gpu` + `sharing`, one heterogeneous job | `submit.sh setup-rocm`, then `submit.sh 07` | the real mixed-vendor job inside Explorer, **if** step 0a finds AMD GPUs in `sharing`. Dry-run only until then | **1, 2** on GPUs, 3 with real RCCL ranks, 8 between nodes | ~15 min + ~15 min ROCm setup | free |
+| 8 alt | Explorer `gpu` + `sharing`, one heterogeneous job | `submit.sh setup-rocm`, then `submit.sh 07` | the real mixed-vendor job inside Explorer, **if** step 0a finds AMD GPUs in `sharing`. Dry-run only until then | **1, 2** on GPUs, 3 with real RCCL ranks, 8 between nodes, 11 against per-island baselines | ~15 min + ~15 min ROCm setup | free |
 
 \* Steps 3 to 6 need the `multigpu` partition, which needs an access request
 (see [Explorer](#explorer)). Steps 1 and 2 run on the open `gpu` partition.
@@ -71,8 +71,11 @@ as of 2026-10-06; **verify each one**:
 | `CPUS_PER_GPU`, `MEM_PER_GPU` | `4`, `32G` | per-GPU CPU and memory limits |
 | `CPUS_SETUP`, `MEM_SETUP`, `TIME_SETUP` | `4`, `16G`, 1 h | limits of the setup partition |
 | `TIME_01` ... `TIME_07` | 10-30 min | maximum walltime per partition |
-| `WORK_DIR` | `/projects/jon-bell-research-group/$USER/gpubridge-gpu` | venvs, caches and job logs: ~6 GB, ~20 GB with the ROCm venv. Not home, which is capped at 75 GB |
+| `PROJECT_DIR` | none: **required** | your group's project space, e.g. `/projects/<your-project>`; set it in the environment or in `scripts/gpu/explorer/local.env` (see [Steps](#steps)) |
+| `WORK_DIR` | `$PROJECT_DIR/$USER/gpubridge-gpu` | venvs, caches and job logs: ~7 GB, ~25 GB with the ROCm venv. Not home, which is capped at 75 GB |
 | `VENV`, `VENV_ROCM` | `$WORK_DIR/venv`, `$WORK_DIR/venv-rocm` | - |
+| `ROCM_TORCH_VERSION`, `ROCM_INDEX`, `ROCM_INDEX_URL` | `2.14.1`, `rocm7.2`, the PyTorch index for `ROCM_INDEX` | the ROCm build for `setup-rocm`; see [Choosing the ROCm build](#choosing-the-rocm-build) |
+| `PARTITION_MIXED_NVIDIA`, `GPUS_MIXED_NVIDIA`, `GPUS_MIXED_AMD` | `gpu`, `1`, `1` | step 07's GPUs per side |
 | `SETUP_MODULES` | `explorer` | loaded before installing: it routes compute nodes through the proxy. Set it to `""` to load nothing |
 | `MODULES` | empty | modules for steps 01 to 07; none needed: the PyTorch wheel bundles CUDA/ROCm and uv brings Python |
 | `NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME` | empty (auto) | name of the fast interconnect interface for steps 05 and 07, e.g. `ib0` |
@@ -92,6 +95,7 @@ Also check:
 
 ```bash
 git clone https://github.com/DavidCzartoryski/gpubridge && cd gpubridge
+echo 'PROJECT_DIR=/projects/<your-project>' > scripts/gpu/explorer/local.env   # once
 scripts/gpu/explorer/submit.sh 00               # GPU types per partition (sinfo, seconds)
 scripts/gpu/explorer/submit.sh --dry-run free   # see what will be submitted
 scripts/gpu/explorer/submit.sh setup            # a short CPU job, once (~10 min)
@@ -102,6 +106,12 @@ cat results/explorer/02_split_shared_gpu/check/summary.md
 # after multigpu access:
 scripts/gpu/explorer/submit.sh multi            # steps 03 to 06
 ```
+
+**Your settings.** Every step except 00 needs `PROJECT_DIR`, your group's
+project space, and stops with an error until it's set. Put it in the
+environment or in `scripts/gpu/explorer/local.env`, which git ignores. That
+file is parsed, not run: one `NAME=value` per line, and any setting from
+`submit.sh` works there. The environment overrides it.
 
 **Setup runs on a compute node, never the login node.** `submit.sh setup`
 submits [`setup.sbatch`](../scripts/gpu/explorer/setup.sbatch) to the
@@ -137,7 +147,8 @@ Commit the results directory when a step passes.
 Slurm heterogeneous job can run the real mixed-vendor test without cloud
 machines:
 
-- component 0 is on `gpu`: one NVIDIA GPU, using the CUDA venv;
+- component 0 is on `gpu` (`PARTITION_MIXED_NVIDIA`): `GPUS_MIXED_NVIDIA`
+  NVIDIA GPUs, default 1, using the CUDA venv;
 - component 1 is on `sharing`: `GPUS_MIXED_AMD` AMD GPUs of type
   `GPU_TYPE_AMD`, using a ROCm venv built by a setup job on an AMD node.
 
@@ -148,7 +159,7 @@ scripts/gpu/explorer/submit.sh 00                  # then read 00_partitions/gpu
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh --dry-run setup-rocm
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh --dry-run 07
 # once the hardware is confirmed and AMD_NODES_CONFIRMED=1 is merged in submit.sh:
-GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh setup-rocm   # ROCm venv (6+ GB), on an AMD node
+GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh setup-rocm   # ROCm venv (~16 GB), on an AMD node
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh 07
 ```
 
@@ -163,17 +174,58 @@ runs each phase as one heterogeneous job step (`srun --het-group=0 ... :
 1. `probe` on each side (`probe_nvidia/`, `probe_amd/`), plus `rocm-smi` and `amd-smi` from the AMD node;
 2. `preflight`: the gpu node as master, the AMD node as worker. The job stops here if either side lacks a usable GPU or Gloo can't connect;
 3. `check`: one torchrun per node, with the c10d rendezvous on the gpu node. Both write into `check/` on the shared filesystem, so `summarize` covers every rank without copying. `run.kind` must be `gpu-mixed`, with `split_test` null;
-4. `bench`: bridged all_reduce latency and bandwidth across the two vendors. The
-   native baseline is skipped, because NCCL and RCCL ranks can't form one group.
+4. `bench` (`--ops island,gpubridge`): first each island times its own native
+   all_reduce, both at once (NCCL on the gpu node, RCCL on the AMD node; rows
+   `island:nvidia` and `island:amd`), then the bridged all_reduce across both.
+   `summary.md` adds a `gpubridge / slowest island` column. A native
+   all_reduce over every rank is impossible here, because NCCL and RCCL ranks
+   can't form one group, so the islands are the baselines.
+
+**Per-island baselines need 2+ GPUs per island.** With one GPU, an island's
+all_reduce has nothing to exchange, so its row only times the call itself.
+`gpu` allows one GPU per job. For real baselines, set `GPUS_MIXED_AMD=2`, and,
+with multigpu access, `PARTITION_MIXED_NVIDIA=multigpu GPUS_MIXED_NVIDIA=2`.
 
 Also check with RC before the first real run:
 
 - that heterogeneous jobs are allowed, and can span `gpu` and `sharing`;
 - `sharing`'s walltime and preemption rules;
-- that the ROCm 7.2 wheel supports the AMD GPUs: step 07's probe reports `build_supports_gpus`, and `ROCM_INDEX` picks another build.
+- which ROCm build supports the AMD GPUs; see below.
 
 Interface names may differ between the two partitions' nodes, so leave
 `GLOO_SOCKET_IFNAME` empty unless the preflight's interface check fails.
+
+#### Choosing the ROCm build
+
+Choose `setup-rocm`'s PyTorch from the AMD GPU model that step 00 finds. The
+default, torch 2.14.1 for ROCm 7.2, may not support older Instinct cards. The
+GRES type usually names the model:
+
+| GPU | gfx target |
+| --- | --- |
+| MI50, MI60 | gfx906 |
+| MI100 | gfx908 |
+| MI210, MI250, MI250X | gfx90a |
+| MI300A, MI300X | gfx942 |
+
+1. Find the newest ROCm release that supports that gfx target in AMD's
+   [ROCm compatibility matrix](https://rocm.docs.amd.com/en/latest/compatibility/compatibility-matrix.html).
+2. Pick the newest PyTorch release with a wheel for that ROCm line and
+   Python 3.12 on [download.pytorch.org/whl](https://download.pytorch.org/whl/).
+   Index names look like `rocm6.4`.
+3. Set them for `setup-rocm`, e.g.
+   `ROCM_TORCH_VERSION=2.9.1 ROCM_INDEX=rocm6.4`. Set `ROCM_INDEX_URL` only
+   for a mirror or another index; it defaults to
+   `https://download.pytorch.org/whl/$ROCM_INDEX`.
+
+`setup-rocm` ends with a probe on the AMD node, and fails if the build has no
+kernels for the GPU. `results/explorer/setup_rocm/probe.json` lists the GPU's
+target and the build's targets.
+
+The CUDA side stays at 2.14.1. On CPU, mixed releases from 2.9.1 to 2.14.1
+worked (item 2 in HARDWARE_VALIDATION.md). An older ROCm-side release is
+untested, and `gpubridge.init()` warns when releases differ. For identical
+releases, set `TORCH_VERSION` (and `CUDA_INDEX` if needed) for `submit.sh setup` too.
 
 ## AMD cloud machine
 
@@ -327,6 +379,8 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
+| "set PROJECT_DIR" | no project space configured | put `PROJECT_DIR=/projects/<your-project>` in `scripts/gpu/explorer/local.env`, or export it |
+| setup-rocm: the probe at the end fails | the ROCm build has no kernels for this AMD GPU | pick another build: [Choosing the ROCm build](#choosing-the-rocm-build) |
 | setup: downloads time out or can't connect | the job has no route out | check that the log shows `module load explorer` ran; `SETUP_MODULES` must include `explorer` |
 | setup: "this looks like a Slurm login node" | `setup_env.sh` was run outside a job | use `submit.sh setup`, or run it inside `srun --pty bash` |
 | 00: no AMD GPU type found in `sharing` | no AMD nodes there, or an unrecognized type name | read `gres-sharing.txt`; if the AMD GPUs are there under another name, set `GPU_TYPE_AMD` to it; otherwise use step 8 |

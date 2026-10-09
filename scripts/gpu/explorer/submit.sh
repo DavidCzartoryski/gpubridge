@@ -21,6 +21,8 @@
 set -euo pipefail
 # shellcheck source=../common.sh
 source "$(dirname "$0")/../common.sh" "$@"
+# Your own settings, e.g. PROJECT_DIR, can live in explorer/local.env (gitignored).
+load_env_file "${EXPLORER_LOCAL_ENV:-$KIT_DIR/explorer/local.env}"
 
 # ---- Site settings: VERIFY each against rc-docs.northeastern.edu -------------
 ACCOUNT="${ACCOUNT:-}"                     # --account, if your allocation needs one
@@ -39,8 +41,11 @@ EXTRA_SBATCH="${EXTRA_SBATCH:-}"           # anything else, e.g. "--qos=... --re
 # ---- Job sizes and walltimes (short, so jobs schedule quickly) ---------------
 GPUS_SINGLE_ISLAND="${GPUS_SINGLE_ISLAND:-2}"
 GPUS_PER_NODE_MULTINODE="${GPUS_PER_NODE_MULTINODE:-2}"
-GPUS_MIXED_NVIDIA="${GPUS_MIXED_NVIDIA:-1}"  # step 07, gpu partition (1 GPU per job there)
-GPUS_MIXED_AMD="${GPUS_MIXED_AMD:-1}"        # step 07, AMD partition
+# Step 07. With 1 GPU per island the per-island baselines only time the call
+# itself; 2+ per island (multigpu access for NVIDIA) makes them real baselines.
+PARTITION_MIXED_NVIDIA="${PARTITION_MIXED_NVIDIA:-$PARTITION_1GPU}"
+GPUS_MIXED_NVIDIA="${GPUS_MIXED_NVIDIA:-1}"  # the gpu partition allows 1 GPU per job
+GPUS_MIXED_AMD="${GPUS_MIXED_AMD:-1}"
 TIME_SETUP="${TIME_SETUP:-01:00:00}"
 TIME_01="${TIME_01:-00:10:00}"
 TIME_02="${TIME_02:-00:15:00}"
@@ -50,10 +55,17 @@ TIME_05="${TIME_05:-00:30:00}"
 TIME_06="${TIME_06:-00:30:00}"
 TIME_07="${TIME_07:-00:30:00}"
 # ---- Environment for the jobs -------------------------------------------------
-# Venvs, caches and logs: ~6 GB, ~20 GB with the ROCm venv. Home is capped at 75 GB.
-WORK_DIR="${WORK_DIR:-/projects/jon-bell-research-group/${USER:-$(id -un)}/gpubridge-gpu}"
+# Venvs, caches and logs: ~7 GB, ~25 GB with the ROCm venv. Home is capped at 75 GB,
+# so they go in your group's project space. Required: PROJECT_DIR or WORK_DIR.
+PROJECT_DIR="${PROJECT_DIR:-}"             # e.g. /projects/<your-project>; or set it in local.env
+WORK_DIR="${WORK_DIR:-${PROJECT_DIR:+$PROJECT_DIR/${USER:-$(id -un)}/gpubridge-gpu}}"
 VENV="${VENV:-$WORK_DIR/venv}"             # CUDA build of torch: setup, steps 01 to 07
 VENV_ROCM="${VENV_ROCM:-$WORK_DIR/venv-rocm}"  # ROCm build: setup-rocm, step 07
+# setup-rocm's PyTorch: pick a ROCm build that supports the AMD GPU from step 00
+# (see the runbook); older Instinct cards may not be supported by ROCm 7.2.
+ROCM_TORCH_VERSION="${ROCM_TORCH_VERSION:-2.14.1}"
+ROCM_INDEX="${ROCM_INDEX:-rocm7.2}"        # the wheel's local version tag, e.g. rocm6.4
+ROCM_INDEX_URL="${ROCM_INDEX_URL:-https://download.pytorch.org/whl/$ROCM_INDEX}"
 SETUP_MODULES="${SETUP_MODULES-explorer}"  # loaded before installing; explorer routes
                                            # compute nodes through the proxy ("" = none)
 MODULES="${MODULES:-}"                     # `module load` names for steps 01 to 07; none needed
@@ -68,6 +80,7 @@ AMD_NODES_CONFIRMED=0
 
 LOG_DIR="$WORK_DIR/logs"
 export GPUBRIDGE_REPO="$REPO_DIR" WORK_DIR VENV VENV_ROCM SETUP_MODULES MODULES RESULTS_ROOT
+export ROCM_TORCH_VERSION ROCM_INDEX ROCM_INDEX_URL
 export NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME
 export GPUS_SINGLE_ISLAND GPUS_PER_NODE_MULTINODE GPUS_MIXED_NVIDIA GPUS_MIXED_AMD
 
@@ -96,6 +109,10 @@ gpu_request() {
 sbatch_job() {
     local name=$1 script=$2
     shift 2
+    [ -n "$WORK_DIR" ] || die "set PROJECT_DIR to your group's project space, e.g." \
+        "PROJECT_DIR=/projects/<your-project>, in the environment or in" \
+        "scripts/gpu/explorer/local.env (gitignored); or set WORK_DIR. Venvs, caches and" \
+        "logs go to \$PROJECT_DIR/\$USER/gpubridge-gpu, not home (capped at 75 GB)."
     run mkdir -p "$LOG_DIR"
     run sbatch --job-name="gpubridge-$name" --output="$LOG_DIR/%x-%j.out" --export=ALL \
         "$@" "$KIT_DIR/explorer/$script"
@@ -154,7 +171,7 @@ setup-rocm)
 06) submit 06_scaling.sbatch "$TIME_06" 1 4 "$PARTITION_MULTI" "$GPU_TYPE_MULTI" ;;
 07)
     amd_gate
-    gpu_request "$PARTITION_1GPU" "$GPU_TYPE_1GPU" 1 "$GPUS_MIXED_NVIDIA" "$TIME_07"
+    gpu_request "$PARTITION_MIXED_NVIDIA" "$GPU_TYPE_1GPU" 1 "$GPUS_MIXED_NVIDIA" "$TIME_07"
     nvidia=("${REQUEST[@]}")
     gpu_request "$PARTITION_AMD" "$AMD_TYPE" 1 "$GPUS_MIXED_AMD" "$TIME_07"
     sbatch_job 07_mixed_hetjob 07_mixed_hetjob.sbatch "${nvidia[@]}" : "${REQUEST[@]}"
