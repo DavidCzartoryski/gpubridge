@@ -344,7 +344,8 @@ def test_submit_free_and_multi_submit_every_step():
 @pytest.mark.parametrize(
     ("job", "expected"),
     [
-        ("01_probe.sbatch", ["probe.py"]),
+        ("01_probe.sbatch", ["probe.py", "--nproc-per-node=2",
+                             "--expect-init-error LOCAL_RANK=1\\ asks\\ for\\ GPU\\ 1"]),
         ("02_split_shared_gpu.sbatch", ["--nproc-per-node=2", "check.py"]),
         ("03_single_island.sbatch", ["device_map.py", "check.py", "bench_all_reduce.py"]),
         ("04_split_4gpu.sbatch", ["check_half", "check_alternate", "bench_all_reduce.py"]),
@@ -362,7 +363,8 @@ def test_explorer_jobs_dry_run(job, expected):
 
 def test_amd_dry_run_with_several_gpus():
     out = dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="8").stdout
-    for text in ["rocm-smi", "probe.py", "NCCL_DEBUG=INFO", "--nproc-per-node=8",
+    for text in ["rocm-smi", "probe.py", "--nproc-per-node=9", "LOCAL_RANK=8\\ asks",
+                 "NCCL_DEBUG=INFO", "--nproc-per-node=8",
                  "GPUBRIDGE_SPLIT_TEST=half", "bench_all_reduce.py", "train_n4", "tar -czf"]:
         assert text in out, text
     assert "train_n5" not in out
@@ -416,6 +418,36 @@ def test_check_in_a_split_test_is_flagged_everywhere(tmp_path):
     assert summarize.main([str(out)]) == 0
     assert "SPLIT TEST - not a mixed-vendor result" in (out / "summary.md").read_text()
     assert json.loads((out / "summary.json").read_text())["split_test"] == "half"
+
+
+@pytest.mark.parametrize(
+    ("pattern", "ok"),
+    [("doesn't apply to this cluster", True), ("LOCAL_RANK", False)],
+)
+def test_check_can_expect_init_to_fail_on_every_rank(pattern, ok, tmp_path):
+    # native-only on a split test's two islands fails init() on every rank.
+    out = tmp_path / "check"
+    result = torchrun(2, KIT / "check.py", "--out", str(out), "--policy", "native-only",
+                      "--expect-init-error", pattern,
+                      GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
+    assert (result.returncode == 0) == ok, result.stderr[-3000:]
+    records = read_ranks(out)
+    assert len(records) == 2
+    for record in records:
+        assert record["ok"] is ok
+        (stage,) = record["stages"]
+        assert stage["name"] == "expected_init_error"
+        assert "doesn't apply" in stage["message"]
+    assert summarize.main([str(out)]) == (0 if ok else 1)
+
+
+def test_check_expecting_an_init_error_fails_when_init_succeeds(tmp_path):
+    out = tmp_path / "check"
+    result = torchrun(2, KIT / "check.py", "--out", str(out), "--expect-init-error", "LOCAL_RANK",
+                      GPUBRIDGE_VENDOR="amd")
+    assert result.returncode == 1
+    for record in read_ranks(out):
+        assert "init() succeeded" in record["stages"][0]["error"]
 
 
 def test_check_without_split_is_not_flagged(tmp_path):

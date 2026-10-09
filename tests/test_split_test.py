@@ -98,7 +98,8 @@ def test_split_test_lets_ranks_share_a_gpu(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.setenv("LOCAL_RANK", "1")
-    assert resolve_config().device == torch.device("cuda", 1)  # off: unchanged
+    with pytest.raises(RuntimeError, match="sees only 1 GPU"):  # off: a GPU per rank
+        resolve_config()
     monkeypatch.setenv(SPLIT_TEST_ENV, "half")
     assert resolve_config().device == torch.device("cuda", 0)
 

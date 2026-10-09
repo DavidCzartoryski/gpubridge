@@ -18,11 +18,18 @@ Writes OUT/rank<N>.json. Run scripts/gpu/summarize.py OUT afterwards.
     torchrun --nproc-per-node=4 scripts/gpu/check.py --out results/explorer/04_split_4gpu
 
 --policy picks the collective policy (default auto), so runs can compare them.
+
+--expect-init-error REGEX turns the run into a negative test: every rank must
+fail gpubridge.init() with a matching message, and nothing else runs (item 12).
+Launch one more process than the node has GPUs and expect "LOCAL_RANK":
+
+    torchrun --nproc-per-node=2 scripts/gpu/check.py --out OUT --expect-init-error LOCAL_RANK
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 import traceback
@@ -67,11 +74,16 @@ def main() -> int:
                         help="elements in the busy-GPU tensor (default: 64M on GPU, 1M on CPU)")
     parser.add_argument("--busy-iters", type=int, default=20,
                         help="matmuls queued before the busy-GPU all_reduce")
+    parser.add_argument("--expect-init-error", metavar="REGEX",
+                        help="pass only if gpubridge.init() fails on this rank with a message "
+                             "matching REGEX; runs nothing else")
     args = parser.parse_args()
 
     rank = rank_from_env()
     rec = Record(args.out / f"rank{rank}.json", "scripts/gpu/check.py",
                  hang_dump_seconds=args.timeout * 0.8)
+    if args.expect_init_error:
+        return expect_init_error(rec, args)
     try:
         with rec.stage("init"):
             topology = gpubridge.init(timeout=timedelta(seconds=args.timeout),
@@ -147,6 +159,24 @@ def main() -> int:
     except BaseException:
         traceback.print_exc()
         rec.failed = True
+    return rec.finish()
+
+
+def expect_init_error(rec: Record, args: argparse.Namespace) -> int:
+    """Negative test: init() must fail on this rank, with a message matching the regex."""
+    with rec.stage("expected_init_error") as entry:
+        entry["pattern"] = args.expect_init_error
+        try:
+            gpubridge.init(timeout=timedelta(seconds=args.timeout), policy=args.policy)
+        except RuntimeError as exc:
+            entry["message"] = str(exc)
+            entry["ok"] = re.search(args.expect_init_error, str(exc)) is not None
+            if not entry["ok"]:
+                entry["error"] = f"init() failed, but not with {args.expect_init_error!r}"
+        else:
+            gpubridge.destroy()
+            entry["ok"] = False
+            entry["error"] = "init() succeeded; this run expected it to fail"
     return rec.finish()
 
 

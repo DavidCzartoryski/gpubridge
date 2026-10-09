@@ -91,8 +91,14 @@ def resolve_config() -> Config:
     through the same ``torch.cuda`` API. In split-test mode only, a local rank
     beyond the visible GPU count wraps around, so ranks can share a GPU.
 
+    The device index is checked here, not left to ``torch.cuda.set_device``:
+    discovery turns this error into a problem that fails ``init()`` on every
+    rank, whereas a bad ``set_device`` would crash this rank alone and leave
+    the others waiting in rendezvous.
+
     Raises:
-        RuntimeError: if not simulating and no GPU is visible to this process.
+        RuntimeError: if not simulating and no GPU is visible to this process, or
+            ``LOCAL_RANK`` is not an integer or names a GPU this process can't see.
     """
     if is_simulated():
         return Config(simulated=True, island_backend=CPU_BACKEND, device=torch.device("cpu"))
@@ -103,10 +109,33 @@ def resolve_config() -> Config:
             f"or {CPU_ONLY_ENV}=1 to run on CPU with the vendor of this PyTorch build."
         )
     local_rank = os.environ.get("LOCAL_RANK")
-    index = int(local_rank) if local_rank is not None else torch.cuda.current_device()
-    if split_test_mode() is not None:
+    if local_rank is None:
+        index = torch.cuda.current_device()
+    else:
+        try:
+            index = int(local_rank)
+        except ValueError:
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank!r} is not an integer. It is normally set by the "
+                "launcher (torchrun or srun); don't set it by hand."
+            ) from None
+    count = torch.cuda.device_count()
+    if split_test_mode() is not None and count and index >= count:
         # Test only: lets two islands share GPUs, e.g. two ranks on one GPU.
-        count = torch.cuda.device_count()
-        if count and index >= count:
-            index %= count
+        index %= count
+    if not 0 <= index < count:
+        raise RuntimeError(_no_such_gpu(local_rank, index, count))
     return Config(simulated=False, island_backend=GPU_BACKEND, device=torch.device("cuda", index))
+
+
+def _no_such_gpu(local_rank: str | None, index: int, count: int) -> str:
+    asked = f"LOCAL_RANK={local_rank}" if local_rank is not None else "The current CUDA device"
+    gpus = f"{count} GPU{'s' if count != 1 else ''}"
+    return (
+        f"{asked} asks for GPU {index}, but this process sees only {gpus}. Each rank on a "
+        "node needs its own visible GPU: start no more processes per node than it has GPUs "
+        "(torchrun --nproc-per-node), and check what the job makes visible "
+        "(CUDA_VISIBLE_DEVICES on NVIDIA, HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES on AMD). "
+        "Under Slurm, --gpus-per-task=1 leaves each task a single GPU (index 0), so start "
+        "one process per task, or give the task all of the node's GPUs (e.g. --gpus-per-node)."
+    )

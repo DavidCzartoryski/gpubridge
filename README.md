@@ -67,8 +67,11 @@ These paths are the default [collective policies](#collective-policies).
 2. Each rank detects its vendor from `torch.version.hip` (AMD) or
    `torch.version.cuda` (NVIDIA), and runs `gpubridge.probe()`, which never
    raises: build, visible GPUs, and whether the NCCL and Gloo backends exist.
-   Anything that would stop the rank (no vendor, no GPU, no NCCL/RCCL) is
-   recorded as a problem instead of being raised on that rank alone.
+   Anything that would stop the rank (no vendor, no GPU, no NCCL/RCCL, or a
+   `LOCAL_RANK` with no visible GPU behind it) is recorded as a problem instead
+   of being raised on that rank alone. `torch.cuda.set_device` waits until
+   discovery has passed, so a bad device index can't crash one rank and leave
+   the rest waiting in rendezvous.
 3. Every rank shares its vendor, probe, problems, hostname and chosen bridge
    transport with `all_gather_object`. If any rank reported a problem, or the
    ranks disagree on CPU versus GPU mode or on the bridge transport, `init()`

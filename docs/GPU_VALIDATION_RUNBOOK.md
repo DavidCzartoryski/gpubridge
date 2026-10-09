@@ -29,13 +29,13 @@ real mixed-vendor result:
 | --- | --- | --- | --- | --- | --- | --- |
 | 0a | Explorer login node | `submit.sh 00` | GPU types in `sharing`, `gpu` and `multigpu` (sinfo only): are there AMD GPUs in `sharing`? | - | seconds | free |
 | 0b | Explorer, CPU job | `submit.sh setup` | venv with the CUDA build of torch 2.14.1, built on a compute node | - | ~10 min | free |
-| 1 | Explorer, 1 GPU | `submit.sh 01` | the build runs on the GPU; records the hardware | prerequisite | ~2 min | free |
+| 1 | Explorer, 1 GPU | `submit.sh 01` | the build runs on the GPU; records the hardware; a rank whose `LOCAL_RANK` has no GPU fails `init()` on every rank | prerequisite, **12** | ~2 min | free |
 | 2 | Explorer, 1 GPU | `submit.sh 02` | two single-rank NCCL islands sharing one GPU, plus the bridge | **3**, 6 (partly), 10 on CUDA | ~3 min | free |
 | 3 | Explorer, 2+ GPUs | `submit.sh 03` | real NCCL island; each rank drives its own GPU | **5** on NVIDIA, baseline | ~5 min | free* |
 | 4 | Explorer, 4 GPUs | `submit.sh 04` | two 2-GPU NCCL islands and the bridge, both layouts; native vs bridged benchmark | **3, 6, 7**, 9 (data), **11** | ~10 min | free* |
 | 5 | Explorer, 2 nodes | `submit.sh 05` | NCCL across nodes; the bridge crossing the network between nodes | **8**, 11 across nodes | ~10 min | free* |
 | 6 | Explorer, 4 GPUs | `submit.sh 06` | training throughput and scaling 1 to 4 GPUs (table for the multigpu request) | - | ~10 min | free* |
-| 7 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11 | 20-30 min | ~0.5 h of the hourly rate |
+| 7 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11, 12 | 20-30 min | ~0.5 h of the hourly rate |
 | 8 | NVIDIA + AMD cloud | `mixed/node.sh` on both | the real mixed-vendor job | **1, 2** on GPUs, **8** across networks | 30-45 min | ~0.75 h of each machine's rate |
 | 8 alt | Explorer `gpu` + `sharing`, one heterogeneous job | `submit.sh setup-rocm`, then `submit.sh 07` | the real mixed-vendor job inside Explorer, **if** step 0a finds AMD GPUs in `sharing`. Dry-run only until then | **1, 2** on GPUs, 3 with real RCCL ranks, 8 between nodes, 11 against per-island baselines | ~15 min + ~15 min ROCm setup | free |
 
@@ -244,7 +244,8 @@ The script runs:
 1. setup
 2. `rocm-smi` / `amd-smi` / `rocminfo` output
 3. probe
-4. device mapping under `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES`
+4. device mapping under `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES`, then
+   one more process than GPUs, which must fail `init()` on every rank (item 12)
 5. a 1-GPU check with `NCCL_DEBUG=INFO`, then greps the log for RCCL's version
    (item 4)
 
@@ -388,6 +389,7 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 | 07: stops after `preflight` | no route between the `gpu` and `sharing` nodes, or a GPU the build can't run | read `preflight-*.json` and `probe_*/probe.json`; set `GLOO_SOCKET_IFNAME` if the interface check failed |
 | 01: `build_supports_gpus` fails | wheel without kernels for this GPU | set `CUDA_INDEX` (cu126 for V100; cu128/cu130 for newer GPUs), rerun setup |
 | 01: no GPU visible | job didn't get a GPU, or driver problem | check `nvidia-smi.txt` and `slurm-job.txt` in the results |
+| 01/AMD: `local_rank_check` fails | init() succeeded with more processes than GPUs, or failed for another reason | read `expected_init_error` in `local_rank_check/rank*.json`; if init succeeded, the visible-device count isn't what PyTorch reports (item 12) |
 | `init` stuck (summary says "stuck in this stage") | new_group / NCCL init problem (item 3) | read `rank*.stacks.txt`; rerun with `NCCL_DEBUG=INFO`; this is a real finding, file it |
 | `busy_gpu` wrong values | stream ordering bug in the bridge (item 6) | serious; keep the JSON and open an issue |
 | `dtypes` mismatch | precision or reduction-order problem (item 7) | check `max_abs_error` in the stage |
