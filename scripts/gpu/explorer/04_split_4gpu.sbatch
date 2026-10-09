@@ -24,6 +24,8 @@ for mode in half alternate; do
     step "summarize_$mode" python "$KIT_DIR/summarize.py" "$RESULTS/check_$mode"
 done
 export GPUBRIDGE_SPLIT_TEST=half
+# --ops island and --phases put the island step (a reduce onto the leader) next
+# to a native island all_reduce of the same size (item 13).
 step bench local_torchrun --nproc-per-node="$GPUS" "$KIT_DIR/bench_all_reduce.py" \
-    --out "$RESULTS/bench" --max-bytes "$BENCH_MAX_BYTES"
+    --out "$RESULTS/bench" --max-bytes "$BENCH_MAX_BYTES" --ops native,island,gpubridge --phases
 finish

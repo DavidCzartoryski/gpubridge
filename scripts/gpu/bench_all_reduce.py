@@ -18,6 +18,12 @@ A trial's latency is the slowest rank's (for ``island``, the slowest rank of
 that island). Bandwidth follows nccl-tests: algbw = bytes / time and
 busbw = algbw * 2(n-1)/n, with n the ranks taking part.
 
+--phases attaches a gpubridge observer and adds the median time of each phase
+of the gpubridge op (island-reduce, bridge, island-broadcast for
+reduce-bridge-broadcast), slowest rank, to bench.json and summary.md. With
+--ops island,gpubridge that puts the island step of reduce-bridge-broadcast (a
+reduce onto the leader) next to a native island all_reduce of the same size.
+
 Rank 0 writes OUT/bench.csv, OUT/bench.json and OUT/summary.md. Runs on CPU in
 simulation mode too (use a smaller --max-bytes):
 
@@ -118,6 +124,34 @@ def row(op: str, info: dict[str, Any], nbytes: int, dtype: str, lat: list[float]
     }
 
 
+class PhaseTimes(gpubridge.CollectiveObserver):
+    """Keeps every record; reads phase times once the collective's marks are ready."""
+
+    def __init__(self) -> None:
+        self.records: list[gpubridge.CollectiveRecord] = []
+
+    def on_collective(self, record: gpubridge.CollectiveRecord) -> None:
+        self.records.append(record)
+
+
+def phase_medians(records: list[gpubridge.CollectiveRecord]) -> dict[str, float]:
+    """Median milliseconds per phase name over ``records`` on this rank."""
+    by_phase: dict[str, list[float]] = {}
+    for record in records:
+        for p in record.phases:
+            by_phase.setdefault(p.name, []).append(p.elapsed_ms())
+    return {name: statistics.median(times) for name, times in by_phase.items()}
+
+
+def slowest_phases(mine: dict[str, float]) -> dict[str, float]:
+    """Each phase's time on the slowest rank that ran it. Collective over the world group."""
+    everyone: list[Any] = [None] * dist.get_world_size()
+    dist.all_gather_object(everyone, mine)
+    # In call order: rank 0 always leads its island, so it ran every phase.
+    names = list(dict.fromkeys(name for medians in everyone for name in medians))
+    return {name: round(max(m[name] for m in everyone if name in m), 4) for name in names}
+
+
 def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
     lines = []
     if info["split_test"]:
@@ -159,6 +193,15 @@ def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
             island_us = [by_op[op]["median_us"] for op in islands if op in by_op]
             cells.append(ratio(bridge, max(island_us, default=None)))
         lines.append("| " + " | ".join(cells) + " |")
+    phased = [r for r in rows if r.get("phases_ms")]
+    if phased:
+        names = list(dict.fromkeys(name for r in phased for name in r["phases_ms"]))
+        lines += ["", f"Phases of the gpubridge op ({phased[0]['policy']}), median ms on the "
+                  "slowest rank that ran each phase:", "",
+                  "| size | " + " | ".join(names) + " |", "|" + " --- |" * (len(names) + 1)]
+        for r in phased:
+            lines.append(f"| {human(r['bytes'])} | "
+                         + " | ".join(str(r["phases_ms"].get(n, "-")) for n in names) + " |")
     return "\n".join(lines) + "\n"
 
 
@@ -178,6 +221,8 @@ def main() -> int:
     parser.add_argument("--policy", default="auto",
                         help="collective policy for the gpubridge op, e.g. flat-gloo")
     parser.add_argument("--timeout", type=float, default=1800)
+    parser.add_argument("--phases", action="store_true",
+                        help="also record the median time of each phase of the gpubridge op")
     args = parser.parse_args()
 
     topology = gpubridge.init(timeout=timedelta(seconds=args.timeout), policy=args.policy)
@@ -203,11 +248,16 @@ def main() -> int:
     if "gpubridge" in wanted:
         ops["gpubridge"] = gpubridge.all_reduce
 
+    phases = PhaseTimes() if args.phases else None
+    if phases is not None:
+        gpubridge.add_observer(phases)
     element = torch.tensor([], dtype=dtype).element_size()
     rows = []
     for nbytes in sizes(args.min_bytes, args.max_bytes, args.factor):
         tensor = torch.ones(max(1, nbytes // element), dtype=dtype, device=device)
         for name, op in ops.items():
+            if phases is not None:
+                phases.records.clear()
             per_trial = time_op(op, tensor, device, warmup=args.warmup, trials=args.trials,
                                 max_seconds=args.max_seconds)
             if name == "island":
@@ -216,6 +266,11 @@ def main() -> int:
                        for island in topology.layout.islands]
             else:
                 new = [row(name, info, tensor.numel() * element, args.dtype, slowest(per_trial))]
+            if name == "gpubridge" and phases is not None:
+                # time_op synchronized the device, so every mark is ready. Only the
+                # timed trials count, not the warmup.
+                timed = phases.records[len(phases.records) - len(per_trial):]
+                new[0]["phases_ms"] = slowest_phases(phase_medians(timed))
             rows += new
             if topology.rank == 0:
                 for r in new:
@@ -226,7 +281,7 @@ def main() -> int:
     if topology.rank == 0:
         args.out.mkdir(parents=True, exist_ok=True)
         with open(args.out / "bench.csv", "w", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=FIELDS)
+            writer = csv.DictWriter(fh, fieldnames=FIELDS, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
         write_json(args.out / "bench.json", {

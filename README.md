@@ -46,7 +46,9 @@ belongs to exactly one vendor. gpubridge groups processes by vendor:
 
 **`all_reduce`** uses reduce-bridge-broadcast:
 
-1. `all_reduce` within each island on the native backend.
+1. `reduce` within each island onto its leader, on the native backend. Only
+   the leader needs the island sum, and a reduce moves about half the bytes of
+   an all_reduce.
 2. Leaders copy the island sum to CPU and `all_reduce` it over the bridge.
 3. Each leader copies the total back to its GPU and broadcasts it to its island.
 
@@ -221,7 +223,7 @@ or if the policy doesn't fit the cluster.
 
 | Policy | Applies to | What it does |
 | --- | --- | --- |
-| `reduce-bridge-broadcast` | 2+ islands | island collective, island leaders over the bridge, island broadcast |
+| `reduce-bridge-broadcast` | 2+ islands | island reduce onto each leader, island leaders over the bridge, island broadcast |
 | `native-only` | 1 island | one native NCCL/RCCL (or CPU Gloo) collective |
 | `flat-gloo` | any | every rank copies to CPU and uses the world Gloo group: slow but obviously correct, so it's the test reference and a debugging fallback that never touches NCCL/RCCL |
 | `auto` (default) | any | `native-only` for one island, `reduce-bridge-broadcast` otherwise; today's behaviour |

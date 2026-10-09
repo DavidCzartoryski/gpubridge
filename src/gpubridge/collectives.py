@@ -36,7 +36,7 @@ def all_reduce(tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM) -> N
     policy decides how the data travels; in a mixed cluster the default runs
     reduce-bridge-broadcast:
 
-    1. all_reduce within each island on the native backend.
+    1. reduce within each island onto its leader, on the native backend.
     2. Island leaders copy the island sum to CPU and all_reduce it over the bridge.
     3. Each leader copies the total back to its device and broadcasts it to its island.
 

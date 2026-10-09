@@ -91,6 +91,16 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     the check fires on real nodes. *Step:* `check.py --expect-init-error`,
     launched with one more process than the node has GPUs (Explorer step 01,
     `amd/run_all.sh`).
+13. **The island step of reduce-bridge-broadcast is a reduce onto the leader**,
+    not an all_reduce: only the leader needs the island sum, and a ring reduce
+    moves about half the bytes.
+    *Status: works on CPU: every layout still matches `flat-gloo` exactly, and
+    a test counts one island reduce and one island broadcast per all_reduce.*
+    Still open: the time saved on NCCL and RCCL, by tensor size. Small tensors
+    may see none, because both ops are latency-bound there. *Step:*
+    `bench_all_reduce.py --ops native,island,gpubridge --phases` puts the
+    `island-reduce` phase next to a native island all_reduce (`island:<vendor>`)
+    of the same size (Explorer steps 04, 05 and 07, `amd/run_all.sh`).
 
 ## Mixed build results
 

@@ -32,12 +32,12 @@ real mixed-vendor result:
 | 1 | Explorer, 1 GPU | `submit.sh 01` | the build runs on the GPU; records the hardware; a rank whose `LOCAL_RANK` has no GPU fails `init()` on every rank | prerequisite, **12** | ~2 min | free |
 | 2 | Explorer, 1 GPU | `submit.sh 02` | two single-rank NCCL islands sharing one GPU, plus the bridge | **3**, 6 (partly), 10 on CUDA | ~3 min | free |
 | 3 | Explorer, 2+ GPUs | `submit.sh 03` | real NCCL island; each rank drives its own GPU | **5** on NVIDIA, baseline | ~5 min | free* |
-| 4 | Explorer, 4 GPUs | `submit.sh 04` | two 2-GPU NCCL islands and the bridge, both layouts; native vs bridged benchmark | **3, 6, 7**, 9 (data), **11** | ~10 min | free* |
-| 5 | Explorer, 2 nodes | `submit.sh 05` | NCCL across nodes; the bridge crossing the network between nodes | **8**, 11 across nodes | ~10 min | free* |
+| 4 | Explorer, 4 GPUs | `submit.sh 04` | two 2-GPU NCCL islands and the bridge, both layouts; native vs bridged benchmark | **3, 6, 7**, 9 (data), **11**, 13 | ~10 min | free* |
+| 5 | Explorer, 2 nodes | `submit.sh 05` | NCCL across nodes; the bridge crossing the network between nodes | **8**, 11 and 13 across nodes | ~10 min | free* |
 | 6 | Explorer, 4 GPUs | `submit.sh 06` | training throughput and scaling 1 to 4 GPUs (table for the multigpu request) | - | ~10 min | free* |
-| 7 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11, 12 | 20-30 min | ~0.5 h of the hourly rate |
+| 7 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11, 12, 13 | 20-30 min | ~0.5 h of the hourly rate |
 | 8 | NVIDIA + AMD cloud | `mixed/node.sh` on both | the real mixed-vendor job | **1, 2** on GPUs, **8** across networks | 30-45 min | ~0.75 h of each machine's rate |
-| 8 alt | Explorer `gpu` + `sharing`, one heterogeneous job | `submit.sh setup-rocm`, then `submit.sh 07` | the real mixed-vendor job inside Explorer, **if** step 0a finds AMD GPUs in `sharing`. Dry-run only until then | **1, 2** on GPUs, 3 with real RCCL ranks, 8 between nodes, 11 against per-island baselines | ~15 min + ~15 min ROCm setup | free |
+| 8 alt | Explorer `gpu` + `sharing`, one heterogeneous job | `submit.sh setup-rocm`, then `submit.sh 07` | the real mixed-vendor job inside Explorer, **if** step 0a finds AMD GPUs in `sharing`. Dry-run only until then | **1, 2** on GPUs, 3 with real RCCL ranks, 8 between nodes, 11 against per-island baselines, 13 | ~15 min + ~15 min ROCm setup | free |
 
 \* Steps 3 to 6 need the `multigpu` partition, which needs an access request
 (see [Explorer](#explorer)). Steps 1 and 2 run on the open `gpu` partition.
