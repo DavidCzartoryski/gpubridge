@@ -5,11 +5,12 @@
 #   scripts/gpu/setup_env.sh --flavor cuda|rocm|system [--venv DIR] [--dry-run]
 #
 #   cuda    CUDA build of PyTorch from the PyTorch index (Explorer, NVIDIA clouds)
-#   rocm    ROCm build of PyTorch from the PyTorch index (AMD clouds)
+#   rocm    ROCm build of PyTorch from the PyTorch index (AMD clouds, Explorer AMD nodes)
 #   system  reuse a PyTorch already installed in the machine's Python, e.g. a
 #           ROCm container image; saves a 6+ GB download on a paid machine
 #
-# Needs internet access (run it on a login node on Explorer, not in a job).
+# Needs internet access. On a Slurm cluster it refuses to run outside a job, so
+# installs never land on a login node; on Explorer use explorer/submit.sh setup.
 set -euo pipefail
 # shellcheck source=common.sh
 source "$(dirname "$0")/common.sh" "$@"
@@ -40,6 +41,13 @@ rocm) index_tag=$ROCM_INDEX ;;
 system) index_tag="" ;;
 *) die "--flavor must be cuda, rocm or system" ;;
 esac
+
+# sbatch on the PATH but no job: this is a cluster's login node.
+if [ "$DRY_RUN" = 0 ] && [ -z "${SLURM_JOB_ID:-}" ] && command -v sbatch >/dev/null 2>&1; then
+    die "this looks like a Slurm login node (sbatch is here, but no job is running)." \
+        "Install on a compute node: scripts/gpu/explorer/submit.sh setup on Explorer," \
+        "or run this inside an interactive job (srun --pty bash)."
+fi
 
 # uv's cache next to the venv keeps multi-GB wheels out of small home quotas.
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$(dirname "$VENV")/uv-cache}"
