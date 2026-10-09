@@ -1,8 +1,10 @@
-# Prior art: Modular MAX `comm`, RAJA, Triton, Triton-distributed and torchcomms
+# Prior art: Modular MAX `comm`, RAJA, Triton, Triton-distributed, torchcomms and three 2026 papers
 
 Notes comparing gpubridge with five projects that also promise "write it once,
-run it on NVIDIA or AMD". Each repo was read at a fixed commit (on 2026-10-06,
-torchcomms on 2026-10-07), and every code link points at that commit:
+run it on NVIDIA or AMD", and with three 2026 papers that put both vendors in
+one training job ([below](#three-2026-papers-mixed-vendor-collectives-over-rdma)).
+Each repo was read at a fixed commit (on 2026-10-06, torchcomms on 2026-10-07),
+and every code link points at that commit:
 
 - Modular [`85356f6`](https://github.com/modular/modular/tree/85356f6562ed57bab8762fde38448ba5b50b69c9)
 - RAJA [`09626e8`](https://github.com/llnl/RAJA/tree/09626e855db5005357eb1dac7cc4db0546cf0f53)
@@ -23,6 +25,9 @@ running it.
 | Triton | compute (kernel language and compiler) | NVIDIA (compute capability 8.0+), AMD (ROCm 6.2+) | run time, one driver per process; compiled per GPU architecture | no: exactly one active driver per process |
 | Triton-distributed | communication inside kernels, overlapped with compute | NVIDIA (NVSHMEM), AMD (rocSHMEM or MORI, single node), MetaX | run time, per process (`nvidia-smi` / `rocm-smi` on PATH) | no: one SHMEM library over one NCCL group |
 | torchcomms (Meta) | communication (collectives, plus one-sided windows) | NVIDIA (NCCL, NCCLX), AMD (RCCL, RCCLX), Intel XPU, CPU (Gloo) | build time (a CUDA or a ROCm build), then a backend per communicator | no: one vendor library per communicator; listed as a design goal |
+| HetCCL, SNU et al. ([2601.22585](https://arxiv.org/abs/2601.22585)) | communication (orchestrates NCCL and RCCL) | NVIDIA, AMD | per node | **yes**: NCCL/RCCL inside each vendor, GPU-to-GPU RDMA between vendors |
+| HetCCL, PKU/BAAI et al. ([2605.31000](https://arxiv.org/abs/2605.31000)) | communication (wraps vendor libraries) | 8 claimed; evaluated NVIDIA A800 and three unnamed vendors | per vendor group | **yes**: vendor-library collectives inside each group, RDMA between groups |
+| Joint Training on AMD and NVIDIA GPUs ([2602.18007](https://arxiv.org/abs/2602.18007)) | communication for Megatron/DeepSpeed training | AMD (MI325X), NVIDIA (H200) | per node | **yes**, for pipeline-parallel traffic only |
 | **gpubridge** | communication (no kernels) | NVIDIA, AMD | run time, per process (from the PyTorch build) | **yes**: one island per vendor, joined by a CPU bridge |
 
 ## Modular MAX: `comm` and `comm/vendor/ccl`
@@ -673,24 +678,145 @@ windows.
    *Status: not implemented. Worth revisiting when torchcomms' API stabilizes
    and its ROCm wheels leave the nightly index.*
 
-## Positioning (proposed README paragraph)
+## Three 2026 papers: mixed-vendor collectives over RDMA
 
-Updated 2026-10-07 with the torchcomms sentence, which the README doesn't have
-yet.
+Three papers from 2026 put NVIDIA and AMD (or other vendors) in one training
+job. Read on arXiv on 2026-10-09 (version 1 of each). Two of them are called
+HetCCL but come from different groups with different designs; the later one
+doesn't cite the earlier. Numbers below are as the papers report them, not
+reproduced. None of the three has released code that could be found on
+2026-10-09.
+
+### HetCCL (Seoul National University, Samsung Research, Moreh)
+
+"HetCCL: Accelerating LLM Training with Heterogeneous GPUs", Heehoon Kim,
+Jaehwan Lee, Taejeoung Kim, Jongwon Park et al., [arXiv 2601.22585](https://arxiv.org/abs/2601.22585)
+(30 Jan 2026).
+
+**What it does.**
+- An orchestration layer over NCCL and RCCL: "HetCCL acts as an orchestration
+  layer that invokes pure NCCL and RCCL for vendor-local collectives, while
+  handling cross-vendor coordination in a separate layer" (§4.1).
+- **Between vendors, GPU memory goes straight to the NIC.** Memory from
+  `cudaMalloc` / `hipMalloc` is registered with `ibv_reg_mr` and sent with IB
+  Verbs, relying on NVIDIA GPUDirect RDMA and AMD DirectGMA. No driver
+  changes. It falls back to host staging when RDMA isn't available.
+- One vendor per node. Applications run unchanged: `LD_PRELOAD` swaps in
+  HetCCL's NCCL/RCCL symbols.
+- Also balances load: faster GPUs get larger micro-batches, sized from a short
+  profiling run.
+
+**Results (paper).** 2 nodes of 4x V100-PCIe and 2 nodes of 4x Radeon Pro
+W7800, ConnectX-6 InfiniBand:
+- up to 1.48x faster than NVIDIA-only training and 2.97x faster than AMD-only;
+- up to 97% efficiency (about 90% on average), defined as mixed throughput
+  over the sum of the two single-vendor throughputs.
+
+**Availability.** The paper says the code is released, but its links are
+omitted for review, and no code could be found.
+
+### HetCCL (Peking University, BAAI, Infrawaves, ICT-CAS)
+
+"HetCCL: Enabling Collective Communication For Mixed-Vendor Heterogeneous
+Clusters", Yuejie Wang, Tao Chang, Yuanyuan Zhao, Yulong Ao et al.,
+[arXiv 2605.31000](https://arxiv.org/abs/2605.31000) (29 May 2026).
+
+**What it does.**
+- **Device-centric transport.** "We choose the common RDMA APIs (i.e., verbs)
+  as the bridge for cross-vendor device data transport" (§2.1). The sender
+  copies into a registered RDMA buffer in GPU memory. A CPU proxy thread
+  drives IB Verbs, in 4 MB chunks, with copies and transfers pipelined.
+- **Hierarchical collectives.** Each vendor's own library runs inside its
+  group, with a ring between groups. Reductions use the vendor library inside
+  a "border communicator".
+- A C++ PyTorch backend plugin, so training code runs unchanged.
+
+**Results (paper).**
+- Hardware: NVIDIA A800 and three unnamed vendors. AMD is not among the
+  evaluated hardware.
+- Against Gloo: the abstract reports 17-19x Gloo's bandwidth; §6.1.1 says
+  "> 6x" for point to point.
+- Training step time drops 9.1% (Llama3-3B) and 16.9% (Llama3-8B) against
+  Gloo.
+
+**Availability.** "publicly available", link omitted for anonymity; no code
+could be found.
+
+### Joint Training on AMD and NVIDIA GPUs (Zettabyte AI)
+
+Jon Hu, Thomas Jia, Jing Zhu, Zhendong Yu, [arXiv 2602.18007](https://arxiv.org/abs/2602.18007)
+(20 Feb 2026).
+
+**What it does.** Two designs for Megatron, with heterogeneity only in the
+pipeline-parallel groups ("In this paper, heterogeneity is introduced only in
+the PP groups", §4.1):
+- **CPU forwarding.** Gloo carries only the cross-vendor pipeline-parallel
+  traffic, while data- and tensor-parallel groups stay on NCCL or RCCL. This
+  is close to gpubridge's design, applied to pipeline parallelism.
+- **Device-Direct.** A CPU proxy controls transfers. The GPU copies into a
+  chunk buffer, and GPUDirect RDMA sends it to the NIC on both sides, through
+  ibverbs. Exposed as a PyTorch backend plugin.
+
+**Results (paper).** One node of 8x H200 and one of 8x MI325X, with 8x
+BlueField-3 per node. LLaMA-8B, TFLOPs per GPU:
+
+| Setup | TFLOPs/GPU |
+| --- | --- |
+| Gloo for all communication, mixed | 11.1 |
+| Gloo for cross-vendor pipeline traffic only, mixed | 160.8 |
+| same, plus one NIC per GPU, mixed | 236.5 |
+| AMD only | 534.9 |
+| Device-Direct, mixed | 539.6 |
+| NVIDIA only | 549.7 |
+
+**Availability.** No code, repository or license is mentioned.
+
+### What this means for gpubridge
+
+- **The published systems are much faster across vendors.** All three move
+  cross-vendor data GPU to GPU over RDMA, or through GPU-side buffers and
+  RDMA. All three report far higher bridge bandwidth than a Gloo bridge through
+  host memory, which is what gpubridge has. In the Zettabyte numbers, the
+  Gloo-based variants reach 2% to 44% of Device-Direct's throughput. Expect
+  gpubridge's bridge to be the bottleneck for bandwidth-bound collectives.
+- **What gpubridge offers instead.**
+  - It is open source (MIT) and pure Python over stock PyTorch builds (2.3 or
+    later, CUDA or ROCm).
+  - It needs no custom build, no `LD_PRELOAD`, no RDMA-capable NIC, no
+    GPUDirect or peer-memory support, and no particular network: TCP between
+    the machines is enough.
+  - It installs with pip from its Git repository (it isn't on PyPI).
+  - It is a working baseline you can run today, and a reference to check
+    faster paths against.
+- **Where the papers point.** gpubridge's `BridgeTransport` is where a
+  GPU-to-GPU RDMA transport would plug in. Nothing like it exists in
+  gpubridge yet, and its benefit depends on hardware these papers needed:
+  InfiniBand or BlueField NICs, and GPUDirect RDMA or DirectGMA.
+- **Not comparable yet.** gpubridge has no GPU numbers at all yet (see
+  HARDWARE_VALIDATION.md), so none of the papers' figures can be put next to
+  its own.
+
+## Positioning (README paragraph)
+
+Updated 2026-10-09 with the 2026 papers; now in the README.
 
 > gpubridge lets one distributed PyTorch job span NVIDIA and AMD GPUs at the
 > same time. Choosing between NCCL and RCCL on a single-vendor machine is
 > already solved: PyTorch's `"nccl"` backend runs NCCL on CUDA builds and RCCL
 > on ROCm builds, and Modular's MAX loads NCCL or RCCL to match the GPU it
-> was built for.
-> Neither connects the two, because an NCCL communicator and an RCCL
-> communicator cannot exchange data, and Modular states that mixed-vendor
-> hosts are not supported. Meta's torchcomms, planned as the future
-> implementation of PyTorch Distributed, lists mixed-vendor jobs as a design
-> goal, but each of its communicators still runs one vendor's library.
-> gpubridge keeps each vendor on its native library inside an island and
-> joins the islands with a CPU bridge. One `all_reduce`, `broadcast` or
-> `barrier` call then covers every GPU in the job, from the same code on
-> every node. CUDA and ROCm builds of PyTorch, from 2.9.1 to
-> 2.14.1, have been shown to join one job and complete the bridge on CPU;
-> validation on real GPUs is next.
+> was built for. Neither connects the two, because an NCCL communicator and
+> an RCCL communicator cannot exchange data, and Modular states that
+> mixed-vendor hosts are not supported. Meta's torchcomms lists mixed-vendor
+> jobs as a design goal, but each of its communicators still runs one
+> vendor's library. Research systems published in 2026 (two called HetCCL,
+> and Zettabyte's joint AMD and NVIDIA training) do join the vendors, moving
+> data GPU to GPU over RDMA, and report much higher cross-vendor bandwidth
+> than a Gloo-based bridge like gpubridge's. Their code isn't available
+> (October 2026), and they rely on RDMA-capable NICs for that speed and on
+> custom builds or plugins. gpubridge is
+> the open-source option that runs on stock PyTorch builds over any network.
+> It keeps each vendor on its native library inside an island and joins the
+> islands with a CPU bridge. One `all_reduce`, `broadcast` or `barrier` call
+> then covers every GPU in the job, from the same code on every node. CUDA
+> and ROCm builds of PyTorch, from 2.9.1 to 2.14.1, have been shown to join
+> one job and complete the bridge on CPU; validation on real GPUs is next.
