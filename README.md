@@ -242,12 +242,14 @@ policies that do.
 | `flat-gloo` | any | every rank copies to CPU and uses the world Gloo group: slow but obviously correct, so it's the test reference and a debugging fallback that never touches NCCL/RCCL |
 | `auto` (default) | any | `native-only` for one island, `reduce-bridge-broadcast` otherwise; today's behaviour |
 | `pipelined-reduce-bridge-broadcast` (opt-in, **not validated on GPUs**) | 2+ islands | reduce-bridge-broadcast with the leaders' bridge step cut into chunks: on GPUs the copy of chunk k+1 to pinned host memory, the bridge step of chunk k and the copy of chunk k-1 back overlap, ordered with CUDA events. Chunk size: `GPUBRIDGE_CHUNK_BYTES` (default `4M`) |
+| `sharded-bridge` (opt-in, **not validated on GPUs**) | 2+ islands | k ranks per island share the bridge step instead of one leader, where k is the size of the smallest island: each island reduce_scatters (or reduces) the tensor onto k ranks, rank j of every island all_reduces segment j over its own bridge link, and each island all_gathers (or broadcasts) the result. With an island of one rank, k is 1 and it is reduce-bridge-broadcast. On CPU it is slower than reduce-bridge-broadcast; GPU numbers are HARDWARE_VALIDATION.md item 21 |
 | `auto-tuned` (opt-in, **not validated on GPUs**) | any | picks one of the above by message size, from a thresholds file measured on the cluster (`GPUBRIDGE_THRESHOLDS`, written by `bench_all_reduce.py --write-thresholds`); without a file, it does what `auto` does |
 
-The opt-in policies are never chosen by `auto`. Their settings (the chunk size,
-the thresholds) decide how many messages a collective sends, so every rank
-reports them during discovery, and `init()` fails on every rank if they differ
-or if one is invalid.
+The opt-in policies are never chosen by `auto`, and the default path is the
+same as without them. Their settings (the chunk size, the thresholds) decide
+how many messages a collective sends, so every rank reports them during
+discovery, and `init()` fails on every rank if they differ or if one is
+invalid.
 
 ```python
 gpubridge.init(policy="flat-gloo")     # e.g. to rule out NCCL/RCCL while debugging
@@ -258,7 +260,8 @@ A custom policy subclasses `CollectivePolicy`, implements `applies_to`,
 `all_gather_into_tensor`, `reduce_scatter_tensor`, and MAX/MIN (by listing them
 in `reduce_ops` and taking `op=`). Optional hooks leave room for performance
 work without changing the public API:
-- `setup()` and `close()`, for staging buffers or streams;
+- `setup()` and `close()`, for staging buffers, streams or extra groups
+  (`topology.timeout` is the timeout `init()` gave its own groups);
 - `select_policy(nbytes)`, to choose a path by message size;
 - `settings()`, a classmethod returning values read from the environment that
   every rank must share; discovery compares them.
@@ -320,12 +323,16 @@ class MyTransport(BridgeTransport):
     def all_reduce(self, tensor): ...          # in-place SUM of a CPU tensor
     def broadcast(self, tensor, src): ...      # in-place copy from global rank `src`
     # Optional: reduce_ops = frozenset({"sum", "max", "min"}) and all_reduce(tensor, op=...)
+    # Optional: create_groups(groups, *, timeout=None), several links at once
+    # (the default calls create() once per group)
 
 init(bridge="my-transport")  # or init(bridge=MyTransport)
 ```
 
 Every rank reports its transport's name during discovery, so a job where ranks
-picked different transports fails at `init()` instead of hanging.
+picked different transports fails at `init()` instead of hanging. Policies
+with more than one bridge link, such as `sharded-bridge`, make the extra links
+with the same transport through `create_groups`.
 `tests/_transports.py` has a working example that carries the bridge over a
 c10d `FileStore`.
 
@@ -340,6 +347,8 @@ collective, an observer gets a `CollectiveRecord`:
   `"max"` or `"min"` for reductions);
 - `start` and `end` marks, and `phases`. Reduce-bridge-broadcast marks
   `island-reduce`, `bridge` (leaders only) and `island-broadcast`.
+  `sharded-bridge` marks `island-reduce-scatter` and `island-all-gather`
+  instead on islands of exactly k ranks, and `bridge` on every rank with a link.
 
 ```python
 import gpubridge
@@ -401,8 +410,11 @@ mixed hardware, such as monitoring or profiling tools:
   other.
 - With NaN in the data, `MAX` and `MIN` follow whatever NCCL/RCCL and Gloo do,
   which may differ (HARDWARE_VALIDATION.md item 14).
-- No performance work yet. Cross-vendor traffic goes through each island
-  leader's CPU and Gloo, with no chunking, overlap or pinned memory.
+- On the default path, cross-vendor traffic goes through one leader per
+  island, its CPU and Gloo, with no chunking, overlap or pinned memory. The
+  opt-in `pipelined-reduce-bridge-broadcast` and `sharded-bridge` policies
+  address that, but they are not validated on GPUs and may not be faster
+  there (HARDWARE_VALIDATION.md items 17 to 21).
 - No custom kernels and no direct RDMA between vendors.
 
 ## Development

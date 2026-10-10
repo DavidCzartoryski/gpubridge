@@ -149,6 +149,32 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     thresholds themselves, per cluster. *Step:* the `bench_candidates` and
     `check_auto_tuned` steps write `thresholds.json` next to the results and
     rerun the check under `auto-tuned` with it.
+20. **The sharded bridge is correct on GPUs.** `sharded-bridge` (opt-in) runs
+    NCCL/RCCL `reduce_scatter_tensor` and `all_gather_into_tensor` on islands
+    of exactly k ranks, k NCCL/RCCL reduces and broadcasts on larger ones, and
+    k Gloo bridge groups at once, one per island rank below k.
+    *Status: works on CPU, bit for bit against `flat-gloo` for every
+    supported dtype and SUM/AVG/MAX/MIN, in 2+2, 3+1, 3+2, 2+4, 3+3,
+    interleaved and three-island layouts, with sizes that need padding and
+    sizes smaller than k (`tests/test_sharded.py`).* Still open: the native
+    collectives on device tensors, and k bridge groups on separate hosts.
+    *Step:* `check.py --policy sharded-bridge` in Explorer steps 04, 05 and 07
+    and `amd/run_all.sh` (`OPT_IN_POLICIES`).
+21. **More bridge links mean more cross-vendor bandwidth.** Each link carries
+    1/k of the bytes, and each of the k ranks copies its own segment to the
+    host, so with the bridge as the bottleneck, k links should beat one.
+    *Status: not shown on CPU.* In CPU simulation (8 ranks on one 10-core
+    machine), `sharded-bridge` is 1.3x to 1.8x slower than
+    reduce-bridge-broadcast. Every rank shares one CPU and memory, so the
+    bridge phase barely changes with 4 links (10.8 ms against 10.9 ms at
+    64 MB). The island steps are Gloo there, and on CPU islands the
+    reduce_scatter is an all_reduce plus a slice, which makes them slower.
+    GPU islands use NCCL/RCCL for those steps.
+    *Step:* `bench_candidates` in step 05, where the bridge crosses the
+    network, and in step 07: compare the `policy:sharded-bridge` and
+    `policy:reduce-bridge-broadcast` columns. Step 05's
+    `bench_phases_sharded-bridge` times the bridge phase alone, next to the
+    `bench_split_by_node` phases of reduce-bridge-broadcast.
 
 ## Mixed build results
 

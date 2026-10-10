@@ -19,22 +19,25 @@ Built in:
 - ``pipelined-reduce-bridge-broadcast``: reduce-bridge-broadcast with the
   leaders' bridge step split into chunks, so copies to and from the GPU
   overlap the bridge (``GPUBRIDGE_CHUNK_BYTES``, default 4 MiB).
+- ``sharded-bridge``: k ranks per island share the bridge step, one segment
+  each, over k bridge links (k is the size of the smallest island).
 - ``auto-tuned``: picks one of the others by message size, from a thresholds
   file measured on the cluster (``GPUBRIDGE_THRESHOLDS``); without one, it
   does what ``auto`` does.
 
 ``auto`` (the default) picks ``native-only`` for one island and
-``reduce-bridge-broadcast`` otherwise.
+``reduce-bridge-broadcast`` otherwise. It never picks the pipelined, sharded or
+auto-tuned policies: they are opt-in until validated on GPUs.
 
 What each built-in policy carries:
 
 ==========================  =====================  ==========================
 collective                  reductions             policies
 ==========================  =====================  ==========================
-all_reduce                  SUM, AVG, MAX, MIN     all three
-broadcast                   (none)                 all three
-all_gather_into_tensor      (none)                 all three
-reduce_scatter_tensor       SUM, AVG               all three
+all_reduce                  SUM, AVG, MAX, MIN     all built-in
+broadcast                   (none)                 all built-in
+all_gather_into_tensor      (none)                 all built-in
+reduce_scatter_tensor       SUM, AVG               all built-in
 ==========================  =====================  ==========================
 
 AVG is always a SUM followed by a division in ``collectives.py``, so policies
@@ -112,13 +115,13 @@ def _all_gather(output: torch.Tensor, input: torch.Tensor, group, native: bool) 
 
 
 def _reduce_scatter(output: torch.Tensor, input: torch.Tensor, group, rank: int,  # noqa: A002
-                    native: bool) -> None:
-    """SUM ``input`` over ``group`` and keep slice ``rank`` (a group rank) in ``output``."""
+                    native: bool, op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
+    """Reduce ``input`` over ``group`` and keep slice ``rank`` (a group rank) in ``output``."""
     if native:
-        dist.reduce_scatter_tensor(output, input, group=group)
+        dist.reduce_scatter_tensor(output, input, op=op, group=group)
     else:  # Gloo: all_reduce a copy, then slice it; the input stays unmodified
         work = input.clone()
-        dist.all_reduce(work, group=group)
+        dist.all_reduce(work, op=op, group=group)
         size = dist.get_world_size(group)
         output.view(-1).copy_(work.view(size, -1)[rank])
 
@@ -507,6 +510,150 @@ class PipelinedReduceBridgeBroadcast(ReduceBridgeBroadcast):
         staging.end(last_back)
 
 
+class ShardedBridge(ReduceBridgeBroadcast):
+    """Split the bridge step across several links, so no single leader carries every byte.
+
+    In reduce-bridge-broadcast one rank per island moves the whole tensor
+    through host memory and over the bridge. Here k ranks per island do,
+    where k is the size of the smallest island: rank j of every island (in
+    island order) joins bridge link j, and link 0 is the leader bridge
+    ``init()`` already made. ``setup()`` creates links 1 to k-1 on every rank,
+    in the same order, through :meth:`BridgeTransport.create_groups`.
+
+    all_reduce, on the tensor padded to k equal segments:
+
+    1. Each island leaves its reduction of segment j on its rank j: one
+       reduce_scatter if the island has exactly k ranks, else k reduces.
+    2. Rank j of every island all_reduces segment j over link j. The k links
+       run at the same time, each carrying 1/k of the bytes.
+    3. Each island reassembles the tensor: one all_gather if it has exactly k
+       ranks, else k broadcasts.
+
+    This is the usual two-level all_reduce (reduce_scatter inside, all_reduce
+    across, all_gather inside) with islands in place of nodes. Padding is
+    reduced only with padding, and never copied back.
+
+    broadcast: island broadcast from ``src``, then segment j from rank j of
+    ``src``'s island over link j, then step 3 in the other islands.
+
+    With an island of one rank, k is 1 and every step is reduce-bridge-
+    broadcast's. all_gather_into_tensor and reduce_scatter_tensor are those
+    of reduce-bridge-broadcast.
+    """
+
+    name = "sharded-bridge"
+
+    def __init__(self) -> None:
+        self.k = 1
+        self.index = 0  # this rank's position in its island
+        self.link: BridgeTransport | None = None  # link ``index``, on ranks below k
+        self._created: list[BridgeTransport] = []
+
+    def setup(self, topology: Topology) -> None:
+        islands = topology.layout.islands
+        self.k = min(len(island.ranks) for island in islands)
+        self.index = topology.island.ranks.index(topology.rank)
+        groups = [sorted(island.ranks[j] for island in islands) for j in range(1, self.k)]
+        links: list[BridgeTransport | None] = []
+        if groups:
+            transport = topology.transport
+            assert transport is not None
+            links = transport.create_groups(groups, timeout=topology.timeout)
+            for ranks, link in zip(groups, links, strict=True):
+                if (link is not None) != (topology.rank in ranks):
+                    raise RuntimeError(
+                        f"{transport.__name__}.create_groups() must return a transport exactly "
+                        f"on each group's members; rank {topology.rank} got {link!r} for {ranks}")
+        self._created = [link for link in links if link is not None]
+        if self.index == 0:
+            self.link = topology.bridge
+        elif self.index < self.k:
+            self.link = links[self.index - 1]
+
+    def close(self) -> None:
+        for link in self._created:
+            link.close()
+        self._created, self.link = [], None
+
+    def all_reduce(self, tensor: torch.Tensor, topology: Topology,
+                   op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
+        flat, padded = self._padded(tensor)
+        segments = padded.view(self.k, -1)
+        island, group = topology.island, topology.island_group
+        exact = len(island.ranks) == self.k
+        mine: torch.Tensor | None = None
+        if exact:
+            with phase("island-reduce-scatter"):
+                mine = torch.empty_like(segments[0])
+                _reduce_scatter(mine, padded, group, self.index, _native(topology), op)
+        else:
+            with phase("island-reduce"):
+                for j in range(self.k):
+                    dist.reduce(segments[j], dst=island.ranks[j], op=op, group=group)
+            if self.index < self.k:
+                mine = segments[self.index]
+        if self.link is not None:
+            assert mine is not None
+            with phase("bridge"):
+                staged = _stage_to_host(mine)
+                _bridge_all_reduce(self.link, staged, op)
+                if staged is not mine:
+                    mine.copy_(staged)
+        self._reassemble(padded, mine, topology)
+        if padded is not flat:
+            flat.copy_(padded[:flat.numel()])
+
+    def broadcast(self, tensor: torch.Tensor, src: int, topology: Topology) -> None:
+        src_island = topology.layout.island_of(src)
+        in_src_island = topology.island == src_island
+        if in_src_island:
+            with phase("island-broadcast"):
+                dist.broadcast(tensor, src=src, group=topology.island_group)
+        flat, padded = self._padded(tensor)
+        segments = padded.view(self.k, -1)
+        mine: torch.Tensor | None = None
+        if self.index < self.k:
+            # all_gather needs its input apart from its output.
+            exact = len(topology.island.ranks) == self.k
+            mine = (torch.empty_like(segments[0]) if exact and not in_src_island
+                    else segments[self.index])
+        if self.link is not None:
+            assert mine is not None
+            with phase("bridge"):
+                staged = _stage_to_host(mine)
+                self.link.broadcast(staged, src=src_island.ranks[self.index])
+                if not in_src_island and staged is not mine:
+                    mine.copy_(staged)
+        if not in_src_island:
+            self._reassemble(padded, mine, topology)
+            if padded is not flat:
+                flat.copy_(padded[:flat.numel()])
+
+    def _padded(self, tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``tensor`` flattened, and k equal segments holding it: itself if it divides evenly."""
+        flat = tensor.view(-1)
+        size = -(-flat.numel() // self.k) * self.k
+        if size == flat.numel():
+            return flat, flat
+        padded = torch.zeros(size, dtype=flat.dtype, device=flat.device)
+        padded[:flat.numel()].copy_(flat)
+        return flat, padded
+
+    def _reassemble(self, padded: torch.Tensor, mine: torch.Tensor | None,
+                    topology: Topology) -> None:
+        """Step 3: every island rank ends with all k segments, segment j from island rank j."""
+        island, group = topology.island, topology.island_group
+        if len(island.ranks) == self.k:
+            assert mine is not None
+            with phase("island-all-gather"):
+                _all_gather(padded, mine, group, _native(topology))
+            return
+        segments = padded.view(self.k, -1)
+        with phase("island-broadcast"):
+            for j in range(self.k):
+                dist.broadcast(segments[j], src=island.ranks[j], group=group)
+
+
 class AutoTuned(CollectivePolicy):
     """Choose a policy by message size, from thresholds measured on this cluster.
 
@@ -638,7 +785,7 @@ DEFAULT_POLICY = AUTO
 
 _POLICIES: dict[str, type[CollectivePolicy]] = {
     cls.name: cls for cls in (ReduceBridgeBroadcast, NativeOnly, FlatGloo,
-                              PipelinedReduceBridgeBroadcast, AutoTuned)
+                              PipelinedReduceBridgeBroadcast, ShardedBridge, AutoTuned)
 }
 
 

@@ -313,6 +313,7 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     # probe, preflight, check, bench, then a check per opt-in policy and the candidates bench
     assert len(sruns) >= 6
     assert any("--policy pipelined-reduce-bridge-broadcast" in line for line in sruns[4:])
+    assert any("--policy sharded-bridge" in line for line in sruns[4:])
     assert "--write-thresholds" in sruns[-1]
     for line in sruns:
         nvidia, amd = line.split(" : ")
@@ -353,8 +354,10 @@ def test_submit_free_and_multi_submit_every_step():
         ("03_single_island.sbatch", ["device_map.py", "check.py", "bench_all_reduce.py"]),
         ("04_split_4gpu.sbatch", ["check_half", "check_alternate", "bench_all_reduce.py",
                                   "--policy pipelined-reduce-bridge-broadcast",
-                                  "--write-thresholds", "--policy auto-tuned"]),
+                                  "--policy sharded-bridge", "--write-thresholds",
+                                  "--policy auto-tuned"]),
         ("05_multinode.sbatch", ["--policy pipelined-reduce-bridge-broadcast",
+                                 "--policy sharded-bridge", "bench_phases_sharded-bridge",
                                  "--write-thresholds"]),
         ("05_multinode.sbatch", ["srun", "--rdzv-backend=c10d", "check_split_by_node"]),
         ("06_scaling.sbatch", ["--nproc-per-node=4", "train_synthetic.py", "summarize.py"]),
@@ -372,7 +375,8 @@ def test_amd_dry_run_with_several_gpus():
     out = dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="8").stdout
     for text in ["rocm-smi", "probe.py", "--nproc-per-node=9", "LOCAL_RANK=8\\ asks",
                  "NCCL_DEBUG=INFO", "--nproc-per-node=8",
-                 "GPUBRIDGE_SPLIT_TEST=half", "bench_all_reduce.py", "train_n4", "tar -czf"]:
+                 "GPUBRIDGE_SPLIT_TEST=half", "bench_all_reduce.py", "train_n4", "tar -czf",
+                 "--policy pipelined-reduce-bridge-broadcast", "--policy sharded-bridge"]:
         assert text in out, text
     assert "train_n5" not in out
 

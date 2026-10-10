@@ -560,6 +560,19 @@ job.
      only where Gloo needs the data. This pairs with idea 1.
    - The AMD lesson, that the signalling mechanism is vendor-specific, puts
      that choice in the proposed `VendorSpec`.
+4. **Share the bridge step out, as the two-shot all-reduce shares the
+   reduction.** Two-shot gives each rank one shard to reduce, then all-gathers.
+   gpubridge's bridge runs the same split one level up: each island
+   reduce-scatters onto k ranks, and rank j of every island all-reduces shard
+   j over its own bridge link.
+   *Status: implemented as the opt-in policy `sharded-bridge`, with extra
+   links from `BridgeTransport.create_groups`. Tested on CPU, bit for bit
+   against `flat-gloo` in uneven and three-island layouts. Slower than
+   reduce-bridge-broadcast in CPU simulation; not validated on GPUs
+   (HARDWARE_VALIDATION.md items 20 and 21).*
+   - Success: with the bridge crossing the network (Explorer step 05), the
+     bridge phase shrinks as k grows, and the whole all_reduce beats
+     reduce-bridge-broadcast for large tensors.
 
 ## torchcomms
 

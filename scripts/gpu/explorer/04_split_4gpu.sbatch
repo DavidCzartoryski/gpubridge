@@ -29,7 +29,7 @@ export GPUBRIDGE_SPLIT_TEST=half
 # to a native island all_reduce of the same size (item 13).
 step bench local_torchrun --nproc-per-node="$GPUS" "$KIT_DIR/bench_all_reduce.py" \
     --out "$RESULTS/bench" --max-bytes "$BENCH_MAX_BYTES" --ops native,island,gpubridge --phases
-# Opt-in policies (items 17 to 19): the same check under each, then one benchmark
+# Opt-in policies (items 17 to 21): the same check under each, then one benchmark
 # that times every candidate side by side and writes a thresholds file, then the
 # check again under auto-tuned with that file.
 for policy in $OPT_IN_POLICIES; do

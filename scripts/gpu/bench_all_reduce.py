@@ -27,7 +27,8 @@ reduce onto the leader) next to a native island all_reduce of the same size.
 --candidates a,b,c times gpubridge's all_reduce under each of those collective
 policies in the same job (rows ``policy:<name>``; policies that don't fit the
 cluster are skipped). --write-thresholds PATH also times the candidates
-(default: flat-gloo, reduce-bridge-broadcast and the pipelined policy), picks
+(default: flat-gloo, reduce-bridge-broadcast and the pipelined and sharded
+policies), picks
 the fastest per size and writes a thresholds file for the ``auto-tuned``
 policy: point GPUBRIDGE_THRESHOLDS at it on every rank. Measure on the cluster
 and layout you will train on; thresholds don't carry over.
@@ -63,7 +64,8 @@ from gpubridge.policies import (
     resolve_policy,
 )
 
-DEFAULT_CANDIDATES = "flat-gloo,reduce-bridge-broadcast,pipelined-reduce-bridge-broadcast"
+DEFAULT_CANDIDATES = ("flat-gloo,reduce-bridge-broadcast,pipelined-reduce-bridge-broadcast,"
+                      "sharded-bridge")
 
 UNITS = {"K": 2**10, "M": 2**20, "G": 2**30}
 DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}

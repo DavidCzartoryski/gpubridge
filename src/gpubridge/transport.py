@@ -49,6 +49,23 @@ class BridgeTransport(abc.ABC):
             A transport on members of ``ranks``, None everywhere else.
         """
 
+    @classmethod
+    def create_groups(
+        cls, groups: Sequence[Sequence[int]], *, timeout: timedelta | None = None
+    ) -> list[BridgeTransport | None]:
+        """Set up one bridge per entry of ``groups``, for policies that use several links.
+
+        Collective over the whole world, like :meth:`create`: every rank calls
+        it with the same ``groups`` in the same order. The default calls
+        :meth:`create` once per group, in order, so every transport supports
+        it; one that can set up several links more cheaply at once may
+        override it. The leader bridge ``init()`` creates is unaffected.
+
+        Returns:
+            One entry per group: a transport on that group's members, None elsewhere.
+        """
+        return [cls.create(ranks, timeout=timeout) for ranks in groups]
+
     @abc.abstractmethod
     def all_reduce(self, tensor: torch.Tensor) -> None:
         """Sum a contiguous CPU tensor across all bridge members, in place.

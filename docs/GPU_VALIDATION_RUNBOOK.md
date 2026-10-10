@@ -46,8 +46,9 @@ AMD GPUs; see [Mixed-vendor job inside Explorer](#mixed-vendor-job-inside-explor
 Every step that runs `check.py` also covers items 14 to 16 (reductions,
 all_gather, reduce_scatter, async, and where NCCL/RCCL and Gloo agree).
 Steps 04, 05, 07 and the AMD script also check every opt-in policy in
-`OPT_IN_POLICIES` and write `thresholds.json` (items 17 to 19). Opt-in policies
-are not validated on GPUs until those steps pass.
+`OPT_IN_POLICIES` (the pipelined and sharded policies) and write
+`thresholds.json` (items 17 to 21); step 05 also times each one's phases.
+Opt-in policies are not validated on GPUs until those steps pass.
 Times exclude queue waits. For cost, multiply by the provider's current hourly
 rate; for example, at a hypothetical $3/h, step 7 costs about $1.50.
 
