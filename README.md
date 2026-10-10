@@ -189,14 +189,21 @@ The API follows `torch.distributed`, always on the world group.
 | Function | Description |
 | --- | --- |
 | `init(init_method=None, *, rank=None, world_size=None, timeout=None, bridge="gloo", policy="auto") -> Topology` | Join the cluster and build the islands and bridge. Same arguments as `init_process_group`, plus the bridge transport (a registered name or a `BridgeTransport` subclass) and the [collective policy](#collective-policies) (`"auto"`, a registered name, or a `CollectivePolicy` subclass). Both must be the same on every rank. |
-| `all_reduce(tensor, op=ReduceOp.SUM)` | In-place sum across all ranks. Only SUM is supported in v1. |
-| `broadcast(tensor, src)` | In-place copy from global rank `src` to all ranks. |
-| `barrier()` | Wait for all ranks. On GPUs, first waits for this rank's queued GPU work. |
+| `all_reduce(tensor, op=ReduceOp.SUM, *, async_op=False)` | In-place reduction across all ranks: `SUM`, `AVG`, `MAX` or `MIN`. `AVG` is a SUM divided by the world size, identically on every rank, so it needs a floating-point dtype. |
+| `broadcast(tensor, src, *, async_op=False)` | In-place copy from global rank `src` to all ranks. |
+| `all_gather_into_tensor(output, input, *, async_op=False)` | Every rank's `input`, back to back in global rank order, in `output` (`world_size` times as many elements). |
+| `reduce_scatter_tensor(output, input, op=ReduceOp.SUM, *, async_op=False)` | Rank `r` gets slice `r` of the reduced `input` (`SUM` or `AVG`). |
+| `barrier(*, async_op=False)` | Wait for all ranks. On GPUs, first waits for this rank's queued GPU work. |
 | `destroy()` | Tear down every group `init` created. |
 | `get_topology() -> Topology` | This rank's view of the cluster (see below). |
 | `is_initialized() -> bool` | True between `init` and `destroy`. |
 | `probe() -> Probe` | This process's build vendor, CUDA/HIP versions, visible GPU count, and NCCL/Gloo availability. Never raises; failed checks are listed in `Probe.errors`. Works before `init`. |
 | `add_observer(observer)` / `remove_observer(observer)` | Start or stop sending this rank's collective records to a `CollectiveObserver` (see [Observing collectives](#observing-collectives)). |
+
+Every collective takes `async_op`. With `async_op=True` it returns a `Work`
+(`wait()`, `is_completed()`, `exception()`, `get_future()`); see
+[Async collectives](#async-collectives). `PRODUCT` is not supported yet:
+NCCL/RCCL and Gloo still have to be shown to agree on it in every dtype.
 
 Tensors must be contiguous and on `topology.device`: the rank's GPU, or CPU in
 simulation mode. Their dtype must be one that both the island backend and Gloo
@@ -221,6 +228,13 @@ data, and in which order. It never changes what the collective computes.
 Every rank must use the same policy; `init()` fails on every rank otherwise,
 or if the policy doesn't fit the cluster.
 
+Every built-in policy carries every collective and reduction above. MAX and
+MIN over the bridge also need the bridge transport to list them in
+`reduce_ops`, as the default Gloo transport does. A custom policy offers
+`all_gather_into_tensor` and `reduce_scatter_tensor` only if it overrides them;
+otherwise those calls fail on every rank before any communication, naming the
+policies that do.
+
 | Policy | Applies to | What it does |
 | --- | --- | --- |
 | `reduce-bridge-broadcast` | 2+ islands | island reduce onto each leader, island leaders over the bridge, island broadcast |
@@ -233,13 +247,46 @@ gpubridge.init(policy="flat-gloo")     # e.g. to rule out NCCL/RCCL while debugg
 ```
 
 A custom policy subclasses `CollectivePolicy`, implements `applies_to`,
-`all_reduce` and `broadcast`, and registers with `register_policy`. Optional
-hooks leave room for performance work without changing the public API:
+`all_reduce` and `broadcast`, and registers with `register_policy`. It may add
+`all_gather_into_tensor`, `reduce_scatter_tensor`, and MAX/MIN (by listing them
+in `reduce_ops` and taking `op=`). Optional hooks leave room for performance
+work without changing the public API:
 - `setup()` and `close()`, for staging buffers or streams;
 - `select_policy(nbytes)`, to choose a path by message size.
 
 The GPU kit's `check.py` and `bench_all_reduce.py` take `--policy`, so runs can
 compare policies.
+
+### Async collectives
+
+`async_op=True` validates the call at once, on the calling thread (so a bad
+call still fails on every rank before any communication), then queues it on
+this rank's gpubridge worker thread and returns a `Work`. The worker runs
+queued collectives one at a time, in order. A synchronous collective first
+waits for every queued one, so collectives always run in program order: the
+same order on every rank.
+
+```python
+work = gpubridge.all_reduce(grad, op=gpubridge.ReduceOp.AVG, async_op=True)
+...                                  # queue more GPU work; don't touch grad
+work.wait()                          # grad is ready for kernels queued after this
+```
+
+Stream semantics on GPUs follow `torch.distributed` with NCCL:
+
+- The collective starts after the work already queued on the caller's
+  current stream (an event recorded at the call). Its tensors are marked with
+  `record_stream`, so the caching allocator won't reuse them early.
+- `wait()` blocks the host until the worker has run the collective, then makes
+  the caller's current stream wait on an event recorded after it.
+  `get_future()` returns a future created with the rank's device, so
+  `future.wait()` synchronizes the same way.
+- Between the call and `wait()`, don't read or write the tensors.
+
+If an async collective fails, `wait()` raises with the original error as its
+cause, and every later collective on that rank refuses to start, because the
+process groups may be inconsistent. `destroy()` runs whatever is still queued
+before tearing down.
 
 ### Bridge transports
 
@@ -262,6 +309,7 @@ class MyTransport(BridgeTransport):
 
     def all_reduce(self, tensor): ...          # in-place SUM of a CPU tensor
     def broadcast(self, tensor, src): ...      # in-place copy from global rank `src`
+    # Optional: reduce_ops = frozenset({"sum", "max", "min"}) and all_reduce(tensor, op=...)
 
 init(bridge="my-transport")  # or init(bridge=MyTransport)
 ```
@@ -274,11 +322,12 @@ c10d `FileStore`.
 ### Observing collectives
 
 Monitoring or profiling tools can watch every collective on a rank. After each
-`all_reduce`, `broadcast` and `barrier`, an observer gets a `CollectiveRecord`:
+collective, an observer gets a `CollectiveRecord`:
 
 - `seq`: the collective's number since `init()`, the same on every rank, so
   records from different ranks line up;
-- `op`, `nbytes`, `dtype`, `src` and `policy`;
+- `op`, `nbytes`, `dtype`, `src`, `policy` and `reduce_op` (`"sum"`, `"avg"`,
+  `"max"` or `"min"` for reductions);
 - `start` and `end` marks, and `phases`. Reduce-bridge-broadcast marks
   `island-reduce`, `bridge` (leaders only) and `island-broadcast`.
 
@@ -312,6 +361,8 @@ The rules keep observers from changing what any rank communicates:
   or not, so ranks can attach observers at different times.
 - **A failing observer is detached on its own rank**, with a `RuntimeWarning`
   and a call to its `on_detach` hook. Collectives carry on on every rank.
+- **Async collectives are observed when they run**, on the worker thread, in
+  submission order.
 - **Timing never syncs the GPU.** On GPUs a mark is a CUDA event recorded on
   the current stream, so check `record.ready()` before reading times. On CPU a
   mark is a `perf_counter_ns` reading. With no observers attached, gpubridge
@@ -333,8 +384,13 @@ mixed hardware, such as monitoring or profiling tools:
 
 ## Limitations in v1
 
-- `all_reduce` supports only `SUM`. All calls are synchronous (no `async_op`)
-  and run on the world group (no custom groups).
+- Reductions are `SUM`, `AVG`, `MAX` and `MIN` (no `PRODUCT` yet), and
+  `reduce_scatter_tensor` takes `SUM` and `AVG` only. Collectives run on the
+  world group (no custom groups). `async_op` runs collectives on one worker
+  thread per rank, one at a time, so two async collectives never overlap each
+  other.
+- With NaN in the data, `MAX` and `MIN` follow whatever NCCL/RCCL and Gloo do,
+  which may differ (HARDWARE_VALIDATION.md item 14).
 - No performance work yet. Cross-vendor traffic goes through each island
   leader's CPU and Gloo, with no chunking, overlap or pinned memory.
 - No custom kernels and no direct RDMA between vendors.

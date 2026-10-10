@@ -414,7 +414,11 @@ def test_check_in_a_split_test_is_flagged_everywhere(tmp_path):
         assert record["run"]["real_mixed_vendor"] is False
         assert "NOT a mixed-vendor result" in record["run"]["warning"]
         assert [s["name"] for s in record["stages"]] == [
-            "init", "device", "dtypes", "busy_gpu", "broadcast", "barrier", "destroy"]
+            "init", "device", "dtypes", "busy_gpu", "broadcast", "reductions", "all_gather",
+            "reduce_scatter", "async", "reduction_agreement", "barrier", "destroy"]
+        agreement = next(s for s in record["stages"] if s["name"] == "reduction_agreement")
+        assert agreement["all_product_agree"] is True  # Gloo against Gloo on CPU
+        assert agreement["backend"] == "gloo"
     assert summarize.main([str(out)]) == 0
     assert "SPLIT TEST - not a mixed-vendor result" in (out / "summary.md").read_text()
     assert json.loads((out / "summary.json").read_text())["split_test"] == "half"
