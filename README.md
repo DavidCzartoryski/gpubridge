@@ -6,22 +6,35 @@ solved: PyTorch's `"nccl"` backend runs NCCL on CUDA builds and RCCL on ROCm
 builds, and Modular's MAX loads NCCL or RCCL to match the GPU it was built for.
 Neither connects the two, because an NCCL communicator and an RCCL
 communicator cannot exchange data, and Modular states that mixed-vendor hosts
-are not supported. gpubridge keeps each vendor on its native library inside an
-island and joins the islands with a CPU bridge. One `all_reduce`, `broadcast`
-or `barrier` call then covers every GPU in the job, from the same code on every
-node. CUDA and ROCm builds of PyTorch, from 2.9.1 to 2.14.1, have been shown to
-join one job and complete the bridge on CPU; validation on real GPUs is next.
+are not supported. Meta's torchcomms lists mixed-vendor jobs as a design goal,
+but each of its communicators still runs one vendor's library. Research
+systems published in 2026 (two called HetCCL, and Zettabyte's joint AMD and
+NVIDIA training) do join the vendors, moving data GPU to GPU over RDMA, and
+report much higher cross-vendor bandwidth than a Gloo-based bridge like
+gpubridge's. Their code isn't available (October 2026), and they rely on
+RDMA-capable NICs for that speed and on custom builds or plugins. gpubridge is
+the open-source option that runs on stock PyTorch builds over any network. It
+keeps each vendor on its native library inside an island and joins the islands
+with a CPU bridge. One `all_reduce`, `broadcast`, `all_gather_into_tensor`,
+`reduce_scatter_tensor` or `barrier` call then covers every GPU in the job,
+from the same code on every node, and DistributedDataParallel can sync
+gradients through it with a comm hook. CUDA and ROCm builds of PyTorch, from
+2.9.1 to 2.14.1, have been shown to join one job and complete the bridge on
+CPU; validation on real GPUs is next.
 
 gpubridge writes no CUDA or HIP code. It composes collectives that PyTorch
 already provides. For how it relates to Modular MAX, RAJA, Triton,
-Triton-distributed and Meta's torchcomms, see
+Triton-distributed, Meta's torchcomms and the 2026 papers, see
 [docs/PRIOR_ART.md](docs/PRIOR_ART.md).
 
-> **Status: v0.1, correctness first.** All orchestration logic is tested in CPU
-> simulation mode, and the CPU side of a mixed job has been checked with real
-> CUDA and ROCm builds. It has not yet run on a real mixed cluster; see
+> **Status: v0.2 alpha, correctness first.** All orchestration logic is tested
+> in CPU simulation mode, and the CPU side of a mixed job has been checked with
+> real CUDA and ROCm builds. It has not yet run on a real mixed cluster; see
 > [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the results and what
-> still needs checking.
+> still needs checking. The default path is reduce-bridge-broadcast. The
+> opt-in policies (pipelined, sharded, auto-tuned) and the DDP comm hook are
+> tested on CPU only and are **not validated on GPUs**.
+> [docs/ROADMAP.md](docs/ROADMAP.md) holds designs that wait on GPU results.
 
 ## How it works
 
@@ -59,6 +72,8 @@ from each leader to the rest of its island.
 If the cluster has only one vendor there is no bridge, and every call goes
 straight to the native collective.
 These paths are the default [collective policies](#collective-policies).
+Opt-in policies change how data travels (in chunks, or over several bridge
+links at once), never what a collective computes, and `auto` never picks them.
 
 ### Initialization
 
@@ -86,13 +101,21 @@ These paths are the default [collective policies](#collective-policies).
 
 ## Install
 
+gpubridge isn't on PyPI. Install it with pip from the repository:
+
+```bash
+pip install git+https://github.com/DavidCzartoryski/gpubridge
+```
+
+or, for development:
+
 ```bash
 uv venv
 uv pip install -e ".[test]"
 ```
 
 On GPU nodes, install the CUDA or ROCm build of PyTorch first. gpubridge only
-needs `torch>=2.3`, so it leaves an existing install alone.
+needs `torch>=2.3` (and numpy), so it leaves an existing install alone.
 
 ## Usage
 
@@ -432,7 +455,7 @@ mixed hardware, such as monitoring or profiling tools:
   can create its own Gloo group after `init()` (on every rank, in the same
   order) to carry monitoring data without disturbing training traffic.
 
-## Limitations in v1
+## Limitations
 
 - Reductions are `SUM`, `AVG`, `MAX` and `MIN` (no `PRODUCT` yet), and
   `reduce_scatter_tensor` takes `SUM` and `AVG` only. Collectives run on the
@@ -441,15 +464,24 @@ mixed hardware, such as monitoring or profiling tools:
   other.
 - With NaN in the data, `MAX` and `MIN` follow whatever NCCL/RCCL and Gloo do,
   which may differ (HARDWARE_VALIDATION.md item 14).
+- **Cross-vendor bandwidth is limited by design.** The bridge copies data to
+  host memory and sends it with Gloo over TCP. The RDMA-based systems
+  published in 2026 report much higher cross-vendor bandwidth (see
+  [docs/PRIOR_ART.md](docs/PRIOR_ART.md#three-2026-papers-mixed-vendor-collectives-over-rdma)).
+  gpubridge trades that for running on stock PyTorch builds over any network.
 - On the default path, cross-vendor traffic goes through one leader per
   island, its CPU and Gloo, with no chunking, overlap or pinned memory. The
   opt-in `pipelined-reduce-bridge-broadcast` and `sharded-bridge` policies
   address that, but they are not validated on GPUs and may not be faster
-  there (HARDWARE_VALIDATION.md items 17 to 21).
-- No custom kernels and no direct RDMA between vendors.
+  there (HARDWARE_VALIDATION.md items 17 to 21). Neither changes the limit
+  above: both still go through host memory and Gloo.
+- No custom kernels and no direct RDMA between vendors. A GPU-to-GPU transport
+  would plug in through `BridgeTransport`.
 - Designed but not implemented, each waiting on GPU results: bridge-only
   compression, an RDMA bridge transport, and a `torch.distributed` backend for
   FSDP2 and DeviceMesh. See [docs/ROADMAP.md](docs/ROADMAP.md).
+- No GPU numbers yet: everything above is tested on CPU (see
+  [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)).
 
 ## Development
 
