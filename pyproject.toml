@@ -12,8 +12,10 @@ license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
     # On GPU nodes, install the CUDA or ROCm build of torch first; pip and uv
-    # leave an existing install alone as long as it meets this floor.
-    "torch>=2.3",
+    # leave an existing install alone as long as it meets this floor. Before
+    # 2.8, tearing down a Gloo group could deadlock (see gpubridge.destroy();
+    # fixed upstream by https://github.com/pytorch/pytorch/pull/154976).
+    "torch>=2.8",
     # torch.distributed.all_gather_object, used for discovery, needs numpy,
     # which torch does not install.
     "numpy",

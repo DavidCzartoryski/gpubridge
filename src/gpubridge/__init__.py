@@ -195,4 +195,9 @@ def destroy() -> None:
         if topology.bridge is not None:
             topology.bridge.close()
     finally:
+        # Why torch 2.8 is the floor: before it, this could deadlock. A Gloo
+        # worker dropping the last reference to a Python tensor waits for the
+        # GIL while holding the group's work lock, and the group's destructor
+        # ran with the GIL held, waiting for that lock. torch 2.8 releases the
+        # GIL first (https://github.com/pytorch/pytorch/pull/154976).
         dist.destroy_process_group()

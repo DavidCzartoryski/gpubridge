@@ -115,7 +115,11 @@ uv pip install -e ".[test]"
 ```
 
 On GPU nodes, install the CUDA or ROCm build of PyTorch first. gpubridge only
-needs `torch>=2.3` (and numpy), so it leaves an existing install alone.
+needs `torch>=2.8` (and numpy), so it leaves an existing 2.8 or newer install
+alone. With an older one, pip would replace it with a default build, so
+upgrade it first. Older releases can deadlock while tearing down Gloo groups,
+which [pytorch/pytorch#154976](https://github.com/pytorch/pytorch/pull/154976)
+fixed in 2.8. CI tests 2.8.0 on Python 3.10 and the newest release on 3.12.
 
 ## Usage
 

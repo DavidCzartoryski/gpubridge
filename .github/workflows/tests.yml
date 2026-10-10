@@ -7,10 +7,17 @@ on:
 
 jobs:
   pytest:
+    # main's ruleset requires the checks "pytest (3.10)" and "pytest (3.12)".
+    name: pytest (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        # The oldest supported torch on the oldest Python, and the newest on 3.12.
+        include:
+          - {python-version: "3.10", torch: "torch==2.8.0"}
+          - {python-version: "3.12", torch: "torch"}
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.2.0  # setup-uv publishes no moving major tags since v8
@@ -18,7 +25,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
           activate-environment: true
       # CPU wheels keep the job small; the tests run in simulation mode.
-      - run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: uv pip install "${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
+      - run: python -c "import torch; print(torch.__version__)"
       - run: uv pip install -e ".[test]"
       # shellcheck ships with ubuntu-latest; the kit's tests also run it when present.
       - run: shellcheck scripts/*.sh scripts/gpu/*.sh scripts/gpu/*/*.sh scripts/gpu/explorer/*.sbatch
