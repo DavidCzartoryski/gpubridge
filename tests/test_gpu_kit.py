@@ -276,7 +276,7 @@ def test_step_00_dry_run_prints_the_sinfo_commands():
         assert f"+ sinfo -p {partition} -o %20N\\ %10c" in out, out
 
 
-@pytest.mark.parametrize("step", ["setup-rocm", "07"])
+@pytest.mark.parametrize("step", ["setup-rocm", "amd", "07"])
 def test_explorer_mixed_path_is_dry_run_only_until_amd_gpus_are_confirmed(step, tmp_path):
     path = fake_command(tmp_path / "bin", "sbatch", "echo SUBMITTED\n")
     result = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), step],
@@ -286,6 +286,14 @@ def test_explorer_mixed_path_is_dry_run_only_until_amd_gpus_are_confirmed(step, 
     assert result.returncode == 1
     assert "dry-run only until step 00" in result.stderr
     assert "SUBMITTED" not in result.stdout
+
+
+def test_submit_amd_is_one_job_on_an_amd_node():
+    out = dry_run(KIT / "explorer" / "submit.sh", "amd", GPU_TYPE_AMD="mi100").stdout
+    sbatch = [line for line in out.splitlines() if line.startswith("+ sbatch ")]
+    assert len(sbatch) == 1, out
+    assert "--partition=sharing " in sbatch[0] and "--gres=gpu:mi100:1 " in sbatch[0]
+    assert "--time=00:30:00" in sbatch[0] and sbatch[0].rstrip().endswith("amd_node.sbatch")
 
 
 def test_submit_07_is_one_heterogeneous_job_on_gpu_and_sharing():

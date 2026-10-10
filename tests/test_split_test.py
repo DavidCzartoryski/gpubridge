@@ -11,6 +11,7 @@ from _harness import TIMEOUT, expected_sum, rank_tensor, run_failing_init, run_r
 
 import gpubridge
 from gpubridge.config import (
+    CPU_ONLY_ENV,
     SIM_HOSTNAME_ENV,
     SPLIT_TEST_ENV,
     VENDOR_ENV,
@@ -144,6 +145,30 @@ def test_node_mode_on_one_machine_with_simulated_hostnames(tmp_path, monkeypatch
     labels = ["nvidia", "nvidia", "amd", "amd"]
     run_ranks(["nvidia"] * 4, partial(_check_split_run, labels=labels, mode="node"), tmp_path,
               before_init=_two_machines)
+
+
+def test_split_on_cuda_builds_needs_no_vendor_variable(tmp_path, monkeypatch):
+    # As on an NVIDIA node: the vendor comes from the CUDA build, not GPUBRIDGE_VENDOR.
+    monkeypatch.setenv(SPLIT_TEST_ENV, "half")
+    labels = ["nvidia", "nvidia", "amd", "amd"]
+    run_ranks(["nvidia"] * 4, partial(_check_split_run, labels=labels), tmp_path,
+              fake_builds=True)
+
+
+@pytest.mark.parametrize(("gpus", "devices"), [(4, [0, 1, 2, 3]), (2, [0, 1, 0, 1])])
+def test_split_on_one_node_maps_ranks_to_gpus(gpus, devices, monkeypatch):
+    # One multi-GPU NVIDIA node: each rank its own GPU; with fewer GPUs than
+    # ranks, split-test mode wraps around so ranks share them. Both islands use NCCL.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: gpus)
+    monkeypatch.delenv(VENDOR_ENV, raising=False)
+    monkeypatch.delenv(CPU_ONLY_ENV, raising=False)
+    monkeypatch.setenv(SPLIT_TEST_ENV, "half")
+    for local_rank, index in enumerate(devices):
+        monkeypatch.setenv("LOCAL_RANK", str(local_rank))
+        config = resolve_config()
+        assert config.device == torch.device("cuda", index)
+        assert config.island_backend == "nccl" and not config.simulated
 
 
 def test_simulated_hostname_is_ignored_on_gpus(monkeypatch):
