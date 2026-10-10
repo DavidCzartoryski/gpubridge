@@ -101,6 +101,31 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     `bench_all_reduce.py --ops native,island,gpubridge --phases` puts the
     `island-reduce` phase next to a native island all_reduce (`island:<vendor>`)
     of the same size (Explorer steps 04, 05 and 07, `amd/run_all.sh`).
+14. **Where NCCL/RCCL and Gloo agree on reductions.** gpubridge mixes the island
+    backend and Gloo in one reduction, so a result is only well defined where
+    both agree. PRODUCT is left out until they are shown to agree in every
+    supported dtype, including 8-bit overflow. MAX and MIN with NaN in the data
+    follow whatever the backends do.
+    *Status: not verifiable on CPU, where islands are Gloo too.* *Step:*
+    `check.py` stage `reduction_agreement` (informational) compares a raw
+    island-backend all_reduce with a Gloo one: PRODUCT in every dtype, MAX/MIN
+    with a NaN on one rank. Read `product_agree` and `nan_max_min` in the rank
+    records.
+15. **MAX, MIN, AVG, `all_gather_into_tensor` and `reduce_scatter_tensor` on
+    NCCL/RCCL islands.** Native-only uses NCCL's own all_gather_into_tensor
+    and reduce_scatter_tensor; reduce-bridge-broadcast uses island gather and
+    scatter, which torch builds from NCCL send/recv.
+    *Status: works on CPU, bit for bit against `flat-gloo` in every layout and
+    policy (`tests/test_ops.py`).* Still open: the same on GPUs. *Step:*
+    `check.py` stages `reductions`, `all_gather` and `reduce_scatter`.
+16. **Async collectives keep their stream semantics.** The worker's stream
+    waits on an event recorded on the caller's stream; `wait()` makes the
+    caller's stream wait on an event recorded after the collective.
+    *Status: ordering, results and failure handling work on CPU
+    (`tests/test_ops.py`), where there are no streams.* Still open: the
+    events and `record_stream` on real GPUs. *Step:* `check.py` stage `async`
+    queues the all_reduce right behind GPU work and checks the result on the
+    caller's stream after `wait()`, with no host sync in between.
 
 ## Mixed build results
 

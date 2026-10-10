@@ -115,8 +115,9 @@ Serving sets it from the `MAX_SERVE_USE_VENDOR_CCL` env var, which defaults to `
 ### Overlap with gpubridge
 
 - Both pick NCCL or RCCL for the user, so one call works on either vendor.
-- Both start with a deliberately narrow v1: SUM only, a few dtypes, and
-  all_reduce, broadcast and allgather-style ops.
+- Both started with a deliberately narrow v1: SUM only, a few dtypes, and
+  all_reduce, broadcast and allgather-style ops. gpubridge has since added
+  AVG, MAX and MIN, `all_gather_into_tensor` and `reduce_scatter_tensor`.
 - Both keep a vendor-library path and a second path behind one API: Modular's
   own kernels; gpubridge's simulation and CPU-only modes.
 
@@ -655,8 +656,9 @@ windows.
   wheels are nightly-only.
 - **Scope.** torchcomms is a whole communications stack: new collective
   semantics, one-sided windows, fault tolerance, scaling to 100,000+ GPUs.
-  gpubridge offers three cluster-wide collectives and the cross-vendor
-  composition.
+  gpubridge offers five cluster-wide collectives (all_reduce, broadcast,
+  all_gather_into_tensor, reduce_scatter_tensor, barrier), each with
+  `async_op`, and the cross-vendor composition.
 - **Who could host whom.** *(reading)*
   - gpubridge's islands could run on torchcomms `nccl` and `rccl`
     communicators.
