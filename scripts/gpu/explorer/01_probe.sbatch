@@ -15,8 +15,11 @@ source "$KIT_DIR/explorer/job_env.sh"
 job_setup 01_probe
 step probe python "$KIT_DIR/probe.py" --out "$RESULTS"
 # Item 12: two processes on one GPU, without split-test mode. Rank 1's
-# LOCAL_RANK has no GPU, so init() must fail on BOTH ranks, naming it.
-step local_rank_check local_torchrun --nproc-per-node=2 "$KIT_DIR/check.py" \
-    --out "$RESULTS/local_rank_check" --expect-init-error "LOCAL_RANK=1 asks for GPU 1"
-step summarize python "$KIT_DIR/summarize.py" "$RESULTS/local_rank_check"
+# LOCAL_RANK has no GPU, so init() must fail on BOTH ranks, naming it. Real GPUs
+# only: simulation has no devices to check.
+if [ -z "${GPUBRIDGE_VENDOR:-}${GPUBRIDGE_CPU_ONLY:-}" ]; then
+    step local_rank_check local_torchrun --nproc-per-node=2 "$KIT_DIR/check.py" \
+        --out "$RESULTS/local_rank_check" --expect-init-error "LOCAL_RANK=1 asks for GPU 1"
+    step summarize python "$KIT_DIR/summarize.py" "$RESULTS/local_rank_check"
+fi
 finish

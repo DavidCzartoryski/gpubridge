@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -54,9 +56,12 @@ def main() -> None:
     parser.add_argument("--classes", type=int, default=16)
     parser.add_argument("--lr", type=float, default=0.2)
     parser.add_argument("--json", type=Path, help="rank 0 writes a result record here")
+    parser.add_argument("--timeout", type=float,
+                        default=float(os.environ.get("KIT_TIMEOUT") or 600),
+                        help="process-group timeout (s); default KIT_TIMEOUT, else 600")
     args = parser.parse_args()
 
-    topology = gpubridge.init()
+    topology = gpubridge.init(timeout=timedelta(seconds=args.timeout))
     device, rank, world = topology.device, topology.rank, topology.world_size
 
     # Same seed everywhere; DDP also broadcasts rank 0's parameters when it wraps

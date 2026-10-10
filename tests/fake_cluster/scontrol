@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fake scontrol: "show hostnames LIST" prints a comma-separated LIST one name per
+# line (no bracket ranges); "show job ID" prints a placeholder.
+case "${1:-} ${2:-}" in
+"show hostnames") tr ',' '\n' <<<"${3:-}" ;;
+"show job") echo "JobId=${3:-} (fake scontrol)" ;;
+*) echo "fake scontrol: unsupported: $*" >&2 && exit 1 ;;
+esac

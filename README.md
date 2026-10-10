@@ -157,6 +157,10 @@ Everything else is the code path used on real GPUs: discovery, leader
 election, group creation, and reduce-bridge-broadcast. Set the variable on
 every rank or on none; `init()` refuses a mix of CPU and GPU ranks.
 
+`GPUBRIDGE_SIM_HOSTNAME` sets the machine name a simulated rank reports, so
+processes on one machine can stand in for several nodes (for `node` split-test
+mode, and for the multi-node job scripts' CPU tests). It is ignored on GPUs.
+
 Run the four-rank demo (2 NVIDIA + 2 AMD):
 
 ```bash

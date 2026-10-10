@@ -7,6 +7,30 @@ command, and every step writes its records to `results/<target>/`. Every shell
 script accepts `--dry-run`, which prints the commands without running them.
 Try that first on any new machine.
 
+**Before an allocation.** `pytest tests/test_gpu_jobs.py` runs every job script
+end to end on CPU, against a fake Slurm (`tests/fake_cluster`: sbatch, srun,
+scontrol, module, uv) and gpubridge's simulation mode: `submit.sh` through each
+Explorer job, the two-node and heterogeneous jobs on pretend nodes, and
+`mixed/node.sh` as two machines. Only the steps that need a GPU (`probe`,
+`device_map`) fail there. CI runs it on every push, so a script bug shows up
+before it can cost GPU time.
+
+**Limits on every job.**
+- `KIT_TIMEOUT` (default 300 s, set in `common.sh`): the process-group timeout
+  every tool passes to `gpubridge.init`. It bounds the rendezvous and each
+  collective, Gloo on the bridge and NCCL/RCCL in the islands, where
+  `TORCH_NCCL_ASYNC_ERROR_HANDLING=3` ends the process once a collective
+  exceeds it. A tool's `--timeout` overrides it.
+- `STEP_TIMEOUT` (default 1200 s): a wall-clock limit on each `torchrun` or
+  `srun` launch, through coreutils `timeout`, so one hung step can't use up
+  the job. `steps.jsonl` marks such a step `"timed_out": true`.
+- Slurm's `--time` on every Explorer job (`TIME_01` ... `TIME_07` in `submit.sh`).
+
+**NCCL/RCCL logs.** Every step runs with `NCCL_DEBUG=INFO`, written to
+`results/<target>/nccl/<step>/<host>.<pid>.log` instead of the
+console. When a step fails, the last 40 lines of each of its logs are appended
+to `<step>.log`, so the first thing to read already has them.
+
 ## Split-test mode, in one paragraph
 
 `GPUBRIDGE_SPLIT_TEST=half|alternate|node` labels some ranks of an all-NVIDIA
@@ -255,8 +279,8 @@ The script runs:
 3. probe
 4. device mapping under `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES`, then
    one more process than GPUs, which must fail `init()` on every rank (item 12)
-5. a 1-GPU check with `NCCL_DEBUG=INFO`, then greps the log for RCCL's version
-   (item 4)
+5. a 1-GPU check, then greps its NCCL log (`nccl/check_1gpu/`) for RCCL's
+   version (item 4)
 
 With 2+ GPUs it continues with:
 
@@ -372,8 +396,11 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
   - `rank<N>.stacks.txt`: a stack dump if the rank hung in a stage.
 - `summary.md` / `summary.json`: the per-stage table, missing ranks, and GPUs
   shared outside a split test.
-- `steps.jsonl` and `<step>.log`: exit code and full output of every scripted
-  step.
+- `steps.jsonl` and `<step>.log`: exit code (and `timed_out`) and full output
+  of every scripted step. A failed step's log ends with the last lines of its
+  NCCL/RCCL logs.
+- `nccl/<step>/<host>.<pid>.log`: NCCL/RCCL's `NCCL_DEBUG=INFO` output, one file
+  per rank.
 - `bench/bench.csv`: latency and bandwidth per size, for native and gpubridge.
 
 `run.kind` values:
@@ -399,16 +426,17 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 | 01: `build_supports_gpus` fails | wheel without kernels for this GPU | set `CUDA_INDEX` (cu126 for V100; cu128/cu130 for newer GPUs), rerun setup |
 | 01: no GPU visible | job didn't get a GPU, or driver problem | check `nvidia-smi.txt` and `slurm-job.txt` in the results |
 | 01/AMD: `local_rank_check` fails | init() succeeded with more processes than GPUs, or failed for another reason | read `expected_init_error` in `local_rank_check/rank*.json`; if init succeeded, the visible-device count isn't what PyTorch reports (item 12) |
-| `init` stuck (summary says "stuck in this stage") | new_group / NCCL init problem (item 3) | read `rank*.stacks.txt`; rerun with `NCCL_DEBUG=INFO`; this is a real finding, file it |
+| `init` stuck (summary says "stuck in this stage") | new_group / NCCL init problem (item 3) | read `rank*.stacks.txt` and the NCCL/RCCL log lines at the end of `<step>.log` (all of them in `nccl/<step>/`); this is a real finding, file it |
+| `steps.jsonl` says `"timed_out": true` | the launch ran past `STEP_TIMEOUT` | read `<step>.log` and `rank*.stacks.txt`; raise `STEP_TIMEOUT` only if the step was still making progress |
 | `busy_gpu` wrong values | stream ordering bug in the bridge (item 6) | serious; keep the JSON and open an issue |
 | `dtypes` mismatch | precision or reduction-order problem (item 7) | check `max_abs_error` in the stage |
 | `reductions`, `all_gather` or `reduce_scatter` mismatch | a MAX/MIN/AVG or tensor-collective path differs on NCCL/RCCL (item 15) | the failing `cases` name the dtype and op; rerun with `--policy flat-gloo` to see whether the policy or the backend is at fault |
 | `async` wrong values | the worker's stream didn't wait for the caller's, or `wait()` didn't order the caller's stream (item 16) | serious; keep the JSON and open an issue |
 | `reduction_agreement` shows `product_agree` false | NCCL/RCCL and Gloo disagree on PRODUCT for that dtype (item 14) | not a failure: it's the evidence item 14 asks for; record it |
-| timeouts during large all_reduces | NCCL/RCCL watchdog vs a slow bridge (item 9) | raise `--timeout`; note the `all_reduce_seconds` of `busy_gpu` |
+| timeouts during large all_reduces | NCCL/RCCL watchdog vs a slow bridge (item 9) | raise `KIT_TIMEOUT` (or `--timeout`); note the `all_reduce_seconds` of `busy_gpu` |
 | 05: rendezvous never completes | wrong interface or blocked ports between nodes | set `NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` (e.g. `ib0`) |
 | 03/AMD: `device_map` mismatch | visible-devices variable maps to a different GPU (item 5) | record it; check scheduler GPU binding |
-| AMD: `rccl_version` fails | RCCL didn't log, or this isn't a ROCm build | check `check_1gpu.log` and `probe/probe.json` (`torch_hip`) |
+| AMD: `rccl_version` fails | RCCL didn't log, or this isn't a ROCm build | check `nccl/check_1gpu/` and `probe/probe.json` (`torch_hip`) |
 | mixed: preflight `resolve` / `tcp` fails | wrong address, or overlay down | `tailscale status`; use `tailscale ip -4` of the master |
 | mixed: preflight `gloo` fails, `tcp` passes | rendezvous port open, random ports blocked | use the overlay addresses and interface, not public IPs |
 | NCCL "unhandled system error" in a container | too little shared memory | start the container with a larger `--shm-size` |

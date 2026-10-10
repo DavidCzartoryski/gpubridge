@@ -11,7 +11,10 @@
 #   capture F CMD    save a command's output to file F; never fails the script
 #   step NAME CMD    run a named step, log to $RESULTS/NAME.log, record pass/fail in
 #                    $RESULTS/steps.jsonl and carry on, so one failure doesn't
-#                    waste the rest of a paid session
+#                    waste the rest of a paid session. NCCL/RCCL write their
+#                    NCCL_DEBUG=INFO output to $RESULTS/nccl/NAME/; if the step
+#                    fails, the end of each of those logs is added to NAME.log
+#   limited CMD      run CMD under coreutils timeout (STEP_TIMEOUT), or print it
 #   finish      print the step table; exit non-zero if any step failed
 #   load_env_file F  read NAME=value settings from file F, if it exists
 
@@ -25,6 +28,21 @@ for arg in "$@"; do
     if [ "$arg" = "--dry-run" ]; then DRY_RUN=1; else ARGS+=("$arg"); fi
 done
 export DRY_RUN
+
+# ---- Hard limits, so a hang costs minutes instead of the allocation ------------
+# KIT_TIMEOUT: the process-group timeout, in seconds, that every kit tool passes
+# to gpubridge.init unless given --timeout. It bounds the rendezvous and every
+# collective: Gloo on the bridge, and NCCL/RCCL in the islands, where
+# TORCH_NCCL_ASYNC_ERROR_HANDLING=3 ends the process once a collective exceeds it.
+export KIT_TIMEOUT="${KIT_TIMEOUT:-300}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-3}"
+# STEP_TIMEOUT: wall-clock limit, in seconds, on each torchrun or srun launch
+# (coreutils timeout, where installed; 0 = none). It is above KIT_TIMEOUT, so a
+# stuck collective fails with its own error first. Slurm's --time caps each job.
+export STEP_TIMEOUT="${STEP_TIMEOUT:-1200}"
+# NCCL/RCCL say which version, transport and interfaces they picked at INFO;
+# step sends it to files, so it costs nothing until a step fails.
+export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 
 FAILED_STEPS=()
 PASSED_STEPS=()
@@ -58,6 +76,30 @@ run() {
     "$@"
 }
 
+# limited CMD...: CMD under coreutils timeout, which signals CMD's whole process
+# group after STEP_TIMEOUT seconds (KILL 30 s later); exit code 124 means it ran
+# out of time. Without timeout installed (macOS), CMD just runs.
+limited() {
+    if [ "$STEP_TIMEOUT" != 0 ] && { [ "$DRY_RUN" = 1 ] || command -v timeout >/dev/null 2>&1; }
+    then
+        run timeout --kill-after=30 "$STEP_TIMEOUT" "$@"
+    else
+        run "$@"
+    fi
+}
+
+# nccl_report DIR: the last lines of each NCCL/RCCL log in DIR, for a failed step.
+nccl_report() {
+    local dir=$1 file found=0
+    for file in "$dir"/*; do
+        [ -f "$file" ] || continue
+        found=1
+        printf '\n==> NCCL/RCCL log %s (last 40 lines) <==\n' "$file"
+        tail -n 40 "$file"
+    done
+    [ "$found" = 1 ] || printf '\n(no NCCL/RCCL log in %s: no communicator was created)\n' "$dir"
+}
+
 capture() {
     local out=$1
     shift
@@ -88,20 +130,31 @@ step() {
         PASSED_STEPS+=("$name")
         return 0
     fi
-    mkdir -p "$RESULTS"
-    local start code
+    local start code timed_out=false nccl_dir="$RESULTS/nccl/$name"
+    mkdir -p "$nccl_dir"
     start=$(date +%s)
     set +e
-    "$@" 2>&1 | tee "$RESULTS/$name.log"
+    # %h and %p: NCCL/RCCL fill in the host and process id, one file per rank.
+    NCCL_DEBUG_FILE="$nccl_dir/%h.%p.log" "$@" 2>&1 | tee "$RESULTS/$name.log"
     code=${PIPESTATUS[0]}
     set -e
-    printf '{"step": "%s", "exit_code": %d, "seconds": %d, "log": "%s.log"}\n' \
-        "$name" "$code" "$(($(date +%s) - start))" "$name" >>"$RESULTS/steps.jsonl"
+    if [ "$code" = 124 ]; then
+        timed_out=true
+        log "step $name ran out of time (STEP_TIMEOUT=${STEP_TIMEOUT}s)" 2>&1 |
+            tee -a "$RESULTS/$name.log"
+    fi
+    if [ "$code" != 0 ]; then
+        nccl_report "$nccl_dir" >>"$RESULTS/$name.log"
+    fi
+    rmdir "$nccl_dir" "$RESULTS/nccl" 2>/dev/null || true  # only if empty (CPU runs)
+    printf '{"step": "%s", "exit_code": %d, "seconds": %d, "log": "%s.log", "timed_out": %s}\n' \
+        "$name" "$code" "$(($(date +%s) - start))" "$name" "$timed_out" >>"$RESULTS/steps.jsonl"
     if [ "$code" = 0 ]; then
         PASSED_STEPS+=("$name")
     else
         FAILED_STEPS+=("$name")
-        log "step $name FAILED (exit $code); continuing. Log: $RESULTS/$name.log"
+        log "step $name FAILED (exit $code); continuing. Log, with the end of any" \
+            "NCCL/RCCL logs: $RESULTS/$name.log"
     fi
     return 0
 }
@@ -178,7 +231,7 @@ free_port() {
 # instead of --standalone, which hangs on hosts whose own name doesn't resolve
 # (seen on macOS).
 local_torchrun() {
-    run torchrun --nnodes=1 --master-addr=127.0.0.1 --master-port="$(free_port)" "$@"
+    limited torchrun --nnodes=1 --master-addr=127.0.0.1 --master-port="$(free_port)" "$@"
 }
 
 # env_local_torchrun NAME=VALUE... ARGS: local_torchrun with extra environment variables.
@@ -188,6 +241,6 @@ env_local_torchrun() {
         assignments+=("$1")
         shift
     done
-    run env "${assignments[@]}" torchrun --nnodes=1 --master-addr=127.0.0.1 \
+    limited env "${assignments[@]}" torchrun --nnodes=1 --master-addr=127.0.0.1 \
         --master-port="$(free_port)" "$@"
 }
