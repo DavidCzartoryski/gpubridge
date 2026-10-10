@@ -57,6 +57,19 @@ inside Explorer as one heterogeneous Slurm job.
    the finished island all_reduce, and the island broadcast must see the
    leader's `copy_` back to the GPU. PyTorch's synchronous collectives should
    guarantee both. Check it on both vendors with large tensors and a busy GPU.
+   *Code audit (2026-10-10):* the island reduce is a synchronous `dist.reduce`,
+   whose `work.wait()` makes the caller's current stream wait for it; the
+   copy (`tensor.cpu()`) then runs on that same stream and blocks the host
+   until it finishes. The `copy_` back and the island broadcast follow on the
+   same stream. With `async_op=True` the same sequence runs on the worker's
+   stream, which first waits on an event recorded on the caller's stream. The
+   pipelined policy records its start event after the island reduce and makes
+   the stream wait on its last copy back before the island broadcast. Nothing
+   in the code was found to need a change; it is unverified on GPUs.
+   *Step:* `pytest -m gpu tests/test_gpu.py` (Explorer steps 02 and 04, `amd/run_all.sh`):
+   `test_bridge_copies_wait_for_the_callers_stream_and_the_island_reduce`
+   writes the input at the end of a queue of matmuls on a side stream, sync
+   and async, for every bridge policy.
 7. **float16 and other dtypes over Gloo between real hosts**, compared bit for
    bit with a single-vendor NCCL/RCCL all_reduce on integer-valued data.
 
@@ -117,7 +130,9 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     scatter, which torch builds from NCCL send/recv.
     *Status: works on CPU, bit for bit against `flat-gloo` in every layout and
     policy (`tests/test_ops.py`).* Still open: the same on GPUs. *Step:*
-    `check.py` stages `reductions`, `all_gather` and `reduce_scatter`.
+    `check.py` stages `reductions`, `all_gather` and `reduce_scatter`, and
+    `pytest -m gpu tests/test_gpu.py` (Explorer steps 02 and 04, `amd/run_all.sh`), which compares every policy with `flat-gloo` bit for
+    bit for every op, fp32/fp16/bf16 and odd sizes.
 16. **Async collectives keep their stream semantics.** The worker's stream
     waits on an event recorded on the caller's stream; `wait()` makes the
     caller's stream wait on an event recorded after the collective.
@@ -125,7 +140,9 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     (`tests/test_ops.py`), where there are no streams.* Still open: the
     events and `record_stream` on real GPUs. *Step:* `check.py` stage `async`
     queues the all_reduce right behind GPU work and checks the result on the
-    caller's stream after `wait()`, with no host sync in between.
+    caller's stream after `wait()`, with no host sync in between. Also
+    `pytest -m gpu tests/test_gpu.py` (Explorer steps 02 and 04, `amd/run_all.sh`), which submits from one non-default stream and waits
+    on another.
 17. **The pipelined bridge is correct on GPUs.** `pipelined-reduce-bridge-broadcast`
     (opt-in) copies chunks through pinned host memory on two side streams,
     ordered by CUDA events, waiting on the host only for the chunk the bridge

@@ -99,7 +99,8 @@ else
 fi
 
 log "installing gpubridge from $REPO_DIR"
-run uv pip install --python "$VENV/bin/python" -e "$REPO_DIR"
+# [test] adds pytest, for the GPU-only tests (pytest -m gpu tests/test_gpu.py).
+run uv pip install --python "$VENV/bin/python" -e "${REPO_DIR}[test]"
 run "$VENV/bin/python" -c "import torch, gpubridge; print('torch', torch.__version__, \
 'cuda', torch.version.cuda, 'hip', torch.version.hip, 'gpubridge', gpubridge.__version__)"
 log "environment ready: $VENV"

@@ -27,3 +27,4 @@ packages = ["src/gpubridge"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["gpu: needs a CUDA or ROCm GPU; skipped without one (pytest -m gpu on a GPU node)"]
