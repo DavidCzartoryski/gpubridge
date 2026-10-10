@@ -14,7 +14,13 @@ import torch
 import torch.multiprocessing as mp
 
 import gpubridge
-from gpubridge.config import CPU_ONLY_ENV, SPLIT_TEST_ENV, VENDOR_ENV
+from gpubridge.config import (
+    CHUNK_BYTES_ENV,
+    CPU_ONLY_ENV,
+    SPLIT_TEST_ENV,
+    THRESHOLDS_ENV,
+    VENDOR_ENV,
+)
 
 # Fail a deadlocked test instead of hanging the suite.
 TIMEOUT = timedelta(seconds=60)
@@ -116,7 +122,7 @@ def _failing_rank_main(
     rank: int, setups: tuple[dict[str, Any], ...], init_file: str, patterns: tuple[str, ...]
 ) -> None:
     setup = setups[rank]
-    for name in (VENDOR_ENV, CPU_ONLY_ENV, SPLIT_TEST_ENV):
+    for name in (VENDOR_ENV, CPU_ONLY_ENV, SPLIT_TEST_ENV, CHUNK_BYTES_ENV, THRESHOLDS_ENV):
         os.environ.pop(name, None)
     os.environ.update(setup.get("env", {}))
     for attr in ("cuda", "hip"):

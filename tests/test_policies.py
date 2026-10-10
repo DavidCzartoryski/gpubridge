@@ -141,7 +141,7 @@ def test_resolve_accepts_auto_names_and_classes():
     assert resolve_policy(AUTO) == AUTO
     assert resolve_policy("flat-gloo") is FlatGloo
     assert resolve_policy(NativeOnly) is NativeOnly
-    with pytest.raises(ValueError, match="known: auto, flat-gloo"):
+    with pytest.raises(ValueError, match="known: auto, auto-tuned, flat-gloo"):
         resolve_policy("chunked")
     with pytest.raises(TypeError):
         resolve_policy(3)
@@ -194,7 +194,8 @@ def test_a_policy_that_does_not_fit_fails_init_on_every_rank(vendors, policy, tm
     run_failing_init(
         [{"env": {VENDOR_ENV: v}, "init_kwargs": {"policy": policy}} for v in vendors],
         tmp_path,
-        [rf"'{policy}' doesn't apply to this cluster", r"Policies that do: auto, flat-gloo"],
+        [rf"'{policy}' doesn't apply to this cluster",
+         r"Policies that do: auto, auto-tuned, flat-gloo"],
     )
 
 

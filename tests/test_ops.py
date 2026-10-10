@@ -227,7 +227,8 @@ def _check_what_a_policy_offers(topology):
         gpubridge.all_reduce(torch.ones(2), op=ReduceOp.MAX)
     with pytest.raises(NotImplementedError,
                        match="'test-sum-only' doesn't implement all_gather_into_tensor. Policies "
-                             "that do and fit this cluster: flat-gloo, reduce-bridge-broadcast"):
+                             "that do and fit this cluster: auto-tuned, flat-gloo, "
+                             "pipelined-reduce-bridge-broadcast, reduce-bridge-broadcast"):
         gpubridge.all_gather_into_tensor(torch.ones(world), torch.ones(1))
     with pytest.raises(NotImplementedError, match="doesn't implement reduce_scatter_tensor"):
         gpubridge.reduce_scatter_tensor(torch.ones(1), torch.ones(world), async_op=True)

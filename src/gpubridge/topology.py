@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import socket
 import warnings
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from typing import Any, cast
 
@@ -23,7 +24,7 @@ from gpubridge.config import (
     split_test_mode,
 )
 from gpubridge.detect import Probe, detect_vendor, probe
-from gpubridge.policies import AUTO, CollectivePolicy, choose_policy
+from gpubridge.policies import AUTO, CollectivePolicy, choose_policy, policy_name
 from gpubridge.split_test import SplitTestWarning, banner, split_labels
 from gpubridge.transport import BridgeTransport
 
@@ -113,6 +114,8 @@ class PeerInfo:
     """This rank's ``GPUBRIDGE_SPLIT_TEST`` mode, or empty when off. TEST ONLY."""
     policy: str = AUTO
     """Name of the collective policy this rank was asked to use (``auto`` by default)."""
+    policy_settings: dict[str, Any] = field(default_factory=dict)
+    """That policy's :meth:`~gpubridge.CollectivePolicy.settings`, e.g. a chunk size."""
 
     @property
     def torch_version(self) -> str:
@@ -131,13 +134,16 @@ class PeerInfo:
         return cls(probe=Probe(**probe_data), **data)
 
 
-def describe_local(bridge: str, policy: str = AUTO) -> tuple[PeerInfo, Config]:
+def describe_local(
+    bridge: str, policy: str | type[CollectivePolicy] = AUTO
+) -> tuple[PeerInfo, Config]:
     """Work out this rank's vendor, configuration and capabilities.
 
     Anything that would stop this rank from joining (no detectable vendor, no
-    GPU, no NCCL/RCCL backend) is recorded in :attr:`PeerInfo.problems` rather
-    than raised. Discovery then reports every rank's problems at once, on every
-    rank, instead of one rank exiting and the others hanging until a timeout.
+    GPU, no NCCL/RCCL backend, a bad policy setting) is recorded in
+    :attr:`PeerInfo.problems` rather than raised. Discovery then reports every
+    rank's problems at once, on every rank, instead of one rank exiting and the
+    others hanging until a timeout.
 
     Raises:
         ValueError: for invalid ``GPUBRIDGE_VENDOR``, ``GPUBRIDGE_CPU_ONLY`` or
@@ -164,6 +170,12 @@ def describe_local(bridge: str, policy: str = AUTO) -> tuple[PeerInfo, Config]:
             "This PyTorch build has no NCCL backend (RCCL on ROCm builds), so it cannot "
             "form a GPU island."
         )
+    settings: dict[str, Any] = {}
+    if not isinstance(policy, str):
+        try:
+            settings = policy.settings()
+        except ValueError as exc:
+            problems.append(f"Collective policy {policy.name!r}: {exc}")
     local = PeerInfo(
         vendor=vendor,
         simulated=config.simulated,
@@ -172,7 +184,8 @@ def describe_local(bridge: str, policy: str = AUTO) -> tuple[PeerInfo, Config]:
         probe=local_probe,
         problems=tuple(problems),
         split_test=split,
-        policy=policy,
+        policy=policy_name(policy),
+        policy_settings=settings,
     )
     return local, config
 
@@ -185,7 +198,7 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
     Raises:
         RuntimeError: if any rank reported problems, if some ranks run on CPU and
             others on GPUs, or if ranks picked different bridge transports,
-            collective policies or split-test modes.
+            collective policies, policy settings or split-test modes.
     """
     failing = [(rank, peer) for rank, peer in enumerate(peers) if peer.problems]
     if failing:
@@ -224,6 +237,16 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
             f"Ranks picked different collective policies: {detail}. Pass the same policy "
             "to gpubridge.init() on every rank."
         )
+    settings: dict[str, list[int]] = {}
+    for rank, peer in enumerate(peers):
+        settings.setdefault(_canonical(peer.policy_settings), []).append(rank)
+    if len(settings) > 1:
+        detail = "; ".join(f"{text} on ranks {ranks}" for text, ranks in settings.items())
+        raise RuntimeError(
+            f"Ranks disagree on the settings of collective policy {peers[0].policy!r}: "
+            f"{detail}. Set the same GPUBRIDGE_* variables (and thresholds file) on every "
+            "rank: settings such as a chunk size decide how many messages a collective sends."
+        )
     splits: dict[str, list[int]] = {}
     for rank, peer in enumerate(peers):
         splits.setdefault(peer.split_test or "off", []).append(rank)
@@ -243,6 +266,10 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
             "prefer the same release on every rank.",
             stacklevel=2,
         )
+
+
+def _canonical(settings: dict[str, Any]) -> str:
+    return json.dumps(settings, sort_keys=True)
 
 
 def _release_key(release: str) -> tuple[tuple[int, int | str], ...]:
@@ -272,6 +299,11 @@ class Topology:
     def policy_name(self) -> str:
         """Name of the active collective policy, e.g. ``"reduce-bridge-broadcast"``."""
         return self.policy.name
+
+    @property
+    def policy_settings(self) -> dict[str, Any]:
+        """The policy's settings, identical on every rank (discovery checked)."""
+        return self.peers[self.rank].policy_settings
 
     @property
     def bridge_group(self) -> ProcessGroup | None:

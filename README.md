@@ -241,6 +241,13 @@ policies that do.
 | `native-only` | 1 island | one native NCCL/RCCL (or CPU Gloo) collective |
 | `flat-gloo` | any | every rank copies to CPU and uses the world Gloo group: slow but obviously correct, so it's the test reference and a debugging fallback that never touches NCCL/RCCL |
 | `auto` (default) | any | `native-only` for one island, `reduce-bridge-broadcast` otherwise; today's behaviour |
+| `pipelined-reduce-bridge-broadcast` (opt-in, **not validated on GPUs**) | 2+ islands | reduce-bridge-broadcast with the leaders' bridge step cut into chunks: on GPUs the copy of chunk k+1 to pinned host memory, the bridge step of chunk k and the copy of chunk k-1 back overlap, ordered with CUDA events. Chunk size: `GPUBRIDGE_CHUNK_BYTES` (default `4M`) |
+| `auto-tuned` (opt-in, **not validated on GPUs**) | any | picks one of the above by message size, from a thresholds file measured on the cluster (`GPUBRIDGE_THRESHOLDS`, written by `bench_all_reduce.py --write-thresholds`); without a file, it does what `auto` does |
+
+The opt-in policies are never chosen by `auto`. Their settings (the chunk size,
+the thresholds) decide how many messages a collective sends, so every rank
+reports them during discovery, and `init()` fails on every rank if they differ
+or if one is invalid.
 
 ```python
 gpubridge.init(policy="flat-gloo")     # e.g. to rule out NCCL/RCCL while debugging
@@ -252,10 +259,13 @@ A custom policy subclasses `CollectivePolicy`, implements `applies_to`,
 in `reduce_ops` and taking `op=`). Optional hooks leave room for performance
 work without changing the public API:
 - `setup()` and `close()`, for staging buffers or streams;
-- `select_policy(nbytes)`, to choose a path by message size.
+- `select_policy(nbytes)`, to choose a path by message size;
+- `settings()`, a classmethod returning values read from the environment that
+  every rank must share; discovery compares them.
 
 The GPU kit's `check.py` and `bench_all_reduce.py` take `--policy`, so runs can
-compare policies.
+compare policies. `bench_all_reduce.py --candidates` times several policies in
+one job, and `--write-thresholds` turns that into a file for `auto-tuned`.
 
 ### Async collectives
 
