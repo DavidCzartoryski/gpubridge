@@ -47,21 +47,49 @@ real mixed-vendor result:
   `run.warning`;
 - every `summary.md` starts with a banner.
 
-## Order at a glance
+## The ladder
 
-| # | Where | Step | What it proves | Items closed | Time (compute) | Cost |
-| --- | --- | --- | --- | --- | --- | --- |
-| 0a | Explorer login node | `submit.sh 00` | GPU types in `sharing`, `gpu` and `multigpu` (sinfo only): are there AMD GPUs in `sharing`? | - | seconds | free |
-| 0b | Explorer, CPU job | `submit.sh setup` | venv with the CUDA build of torch 2.14.1, built on a compute node | - | ~10 min | free |
-| 1 | Explorer, 1 GPU | `submit.sh 01` | the build runs on the GPU; records the hardware; a rank whose `LOCAL_RANK` has no GPU fails `init()` on every rank | prerequisite, **12** | ~2 min | free |
-| 2 | Explorer, 1 GPU | `submit.sh 02` | two single-rank NCCL islands sharing one GPU, plus the bridge | **3**, 6 (partly), 10 on CUDA | ~3 min | free |
-| 3 | Explorer, 2+ GPUs | `submit.sh 03` | real NCCL island; each rank drives its own GPU | **5** on NVIDIA, baseline | ~5 min | free* |
-| 4 | Explorer, 4 GPUs | `submit.sh 04` | two 2-GPU NCCL islands and the bridge, both layouts; native vs bridged benchmark | **3, 6, 7**, 9 (data), **11**, 13 | ~10 min | free* |
-| 5 | Explorer, 2 nodes | `submit.sh 05` | NCCL across nodes; the bridge crossing the network between nodes | **8**, 11 and 13 across nodes | ~10 min | free* |
-| 6 | Explorer, 4 GPUs | `submit.sh 06` | training throughput and scaling 1 to 4 GPUs (table for the multigpu request) | - | ~10 min | free* |
-| 7 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11, 12, 13 | 20-30 min | ~0.5 h of the hourly rate |
-| 8 | NVIDIA + AMD cloud | `mixed/node.sh` on both | the real mixed-vendor job | **1, 2** on GPUs, **8** across networks | 30-45 min | ~0.75 h of each machine's rate |
-| 8 alt | Explorer `gpu` + `sharing`, one heterogeneous job | `submit.sh setup-rocm`, then `submit.sh 07` | the real mixed-vendor job inside Explorer, **if** step 0a finds AMD GPUs in `sharing`. Dry-run only until then | **1, 2** on GPUs, 3 with real RCCL ranks, 8 between nodes, 11 against per-island baselines, 13 | ~15 min + ~15 min ROCm setup | free |
+Four rungs, climbed in order. Each one is a result the next builds on, so
+don't spend GPU time on a rung until the one below passes: a failure there
+would fail everything above it, for the same reason.
+
+| Rung | Proves | On Explorer | Elsewhere | Passing means |
+| --- | --- | --- | --- | --- |
+| 1. Single NVIDIA | the CUDA build runs; NCCL in one native island; the records | `submit.sh 01` (1 GPU, free); with `multigpu`, `submit.sh 03` (2+ GPUs, one NCCL island, native benchmark) | any NVIDIA machine: `torchrun --nnodes=1 --master-addr=127.0.0.1 --nproc-per-node=<GPUs> scripts/gpu/check.py --out results/nvidia` | `01_probe/probe.json` names the GPU and `build_supports_gpus` passes; `03_single_island/check/summary.md` passes with `run.kind` `gpu-single-vendor` |
+| 2. NVIDIA split test | two NCCL islands and the Gloo bridge on device tensors, every policy, the GPU-only tests | `submit.sh 02` (2 ranks share 1 GPU, free); with `multigpu`, `submit.sh 04` (2 + 2 on one 4-GPU node, both layouts), then `05` (split by node, so the bridge crosses the network) | one multi-GPU NVIDIA machine: the same command with `GPUBRIDGE_SPLIT_TEST=half` | every summary passes with `run.kind` `split-test`, including `busy_gpu` and `async`; `gpu_tests.xml` has no failures |
+| 3. Single AMD | the ROCm build runs; RCCL in one native island; an AMD split test | `submit.sh setup-rocm`, then `submit.sh amd` (one node in `sharing`), if step 00 finds AMD GPUs there | `amd/run_all.sh` on an AMD cloud machine | `check_1gpu`, `rccl_version` and `gpu_tests` pass; with 2+ GPUs, `check_island` and `check_split` too |
+| 4. Mixed | NCCL and RCCL islands joined by the bridge: the result items 1 and 2 ask for | `submit.sh 07` (one heterogeneous job on `gpu` + `sharing`), if AMD GPUs are there | `mixed/node.sh` on an NVIDIA and an AMD machine | `check/summary.md` passes with `run.kind` `gpu-mixed` |
+
+- **Split-test mode on one NVIDIA node.** Leave `GPUBRIDGE_VENDOR` unset:
+  setting it switches to CPU simulation. The vendor comes from the CUDA
+  build, each rank uses `cuda:$LOCAL_RANK`, and both islands use NCCL. With
+  fewer GPUs than ranks, split-test mode lets ranks share them (step 02).
+  `tests/test_split_test.py` checks this on CPU: the CUDA-build path, and the
+  device of each rank on a 4-GPU and a 2-GPU node.
+- **Where it went wrong.** Rung 1 failing points at the environment, driver
+  or build. Rung 2 failing after 1 passed points at gpubridge's bridge or
+  policies on GPUs: fix that before spending AMD time. Rung 3 failing points
+  at the ROCm build or RCCL. Rung 4 failing after 2 and 3 passed points at
+  NCCL and RCCL together, or at the network between the nodes.
+- Scaling (step 06) and DDP training sit beside rung 2; they need rung 2's
+  bridge to work.
+
+## Every step at a glance
+
+| # | Rung | Where | Step | What it proves | Items closed | Time (compute) | Cost |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0a | - | Explorer login node | `submit.sh 00` | GPU types in `sharing`, `gpu` and `multigpu` (sinfo only): are there AMD GPUs in `sharing`? | - | seconds | free |
+| 0b | - | Explorer, CPU job | `submit.sh setup` | venv with the CUDA build of torch 2.14.1, built on a compute node | - | ~10 min | free |
+| 1 | 1 | Explorer, 1 GPU | `submit.sh 01` | the build runs on the GPU; records the hardware; a rank whose `LOCAL_RANK` has no GPU fails `init()` on every rank | prerequisite, **12** | ~2 min | free |
+| 2 | 2 | Explorer, 1 GPU | `submit.sh 02` | two single-rank NCCL islands sharing one GPU, plus the bridge | **3**, 6 (partly), 10 on CUDA | ~3 min | free |
+| 3 | 1 | Explorer, 2+ GPUs | `submit.sh 03` | real NCCL island; each rank drives its own GPU | **5** on NVIDIA, baseline | ~5 min | free* |
+| 4 | 2 | Explorer, 4 GPUs | `submit.sh 04` | two 2-GPU NCCL islands and the bridge, both layouts; native vs bridged benchmark | **3, 6, 7**, 9 (data), **11**, 13 | ~10 min | free* |
+| 5 | 2 | Explorer, 2 nodes | `submit.sh 05` | NCCL across nodes; the bridge crossing the network between nodes | **8**, 11 and 13 across nodes | ~10 min | free* |
+| 6 | 2 | Explorer, 4 GPUs | `submit.sh 06` | training throughput and scaling 1 to 4 GPUs (table for the multigpu request) | - | ~10 min | free* |
+| 7 | 3 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11, 12, 13 | 20-30 min | ~0.5 h of the hourly rate |
+| 7 alt | 3 | Explorer `sharing`, 1 AMD GPU | `submit.sh setup-rocm`, then `submit.sh amd` | rung 3 inside Explorer, **if** step 0a finds AMD GPUs in `sharing`: `amd/run_all.sh` on the node, without setup or tarball. Dry-run only until then | **4, 5** on AMD, 6, 7, 10 on ROCm, 12 | ~15 min + ~15 min ROCm setup | free |
+| 8 | 4 | NVIDIA + AMD cloud | `mixed/node.sh` on both | the real mixed-vendor job | **1, 2** on GPUs, **8** across networks | 30-45 min | ~0.75 h of each machine's rate |
+| 8 alt | 4 | Explorer `gpu` + `sharing`, one heterogeneous job | `submit.sh setup-rocm`, then `submit.sh 07` | the real mixed-vendor job inside Explorer, **if** step 0a finds AMD GPUs in `sharing`. Dry-run only until then | **1, 2** on GPUs, 3 with real RCCL ranks, 8 between nodes, 11 against per-island baselines, 13 | ~15 min + ~15 min ROCm setup | free |
 
 \* Steps 3 to 6 need the `multigpu` partition, which needs an access request
 (see [Explorer](#explorer)). Steps 1 and 2 run on the open `gpu` partition.
@@ -196,14 +224,19 @@ Both components sit on the cluster network, so no overlay is needed.
 ```bash
 scripts/gpu/explorer/submit.sh 00                  # then read 00_partitions/gpu-types.txt
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh --dry-run setup-rocm
+GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh --dry-run amd
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh --dry-run 07
 # once the hardware is confirmed and AMD_NODES_CONFIRMED=1 is merged in submit.sh:
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh setup-rocm   # ROCm venv (~16 GB), on an AMD node
-GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh 07
+GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh amd          # rung 3: one AMD node on its own
+GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh 07           # rung 4, once amd passes
 ```
 
-Until then, `setup-rocm` and `07` stop with an error unless `--dry-run` is
-given. The switch, `AMD_NODES_CONFIRMED` in `submit.sh`, is deliberately not
+`submit.sh amd` ([`amd_node.sbatch`](../scripts/gpu/explorer/amd_node.sbatch))
+runs `amd/run_all.sh` on one AMD node with the ROCm venv, skipping its setup
+and its results tarball; `GPUS_AMD_NODE` (default 1) sets how many GPUs. Until
+the hardware is confirmed, `setup-rocm`, `amd` and `07` stop with an error
+unless `--dry-run` is given. The switch, `AMD_NODES_CONFIRMED` in `submit.sh`, is deliberately not
 an environment variable: turning the path on is a reviewed one-line change.
 
 [`07_mixed_hetjob.sbatch`](../scripts/gpu/explorer/07_mixed_hetjob.sbatch)

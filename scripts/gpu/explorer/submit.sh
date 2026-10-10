@@ -15,7 +15,8 @@
 #   06     scaling run, 1 to 4 GPUs              multigpu
 #   multi  03 to 06
 #   setup-rocm  create the ROCm venv in a job on an AMD node    dry-run only until
-#   07     real mixed job: gpu + sharing, one heterogeneous job   step 00 shows AMD GPUs
+#   amd    one AMD node: RCCL checks, AMD split test (rung 3)    step 00 shows
+#   07     real mixed job: gpu + sharing, one heterogeneous job   AMD GPUs
 #
 # See docs/GPU_VALIDATION_RUNBOOK.md for what each step proves.
 set -euo pipefail
@@ -46,6 +47,7 @@ GPUS_PER_NODE_MULTINODE="${GPUS_PER_NODE_MULTINODE:-2}"
 PARTITION_MIXED_NVIDIA="${PARTITION_MIXED_NVIDIA:-$PARTITION_1GPU}"
 GPUS_MIXED_NVIDIA="${GPUS_MIXED_NVIDIA:-1}"  # the gpu partition allows 1 GPU per job
 GPUS_MIXED_AMD="${GPUS_MIXED_AMD:-1}"
+GPUS_AMD_NODE="${GPUS_AMD_NODE:-1}"        # step amd; 2+ adds an RCCL island and split test
 TIME_SETUP="${TIME_SETUP:-01:00:00}"
 TIME_01="${TIME_01:-00:10:00}"
 TIME_02="${TIME_02:-00:25:00}"
@@ -54,13 +56,14 @@ TIME_04="${TIME_04:-00:40:00}"
 TIME_05="${TIME_05:-00:30:00}"
 TIME_06="${TIME_06:-00:30:00}"
 TIME_07="${TIME_07:-00:30:00}"
+TIME_AMD="${TIME_AMD:-00:30:00}"
 # ---- Environment for the jobs -------------------------------------------------
 # Venvs, caches and logs: ~7 GB, ~25 GB with the ROCm venv. Home is capped at 75 GB,
 # so they go in your group's project space. Required: PROJECT_DIR or WORK_DIR.
 PROJECT_DIR="${PROJECT_DIR:-}"             # e.g. /projects/<your-project>; or set it in local.env
 WORK_DIR="${WORK_DIR:-${PROJECT_DIR:+$PROJECT_DIR/${USER:-$(id -un)}/gpubridge-gpu}}"
 VENV="${VENV:-$WORK_DIR/venv}"             # CUDA build of torch: setup, steps 01 to 07
-VENV_ROCM="${VENV_ROCM:-$WORK_DIR/venv-rocm}"  # ROCm build: setup-rocm, step 07
+VENV_ROCM="${VENV_ROCM:-$WORK_DIR/venv-rocm}"  # ROCm build: setup-rocm, steps amd and 07
 # setup-rocm's PyTorch: pick a ROCm build that supports the AMD GPU from step 00
 # (see the runbook); older Instinct cards may not be supported by ROCm 7.2.
 ROCM_TORCH_VERSION="${ROCM_TORCH_VERSION:-2.14.1}"
@@ -74,7 +77,7 @@ GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-}"  # steps 05 and 07; empty = auto
 RESULTS_ROOT="${RESULTS_ROOT:-$REPO_DIR/results/explorer}"
 # ------------------------------------------------------------------------------
 
-# setup-rocm and 07 only print their commands until step 00 shows AMD GPUs in
+# setup-rocm, amd and 07 only print their commands until step 00 shows AMD GPUs in
 # $PARTITION_AMD. Set this to 1 in a reviewed change once the hardware is confirmed.
 AMD_NODES_CONFIRMED=0
 
@@ -169,6 +172,11 @@ setup-rocm)
 05) submit 05_multinode.sbatch "$TIME_05" 2 "$GPUS_PER_NODE_MULTINODE" \
         "$PARTITION_MULTI" "$GPU_TYPE_MULTI" ;;
 06) submit 06_scaling.sbatch "$TIME_06" 1 4 "$PARTITION_MULTI" "$GPU_TYPE_MULTI" ;;
+amd)
+    amd_gate
+    gpu_request "$PARTITION_AMD" "$AMD_TYPE" 1 "$GPUS_AMD_NODE" "$TIME_AMD"
+    sbatch_job amd_node amd_node.sbatch "${REQUEST[@]}"
+    ;;
 07)
     amd_gate
     gpu_request "$PARTITION_MIXED_NVIDIA" "$GPU_TYPE_1GPU" 1 "$GPUS_MIXED_NVIDIA" "$TIME_07"
@@ -182,5 +190,5 @@ free | multi)
     [ "${ARGS[0]}" = multi ] && steps=(03 04 05 06)
     for s in "${steps[@]}"; do "$0" "$s"; done
     ;;
-*) sed -n '2,20p' "$0" >&2; exit 2 ;;
+*) sed -n '2,21p' "$0" >&2; exit 2 ;;
 esac
