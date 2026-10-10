@@ -310,7 +310,10 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     assert result.returncode == 0, result.stderr
     out = result.stdout
     sruns = [line for line in out.splitlines() if line.startswith("+ srun --het-group=0")]
-    assert len(sruns) == 4  # probe, preflight, check, bench
+    # probe, preflight, check, bench, then a check per opt-in policy and the candidates bench
+    assert len(sruns) >= 6
+    assert any("--policy pipelined-reduce-bridge-broadcast" in line for line in sruns[4:])
+    assert "--write-thresholds" in sruns[-1]
     for line in sruns:
         nvidia, amd = line.split(" : ")
         assert "/w/venv/bin/" in nvidia and "/w/venv-rocm/" not in nvidia
@@ -348,7 +351,11 @@ def test_submit_free_and_multi_submit_every_step():
                              "--expect-init-error LOCAL_RANK=1\\ asks\\ for\\ GPU\\ 1"]),
         ("02_split_shared_gpu.sbatch", ["--nproc-per-node=2", "check.py"]),
         ("03_single_island.sbatch", ["device_map.py", "check.py", "bench_all_reduce.py"]),
-        ("04_split_4gpu.sbatch", ["check_half", "check_alternate", "bench_all_reduce.py"]),
+        ("04_split_4gpu.sbatch", ["check_half", "check_alternate", "bench_all_reduce.py",
+                                  "--policy pipelined-reduce-bridge-broadcast",
+                                  "--write-thresholds", "--policy auto-tuned"]),
+        ("05_multinode.sbatch", ["--policy pipelined-reduce-bridge-broadcast",
+                                 "--write-thresholds"]),
         ("05_multinode.sbatch", ["srun", "--rdzv-backend=c10d", "check_split_by_node"]),
         ("06_scaling.sbatch", ["--nproc-per-node=4", "train_synthetic.py", "summarize.py"]),
         ("07_mixed_hetjob.sbatch", ["--het-group=1", "--rdzv-backend=c10d", "summarize.py"]),

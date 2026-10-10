@@ -522,9 +522,11 @@ job.
 
 1. **A chunked, pipelined bridge**, from the chunked all-reduce, per-chunk
    flags and copy-engine streams.
-   *Status: not implemented yet. The hooks it needs exist: a marked place in
-   `policies.py`, plus `CollectivePolicy.setup()` / `close()` for pinned buffers
-   and streams.*
+   *Status: implemented as the opt-in policy
+   `pipelined-reduce-bridge-broadcast` (chunk size `GPUBRIDGE_CHUNK_BYTES`),
+   with its device code in `staging.py`. Tested on CPU, including a staging
+   layer that runs each copy only when its event is waited for. Not validated
+   on GPUs (HARDWARE_VALIDATION.md items 17 and 18).*
    - Split the leaders' bridge step into chunks. On a side stream, copy chunk
      k+1 from GPU to pinned CPU memory while Gloo all-reduces chunk k and
      chunk k-1 is copied back.
@@ -536,11 +538,11 @@ job.
      small ones.
 2. **Choose the algorithm by size.** Triton-distributed picks one-shot or
    two-shot by byte count, and falls back to NCCL for small inputs.
-   *Status: not implemented yet. The hook exists:
-   `CollectivePolicy.select_policy(nbytes)`, which every collective goes
-   through, and which a test policy already uses to route small messages
-   through `flat-gloo`. Thresholds wait for real GPU benchmark data
-   (`bench_all_reduce.py --policy`).*
+   *Status: implemented as the opt-in policy `auto-tuned`. It reads rules
+   from `GPUBRIDGE_THRESHOLDS`, a file `bench_all_reduce.py
+   --write-thresholds` writes after timing the candidate policies side by
+   side; without one it does what `auto` does. The thresholds themselves still
+   need real GPU benchmark data (item 19).*
    - For gpubridge: small tensors take one Gloo all_reduce across all ranks
      (the `FlatGloo` policy), which avoids three serialized steps. Large
      tensors take the pipelined bridge.
@@ -549,7 +551,10 @@ job.
 3. **Order copies on the GPU, not with host syncs.** Triton-distributed orders
    copies with stream wait/write-value on CUDA, and tiny memcpys on AMD,
    instead of blocking the host.
-   *Status: not implemented yet.*
+   *Status: implemented in the pipelined policy (`CudaStaging`): copies are
+   non-blocking, into pinned memory, on two side streams, ordered by events;
+   the host waits only for the chunk the bridge needs next. Not validated on
+   GPUs.*
    - In gpubridge, the leader's `tensor.cpu()` blocks the host. Replace it
      with non-blocking copies into pinned memory, ordered by events, and block
      only where Gloo needs the data. This pairs with idea 1.

@@ -16,6 +16,12 @@ Built in:
 - ``flat-gloo``: every rank stages its tensor to CPU and uses the world Gloo
   group. Slow but obviously correct: the reference in tests, and a fallback for
   debugging that never touches NCCL/RCCL communicators.
+- ``pipelined-reduce-bridge-broadcast``: reduce-bridge-broadcast with the
+  leaders' bridge step split into chunks, so copies to and from the GPU
+  overlap the bridge (``GPUBRIDGE_CHUNK_BYTES``, default 4 MiB).
+- ``auto-tuned``: picks one of the others by message size, from a thresholds
+  file measured on the cluster (``GPUBRIDGE_THRESHOLDS``); without one, it
+  does what ``auto`` does.
 
 ``auto`` (the default) picks ``native-only`` for one island and
 ``reduce-bridge-broadcast`` otherwise.
@@ -41,13 +47,16 @@ doesn't offer them: the call fails on every rank before any communication.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, ClassVar
+import json
+import os
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp
 
-from gpubridge.config import GPU_BACKEND
+from gpubridge import staging as _staging
+from gpubridge.config import GPU_BACKEND, THRESHOLDS_ENV, chunk_bytes_setting
 from gpubridge.observe import phase
 
 if TYPE_CHECKING:
@@ -173,6 +182,20 @@ class CollectivePolicy(abc.ABC):
         rejects is rejected everywhere. The default is :attr:`reduce_ops`.
         """
         return self.reduce_ops
+
+    @classmethod
+    def settings(cls) -> dict[str, Any]:
+        """Settings this policy reads from the environment, which every rank must share.
+
+        Called on every rank before discovery. Discovery refuses a job whose
+        ranks report different settings, because a setting such as a chunk
+        size decides how many messages a collective sends: ranks that disagree
+        would hang. Return plain JSON values. Raise ``ValueError`` for a bad
+        value: ``init()`` then fails on every rank with that message. The
+        policy reads the agreed values in :meth:`setup` from
+        ``topology.policy_settings``. The default has none.
+        """
+        return {}
 
     def setup(self, topology: Topology) -> None:  # noqa: B027 - optional hook
         """Called once by ``init()`` after every group exists, e.g. to allocate staging buffers."""
@@ -376,24 +399,246 @@ class FlatGloo(CollectivePolicy):
             output.copy_(received)
 
 
-# ---- Planned, not implemented -------------------------------------------------
-#
-# PipelinedReduceBridgeBroadcast (docs/PRIOR_ART.md, Triton-distributed idea 1):
-# reduce-bridge-broadcast with the leaders' bridge step split into chunks, so
-# the GPU->CPU copy of chunk k+1, the bridge all_reduce of chunk k and the
-# CPU->GPU copy of chunk k-1 overlap. It needs no API change:
-#   - setup(): allocate pinned staging buffers and a side stream once;
-#   - all_reduce() / broadcast(): the chunked pipeline;
-#   - close(): free the buffers.
-# Size-based choice (idea 2) is select_policy(nbytes) on a policy that returns,
-# say, FlatGloo below a threshold and the pipelined policy above it. Thresholds
-# come from scripts/gpu/bench_all_reduce.py runs on real GPUs (--policy).
-# -------------------------------------------------------------------------------
+class PipelinedReduceBridgeBroadcast(ReduceBridgeBroadcast):
+    """Reduce-bridge-broadcast with the leaders' bridge step split into pipelined chunks.
+
+    Each leader moves its tensor through the bridge chunk by chunk. On GPUs,
+    the copy of chunk k+1 into pinned host memory, the bridge step of chunk k
+    and the copy of chunk k-1 back to the GPU run at the same time: copies go
+    on two side streams and are ordered with CUDA events, and the host waits
+    only for the chunk the bridge needs next (see :mod:`gpubridge.staging`).
+    ``setup()`` allocates the pinned buffers and streams once.
+
+    Ideas 1 and 3 from docs/PRIOR_ART.md (Triton-distributed). The chunk size
+    comes from ``GPUBRIDGE_CHUNK_BYTES`` (default 4 MiB) and must match on
+    every rank; discovery checks. Island steps, all_gather_into_tensor and
+    reduce_scatter_tensor are those of reduce-bridge-broadcast.
+    """
+
+    name = "pipelined-reduce-bridge-broadcast"
+    #: Host slots: chunk k-1 copies back, k is on the bridge, k+1 copies out.
+    SLOTS = 3
+    DEFAULT_CHUNK_BYTES = 4 * 2**20
+
+    def __init__(self, chunk_bytes: int | None = None) -> None:
+        self.chunk_bytes = chunk_bytes
+        self.staging: _staging.Staging | None = None
+
+    @classmethod
+    def settings(cls) -> dict[str, Any]:
+        return {"chunk_bytes": chunk_bytes_setting(cls.DEFAULT_CHUNK_BYTES)}
+
+    def setup(self, topology: Topology) -> None:
+        if self.chunk_bytes is None:
+            self.chunk_bytes = int(topology.policy_settings.get("chunk_bytes",
+                                                                self.DEFAULT_CHUNK_BYTES))
+        if topology.layout.needs_bridge and topology.is_leader:
+            self.staging = _staging.make_staging(topology.device, self.chunk_bytes, self.SLOTS)
+
+    def close(self) -> None:
+        if self.staging is not None:
+            self.staging.close()
+            self.staging = None
+
+    def all_reduce(self, tensor: torch.Tensor, topology: Topology,
+                   op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
+        leader = topology.island.leader
+        with phase("island-reduce"):
+            dist.reduce(tensor, dst=leader, op=op, group=topology.island_group)
+        if topology.is_leader:
+            bridge = topology.bridge
+            assert bridge is not None
+            with phase("bridge"):
+                self._pipeline(tensor, lambda host: _bridge_all_reduce(bridge, host, op),
+                               send=True, receive=True)
+        with phase("island-broadcast"):
+            dist.broadcast(tensor, src=leader, group=topology.island_group)
+
+    def broadcast(self, tensor: torch.Tensor, src: int, topology: Topology) -> None:
+        src_island = topology.layout.island_of(src)
+        in_src_island = topology.island == src_island
+        if in_src_island:
+            with phase("island-broadcast"):
+                dist.broadcast(tensor, src=src, group=topology.island_group)
+        if topology.is_leader:
+            bridge = topology.bridge
+            assert bridge is not None
+            with phase("bridge"):
+                self._pipeline(tensor, lambda host: bridge.broadcast(host, src=src_island.leader),
+                               send=in_src_island, receive=not in_src_island)
+        if not in_src_island:
+            with phase("island-broadcast"):
+                dist.broadcast(tensor, src=topology.island.leader, group=topology.island_group)
+
+    def _pipeline(self, tensor: torch.Tensor, bridge_step, *, send: bool, receive: bool) -> None:
+        """Run ``bridge_step`` on every chunk's host slot, overlapping the copies.
+
+        ``send``: copy each chunk to the host before its bridge step.
+        ``receive``: copy each slot back into its chunk after its bridge step.
+        Every leader cuts the same chunks, because the chunk size and the
+        tensor's size and dtype are the same on every rank.
+        """
+        staging, slots = self.staging, self.SLOTS
+        assert staging is not None and self.chunk_bytes is not None
+        flat = tensor.view(-1)
+        step = max(1, self.chunk_bytes // tensor.element_size())
+        chunks = [flat[lo:lo + step] for lo in range(0, flat.numel(), step)]
+        copied_out: list[Any] = [None] * len(chunks)  # chunk k is in host memory
+        copied_back: list[Any] = [None] * slots       # last copy back out of each slot
+        last_back = None
+
+        def copy_out(k: int) -> None:
+            slot = staging.slot(k % slots, chunks[k])
+            copied_out[k] = staging.to_host(slot, chunks[k], after=copied_back[k % slots])
+
+        staging.begin(tensor)
+        if send and chunks:
+            copy_out(0)
+        for k, chunk in enumerate(chunks):
+            if send and k + 1 < len(chunks):
+                copy_out(k + 1)  # overlaps this chunk's bridge step
+            host = staging.slot(k % slots, chunk)
+            # Before the bridge touches the slot: its data has arrived (send), or
+            # the copy back of the chunk that used it last is done (receive only).
+            staging.wait_host(copied_out[k] if send else copied_back[k % slots])
+            bridge_step(host)
+            if receive:
+                copied_back[k % slots] = last_back = staging.to_device(chunk, host)
+        staging.end(last_back)
+
+
+class AutoTuned(CollectivePolicy):
+    """Choose a policy by message size, from thresholds measured on this cluster.
+
+    ``GPUBRIDGE_THRESHOLDS`` names a JSON file written by
+    ``scripts/gpu/bench_all_reduce.py --write-thresholds``: rules, each up to a
+    size, naming the policy that was fastest there, e.g. ``flat-gloo`` for
+    small tensors and the pipelined policy for large ones (idea 2 in
+    docs/PRIOR_ART.md). Without the variable every size gets what ``auto``
+    would choose, so the default is safe. The rules are part of this policy's
+    settings, so discovery refuses ranks that loaded different files.
+    """
+
+    name = "auto-tuned"
+    reduce_ops = frozenset({"sum", "max", "min"})
+
+    def __init__(self) -> None:
+        self.rules: list[tuple[int | None, CollectivePolicy]] = []
+
+    @classmethod
+    def applies_to(cls, layout: Layout) -> bool:
+        return True
+
+    @classmethod
+    def settings(cls) -> dict[str, Any]:
+        path = os.environ.get(THRESHOLDS_ENV, "").strip()
+        chunk = chunk_bytes_setting(PipelinedReduceBridgeBroadcast.DEFAULT_CHUNK_BYTES)
+        if not path:
+            return {"rules": [{"max_bytes": None, "policy": AUTO}], "chunk_bytes": chunk}
+        return load_thresholds(path, chunk)
+
+    def setup(self, topology: Topology) -> None:
+        settings = topology.policy_settings
+        for rule in settings["rules"]:
+            try:
+                cls = choose_policy(resolve_policy(rule["policy"]), topology.layout)
+            except RuntimeError as exc:
+                raise RuntimeError(f"{THRESHOLDS_ENV}: the rule for sizes up to "
+                                   f"{rule['max_bytes']} bytes can't be used here. {exc}") from None
+            policy = (cls(chunk_bytes=settings["chunk_bytes"])
+                      if issubclass(cls, PipelinedReduceBridgeBroadcast) else cls())
+            policy.setup(topology)
+            self.rules.append((rule["max_bytes"], policy))
+
+    def close(self) -> None:
+        for _, policy in self.rules:
+            policy.close()
+
+    def select_policy(self, nbytes: int) -> CollectivePolicy:
+        for max_bytes, policy in self.rules:
+            if max_bytes is None or nbytes <= max_bytes:
+                return policy.select_policy(nbytes)
+        raise AssertionError("the last thresholds rule covers every size")
+
+    def supported_reduce_ops(self, topology: Topology) -> frozenset[str]:
+        ops = self.reduce_ops
+        for _, policy in self.rules:
+            ops &= policy.supported_reduce_ops(topology)
+        return ops
+
+    # collectives.py calls select_policy() and then the chosen policy directly;
+    # these delegate the same way for anyone calling the policy itself.
+    def all_reduce(self, tensor: torch.Tensor, topology: Topology,
+                   op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
+        chosen = self.select_policy(tensor.nbytes)
+        if op == ReduceOp.SUM:
+            chosen.all_reduce(tensor, topology)
+        else:
+            chosen.all_reduce(tensor, topology, op=op)
+
+    def broadcast(self, tensor: torch.Tensor, src: int, topology: Topology) -> None:
+        self.select_policy(tensor.nbytes).broadcast(tensor, src, topology)
+
+    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor,  # noqa: A002
+                               topology: Topology) -> None:
+        self.select_policy(output.nbytes).all_gather_into_tensor(output, input, topology)
+
+    def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor,  # noqa: A002
+                              topology: Topology) -> None:
+        self.select_policy(input.nbytes).reduce_scatter_tensor(output, input, topology)
+
+
+THRESHOLDS_FORMAT = 1
+
+
+def load_thresholds(path: str, chunk_bytes: int) -> dict[str, Any]:
+    """Read and check a thresholds file; return the auto-tuned policy's settings.
+
+    Raises:
+        ValueError: naming ``GPUBRIDGE_THRESHOLDS`` and what is wrong, so
+            ``init()`` fails on every rank with one clear message.
+    """
+    where = f"{THRESHOLDS_ENV}={path!r}"
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except OSError as exc:
+        raise ValueError(f"{where}: can't read it ({exc.strerror or exc})") from None
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{where}: not valid JSON ({exc})") from None
+    if not isinstance(data, dict) or data.get("gpubridge_thresholds") != THRESHOLDS_FORMAT:
+        raise ValueError(f"{where}: not a gpubridge thresholds file (format "
+                         f"{THRESHOLDS_FORMAT}); write one with bench_all_reduce.py "
+                         "--write-thresholds")
+    rules = data.get("rules")
+    if not isinstance(rules, list) or not rules:
+        raise ValueError(f"{where}: needs a non-empty list of rules")
+    checked, previous = [], -1
+    for i, rule in enumerate(rules):
+        name, max_bytes = (rule.get("policy"), rule.get("max_bytes")) if isinstance(
+            rule, dict) else (None, None)
+        last = i == len(rules) - 1
+        if name == AutoTuned.name or (name != AUTO and name not in _POLICIES):
+            known = ", ".join([AUTO, *sorted(n for n in _POLICIES if n != AutoTuned.name)])
+            raise ValueError(f"{where}: rule {i} names policy {name!r}; known: {known}")
+        if last and max_bytes is not None:
+            raise ValueError(f"{where}: the last rule must cover every size (max_bytes null)")
+        if not last and (not isinstance(max_bytes, int) or max_bytes <= previous):
+            raise ValueError(f"{where}: rule {i} needs an integer max_bytes larger than the "
+                             "previous rule's")
+        previous = max_bytes if max_bytes is not None else previous
+        checked.append({"max_bytes": max_bytes, "policy": name})
+    chunk = data.get("chunk_bytes", chunk_bytes)
+    if not isinstance(chunk, int) or chunk < 8 or chunk % 8:
+        raise ValueError(f"{where}: chunk_bytes must be a positive multiple of 8")
+    return {"rules": checked, "chunk_bytes": chunk}
+
 
 DEFAULT_POLICY = AUTO
 
 _POLICIES: dict[str, type[CollectivePolicy]] = {
-    cls.name: cls for cls in (ReduceBridgeBroadcast, NativeOnly, FlatGloo)
+    cls.name: cls for cls in (ReduceBridgeBroadcast, NativeOnly, FlatGloo,
+                              PipelinedReduceBridgeBroadcast, AutoTuned)
 }
 
 

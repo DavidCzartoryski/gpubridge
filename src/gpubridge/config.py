@@ -21,6 +21,12 @@ CPU_ONLY_ENV = "GPUBRIDGE_CPU_ONLY"
 #: can exercise two islands and the bridge. See :mod:`gpubridge.split_test`.
 SPLIT_TEST_ENV = "GPUBRIDGE_SPLIT_TEST"
 SPLIT_TEST_MODES = ("half", "alternate", "node")
+#: Chunk size of the pipelined bridge, in bytes (``4M``, ``65536`` ...). Must be
+#: the same on every rank: it decides how many bridge calls a collective makes.
+CHUNK_BYTES_ENV = "GPUBRIDGE_CHUNK_BYTES"
+#: Path of a thresholds file for the ``auto-tuned`` policy, as written by
+#: ``scripts/gpu/bench_all_reduce.py --write-thresholds``.
+THRESHOLDS_ENV = "GPUBRIDGE_THRESHOLDS"
 
 #: Backend of the global discovery group and the cross-vendor bridge. Both run on CPU.
 CPU_BACKEND = "gloo"
@@ -61,6 +67,43 @@ def split_test_mode() -> str | None:
         f"{SPLIT_TEST_ENV}={os.environ[SPLIT_TEST_ENV]!r} is not valid; use one of "
         f"{', '.join(SPLIT_TEST_MODES)}, 1 (half) or 0 (off)"
     )
+
+
+_UNITS = {"K": 2**10, "M": 2**20, "G": 2**30}
+
+
+def parse_size(text: str) -> int:
+    """Parse ``"4M"``, ``"64K"``, ``"1G"`` or plain bytes (``"65536"``) into bytes.
+
+    Raises:
+        ValueError: for anything else.
+    """
+    value = text.strip().upper().removesuffix("B")
+    try:
+        if value and value[-1] in _UNITS:
+            return int(float(value[:-1]) * _UNITS[value[-1]])
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{text!r} is not a size; use bytes or a K/M/G suffix, e.g. 4M") from None
+
+
+def chunk_bytes_setting(default: int) -> int:
+    """The pipelined bridge's chunk size: ``GPUBRIDGE_CHUNK_BYTES``, or ``default``.
+
+    Raises:
+        ValueError: unless it is a positive multiple of 8 bytes (so a host slot
+            can be viewed as any supported dtype).
+    """
+    raw = os.environ.get(CHUNK_BYTES_ENV, "").strip()
+    if not raw:
+        return default
+    try:
+        chunk = parse_size(raw)
+    except ValueError as exc:
+        raise ValueError(f"{CHUNK_BYTES_ENV}: {exc}") from None
+    if chunk < 8 or chunk % 8:
+        raise ValueError(f"{CHUNK_BYTES_ENV}={raw!r} must be a positive multiple of 8 bytes")
+    return chunk
 
 
 def is_simulated() -> bool:

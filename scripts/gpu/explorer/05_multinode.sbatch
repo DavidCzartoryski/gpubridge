@@ -46,4 +46,13 @@ step summarize_split_by_node python "$KIT_DIR/summarize.py" "$RESULTS/check_spli
 step bench_split_by_node multinode bench "$KIT_DIR/bench_all_reduce.py" \
     --out "$RESULTS/bench_split_by_node" --max-bytes "$BENCH_MAX_BYTES" \
     --ops native,island,gpubridge --phases
+# Opt-in policies with the bridge crossing the network (items 17 to 19).
+for policy in $OPT_IN_POLICIES; do
+    step "check_$policy" multinode "check-$policy" "$KIT_DIR/check.py" \
+        --out "$RESULTS/check_$policy" --policy "$policy"
+    step "summarize_$policy" python "$KIT_DIR/summarize.py" "$RESULTS/check_$policy"
+done
+step bench_candidates multinode candidates "$KIT_DIR/bench_all_reduce.py" \
+    --out "$RESULTS/bench_candidates" --max-bytes "$BENCH_MAX_BYTES" --ops gpubridge \
+    --write-thresholds "$RESULTS/thresholds.json"
 finish

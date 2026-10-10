@@ -126,6 +126,29 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     events and `record_stream` on real GPUs. *Step:* `check.py` stage `async`
     queues the all_reduce right behind GPU work and checks the result on the
     caller's stream after `wait()`, with no host sync in between.
+17. **The pipelined bridge is correct on GPUs.** `pipelined-reduce-bridge-broadcast`
+    (opt-in) copies chunks through pinned host memory on two side streams,
+    ordered by CUDA events, waiting on the host only for the chunk the bridge
+    needs next.
+    *Status: works on CPU, bit for bit against `flat-gloo`, including with a
+    staging layer that runs each copy only when something waits for its event,
+    so a missing wait corrupts the result (`tests/test_pipelined.py` shows it
+    does).* Still open: the real events, pinned buffers and `record_stream` on
+    GPUs. *Step:* `check.py --policy pipelined-reduce-bridge-broadcast` (its
+    `busy_gpu` stage queues work ahead of the collective), in Explorer steps
+    04, 05 and 07 and `amd/run_all.sh` (`OPT_IN_POLICIES`).
+18. **The overlap pays off.** For large tensors the pipelined bridge should
+    beat reduce-bridge-broadcast without hurting small ones; the best chunk
+    size depends on the machine.
+    *Status: not measurable on CPU.* *Step:* `bench_all_reduce.py
+    --candidates` (or `--write-thresholds`), rerun with a few
+    `GPUBRIDGE_CHUNK_BYTES` values.
+19. **Thresholds measured on GPUs drive `auto-tuned`.**
+    *Status: on CPU, a file written by `--write-thresholds` loads, and
+    `auto-tuned` routes each size to the rule's policy.* Still open: the
+    thresholds themselves, per cluster. *Step:* the `bench_candidates` and
+    `check_auto_tuned` steps write `thresholds.json` next to the results and
+    rerun the check under `auto-tuned` with it.
 
 ## Mixed build results
 

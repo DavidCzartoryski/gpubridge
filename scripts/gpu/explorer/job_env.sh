@@ -14,6 +14,9 @@ VENV="${VENV:-$WORK_DIR/venv}"                       # CUDA build of torch
 VENV_ROCM="${VENV_ROCM:-$WORK_DIR/venv-rocm}"        # ROCm build (step 07)
 RESULTS_ROOT="${RESULTS_ROOT:-$REPO_DIR/results/explorer}"
 MODULES="${MODULES:-}"                               # `module load` names, if any
+# Opt-in collective policies each check-and-bench step also runs (off by default
+# in gpubridge itself; selected here with --policy).
+OPT_IN_POLICIES="${OPT_IN_POLICIES:-pipelined-reduce-bridge-broadcast}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
 # load_modules "NAMES": `module load` each space-separated name. Finds Lmod if
