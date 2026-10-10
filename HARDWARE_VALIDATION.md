@@ -175,6 +175,22 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     `policy:reduce-bridge-broadcast` columns. Step 05's
     `bench_phases_sharded-bridge` times the bridge phase alone, next to the
     `bench_split_by_node` phases of reduce-bridge-broadcast.
+22. **DDP with `gpubridge.ddp_comm_hook` trains correctly on GPUs.** Two
+    things only GPUs show. First, DDP's own traffic runs on the Gloo world
+    group with device tensors: the shape check and parameter broadcast when it
+    wraps the model, on CUDA and ROCm builds. Second, the stream handoff: DDP
+    calls the hook on the autograd thread, the bucket's all_reduce starts after
+    the work queued on that thread's stream, and DDP reads the result through
+    the device-aware future.
+    *Status: works on CPU. Gradients match the exact average bit for bit (with
+    integer-valued gradients) under the default, sharded, pipelined,
+    native-only and flat-gloo policies, with one bucket per parameter. A
+    failed bucket makes `backward()` raise on every rank, and later
+    collectives refuse to start (`tests/test_ddp.py`).* *Step:*
+    `examples/train_synthetic.py`, which exits non-zero if parameters diverge:
+    `train_ddp` in Explorer steps 04 (split test) and 07 (mixed NVIDIA +
+    AMD), `train_ddp_split` in `amd/run_all.sh`, and the single-island
+    scaling runs in step 06.
 
 ## Mixed build results
 

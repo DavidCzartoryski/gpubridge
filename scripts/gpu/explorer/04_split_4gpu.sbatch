@@ -43,4 +43,8 @@ step bench_candidates local_torchrun --nproc-per-node="$GPUS" "$KIT_DIR/bench_al
 step check_auto_tuned env_local_torchrun GPUBRIDGE_THRESHOLDS="$RESULTS/thresholds.json" \
     --nproc-per-node="$GPUS" "$KIT_DIR/check.py" --out "$RESULTS/check_auto_tuned" \
     --policy auto-tuned
+# DDP with gpubridge.ddp_comm_hook across two islands (item 22). It exits non-zero
+# if the ranks' parameters diverge.
+step train_ddp local_torchrun --nproc-per-node="$GPUS" "$REPO_DIR/examples/train_synthetic.py" \
+    --json "$RESULTS/train_ddp.json"
 finish

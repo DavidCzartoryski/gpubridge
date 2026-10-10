@@ -1,10 +1,12 @@
 """Data-parallel training on synthetic data, with gradients synced by gpubridge.
 
 A small MLP learns a fixed random classification task. Each rank trains on its
-own batches; after every backward pass the gradients are summed across all
-ranks with one gpubridge.all_reduce and averaged, so the same script trains on
-NVIDIA, AMD or both at once. It reports throughput (samples/sec across all
-ranks) and checks that every rank ends with identical parameters.
+own batches. The model is wrapped in DistributedDataParallel on gpubridge's
+Gloo world group, with gpubridge.ddp_comm_hook registered: DDP buckets the
+gradients and overlaps their sync with backward, and each bucket is averaged
+with an async gpubridge.all_reduce. So the same script trains on NVIDIA, AMD
+or both at once. It reports throughput (samples/sec across all ranks) and
+checks that every rank ends with identical parameters.
 
 On CPU, in simulation mode:
 
@@ -25,6 +27,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 
 import gpubridge
 
@@ -34,18 +37,6 @@ def make_model(dim: int, layers: int, classes: int) -> nn.Module:
     for _ in range(layers):
         blocks += [nn.Linear(dim, dim), nn.ReLU()]
     return nn.Sequential(*blocks, nn.Linear(dim, classes))
-
-
-def sync_gradients(model: nn.Module, world_size: int) -> None:
-    """Average gradients across all ranks with a single all_reduce."""
-    grads = [p.grad for p in model.parameters()]
-    flat = torch.cat([g.reshape(-1) for g in grads])
-    gpubridge.all_reduce(flat)
-    flat /= world_size
-    offset = 0
-    for g in grads:
-        g.copy_(flat[offset:offset + g.numel()].view_as(g))
-        offset += g.numel()
 
 
 def wait(device: torch.device) -> None:
@@ -68,11 +59,14 @@ def main() -> None:
     topology = gpubridge.init()
     device, rank, world = topology.device, topology.rank, topology.world_size
 
-    # Same seed everywhere, then broadcast from rank 0 anyway: every rank must start equal.
+    # Same seed everywhere; DDP also broadcasts rank 0's parameters when it wraps
+    # the model. The default group is gpubridge's Gloo world group, which spans
+    # both vendors; the hook sends every gradient bucket through gpubridge.
     torch.manual_seed(0)
     model = make_model(args.dim, args.layers, args.classes).to(device)
-    for param in model.parameters():
-        gpubridge.broadcast(param.data, src=0)
+    model = DistributedDataParallel(
+        model, device_ids=[device.index] if device.type == "cuda" else None)
+    model.register_comm_hook(None, gpubridge.ddp_comm_hook)
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
     loss_fn = nn.CrossEntropyLoss()
 
@@ -91,13 +85,12 @@ def main() -> None:
         start = time.perf_counter()
         optimizer.zero_grad(set_to_none=False)
         loss = loss_fn(model(x), y)
-        loss.backward()
-        sync_gradients(model, world)
+        loss.backward()  # DDP waits for every bucket's all_reduce before returning
         optimizer.step()
         wait(device)
         if step >= args.warmup_steps:
             step_times.append(time.perf_counter() - start)
-        losses.append(float(loss))
+        losses.append(loss.item())
 
     # Slowest rank sets the pace; every rank should hold identical parameters.
     elapsed = torch.tensor([sum(step_times)], dtype=torch.float64)
@@ -115,6 +108,8 @@ def main() -> None:
             "run": {"kind": topology.run_kind, "split_test": topology.split_test,
                     "islands": [list(i.ranks) for i in topology.layout.islands]},
             "device": str(device),
+            "grad_sync": "DistributedDataParallel + gpubridge.ddp_comm_hook",
+            "policy": topology.policy_name,
             "batch_size_per_rank": args.batch_size,
             "model": {"dim": args.dim, "layers": args.layers, "classes": args.classes,
                       "parameters": sum(p.numel() for p in model.parameters())},

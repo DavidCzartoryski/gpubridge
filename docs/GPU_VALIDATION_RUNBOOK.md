@@ -49,6 +49,8 @@ Steps 04, 05, 07 and the AMD script also check every opt-in policy in
 `OPT_IN_POLICIES` (the pipelined and sharded policies) and write
 `thresholds.json` (items 17 to 21); step 05 also times each one's phases.
 Opt-in policies are not validated on GPUs until those steps pass.
+Steps 04, 06, 07 and the AMD script train with DDP and `gpubridge.ddp_comm_hook`
+(`examples/train_synthetic.py`, item 22).
 Times exclude queue waits. For cost, multiply by the provider's current hourly
 rate; for example, at a hypothetical $3/h, step 7 costs about $1.50.
 

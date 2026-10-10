@@ -85,6 +85,9 @@ if [ "$GPUS" -ge 2 ]; then
         "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench_candidates" --ops gpubridge \
         --max-bytes "$BENCH_MAX_BYTES" --trials "$BENCH_TRIALS" \
         --write-thresholds "$RESULTS/thresholds.json"
+    # DDP with gpubridge.ddp_comm_hook across two islands (item 22).
+    step train_ddp_split env_local_torchrun GPUBRIDGE_SPLIT_TEST=half --nproc-per-node="$GPUS" \
+        "$REPO_DIR/examples/train_synthetic.py" --json "$RESULTS/train_ddp_split.json"
     max=$((GPUS < SCALING_MAX_GPUS ? GPUS : SCALING_MAX_GPUS))
     for n in $(seq 1 "$max"); do
         step "train_n$n" local_torchrun --nproc-per-node="$n" \
