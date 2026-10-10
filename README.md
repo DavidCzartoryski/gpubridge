@@ -223,6 +223,7 @@ The API follows `torch.distributed`, always on the world group.
 | `is_initialized() -> bool` | True between `init` and `destroy`. |
 | `probe() -> Probe` | This process's build vendor, CUDA/HIP versions, visible GPU count, and NCCL/Gloo availability. Never raises; failed checks are listed in `Probe.errors`. Works before `init`. |
 | `add_observer(observer)` / `remove_observer(observer)` | Start or stop sending this rank's collective records to a `CollectiveObserver` (see [Observing collectives](#observing-collectives)). |
+| `in_flight() -> list[InFlight]` | The collective each thread of this rank is inside right now: `seq`, `op`, `policy`, current `phase`, `phases_done`, `thread`, `seconds`. A debugging aid for hangs, safe to call from any thread (see [Debugging a hang](#debugging-a-hang)). |
 
 Every collective takes `async_op`. With `async_op=True` it returns a `Work`
 (`wait()`, `is_completed()`, `exception()`, `get_future()`); see
@@ -443,6 +444,40 @@ The rules keep observers from changing what any rank communicates:
 
 A custom policy can mark its own steps with `gpubridge.observe.phase("name")`.
 
+### Debugging a hang
+
+`gpubridge.in_flight()` returns the collective each thread of this rank is
+inside right now, oldest first, as `InFlight` entries: `seq`, `op`, `policy`,
+`phase` (the step it is in now, such as `bridge`, or None between steps),
+`phases_done`, `thread` and `seconds`. It works with or without observers,
+and it never blocks, communicates or touches a GPU, so another thread can
+call it while the training thread is stuck inside a collective. `seq` is the
+same on every rank for the same collective.
+
+```python
+import threading
+import time
+
+import gpubridge
+
+topology = gpubridge.init()
+
+def report_long_collectives(limit_s=600.0, every_s=60.0):
+    while True:
+        time.sleep(every_s)
+        for c in gpubridge.in_flight():
+            if c.seconds > limit_s:
+                print(f"rank {topology.rank}: {c.op} #{c.seq} ({c.phase or 'no phase'}) "
+                      f"on {c.thread} for {c.seconds:.0f} s", flush=True)
+
+threading.Thread(target=report_long_collectives, daemon=True).start()
+```
+
+It shows the host's view. On GPUs, NCCL and RCCL calls can return before
+their device work finishes, so a rank whose GPU is still waiting may show
+nothing in flight (HARDWARE_VALIDATION.md item 23). An async collective shows
+on gpubridge's worker thread once it starts.
+
 ## Building on gpubridge
 
 gpubridge is meant to be a base for cluster tooling that has to understand
@@ -451,6 +486,8 @@ mixed hardware, such as monitoring or profiling tools:
 - `get_topology()` tells each rank the vendor, island and host of every rank.
 - [Observers](#observing-collectives) give every rank a timing record for
   each collective, with sequence numbers that match across ranks.
+- [`in_flight()`](#debugging-a-hang) shows which collective, and which step
+  of it, each thread is inside right now.
 - Gloo works the same on both vendors and does not touch GPU streams. A tool
   can create its own Gloo group after `init()` (on every rank, in the same
   order) to carry monitoring data without disturbing training traffic.

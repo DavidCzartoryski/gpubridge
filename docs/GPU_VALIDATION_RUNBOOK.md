@@ -44,7 +44,8 @@ real mixed-vendor result:
 Step 8 alt replaces step 8, and saves the cloud machines, only if Explorer has
 AMD GPUs; see [Mixed-vendor job inside Explorer](#mixed-vendor-job-inside-explorer).
 Every step that runs `check.py` also covers items 14 to 16 (reductions,
-all_gather, reduce_scatter, async, and where NCCL/RCCL and Gloo agree).
+all_gather, reduce_scatter, async, and where NCCL/RCCL and Gloo agree) and
+item 23 (what `in_flight()` shows while one rank is late).
 Steps 04, 05, 07 and the AMD script also check every opt-in policy in
 `OPT_IN_POLICIES` (the pipelined and sharded policies) and write
 `thresholds.json` (items 17 to 21); step 05 also times each one's phases.

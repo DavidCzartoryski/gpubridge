@@ -22,11 +22,18 @@ Rules that keep observers from ever changing what any rank communicates:
   the current stream. Read a record once :meth:`CollectiveRecord.ready` is true;
   until then its times aren't known. On CPU (simulation and CPU-only mode) a
   mark is a ``perf_counter_ns`` reading and records are ready at once.
-- **No observers, no cost.** Without observers, gpubridge creates no events and
-  no records; each collective only bumps the sequence counter.
+- **No observers, almost no cost.** Without observers, gpubridge creates no
+  events and no records; each collective bumps the sequence counter and notes
+  itself in the table :func:`in_flight` reads.
 - **Async collectives are observed when they run.** With ``async_op=True`` a
   collective runs on gpubridge's worker thread, so its record is delivered on
   that thread, in submission order.
+
+:func:`in_flight` is a debugging aid for hangs, and works with or without
+observers: from any thread, it returns the collective each thread of this rank
+is inside right now, with its sequence number, op and current phase. Run on
+every rank of a stuck job, it shows which collective and step each one is
+waiting in.
 """
 
 from __future__ import annotations
@@ -133,9 +140,55 @@ class CollectiveObserver(abc.ABC):
         """Called once if the observer is detached because ``on_collective`` raised."""
 
 
+@dataclass(frozen=True)
+class InFlight:
+    """A collective one thread of this rank is inside right now, from :func:`in_flight`."""
+
+    seq: int
+    """The collective's sequence number, the same on every rank (see :class:`CollectiveRecord`)."""
+    op: str
+    """``"all_reduce"``, ``"broadcast"``, ``"all_gather_into_tensor"``,
+    ``"reduce_scatter_tensor"`` or ``"barrier"``."""
+    policy: str | None
+    """The policy carrying it; None for a barrier."""
+    phase: str | None
+    """The phase its policy marked that the thread is in now (``island-reduce``,
+    ``bridge``...), or None: between phases, or for a policy that marks none."""
+    phases_done: tuple[str, ...]
+    """Phases this thread finished in this collective, in order."""
+    thread: str
+    """The name of the thread: the caller's for a blocking call, gpubridge's worker
+    thread for ``async_op=True``."""
+    seconds: float
+    """How long the thread has been inside it, on this rank's monotonic clock."""
+
+
+class _Flight:
+    """One collective in progress on one thread. Read from other threads by in_flight()."""
+
+    __slots__ = ("seq", "op", "policy", "phase", "done", "ident", "since")
+
+    def __init__(self, seq: int, op: str, policy: str | None) -> None:
+        self.seq, self.op, self.policy = seq, op, policy
+        self.phase: str | None = None
+        self.done: tuple[str, ...] = ()
+
+    def enter(self) -> None:
+        self.ident = threading.get_ident()
+        self.since = time.monotonic()
+        _in_flight[self.ident] = self
+        _state.flight = self
+
+    def leave(self) -> None:
+        _in_flight.pop(self.ident, None)
+        _state.flight = None
+
+
 _observers: list[CollectiveObserver] = []
 _seq = 0
 _seq_lock = threading.Lock()
+_in_flight: dict[int, _Flight] = {}
+"""The collective each thread is inside, by thread id."""
 
 
 class _ThreadState(threading.local):
@@ -143,9 +196,40 @@ class _ThreadState(threading.local):
 
     in_callback = False
     recording: _Recording | None = None
+    flight: _Flight | None = None
 
 
 _state = _ThreadState()
+
+
+def in_flight() -> list[InFlight]:
+    """The collective each thread of this rank is inside right now, oldest first.
+
+    A debugging aid for hangs. Safe to call from any thread at any time (a
+    watchdog thread, a debugger): it never blocks, communicates or touches a
+    device. Empty when no thread is inside a gpubridge collective, or before
+    ``init()``.
+
+    It reflects the host: a thread is in flight from the moment it enters a
+    gpubridge collective until the call returns. On GPUs a call can return
+    before its device work finishes; such work isn't listed. An async
+    collective is listed once gpubridge's worker thread starts it, not while it
+    waits in the queue.
+    """
+    for _ in range(10):
+        try:
+            flights = list(_in_flight.values())
+            break
+        except RuntimeError:  # another thread entered or left a collective mid-copy
+            continue
+    else:
+        return []
+    now = time.monotonic()
+    names = {t.ident: t.name for t in threading.enumerate()}
+    out = [InFlight(seq=f.seq, op=f.op, policy=f.policy, phase=f.phase, phases_done=f.done,
+                    thread=names.get(f.ident, str(f.ident)), seconds=now - f.since)
+           for f in flights if hasattr(f, "since")]
+    return sorted(out, key=lambda f: f.seq)
 
 
 def add_observer(observer: CollectiveObserver) -> None:
@@ -180,6 +264,8 @@ def _reset() -> None:
         _seq = 0
     _state.in_callback = False
     _state.recording = None
+    _state.flight = None
+    _in_flight.clear()
 
 
 def refuse_in_callback(op: str) -> None:
@@ -225,20 +311,39 @@ class _NoRecording:
 _NOT_RECORDING = _NoRecording()
 
 
+class _Tracking:
+    """What :func:`collective` returns when nobody is watching: only the in-flight entry."""
+
+    __slots__ = ("flight",)
+
+    def __init__(self, flight: _Flight) -> None:
+        self.flight = flight
+
+    def __enter__(self) -> None:
+        self.flight.enter()
+
+    def __exit__(self, *exc: object) -> None:
+        self.flight.leave()
+
+
 class _Recording:
     def __init__(self, topology: Topology, op: str, seq: int, tensor: torch.Tensor | None,
-                 src: int | None, policy: str | None, reduce_op: str | None) -> None:
+                 src: int | None, policy: str | None, reduce_op: str | None,
+                 flight: _Flight) -> None:
         self.device = _event_device(topology)
         self.op, self.seq, self.tensor, self.src, self.policy = op, seq, tensor, src, policy
         self.reduce_op = reduce_op
+        self.flight = flight
         self.phases: list[Phase] = []
 
     def __enter__(self) -> None:
+        self.flight.enter()
         self.start = _new_mark(self.device)
         _state.recording = self
 
     def __exit__(self, exc_type: type[BaseException] | None, *exc: object) -> None:
         _state.recording = None
+        self.flight.leave()
         if exc_type is not None:
             return
         tensor = self.tensor
@@ -258,14 +363,21 @@ class _Recording:
 
 
 class _PhaseRecording:
-    def __init__(self, recording: _Recording, name: str) -> None:
-        self.recording, self.name = recording, name
+    """One phase: always noted in the in-flight entry, timed only if anyone is watching."""
+
+    def __init__(self, flight: _Flight, recording: _Recording | None, name: str) -> None:
+        self.flight, self.recording, self.name = flight, recording, name
 
     def __enter__(self) -> None:
-        self.start = _new_mark(self.recording.device)
+        self.outer = self.flight.phase  # policies may nest phases
+        self.flight.phase = self.name
+        if self.recording is not None:
+            self.start = _new_mark(self.recording.device)
 
     def __exit__(self, exc_type: type[BaseException] | None, *exc: object) -> None:
-        if exc_type is None:
+        self.flight.phase = self.outer
+        self.flight.done = (*self.flight.done, self.name)
+        if exc_type is None and self.recording is not None:
             end = _new_mark(self.recording.device)
             self.recording.phases.append(Phase(self.name, self.start, end))
 
@@ -278,8 +390,9 @@ def collective(
     src: int | None = None,
     policy: str | None = None,
     reduce_op: str | None = None,
-) -> _Recording | _NoRecording:
-    """Wrap one validated collective: count it, and record it if anyone is watching.
+) -> _Recording | _Tracking:
+    """Wrap one validated collective: count it, note it as in flight, and record it if
+    anyone is watching.
 
     Use as ``with collective(topology, "all_reduce", tensor, policy=name):``.
     Called on the thread that runs the collective (the worker thread for
@@ -293,24 +406,26 @@ def collective(
     with _seq_lock:
         seq = _seq
         _seq += 1
+    flight = _Flight(seq, op, policy)
     if not _observers:
-        return _NOT_RECORDING
-    return _Recording(topology, op, seq, tensor, src, policy, reduce_op)
+        return _Tracking(flight)
+    return _Recording(topology, op, seq, tensor, src, policy, reduce_op, flight)
 
 
 def phase(name: str) -> _PhaseRecording | _NoRecording:
     """Mark one step of a collective, for policies with more than one step.
 
-    Records nothing when no observer is watching. Use inside
-    :meth:`CollectivePolicy.all_reduce` or :meth:`~CollectivePolicy.broadcast`::
+    :func:`in_flight` shows the step a thread is in; it is timed only when an
+    observer is watching. Use inside :meth:`CollectivePolicy.all_reduce` or
+    :meth:`~CollectivePolicy.broadcast`::
 
         with phase("bridge"):
             topology.bridge.all_reduce(staged)
     """
-    recording = _state.recording
-    if recording is None:
+    flight = _state.flight
+    if flight is None:
         return _NOT_RECORDING
-    return _PhaseRecording(recording, name)
+    return _PhaseRecording(flight, _state.recording, name)
 
 
 def _deliver(record: CollectiveRecord) -> None:
