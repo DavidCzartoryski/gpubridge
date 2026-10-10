@@ -332,10 +332,11 @@ def test_bench_writes_a_thresholds_file_auto_tuned_can_load(tmp_path, monkeypatc
     assert data["chunk_bytes"] == 1024 and data["measured"]["split_test"] == "half"
     assert data["rules"][-1]["max_bytes"] is None
     assert {r["policy"] for r in data["rules"]} <= {
-        "flat-gloo", "reduce-bridge-broadcast", PIPELINED}
+        "flat-gloo", "reduce-bridge-broadcast", PIPELINED, "sharded-bridge"}
     rows = json.loads((out / "bench.json").read_text())["rows"]
     assert {r["op"] for r in rows} == {"gpubridge", "policy:flat-gloo",
-                                       "policy:reduce-bridge-broadcast", f"policy:{PIPELINED}"}
+                                       "policy:reduce-bridge-broadcast", f"policy:{PIPELINED}",
+                                       "policy:sharded-bridge"}
     assert load_thresholds(str(path), 64)["rules"] == data["rules"]
     monkeypatch.setenv(THRESHOLDS_ENV, str(path))
     run_ranks(["nvidia", "amd", "amd"], _check_measured_file, tmp_path,

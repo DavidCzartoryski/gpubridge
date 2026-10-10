@@ -33,6 +33,7 @@ def run_ranks(
     *,
     fake_builds: bool = False,
     init_kwargs: dict[str, Any] | None = None,
+    before_init: Callable[[int], None] | None = None,
 ) -> None:
     """Run ``fn(topology)`` on one CPU process per entry in ``vendors``.
 
@@ -40,14 +41,17 @@ def run_ranks(
     ``fake_builds`` it instead patches ``torch.version`` to look like a CUDA or
     ROCm build and sets ``GPUBRIDGE_CPU_ONLY``, so the vendor comes from build
     detection. ``init_kwargs`` are passed to ``gpubridge.init`` on every rank.
+    ``before_init(rank)``, if given, runs in each process just before init,
+    e.g. to patch something init uses.
 
-    ``fn`` must be picklable: a module-level function or a ``functools.partial``
-    of one. A failure on any rank is re-raised in the calling process.
+    ``fn`` and ``before_init`` must be picklable: module-level functions or
+    ``functools.partial`` of one. A failure on any rank is re-raised in the
+    calling process.
     """
     init_file = tmp_path / "rendezvous"
     mp.spawn(
         _rank_main,
-        args=(tuple(vendors), fn, str(init_file), fake_builds, init_kwargs or {}),
+        args=(tuple(vendors), fn, str(init_file), fake_builds, init_kwargs or {}, before_init),
         nprocs=len(vendors),
     )
 
@@ -59,6 +63,7 @@ def _rank_main(
     init_file: str,
     fake_builds: bool,
     init_kwargs: dict[str, Any],
+    before_init: Callable[[int], None] | None = None,
 ) -> None:
     if fake_builds:
         os.environ[CPU_ONLY_ENV] = "1"
@@ -67,6 +72,8 @@ def _rank_main(
     else:
         os.environ[VENDOR_ENV] = vendors[rank]
     torch.set_num_threads(1)
+    if before_init is not None:
+        before_init(rank)
     topology = gpubridge.init(
         init_method=f"file://{init_file}",
         rank=rank,

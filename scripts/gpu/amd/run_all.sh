@@ -24,7 +24,8 @@ BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-1G}"
 BENCH_TRIALS="${BENCH_TRIALS:-10}"
 SCALING_MAX_GPUS="${SCALING_MAX_GPUS:-4}"
 SKIP_SETUP="${SKIP_SETUP:-0}"            # 1 = reuse an existing venv (e.g. on a rerun)
-OPT_IN_POLICIES="${OPT_IN_POLICIES:-pipelined-reduce-bridge-broadcast}"  # also checked
+# Opt-in collective policies also checked (space-separated).
+OPT_IN_POLICIES="${OPT_IN_POLICIES:-pipelined-reduce-bridge-broadcast sharded-bridge}"
 # -------------------------------------------------------------------------------
 
 RESULTS="$RESULTS_ROOT/$TARGET"
@@ -72,7 +73,7 @@ if [ "$GPUS" -ge 2 ]; then
     step bench env_local_torchrun GPUBRIDGE_SPLIT_TEST=half --nproc-per-node="$GPUS" \
         "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" --ops native,island,gpubridge \
         --phases --max-bytes "$BENCH_MAX_BYTES" --trials "$BENCH_TRIALS"
-    # Opt-in policies (items 17 to 19), each under the same split-test check, then
+    # Opt-in policies (items 17 to 21), each under the same split-test check, then
     # every candidate timed side by side, writing a thresholds file for auto-tuned.
     for policy in $OPT_IN_POLICIES; do
         step "check_$policy" env_local_torchrun GPUBRIDGE_SPLIT_TEST=half \

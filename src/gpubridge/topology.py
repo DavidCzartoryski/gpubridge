@@ -294,6 +294,8 @@ class Topology:
     """The collective policy every rank runs (``auto`` already resolved)."""
     transport: type[BridgeTransport] | None = None
     """The bridge transport class every rank chose, on every rank (leaders or not)."""
+    timeout: timedelta | None = None
+    """The timeout ``init()`` gave its groups, for groups a policy creates in ``setup()``."""
 
     @property
     def policy_name(self) -> str:
@@ -431,6 +433,7 @@ def build_topology(
         bridge=bridge,
         policy=policy_cls(),
         transport=transport,
+        timeout=timeout,
     )
     topology.policy.setup(topology)
     return topology
