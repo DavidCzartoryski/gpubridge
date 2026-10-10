@@ -139,7 +139,7 @@ def test_setup_job_creates_the_cuda_venv(tmp_path):
     assert "module load explorer" in log  # the proxy, before installing
     assert ("--index-url https://download.pytorch.org/whl/cu126 torch==2.14.1+cu126 numpy"
             in log)
-    assert f"uv pip install --python {venv}/bin/python -e {REPO}" in log
+    assert f"uv pip install --python {venv}/bin/python -e {REPO}[test]" in log
     assert "environment ready" in job_output(tmp_path)
 
 

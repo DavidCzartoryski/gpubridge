@@ -63,6 +63,10 @@ rccl_version() {
     run grep -h -m 1 -i -o "RCCL version[^,]*" "$RESULTS/nccl/check_1gpu/"*.log
 }
 step rccl_version rccl_version
+# GPU-only correctness tests (tests/test_gpu.py): every policy against flat-gloo,
+# fp32/fp16/bf16, odd and large sizes, async on non-default streams.
+step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" -q \
+    -p no:cacheprovider --junitxml="$RESULTS/gpu_tests.xml"
 
 checks=("$RESULTS/check_1gpu")
 if [ "$GPUS" -ge 2 ]; then

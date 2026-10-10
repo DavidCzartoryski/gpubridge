@@ -76,6 +76,12 @@ Steps 04, 05, 07 and the AMD script also check every opt-in policy in
 Opt-in policies are not validated on GPUs until those steps pass.
 Steps 04, 06, 07 and the AMD script train with DDP and `gpubridge.ddp_comm_hook`
 (`examples/train_synthetic.py`, item 22).
+Steps 02, 04 and the AMD script also run the GPU-only tests, `pytest -m gpu
+tests/test_gpu.py` (step `gpu_tests`, results in `gpu_tests.xml`): every
+bridge policy against `flat-gloo` bit for bit for every op, fp32/fp16/bf16, odd
+and large sizes; non-contiguous tensors refused; and sync and async
+collectives called from non-default streams behind queued GPU work (items 6,
+15 and 16). On one GPU they run two ranks sharing it.
 Times exclude queue waits. For cost, multiply by the provider's current hourly
 rate; for example, at a hypothetical $3/h, step 7 costs about $1.50.
 
@@ -281,13 +287,14 @@ The script runs:
    one more process than GPUs, which must fail `init()` on every rank (item 12)
 5. a 1-GPU check, then greps its NCCL log (`nccl/check_1gpu/`) for RCCL's
    version (item 4)
+6. the GPU-only tests, `pytest -m gpu tests/test_gpu.py`
 
 With 2+ GPUs it continues with:
 
-6. an RCCL island
-7. a split test
-8. the native vs bridged benchmark
-9. training scaling
+7. an RCCL island
+8. a split test
+9. the native vs bridged benchmark
+10. training scaling
 
 With 1 GPU it runs a shared-GPU split test instead.
 
@@ -402,6 +409,9 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 - `nccl/<step>/<host>.<pid>.log`: NCCL/RCCL's `NCCL_DEBUG=INFO` output, one file
   per rank.
 - `bench/bench.csv`: latency and bandwidth per size, for native and gpubridge.
+- `gpu_tests.xml` and `gpu_tests.log`: the GPU-only tests (JUnit XML and
+  pytest's output). A failure names the policy, op, dtype, size and mode of
+  each wrong case.
 
 `run.kind` values:
 

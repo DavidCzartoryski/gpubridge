@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=gpubridge-04-split-4gpu
-#SBATCH --time=00:30:00
+#SBATCH --time=00:40:00
 # Step 04, 4 GPUs on 1 node (multigpu). Submit with: scripts/gpu/explorer/submit.sh 04
 # TEST ONLY split into two 2-GPU NCCL islands and the Gloo bridge: the full GPU
 # code path except RCCL. Items 3, 6, 7, 9 and 11 (native vs bridged benchmark in
@@ -24,6 +24,10 @@ for mode in half alternate; do
         --out "$RESULTS/check_$mode"
     step "summarize_$mode" python "$KIT_DIR/summarize.py" "$RESULTS/check_$mode"
 done
+# GPU-only correctness tests (tests/test_gpu.py): every policy against flat-gloo,
+# fp32/fp16/bf16, odd and large sizes, async on non-default streams.
+step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" -q \
+    -p no:cacheprovider --junitxml="$RESULTS/gpu_tests.xml"
 export GPUBRIDGE_SPLIT_TEST=half
 # --ops island and --phases put the island step (a reduce onto the leader) next
 # to a native island all_reduce of the same size (item 13).
