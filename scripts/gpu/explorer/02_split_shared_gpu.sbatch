@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=gpubridge-02-split-shared-gpu
-#SBATCH --time=00:15:00
+#SBATCH --time=00:25:00
 # Step 02, 1 GPU (free gpu partition). Submit with: scripts/gpu/explorer/submit.sh 02
 # TEST ONLY split: 2 processes share one GPU, each its own single-rank NCCL island,
 # joined by the Gloo bridge. Covers new_group(backend="nccl") on non-member ranks
@@ -19,4 +19,8 @@ export GPUBRIDGE_SPLIT_TEST=half
 step check local_torchrun --nproc-per-node="$PROCS" "$KIT_DIR/check.py" \
     --out "$RESULTS/check" --large-numel $((16 * 1024 * 1024))
 step summarize python "$KIT_DIR/summarize.py" "$RESULTS/check"
+# GPU-only correctness tests (tests/test_gpu.py): every policy against flat-gloo,
+# fp32/fp16/bf16, odd and large sizes, async on non-default streams.
+step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" -q \
+    -p no:cacheprovider --junitxml="$RESULTS/gpu_tests.xml"
 finish
