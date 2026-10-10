@@ -310,7 +310,13 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     assert result.returncode == 0, result.stderr
     out = result.stdout
     sruns = [line for line in out.splitlines() if line.startswith("+ srun --het-group=0")]
-    assert len(sruns) == 4  # probe, preflight, check, bench
+    # probe, preflight, check, bench, a check per opt-in policy, the candidates bench,
+    # then DDP training
+    assert len(sruns) >= 7
+    assert any("--policy pipelined-reduce-bridge-broadcast" in line for line in sruns[4:])
+    assert any("--policy sharded-bridge" in line for line in sruns[4:])
+    assert "--write-thresholds" in sruns[-2]
+    assert "examples/train_synthetic.py" in sruns[-1] and "train_ddp.json" in sruns[-1]
     for line in sruns:
         nvidia, amd = line.split(" : ")
         assert "/w/venv/bin/" in nvidia and "/w/venv-rocm/" not in nvidia
@@ -348,7 +354,14 @@ def test_submit_free_and_multi_submit_every_step():
                              "--expect-init-error LOCAL_RANK=1\\ asks\\ for\\ GPU\\ 1"]),
         ("02_split_shared_gpu.sbatch", ["--nproc-per-node=2", "check.py"]),
         ("03_single_island.sbatch", ["device_map.py", "check.py", "bench_all_reduce.py"]),
-        ("04_split_4gpu.sbatch", ["check_half", "check_alternate", "bench_all_reduce.py"]),
+        ("04_split_4gpu.sbatch", ["check_half", "check_alternate", "bench_all_reduce.py",
+                                  "--policy pipelined-reduce-bridge-broadcast",
+                                  "--policy sharded-bridge", "--write-thresholds",
+                                  "--policy auto-tuned", "train_synthetic.py",
+                                  "train_ddp.json"]),
+        ("05_multinode.sbatch", ["--policy pipelined-reduce-bridge-broadcast",
+                                 "--policy sharded-bridge", "bench_phases_sharded-bridge",
+                                 "--write-thresholds"]),
         ("05_multinode.sbatch", ["srun", "--rdzv-backend=c10d", "check_split_by_node"]),
         ("06_scaling.sbatch", ["--nproc-per-node=4", "train_synthetic.py", "summarize.py"]),
         ("07_mixed_hetjob.sbatch", ["--het-group=1", "--rdzv-backend=c10d", "summarize.py"]),
@@ -365,7 +378,9 @@ def test_amd_dry_run_with_several_gpus():
     out = dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="8").stdout
     for text in ["rocm-smi", "probe.py", "--nproc-per-node=9", "LOCAL_RANK=8\\ asks",
                  "NCCL_DEBUG=INFO", "--nproc-per-node=8",
-                 "GPUBRIDGE_SPLIT_TEST=half", "bench_all_reduce.py", "train_n4", "tar -czf"]:
+                 "GPUBRIDGE_SPLIT_TEST=half", "bench_all_reduce.py", "train_n4", "tar -czf",
+                 "--policy pipelined-reduce-bridge-broadcast", "--policy sharded-bridge",
+                 "train_ddp_split.json"]:
         assert text in out, text
     assert "train_n5" not in out
 
@@ -414,7 +429,11 @@ def test_check_in_a_split_test_is_flagged_everywhere(tmp_path):
         assert record["run"]["real_mixed_vendor"] is False
         assert "NOT a mixed-vendor result" in record["run"]["warning"]
         assert [s["name"] for s in record["stages"]] == [
-            "init", "device", "dtypes", "busy_gpu", "broadcast", "barrier", "destroy"]
+            "init", "device", "dtypes", "busy_gpu", "broadcast", "reductions", "all_gather",
+            "reduce_scatter", "async", "reduction_agreement", "barrier", "destroy"]
+        agreement = next(s for s in record["stages"] if s["name"] == "reduction_agreement")
+        assert agreement["all_product_agree"] is True  # Gloo against Gloo on CPU
+        assert agreement["backend"] == "gloo"
     assert summarize.main([str(out)]) == 0
     assert "SPLIT TEST - not a mixed-vendor result" in (out / "summary.md").read_text()
     assert json.loads((out / "summary.json").read_text())["split_test"] == "half"
@@ -537,6 +556,7 @@ def test_training_demo_keeps_ranks_in_sync_and_learns(tmp_path):
     assert data["params_in_sync"] is True
     assert data["loss_last"] < data["loss_first"]
     assert data["run"]["split_test"] == "half" and "warning" in data
+    assert "ddp_comm_hook" in data["grad_sync"] and data["policy"] == "reduce-bridge-broadcast"
 
 
 def test_scaling_summary_computes_efficiency(tmp_path):

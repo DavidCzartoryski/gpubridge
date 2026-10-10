@@ -1,13 +1,28 @@
-"""Cluster-wide collectives: validate the call, then hand it to the active collective policy."""
+"""Cluster-wide collectives: validate the call, then hand it to the active collective policy.
+
+Every check here runs before any communication and depends only on the call's
+arguments and on state that is identical on every rank (the policy, the
+bridge transport, the world size), so a call that is rejected is rejected on
+every rank alike and nobody is left waiting.
+
+Every collective takes ``async_op``. With ``async_op=True`` it returns a
+:class:`~gpubridge.work.Work` and runs on this rank's worker thread; see
+:mod:`gpubridge.work` for ordering and stream semantics.
+"""
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp
 
 from gpubridge import observe
+from gpubridge import work as _work
+from gpubridge.policies import CollectivePolicy, implements, policies_implementing
 from gpubridge.topology import Topology, get_topology
+from gpubridge.work import Work
 
 #: Dtypes every built-in path supports: Gloo (world group, bridge, CPU islands)
 #: and NCCL/RCCL (GPU islands). Gloo all_reduce and broadcast were checked for
@@ -27,9 +42,19 @@ SUPPORTED_DTYPES = (
     torch.int64,
 )
 
+#: Reductions gpubridge supports, by name. AVG is a SUM followed by a division
+#: by the world size, done identically on every rank, because Gloo (the bridge)
+#: has no AVG. PRODUCT is left out until NCCL/RCCL and Gloo are shown to agree
+#: on every supported dtype (HARDWARE_VALIDATION.md item 14).
+REDUCE_OPS = {ReduceOp.SUM: "sum", ReduceOp.AVG: "avg", ReduceOp.MAX: "max",
+              ReduceOp.MIN: "min"}
+_BY_NAME = {name: op for op, name in REDUCE_OPS.items()}
+_FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 
-def all_reduce(tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
-    """Sum ``tensor`` across every rank in the cluster, in place.
+
+def all_reduce(tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM, *,
+               async_op: bool = False) -> Work | None:
+    """Reduce ``tensor`` across every rank in the cluster, in place.
 
     Mirrors ``torch.distributed.all_reduce`` on the world group. Every rank must
     call it with a tensor of the same shape and dtype. The active collective
@@ -44,23 +69,43 @@ def all_reduce(tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM) -> N
         tensor: Input and output. Must be contiguous, on this rank's device
             (CPU in simulation and CPU-only mode), and of a dtype in
             :data:`SUPPORTED_DTYPES`.
-        op: Only ``ReduceOp.SUM`` is supported in v1.
+        op: ``ReduceOp.SUM``, ``AVG``, ``MAX`` or ``MIN``. AVG needs a
+            floating-point dtype: it is a SUM followed by a division by the
+            world size, and an integer division would need a rounding rule.
+        async_op: Return a :class:`~gpubridge.work.Work` instead of blocking.
+
+    Returns:
+        A :class:`~gpubridge.work.Work` if ``async_op``, else None.
 
     Raises:
         RuntimeError: if gpubridge is not initialized.
-        ValueError: for any op other than SUM, an unsupported dtype, or a tensor
-            on the wrong device or not contiguous.
+        ValueError: for an unsupported op or dtype, AVG on an integer dtype, or
+            a tensor on the wrong device or not contiguous.
+        NotImplementedError: if the active policy or bridge transport can't
+            carry this op.
     """
     topology = get_topology()
-    if op != ReduceOp.SUM:
-        raise ValueError(f"gpubridge.all_reduce only supports ReduceOp.SUM, got {op}")
+    name = _reduce_op_name(op, "all_reduce")
     _check_tensor(tensor, topology)
+    _check_avg(name, tensor.dtype, "all_reduce")
     policy = topology.policy.select_policy(tensor.nbytes)
-    with observe.collective(topology, "all_reduce", tensor, policy=policy.name):
-        policy.all_reduce(tensor, topology)
+    base = "sum" if name == "avg" else name
+    _check_reduce_op(policy, base, topology, "all_reduce")
+
+    def run() -> None:
+        with observe.collective(topology, "all_reduce", tensor, policy=policy.name,
+                                reduce_op=name):
+            if base == "sum":
+                policy.all_reduce(tensor, topology)  # no op: keeps older subclasses working
+            else:
+                policy.all_reduce(tensor, topology, op=_BY_NAME[base])
+            if name == "avg":
+                tensor.div_(topology.world_size)
+
+    return _start(topology, "all_reduce", run, [tensor], tensor, async_op)
 
 
-def broadcast(tensor: torch.Tensor, src: int) -> None:
+def broadcast(tensor: torch.Tensor, src: int, *, async_op: bool = False) -> Work | None:
     """Copy ``tensor`` from global rank ``src`` to every rank, in place.
 
     Mirrors ``torch.distributed.broadcast`` on the world group. The active
@@ -76,6 +121,7 @@ def broadcast(tensor: torch.Tensor, src: int) -> None:
             contiguous, on this rank's device (CPU in simulation mode), and of a
             dtype in :data:`SUPPORTED_DTYPES`.
         src: Global rank that holds the data.
+        async_op: Return a :class:`~gpubridge.work.Work` instead of blocking.
 
     Raises:
         RuntimeError: if gpubridge is not initialized.
@@ -87,11 +133,88 @@ def broadcast(tensor: torch.Tensor, src: int) -> None:
         raise ValueError(f"src must be a rank in [0, {topology.world_size}), got {src}")
     _check_tensor(tensor, topology)
     policy = topology.policy.select_policy(tensor.nbytes)
-    with observe.collective(topology, "broadcast", tensor, src=src, policy=policy.name):
-        policy.broadcast(tensor, src, topology)
+
+    def run() -> None:
+        with observe.collective(topology, "broadcast", tensor, src=src, policy=policy.name):
+            policy.broadcast(tensor, src, topology)
+
+    return _start(topology, "broadcast", run, [tensor], tensor, async_op)
 
 
-def barrier() -> None:
+def all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor, *,  # noqa: A002
+                           async_op: bool = False) -> Work | None:
+    """Gather every rank's ``input`` into ``output``, ordered by global rank.
+
+    Mirrors ``torch.distributed.all_gather_into_tensor`` on the world group:
+    ``output`` holds ``world_size`` copies of ``input``'s shape back to back,
+    rank 0's first, e.g. ``(world_size * n, ...)`` for an input of ``(n, ...)``.
+
+    Args:
+        output: Receives the result. ``world_size`` times as many elements as
+            ``input``, same dtype and device, contiguous.
+        input: This rank's contribution. Not modified.
+        async_op: Return a :class:`~gpubridge.work.Work` instead of blocking.
+
+    Raises:
+        RuntimeError: if gpubridge is not initialized.
+        ValueError: for mismatched sizes or dtypes, or tensors that fail the
+            usual dtype, device and contiguity checks.
+        NotImplementedError: if the active policy doesn't implement it.
+    """
+    topology = get_topology()
+    _check_pair(output, input, topology, "all_gather_into_tensor", big=output, small=input)
+    policy = topology.policy.select_policy(output.nbytes)
+    _check_implements(policy, "all_gather_into_tensor", topology)
+
+    def run() -> None:
+        with observe.collective(topology, "all_gather_into_tensor", input,
+                                policy=policy.name):
+            policy.all_gather_into_tensor(output, input, topology)
+
+    return _start(topology, "all_gather_into_tensor", run, [output, input], output, async_op)
+
+
+def reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor,  # noqa: A002
+                          op: ReduceOp.RedOpType = ReduceOp.SUM, *,
+                          async_op: bool = False) -> Work | None:
+    """Reduce every rank's ``input`` and give rank ``r`` the ``r``-th slice of the result.
+
+    Mirrors ``torch.distributed.reduce_scatter_tensor`` on the world group:
+    ``input`` holds ``world_size`` slices of ``output``'s shape back to back.
+
+    Args:
+        output: Receives this rank's slice of the reduced input.
+        input: ``world_size`` times as many elements as ``output``, same dtype
+            and device, contiguous. Not modified.
+        op: ``ReduceOp.SUM`` or ``AVG`` (floating-point dtypes only).
+        async_op: Return a :class:`~gpubridge.work.Work` instead of blocking.
+
+    Raises:
+        RuntimeError: if gpubridge is not initialized.
+        ValueError: for an op other than SUM or AVG, AVG on an integer dtype,
+            mismatched sizes or dtypes, or tensors that fail the usual checks.
+        NotImplementedError: if the active policy doesn't implement it.
+    """
+    topology = get_topology()
+    name = _reduce_op_name(op, "reduce_scatter_tensor")
+    if name not in ("sum", "avg"):
+        raise ValueError(f"gpubridge.reduce_scatter_tensor supports SUM and AVG, got {op}")
+    _check_pair(output, input, topology, "reduce_scatter_tensor", big=input, small=output)
+    _check_avg(name, input.dtype, "reduce_scatter_tensor")
+    policy = topology.policy.select_policy(input.nbytes)
+    _check_implements(policy, "reduce_scatter_tensor", topology)
+
+    def run() -> None:
+        with observe.collective(topology, "reduce_scatter_tensor", input, policy=policy.name,
+                                reduce_op=name):
+            policy.reduce_scatter_tensor(output, input, topology)
+            if name == "avg":
+                output.div_(topology.world_size)
+
+    return _start(topology, "reduce_scatter_tensor", run, [output, input], output, async_op)
+
+
+def barrier(*, async_op: bool = False) -> Work | None:
     """Block until every rank in the cluster reaches this call.
 
     On GPUs this first waits for the rank's queued device work, so collectives
@@ -101,10 +224,81 @@ def barrier() -> None:
         RuntimeError: if gpubridge is not initialized.
     """
     topology = get_topology()
-    with observe.collective(topology, "barrier"):
-        if not topology.simulated:
-            torch.cuda.synchronize(topology.device)
-        dist.barrier()
+
+    def run() -> None:
+        with observe.collective(topology, "barrier"):
+            if not topology.simulated:
+                torch.cuda.synchronize(topology.device)
+            dist.barrier()
+
+    return _start(topology, "barrier", run, [], None, async_op)
+
+
+def _start(topology: Topology, op: str, run: Callable[[], None],
+           tensors: list[torch.Tensor], result: object, async_op: bool) -> Work | None:
+    """Run a validated collective now, or queue it on the worker thread."""
+    observe.refuse_in_callback(op)
+    if async_op:
+        return _work.submit(topology.device, op, run, tensors, result)
+    _work.drain()  # queued async collectives go first, in the order they were queued
+    run()
+    return None
+
+
+def _reduce_op_name(op: ReduceOp.RedOpType, fn: str) -> str:
+    for candidate, name in REDUCE_OPS.items():
+        try:
+            if op == candidate:  # also matches dist.ReduceOp instances
+                return name
+        except TypeError:
+            break
+    raise ValueError(
+        f"gpubridge.{fn} supports ReduceOp.SUM, AVG, MAX and MIN, got {op}. PRODUCT is "
+        "not supported yet: NCCL/RCCL and Gloo aren't shown to agree on every dtype."
+    )
+
+
+def _check_avg(name: str, dtype: torch.dtype, fn: str) -> None:
+    if name == "avg" and dtype not in _FLOATS:
+        raise ValueError(
+            f"gpubridge.{fn} with ReduceOp.AVG needs a floating-point tensor, got {dtype}: "
+            "AVG divides the sum by the world size, and an integer division would need a "
+            "rounding rule. Use SUM and divide the way you want, or cast to a float dtype."
+        )
+
+
+def _check_reduce_op(policy: CollectivePolicy, name: str, topology: Topology, fn: str) -> None:
+    supported = policy.supported_reduce_ops(topology)
+    if name not in supported:
+        raise NotImplementedError(
+            f"gpubridge.{fn} with {name.upper()}: collective policy {policy.name!r} with bridge "
+            f"transport {topology.peers[topology.rank].bridge!r} supports only "
+            f"{', '.join(sorted(n.upper() for n in supported))}."
+        )
+
+
+def _check_implements(policy: CollectivePolicy, fn: str, topology: Topology) -> None:
+    if not implements(policy, fn):
+        usable = ", ".join(policies_implementing(fn, topology.layout))
+        raise NotImplementedError(
+            f"collective policy {policy.name!r} doesn't implement {fn}. Policies that do "
+            f"and fit this cluster: {usable or 'none'}."
+        )
+
+
+def _check_pair(output: torch.Tensor, input: torch.Tensor, topology: Topology,  # noqa: A002
+                fn: str, *, big: torch.Tensor, small: torch.Tensor) -> None:
+    _check_tensor(output, topology)
+    _check_tensor(input, topology)
+    if output.dtype != input.dtype:
+        raise ValueError(f"gpubridge.{fn}: output is {output.dtype} but input is {input.dtype}")
+    world = topology.world_size
+    if big.numel() != world * small.numel():
+        raise ValueError(
+            f"gpubridge.{fn}: {'output' if big is output else 'input'} must have "
+            f"world_size ({world}) times as many elements as the "
+            f"{'input' if big is output else 'output'} ({small.numel()}), got {big.numel()}"
+        )
 
 
 def _check_tensor(tensor: torch.Tensor, topology: Topology) -> None:

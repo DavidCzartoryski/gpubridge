@@ -24,6 +24,15 @@ reduce-bridge-broadcast), slowest rank, to bench.json and summary.md. With
 --ops island,gpubridge that puts the island step of reduce-bridge-broadcast (a
 reduce onto the leader) next to a native island all_reduce of the same size.
 
+--candidates a,b,c times gpubridge's all_reduce under each of those collective
+policies in the same job (rows ``policy:<name>``; policies that don't fit the
+cluster are skipped). --write-thresholds PATH also times the candidates
+(default: flat-gloo, reduce-bridge-broadcast and the pipelined and sharded
+policies), picks
+the fastest per size and writes a thresholds file for the ``auto-tuned``
+policy: point GPUBRIDGE_THRESHOLDS at it on every rank. Measure on the cluster
+and layout you will train on; thresholds don't carry over.
+
 Rank 0 writes OUT/bench.csv, OUT/bench.json and OUT/summary.md. Runs on CPU in
 simulation mode too (use a smaller --max-bytes):
 
@@ -47,6 +56,16 @@ import torch.distributed as dist
 from gpukit import KIT_VERSION, environment, run_info, sync, write_json
 
 import gpubridge
+from gpubridge.config import chunk_bytes_setting
+from gpubridge.policies import (
+    THRESHOLDS_FORMAT,
+    PipelinedReduceBridgeBroadcast,
+    choose_policy,
+    resolve_policy,
+)
+
+DEFAULT_CANDIDATES = ("flat-gloo,reduce-bridge-broadcast,pipelined-reduce-bridge-broadcast,"
+                      "sharded-bridge")
 
 UNITS = {"K": 2**10, "M": 2**20, "G": 2**30}
 DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
@@ -114,8 +133,10 @@ def row(op: str, info: dict[str, Any], nbytes: int, dtype: str, lat: list[float]
     median = statistics.median(lat)
     p90 = sorted(lat)[max(0, int(round(0.9 * len(lat))) - 1)]
     algbw = nbytes / median / 1e9
+    policy = info["policy"] if op == "gpubridge" else op.removeprefix("policy:") if (
+        op.startswith("policy:")) else ""
     return {
-        "op": op, "policy": info["policy"] if op == "gpubridge" else "",
+        "op": op, "policy": policy,
         "run_kind": info["kind"], "split_test": info["split_test"] or "",
         "islands": len(info["islands"]), "world_size": world, "bytes": nbytes, "dtype": dtype,
         "trials": len(lat), "median_us": round(median * 1e6, 2), "p90_us": round(p90 * 1e6, 2),
@@ -163,7 +184,8 @@ def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
               ""]
     present = {r["op"] for r in rows}
     islands = sorted(op for op in present if op.startswith("island:"))
-    ops = [op for op in ("native", *islands, "gpubridge") if op in present]
+    candidates = list(dict.fromkeys(r["op"] for r in rows if r["op"].startswith("policy:")))
+    ops = [op for op in ("native", *islands, "gpubridge", *candidates) if op in present]
     ratios = []
     if "gpubridge" in present and "native" in present:
         ratios.append("gpubridge / native")
@@ -205,6 +227,55 @@ def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def candidate_ops(names: str, topology: gpubridge.Topology) -> dict[str, Any]:
+    """One timed op per candidate policy that fits this cluster, run directly on its instance.
+
+    Every rank builds the same instances in the same order (the layout is the
+    same everywhere), so their setup() may create groups.
+    """
+    ops: dict[str, Any] = {}
+    chunk = chunk_bytes_setting(PipelinedReduceBridgeBroadcast.DEFAULT_CHUNK_BYTES)
+    for name in names.split(","):
+        cls = resolve_policy(name)
+        if isinstance(cls, str) or not cls.applies_to(topology.layout):
+            continue
+        cls = choose_policy(cls, topology.layout)
+        policy = (cls(chunk_bytes=chunk) if issubclass(cls, PipelinedReduceBridgeBroadcast)
+                  else cls())
+        policy.setup(topology)
+        ops[f"policy:{name}"] = lambda t, p=policy: p.all_reduce(t, topology)
+    return ops
+
+
+def derive_thresholds(rows: list[dict], info: dict[str, Any], chunk_bytes: int) -> dict:
+    """The fastest candidate per size, merged into rules for the auto-tuned policy."""
+    by_size: dict[int, list[dict]] = {}
+    for r in rows:
+        if r["op"].startswith("policy:"):
+            by_size.setdefault(r["bytes"], []).append(r)
+    winners = [(nbytes, min(cands, key=lambda r: r["median_us"])["policy"])
+               for nbytes, cands in sorted(by_size.items())]
+    rules: list[dict[str, Any]] = []
+    for nbytes, policy in winners:
+        if rules and rules[-1]["policy"] == policy:
+            rules[-1]["max_bytes"] = nbytes
+        else:
+            rules.append({"max_bytes": nbytes, "policy": policy})
+    if rules:
+        rules[-1]["max_bytes"] = None  # the largest measured winner covers everything above
+    return {
+        "gpubridge_thresholds": THRESHOLDS_FORMAT,
+        "rules": rules,
+        "chunk_bytes": chunk_bytes,
+        "measured": {"run_kind": info["kind"], "split_test": info["split_test"],
+                     "islands": info["islands"], "world_size": info["world_size"],
+                     "torch": torch.__version__, "gpubridge": gpubridge.__version__,
+                     "date": time.strftime("%Y-%m-%d"),
+                     "median_us": {f"{r['policy']}@{r['bytes']}": r["median_us"]
+                                   for cands in by_size.values() for r in cands}},
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", type=Path, required=True)
@@ -223,7 +294,13 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--phases", action="store_true",
                         help="also record the median time of each phase of the gpubridge op")
+    parser.add_argument("--candidates", default=None,
+                        help="also time gpubridge's all_reduce under these policies (comma list)")
+    parser.add_argument("--write-thresholds", type=Path, default=None, metavar="PATH",
+                        help="time the candidates and write an auto-tuned thresholds file")
     args = parser.parse_args()
+    if args.write_thresholds and not args.candidates:
+        args.candidates = DEFAULT_CANDIDATES
 
     topology = gpubridge.init(timeout=timedelta(seconds=args.timeout), policy=args.policy)
     info = run_info(topology)
@@ -247,6 +324,8 @@ def main() -> int:
         ops["island"] = lambda t: dist.all_reduce(t, group=topology.island_group)
     if "gpubridge" in wanted:
         ops["gpubridge"] = gpubridge.all_reduce
+    if args.candidates:
+        ops.update(candidate_ops(args.candidates, topology))
 
     phases = PhaseTimes() if args.phases else None
     if phases is not None:
@@ -291,6 +370,11 @@ def main() -> int:
         table = summary_table(rows, info)
         (args.out / "summary.md").write_text(f"# {args.out.name}: all_reduce benchmark\n\n{table}")
         print(table)
+        if args.write_thresholds:
+            chunk = chunk_bytes_setting(PipelinedReduceBridgeBroadcast.DEFAULT_CHUNK_BYTES)
+            thresholds = derive_thresholds(rows, info, chunk)
+            write_json(args.write_thresholds, thresholds)
+            print(f"thresholds -> {args.write_thresholds}: {thresholds['rules']}")
     gpubridge.destroy()
     return 0
 

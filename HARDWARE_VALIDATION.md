@@ -101,6 +101,96 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     `bench_all_reduce.py --ops native,island,gpubridge --phases` puts the
     `island-reduce` phase next to a native island all_reduce (`island:<vendor>`)
     of the same size (Explorer steps 04, 05 and 07, `amd/run_all.sh`).
+14. **Where NCCL/RCCL and Gloo agree on reductions.** gpubridge mixes the island
+    backend and Gloo in one reduction, so a result is only well defined where
+    both agree. PRODUCT is left out until they are shown to agree in every
+    supported dtype, including 8-bit overflow. MAX and MIN with NaN in the data
+    follow whatever the backends do.
+    *Status: not verifiable on CPU, where islands are Gloo too.* *Step:*
+    `check.py` stage `reduction_agreement` (informational) compares a raw
+    island-backend all_reduce with a Gloo one: PRODUCT in every dtype, MAX/MIN
+    with a NaN on one rank. Read `product_agree` and `nan_max_min` in the rank
+    records.
+15. **MAX, MIN, AVG, `all_gather_into_tensor` and `reduce_scatter_tensor` on
+    NCCL/RCCL islands.** Native-only uses NCCL's own all_gather_into_tensor
+    and reduce_scatter_tensor; reduce-bridge-broadcast uses island gather and
+    scatter, which torch builds from NCCL send/recv.
+    *Status: works on CPU, bit for bit against `flat-gloo` in every layout and
+    policy (`tests/test_ops.py`).* Still open: the same on GPUs. *Step:*
+    `check.py` stages `reductions`, `all_gather` and `reduce_scatter`.
+16. **Async collectives keep their stream semantics.** The worker's stream
+    waits on an event recorded on the caller's stream; `wait()` makes the
+    caller's stream wait on an event recorded after the collective.
+    *Status: ordering, results and failure handling work on CPU
+    (`tests/test_ops.py`), where there are no streams.* Still open: the
+    events and `record_stream` on real GPUs. *Step:* `check.py` stage `async`
+    queues the all_reduce right behind GPU work and checks the result on the
+    caller's stream after `wait()`, with no host sync in between.
+17. **The pipelined bridge is correct on GPUs.** `pipelined-reduce-bridge-broadcast`
+    (opt-in) copies chunks through pinned host memory on two side streams,
+    ordered by CUDA events, waiting on the host only for the chunk the bridge
+    needs next.
+    *Status: works on CPU, bit for bit against `flat-gloo`, including with a
+    staging layer that runs each copy only when something waits for its event,
+    so a missing wait corrupts the result (`tests/test_pipelined.py` shows it
+    does).* Still open: the real events, pinned buffers and `record_stream` on
+    GPUs. *Step:* `check.py --policy pipelined-reduce-bridge-broadcast` (its
+    `busy_gpu` stage queues work ahead of the collective), in Explorer steps
+    04, 05 and 07 and `amd/run_all.sh` (`OPT_IN_POLICIES`).
+18. **The overlap pays off.** For large tensors the pipelined bridge should
+    beat reduce-bridge-broadcast without hurting small ones; the best chunk
+    size depends on the machine.
+    *Status: not measurable on CPU.* *Step:* `bench_all_reduce.py
+    --candidates` (or `--write-thresholds`), rerun with a few
+    `GPUBRIDGE_CHUNK_BYTES` values.
+19. **Thresholds measured on GPUs drive `auto-tuned`.**
+    *Status: on CPU, a file written by `--write-thresholds` loads, and
+    `auto-tuned` routes each size to the rule's policy.* Still open: the
+    thresholds themselves, per cluster. *Step:* the `bench_candidates` and
+    `check_auto_tuned` steps write `thresholds.json` next to the results and
+    rerun the check under `auto-tuned` with it.
+20. **The sharded bridge is correct on GPUs.** `sharded-bridge` (opt-in) runs
+    NCCL/RCCL `reduce_scatter_tensor` and `all_gather_into_tensor` on islands
+    of exactly k ranks, k NCCL/RCCL reduces and broadcasts on larger ones, and
+    k Gloo bridge groups at once, one per island rank below k.
+    *Status: works on CPU, bit for bit against `flat-gloo` for every
+    supported dtype and SUM/AVG/MAX/MIN, in 2+2, 3+1, 3+2, 2+4, 3+3,
+    interleaved and three-island layouts, with sizes that need padding and
+    sizes smaller than k (`tests/test_sharded.py`).* Still open: the native
+    collectives on device tensors, and k bridge groups on separate hosts.
+    *Step:* `check.py --policy sharded-bridge` in Explorer steps 04, 05 and 07
+    and `amd/run_all.sh` (`OPT_IN_POLICIES`).
+21. **More bridge links mean more cross-vendor bandwidth.** Each link carries
+    1/k of the bytes, and each of the k ranks copies its own segment to the
+    host, so with the bridge as the bottleneck, k links should beat one.
+    *Status: not shown on CPU.* In CPU simulation (8 ranks on one 10-core
+    machine), `sharded-bridge` is 1.3x to 1.8x slower than
+    reduce-bridge-broadcast. Every rank shares one CPU and memory, so the
+    bridge phase barely changes with 4 links (10.8 ms against 10.9 ms at
+    64 MB). The island steps are Gloo there, and on CPU islands the
+    reduce_scatter is an all_reduce plus a slice, which makes them slower.
+    GPU islands use NCCL/RCCL for those steps.
+    *Step:* `bench_candidates` in step 05, where the bridge crosses the
+    network, and in step 07: compare the `policy:sharded-bridge` and
+    `policy:reduce-bridge-broadcast` columns. Step 05's
+    `bench_phases_sharded-bridge` times the bridge phase alone, next to the
+    `bench_split_by_node` phases of reduce-bridge-broadcast.
+22. **DDP with `gpubridge.ddp_comm_hook` trains correctly on GPUs.** Two
+    things only GPUs show. First, DDP's own traffic runs on the Gloo world
+    group with device tensors: the shape check and parameter broadcast when it
+    wraps the model, on CUDA and ROCm builds. Second, the stream handoff: DDP
+    calls the hook on the autograd thread, the bucket's all_reduce starts after
+    the work queued on that thread's stream, and DDP reads the result through
+    the device-aware future.
+    *Status: works on CPU. Gradients match the exact average bit for bit (with
+    integer-valued gradients) under the default, sharded, pipelined,
+    native-only and flat-gloo policies, with one bucket per parameter. A
+    failed bucket makes `backward()` raise on every rank, and later
+    collectives refuse to start (`tests/test_ddp.py`).* *Step:*
+    `examples/train_synthetic.py`, which exits non-zero if parameters diverge:
+    `train_ddp` in Explorer steps 04 (split test) and 07 (mixed NVIDIA +
+    AMD), `train_ddp_split` in `amd/run_all.sh`, and the single-island
+    scaling runs in step 06.
 
 ## Mixed build results
 

@@ -16,7 +16,7 @@ from typing import ClassVar
 
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup
+from torch.distributed import ProcessGroup, ReduceOp
 
 from gpubridge.config import CPU_BACKEND
 
@@ -29,6 +29,11 @@ class BridgeTransport(abc.ABC):
     """
 
     name: ClassVar[str]
+
+    #: Reductions :meth:`all_reduce` can do: always ``"sum"``, plus ``"max"`` and
+    #: ``"min"`` if listed. Only a transport that lists one is called with it, as
+    #: ``all_reduce(tensor, op=ReduceOp.MAX)``; SUM always comes without ``op``.
+    reduce_ops: ClassVar[frozenset[str]] = frozenset({"sum"})
 
     @classmethod
     @abc.abstractmethod
@@ -44,9 +49,30 @@ class BridgeTransport(abc.ABC):
             A transport on members of ``ranks``, None everywhere else.
         """
 
+    @classmethod
+    def create_groups(
+        cls, groups: Sequence[Sequence[int]], *, timeout: timedelta | None = None
+    ) -> list[BridgeTransport | None]:
+        """Set up one bridge per entry of ``groups``, for policies that use several links.
+
+        Collective over the whole world, like :meth:`create`: every rank calls
+        it with the same ``groups`` in the same order. The default calls
+        :meth:`create` once per group, in order, so every transport supports
+        it; one that can set up several links more cheaply at once may
+        override it. The leader bridge ``init()`` creates is unaffected.
+
+        Returns:
+            One entry per group: a transport on that group's members, None elsewhere.
+        """
+        return [cls.create(ranks, timeout=timeout) for ranks in groups]
+
     @abc.abstractmethod
     def all_reduce(self, tensor: torch.Tensor) -> None:
-        """Sum a contiguous CPU tensor across all bridge members, in place."""
+        """Sum a contiguous CPU tensor across all bridge members, in place.
+
+        Transports that list ``"max"`` or ``"min"`` in :attr:`reduce_ops` also
+        take ``op=ReduceOp.MAX`` / ``ReduceOp.MIN``.
+        """
 
     @abc.abstractmethod
     def broadcast(self, tensor: torch.Tensor, src: int) -> None:
@@ -60,6 +86,7 @@ class GlooTransport(BridgeTransport):
     """The default bridge: a Gloo process group of the island leaders."""
 
     name = "gloo"
+    reduce_ops = frozenset({"sum", "max", "min"})
 
     def __init__(self, group: ProcessGroup) -> None:
         self.group = group
@@ -71,8 +98,8 @@ class GlooTransport(BridgeTransport):
         group = dist.new_group(list(ranks), timeout=timeout, backend=CPU_BACKEND)
         return cls(group) if dist.get_rank() in ranks else None
 
-    def all_reduce(self, tensor: torch.Tensor) -> None:
-        dist.all_reduce(tensor, group=self.group)
+    def all_reduce(self, tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
+        dist.all_reduce(tensor, op=op, group=self.group)
 
     def broadcast(self, tensor: torch.Tensor, src: int) -> None:
         dist.broadcast(tensor, src=src, group=self.group)

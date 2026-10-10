@@ -1,4 +1,4 @@
-"""A non-Gloo bridge transport, to prove the bridge can be swapped."""
+"""Test bridge transports: a non-Gloo one (the bridge can be swapped) and a counting one."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+from torch.distributed import ReduceOp
 
-from gpubridge.transport import BridgeTransport, register_transport
+from gpubridge.transport import BridgeTransport, GlooTransport, register_transport
 
 #: Path of the FileStore the leaders share; set by each test before spawning.
 STORE_ENV = "GPUBRIDGE_TEST_BRIDGE_STORE"
@@ -37,7 +38,9 @@ class StoreTransport(BridgeTransport):
     ) -> StoreTransport | None:
         if dist.get_rank() not in ranks:
             return None
-        return cls(dist.FileStore(os.environ[STORE_ENV], len(ranks)), ranks)
+        # One file per group, so several links (the sharded policy) don't share keys.
+        path = f"{os.environ[STORE_ENV]}-{'-'.join(map(str, sorted(ranks)))}"
+        return cls(dist.FileStore(path, len(ranks)), ranks)
 
     def _key(self, op: str, suffix: str = "") -> str:
         # Leaders make the same bridge calls in the same order, so the counter agrees.
@@ -63,3 +66,28 @@ class StoreTransport(BridgeTransport):
 
 def _from_bytes(data: bytes, like: torch.Tensor) -> torch.Tensor:
     return torch.frombuffer(bytearray(data), dtype=like.dtype).reshape(like.shape)
+
+
+#: (call, numel) of every bridge call this process made through CountingGloo.
+BRIDGE_CALLS: list[tuple[str, int]] = []
+
+
+@register_transport
+class CountingGloo(GlooTransport):
+    """The Gloo bridge, noting every message's size and every create_groups call."""
+
+    name = "test-counting-gloo"
+    groups: list[list[list[int]]] = []  # noqa: RUF012 - per process, on purpose
+
+    @classmethod
+    def create_groups(cls, groups, *, timeout=None):
+        cls.groups.append([list(ranks) for ranks in groups])
+        return super().create_groups(groups, timeout=timeout)
+
+    def all_reduce(self, tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
+        BRIDGE_CALLS.append(("all_reduce", tensor.numel()))
+        super().all_reduce(tensor, op)
+
+    def broadcast(self, tensor: torch.Tensor, src: int) -> None:
+        BRIDGE_CALLS.append(("broadcast", tensor.numel()))
+        super().broadcast(tensor, src)

@@ -5,7 +5,9 @@ Ranks are grouped into one island per vendor, each using its native backend
 default, swappable via :mod:`gpubridge.transport`), and cluster-wide collectives
 are composed from island collectives and the bridge by a collective policy
 (:mod:`gpubridge.policies`). Monitoring or profiling tools can watch every
-collective through observers (:mod:`gpubridge.observe`).
+collective through observers (:mod:`gpubridge.observe`), and
+DistributedDataParallel can sync gradients through gpubridge with
+:func:`ddp_comm_hook` (:mod:`gpubridge.ddp`).
 """
 
 from __future__ import annotations
@@ -18,8 +20,16 @@ from torch.distributed import ReduceOp
 
 from gpubridge import observe as _observe
 from gpubridge import topology as _topology
-from gpubridge.collectives import all_reduce, barrier, broadcast
+from gpubridge import work as _work
+from gpubridge.collectives import (
+    all_gather_into_tensor,
+    all_reduce,
+    barrier,
+    broadcast,
+    reduce_scatter_tensor,
+)
 from gpubridge.config import CPU_BACKEND
+from gpubridge.ddp import ddp_comm_hook
 from gpubridge.detect import Probe, probe
 from gpubridge.observe import (
     CollectiveObserver,
@@ -33,7 +43,6 @@ from gpubridge.observe import (
 from gpubridge.policies import (
     DEFAULT_POLICY,
     CollectivePolicy,
-    policy_name,
     register_policy,
     resolve_policy,
 )
@@ -46,6 +55,7 @@ from gpubridge.transport import (
     register_transport,
     resolve_transport,
 )
+from gpubridge.work import Work
 
 __version__ = "0.2.0a0"
 
@@ -64,16 +74,20 @@ __all__ = [
     "ReduceOp",
     "SplitTestWarning",
     "Topology",
+    "Work",
     "add_observer",
+    "all_gather_into_tensor",
     "all_reduce",
     "barrier",
     "broadcast",
+    "ddp_comm_hook",
     "destroy",
     "elapsed_ms",
     "get_topology",
     "init",
     "is_initialized",
     "probe",
+    "reduce_scatter_tensor",
     "register_policy",
     "register_transport",
     "remove_observer",
@@ -135,7 +149,7 @@ def init(
     chosen = resolve_policy(policy)
     # torch.cuda.set_device waits until discovery has checked every rank's
     # device (build_topology): a bad index then fails init() on every rank.
-    local, config = _topology.describe_local(transport.name, policy_name(chosen))
+    local, config = _topology.describe_local(transport.name, chosen)
 
     kwargs: dict[str, Any] = {}
     if rank is not None:
@@ -152,6 +166,7 @@ def init(
     except BaseException:
         dist.destroy_process_group()
         raise
+    _work.shutdown()
     _observe._reset()
     _topology._set_topology(topology)
     return topology
@@ -160,13 +175,16 @@ def init(
 def destroy() -> None:
     """Tear down every process group created by :func:`init`.
 
-    Does nothing if gpubridge is not initialized.
+    Queued async collectives run first. Does nothing if gpubridge is not initialized.
     """
     if not is_initialized():
         return
     topology = get_topology()
-    _topology._set_topology(None)
-    _observe._reset()
+    try:
+        _work.shutdown()  # queued async collectives run first
+    finally:
+        _topology._set_topology(None)
+        _observe._reset()
     try:
         topology.policy.close()
         if topology.bridge is not None:

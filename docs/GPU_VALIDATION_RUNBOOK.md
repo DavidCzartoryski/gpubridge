@@ -43,6 +43,14 @@ real mixed-vendor result:
 (see [Explorer](#explorer)). Steps 1 and 2 run on the open `gpu` partition.
 Step 8 alt replaces step 8, and saves the cloud machines, only if Explorer has
 AMD GPUs; see [Mixed-vendor job inside Explorer](#mixed-vendor-job-inside-explorer).
+Every step that runs `check.py` also covers items 14 to 16 (reductions,
+all_gather, reduce_scatter, async, and where NCCL/RCCL and Gloo agree).
+Steps 04, 05, 07 and the AMD script also check every opt-in policy in
+`OPT_IN_POLICIES` (the pipelined and sharded policies) and write
+`thresholds.json` (items 17 to 21); step 05 also times each one's phases.
+Opt-in policies are not validated on GPUs until those steps pass.
+Steps 04, 06, 07 and the AMD script train with DDP and `gpubridge.ddp_comm_hook`
+(`examples/train_synthetic.py`, item 22).
 Times exclude queue waits. For cost, multiply by the provider's current hourly
 rate; for example, at a hypothetical $3/h, step 7 costs about $1.50.
 
@@ -393,6 +401,9 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 | `init` stuck (summary says "stuck in this stage") | new_group / NCCL init problem (item 3) | read `rank*.stacks.txt`; rerun with `NCCL_DEBUG=INFO`; this is a real finding, file it |
 | `busy_gpu` wrong values | stream ordering bug in the bridge (item 6) | serious; keep the JSON and open an issue |
 | `dtypes` mismatch | precision or reduction-order problem (item 7) | check `max_abs_error` in the stage |
+| `reductions`, `all_gather` or `reduce_scatter` mismatch | a MAX/MIN/AVG or tensor-collective path differs on NCCL/RCCL (item 15) | the failing `cases` name the dtype and op; rerun with `--policy flat-gloo` to see whether the policy or the backend is at fault |
+| `async` wrong values | the worker's stream didn't wait for the caller's, or `wait()` didn't order the caller's stream (item 16) | serious; keep the JSON and open an issue |
+| `reduction_agreement` shows `product_agree` false | NCCL/RCCL and Gloo disagree on PRODUCT for that dtype (item 14) | not a failure: it's the evidence item 14 asks for; record it |
 | timeouts during large all_reduces | NCCL/RCCL watchdog vs a slow bridge (item 9) | raise `--timeout`; note the `all_reduce_seconds` of `busy_gpu` |
 | 05: rendezvous never completes | wrong interface or blocked ports between nodes | set `NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` (e.g. `ib0`) |
 | 03/AMD: `device_map` mismatch | visible-devices variable maps to a different GPU (item 5) | record it; check scheduler GPU binding |

@@ -2,8 +2,8 @@
 #SBATCH --job-name=gpubridge-06-scaling
 #SBATCH --time=00:30:00
 # Step 06, 4 GPUs on 1 node (multigpu). Submit with: scripts/gpu/explorer/submit.sh 06
-# Data-parallel training (examples/train_synthetic.py, gradients synced with
-# gpubridge.all_reduce) on 1, 2, 3 and 4 GPUs: samples/sec and scaling
+# Data-parallel training (examples/train_synthetic.py: DDP with gradients synced
+# by gpubridge.ddp_comm_hook) on 1, 2, 3 and 4 GPUs: samples/sec and scaling
 # efficiency. The table in summary.md is what the multigpu access request asks for.
 set -euo pipefail
 REPO="${GPUBRIDGE_REPO:?submit with scripts/gpu/explorer/submit.sh}"

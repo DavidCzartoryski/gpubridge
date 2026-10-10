@@ -115,8 +115,9 @@ Serving sets it from the `MAX_SERVE_USE_VENDOR_CCL` env var, which defaults to `
 ### Overlap with gpubridge
 
 - Both pick NCCL or RCCL for the user, so one call works on either vendor.
-- Both start with a deliberately narrow v1: SUM only, a few dtypes, and
-  all_reduce, broadcast and allgather-style ops.
+- Both started with a deliberately narrow v1: SUM only, a few dtypes, and
+  all_reduce, broadcast and allgather-style ops. gpubridge has since added
+  AVG, MAX and MIN, `all_gather_into_tensor` and `reduce_scatter_tensor`.
 - Both keep a vendor-library path and a second path behind one API: Modular's
   own kernels; gpubridge's simulation and CPU-only modes.
 
@@ -237,10 +238,13 @@ with per-backend policy lists kept in one header
 
 1. **Collective policies: separate what a collective computes from how it is
    composed.** `collectives.py` used to hard-code reduce-bridge-broadcast.
-   *Status: implemented as a scaffold in `policies.py`, with
-   `reduce-bridge-broadcast`, `native-only`, `flat-gloo` and `auto` (the
-   default, which keeps the earlier behaviour). There is no per-call override:
-   a mismatch between ranks there would hang with no cheap way to detect it.*
+   *Status: implemented in `policies.py`, with `reduce-bridge-broadcast`,
+   `native-only`, `flat-gloo` and `auto` (the default, which keeps the
+   earlier behaviour). The "later" variants below now exist as opt-in
+   policies, `pipelined-reduce-bridge-broadcast`, `sharded-bridge` and
+   `auto-tuned`, tested on CPU and not validated on GPUs. There is no
+   per-call override: a mismatch between ranks there would hang with no cheap
+   way to detect it.*
    - Make the composition a policy object chosen at `init()`, with an
      optional per-call override:
      - `ReduceBridgeBroadcast`: the current behaviour.
@@ -526,9 +530,11 @@ job.
 
 1. **A chunked, pipelined bridge**, from the chunked all-reduce, per-chunk
    flags and copy-engine streams.
-   *Status: not implemented yet. The hooks it needs exist: a marked place in
-   `policies.py`, plus `CollectivePolicy.setup()` / `close()` for pinned buffers
-   and streams.*
+   *Status: implemented as the opt-in policy
+   `pipelined-reduce-bridge-broadcast` (chunk size `GPUBRIDGE_CHUNK_BYTES`),
+   with its device code in `staging.py`. Tested on CPU, including a staging
+   layer that runs each copy only when its event is waited for. Not validated
+   on GPUs (HARDWARE_VALIDATION.md items 17 and 18).*
    - Split the leaders' bridge step into chunks. On a side stream, copy chunk
      k+1 from GPU to pinned CPU memory while Gloo all-reduces chunk k and
      chunk k-1 is copied back.
@@ -540,11 +546,11 @@ job.
      small ones.
 2. **Choose the algorithm by size.** Triton-distributed picks one-shot or
    two-shot by byte count, and falls back to NCCL for small inputs.
-   *Status: not implemented yet. The hook exists:
-   `CollectivePolicy.select_policy(nbytes)`, which every collective goes
-   through, and which a test policy already uses to route small messages
-   through `flat-gloo`. Thresholds wait for real GPU benchmark data
-   (`bench_all_reduce.py --policy`).*
+   *Status: implemented as the opt-in policy `auto-tuned`. It reads rules
+   from `GPUBRIDGE_THRESHOLDS`, a file `bench_all_reduce.py
+   --write-thresholds` writes after timing the candidate policies side by
+   side; without one it does what `auto` does. The thresholds themselves still
+   need real GPU benchmark data (item 19).*
    - For gpubridge: small tensors take one Gloo all_reduce across all ranks
      (the `FlatGloo` policy), which avoids three serialized steps. Large
      tensors take the pipelined bridge.
@@ -553,12 +559,28 @@ job.
 3. **Order copies on the GPU, not with host syncs.** Triton-distributed orders
    copies with stream wait/write-value on CUDA, and tiny memcpys on AMD,
    instead of blocking the host.
-   *Status: not implemented yet.*
+   *Status: implemented in the pipelined policy (`CudaStaging`): copies are
+   non-blocking, into pinned memory, on two side streams, ordered by events;
+   the host waits only for the chunk the bridge needs next. Not validated on
+   GPUs.*
    - In gpubridge, the leader's `tensor.cpu()` blocks the host. Replace it
      with non-blocking copies into pinned memory, ordered by events, and block
      only where Gloo needs the data. This pairs with idea 1.
    - The AMD lesson, that the signalling mechanism is vendor-specific, puts
      that choice in the proposed `VendorSpec`.
+4. **Share the bridge step out, as the two-shot all-reduce shares the
+   reduction.** Two-shot gives each rank one shard to reduce, then all-gathers.
+   gpubridge's bridge runs the same split one level up: each island
+   reduce-scatters onto k ranks, and rank j of every island all-reduces shard
+   j over its own bridge link.
+   *Status: implemented as the opt-in policy `sharded-bridge`, with extra
+   links from `BridgeTransport.create_groups`. Tested on CPU, bit for bit
+   against `flat-gloo` in uneven and three-island layouts. Slower than
+   reduce-bridge-broadcast in CPU simulation; not validated on GPUs
+   (HARDWARE_VALIDATION.md items 20 and 21).*
+   - Success: with the bridge crossing the network (Explorer step 05), the
+     bridge phase shrinks as k grows, and the whole all_reduce beats
+     reduce-bridge-broadcast for large tensors.
 
 ## torchcomms
 
@@ -655,8 +677,9 @@ windows.
   wheels are nightly-only.
 - **Scope.** torchcomms is a whole communications stack: new collective
   semantics, one-sided windows, fault tolerance, scaling to 100,000+ GPUs.
-  gpubridge offers three cluster-wide collectives and the cross-vendor
-  composition.
+  gpubridge offers five cluster-wide collectives (all_reduce, broadcast,
+  all_gather_into_tensor, reduce_scatter_tensor, barrier), each with
+  `async_op`, and the cross-vendor composition.
 - **Who could host whom.** *(reading)*
   - gpubridge's islands could run on torchcomms `nccl` and `rccl`
     communicators.
@@ -676,7 +699,9 @@ windows.
 2. **Become a torchcomms backend**, so code written for DeviceMesh or FSDP2
    runs on a mixed cluster unchanged.
    *Status: not implemented. Worth revisiting when torchcomms' API stabilizes
-   and its ROCm wheels leave the nightly index.*
+   and its ROCm wheels leave the nightly index. A plain `torch.distributed`
+   backend, which reaches the same FSDP2 and DeviceMesh code, is sketched in
+   [ROADMAP.md](ROADMAP.md), section 3.*
 
 ## Three 2026 papers: mixed-vendor collectives over RDMA
 
@@ -703,8 +728,6 @@ Jaehwan Lee, Taejeoung Kim, Jongwon Park et al., [arXiv 2601.22585](https://arxi
   changes. It falls back to host staging when RDMA isn't available.
 - One vendor per node. Applications run unchanged: `LD_PRELOAD` swaps in
   HetCCL's NCCL/RCCL symbols.
-- Also balances load: faster GPUs get larger micro-batches, sized from a short
-  profiling run.
 
 **Results (paper).** 2 nodes of 4x V100-PCIe and 2 nodes of 4x Radeon Pro
 W7800, ConnectX-6 InfiniBand:
@@ -775,10 +798,12 @@ BlueField-3 per node. LLaMA-8B, TFLOPs per GPU:
 
 - **The published systems are much faster across vendors.** All three move
   cross-vendor data GPU to GPU over RDMA, or through GPU-side buffers and
-  RDMA. All three report far higher bridge bandwidth than a Gloo bridge through
-  host memory, which is what gpubridge has. In the Zettabyte numbers, the
-  Gloo-based variants reach 2% to 44% of Device-Direct's throughput. Expect
-  gpubridge's bridge to be the bottleneck for bandwidth-bound collectives.
+  RDMA, instead of through host memory and Gloo, which is what gpubridge
+  does. The PKU/BAAI HetCCL reports more than 6x Gloo's point-to-point
+  bandwidth (17-19x in its abstract). In the Zettabyte numbers, the
+  Gloo-based variants reach 2% to 44% of Device-Direct's throughput. The SNU
+  HetCCL doesn't compare with Gloo. Expect gpubridge's bridge to be the
+  bottleneck for bandwidth-bound collectives.
 - **What gpubridge offers instead.**
   - It is open source (MIT) and pure Python over stock PyTorch builds (2.3 or
     later, CUDA or ROCm).
@@ -789,16 +814,25 @@ BlueField-3 per node. LLaMA-8B, TFLOPs per GPU:
   - It is a working baseline you can run today, and a reference to check
     faster paths against.
 - **Where the papers point.** gpubridge's `BridgeTransport` is where a
-  GPU-to-GPU RDMA transport would plug in. Nothing like it exists in
-  gpubridge yet, and its benefit depends on hardware these papers needed:
-  InfiniBand or BlueField NICs, and GPUDirect RDMA or DirectGMA.
+  GPU-to-GPU RDMA transport would plug in. [ROADMAP.md](ROADMAP.md), section
+  2, sketches one: peer-memory or dma-buf registration, capabilities checked
+  in discovery, an optional extra rather than a core dependency. *Status:
+  design only, not implemented.* Its benefit depends on hardware these
+  papers needed: InfiniBand or BlueField NICs, and GPUDirect RDMA or
+  DirectGMA.
+- **Without RDMA.** The opt-in `pipelined-reduce-bridge-broadcast` (copies
+  overlapped with the bridge) and `sharded-bridge` (k bridge links instead of
+  one) attack the same bottleneck on ordinary networks. Both still go through
+  host memory and Gloo, so neither closes the gap to the papers, and neither
+  is validated on GPUs yet (HARDWARE_VALIDATION.md items 17 to 21).
 - **Not comparable yet.** gpubridge has no GPU numbers at all yet (see
   HARDWARE_VALIDATION.md), so none of the papers' figures can be put next to
   its own.
 
 ## Positioning (README paragraph)
 
-Updated 2026-10-09 with the 2026 papers; now in the README.
+Updated 2026-10-10 for 0.2 (all five collectives and the DDP comm hook); now
+in the README.
 
 > gpubridge lets one distributed PyTorch job span NVIDIA and AMD GPUs at the
 > same time. Choosing between NCCL and RCCL on a single-vendor machine is
@@ -813,10 +847,12 @@ Updated 2026-10-09 with the 2026 papers; now in the README.
 > data GPU to GPU over RDMA, and report much higher cross-vendor bandwidth
 > than a Gloo-based bridge like gpubridge's. Their code isn't available
 > (October 2026), and they rely on RDMA-capable NICs for that speed and on
-> custom builds or plugins. gpubridge is
-> the open-source option that runs on stock PyTorch builds over any network.
-> It keeps each vendor on its native library inside an island and joins the
-> islands with a CPU bridge. One `all_reduce`, `broadcast` or `barrier` call
-> then covers every GPU in the job, from the same code on every node. CUDA
-> and ROCm builds of PyTorch, from 2.9.1 to 2.14.1, have been shown to join
-> one job and complete the bridge on CPU; validation on real GPUs is next.
+> custom builds or plugins. gpubridge is the open-source option that runs on
+> stock PyTorch builds over any network. It keeps each vendor on its native
+> library inside an island and joins the islands with a CPU bridge. One
+> `all_reduce`, `broadcast`, `all_gather_into_tensor`, `reduce_scatter_tensor`
+> or `barrier` call then covers every GPU in the job, from the same code on
+> every node, and DistributedDataParallel can sync gradients through it with
+> a comm hook. CUDA and ROCm builds of PyTorch, from 2.9.1 to 2.14.1, have
+> been shown to join one job and complete the bridge on CPU; validation on
+> real GPUs is next.
