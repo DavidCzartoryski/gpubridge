@@ -134,7 +134,7 @@ Serving sets it from the `MAX_SERVE_USE_VENDOR_CCL` env var, which defaults to `
 1. **Probes that never crash, plus one capability report.** Modular's probes
    have the right shape but abort the process when the library is missing.
    *Status: implemented as `gpubridge.probe()` and discovery-time problem
-   reports.*
+   reports, which also cover a `LOCAL_RANK` with no visible GPU behind it.*
    - Add `detect.probe()`, which never raises. It returns this rank's build
      vendor, `dist.is_nccl_available()`, `dist.is_gloo_available()`, whether a
      GPU is visible, and the torch version.

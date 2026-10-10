@@ -69,11 +69,37 @@ def test_simulation_uses_gloo_on_cpu(monkeypatch):
 
 def test_real_mode_uses_nccl_on_local_rank(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     monkeypatch.setenv("LOCAL_RANK", "3")
     config = resolve_config()
     assert not config.simulated
     assert config.island_backend == "nccl"
     assert config.device == torch.device("cuda", 3)
+
+
+@pytest.mark.parametrize(
+    ("local_rank", "count", "match"),
+    [("2", 2, r"LOCAL_RANK=2 asks for GPU 2, but this process sees only 2 GPUs\."),
+     ("1", 1, r"sees only 1 GPU\."),
+     ("-1", 4, r"LOCAL_RANK=-1 asks for GPU -1"),
+     ("one", 4, r"LOCAL_RANK='one' is not an integer")],
+)
+def test_a_local_rank_without_a_gpu_is_a_clear_error(monkeypatch, local_rank, count, match):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: count)
+    monkeypatch.setenv("LOCAL_RANK", local_rank)
+    with pytest.raises(RuntimeError, match=match):
+        resolve_config()
+
+
+def test_without_local_rank_the_current_device_is_checked_too(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    assert resolve_config().device == torch.device("cuda", 1)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    with pytest.raises(RuntimeError, match="The current CUDA device asks for GPU 1"):
+        resolve_config()
 
 
 def test_real_mode_without_gpu_points_at_simulation_mode(monkeypatch):

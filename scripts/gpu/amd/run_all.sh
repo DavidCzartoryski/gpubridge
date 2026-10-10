@@ -45,6 +45,13 @@ GPUS=$(gpu_count)
 log "$GPUS GPU(s) visible"
 step probe python "$KIT_DIR/probe.py" --out "$RESULTS/probe"
 step device_map python "$KIT_DIR/device_map.py" --out "$RESULTS/device_map"
+# Item 12: one more process than GPUs. The extra rank's LOCAL_RANK has no GPU,
+# so init() must fail on every rank, naming it. Real GPUs only: simulation
+# has no devices to check.
+if [ -z "${GPUBRIDGE_VENDOR:-}${GPUBRIDGE_CPU_ONLY:-}" ]; then
+    step local_rank_check local_torchrun --nproc-per-node=$((GPUS + 1)) "$KIT_DIR/check.py" \
+        --out "$RESULTS/local_rank_check" --expect-init-error "LOCAL_RANK=$GPUS asks for GPU $GPUS"
+fi
 
 # NCCL_DEBUG=INFO makes RCCL log its version: proof that "nccl" runs RCCL (item 4).
 step check_1gpu env_local_torchrun NCCL_DEBUG=INFO --nproc-per-node=1 \

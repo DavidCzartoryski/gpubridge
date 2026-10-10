@@ -356,6 +356,10 @@ def build_topology(
     dist.all_gather_object(gathered, local.to_wire())
     peers = tuple(PeerInfo.from_wire(info) for info in gathered)
     validate_peers(peers, warn=rank == 0)
+    if not config.simulated:
+        # Only now that every rank's device index has passed discovery. Called
+        # earlier, an index with no GPU behind it crashed one rank on its own.
+        torch.cuda.set_device(config.device)
     # validate_peers has ruled out ranks without a vendor.
     vendors = [cast(str, peer.vendor) for peer in peers]
     labels = vendors

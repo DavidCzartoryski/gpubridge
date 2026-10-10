@@ -75,6 +75,23 @@ inside Explorer as one heterogeneous Slurm job.
 11. Bridge throughput and latency compared with a single-vendor all_reduce, to
     set a baseline before any performance work.
 
+## Added with later features
+
+Each item below came with a feature that is tested on CPU but makes a claim
+only real GPUs or NICs can check. Each names the kit step that checks it.
+
+12. **A rank whose `LOCAL_RANK` has no GPU fails `init()` on every rank.**
+    `resolve_config` compares `LOCAL_RANK` with `torch.cuda.device_count()` and
+    discovery reports a mismatch as that rank's problem; `set_device` now waits
+    until discovery succeeds.
+    *Status: works on CPU, with a faked device count
+    (`test_an_out_of_range_local_rank_fails_init_on_every_rank`).* Still open:
+    that the count PyTorch reports honours `CUDA_VISIBLE_DEVICES`,
+    `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` and Slurm's GPU binding, so
+    the check fires on real nodes. *Step:* `check.py --expect-init-error`,
+    launched with one more process than the node has GPUs (Explorer step 01,
+    `amd/run_all.sh`).
+
 ## Mixed build results
 
 Run on 2026-10-06 with [`scripts/mixed_build_rendezvous.sh`](scripts/mixed_build_rendezvous.sh),

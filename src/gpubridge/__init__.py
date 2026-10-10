@@ -13,7 +13,6 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
-import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp
 
@@ -134,9 +133,9 @@ def init(
         )
     transport = resolve_transport(bridge)
     chosen = resolve_policy(policy)
+    # torch.cuda.set_device waits until discovery has checked every rank's
+    # device (build_topology): a bad index then fails init() on every rank.
     local, config = _topology.describe_local(transport.name, policy_name(chosen))
-    if not config.simulated and not local.problems:
-        torch.cuda.set_device(config.device)
 
     kwargs: dict[str, Any] = {}
     if rank is not None:

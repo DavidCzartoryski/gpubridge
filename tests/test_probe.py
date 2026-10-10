@@ -109,6 +109,20 @@ def test_a_rank_without_a_vendor_fails_init_on_every_rank(tmp_path):
     )
 
 
+def test_an_out_of_range_local_rank_fails_init_on_every_rank(tmp_path):
+    # Rank 1 looks like a CUDA build on a node with 1 visible GPU, but torchrun
+    # gave it LOCAL_RANK=3. torch.cuda.set_device(3) used to crash it alone
+    # (on this CPU build of torch it would raise), leaving ranks 0 and 2 stuck
+    # in rendezvous. Now discovery reports it, and every rank fails together.
+    one_gpu = {"env": {"LOCAL_RANK": "3"}, "cuda": "13.0", "hip": None, "gpu": True, "gpus": 1}
+    run_failing_init(
+        [{"env": {VENDOR_ENV: "nvidia"}}, one_gpu, {"env": {VENDOR_ENV: "amd"}}],
+        tmp_path,
+        [r"rank 1 \([^)]*\): LOCAL_RANK=3 asks for GPU 3, but this process sees only 1 GPU\.",
+         r"CUDA_VISIBLE_DEVICES", r"HIP_VISIBLE_DEVICES", r"--gpus-per-task"],
+    )
+
+
 def test_ranks_without_gpus_fail_init_together(tmp_path):
     no_gpu_cuda_build = {"cuda": "13.0", "hip": None, "gpu": False}
     run_failing_init(
