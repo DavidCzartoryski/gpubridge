@@ -37,7 +37,15 @@ ENV_PREFIXES = (
     "GPUBRIDGE_", "NCCL_", "RCCL_", "GLOO_", "MASTER_", "TORCHELASTIC_", "SLURM_JOB",
     "SLURM_NODELIST", "SLURM_NNODES", "SLURM_GPUS", "CUDA_VISIBLE", "HIP_VISIBLE",
     "ROCR_VISIBLE", "LOCAL_RANK", "RANK", "WORLD_SIZE", "GROUP_RANK", "OMP_NUM_THREADS",
+    "KIT_TIMEOUT", "STEP_TIMEOUT", "TORCH_NCCL_",
 )
+
+
+def default_timeout(fallback: float) -> float:
+    """Seconds for gpubridge.init's timeout: KIT_TIMEOUT, which the kit's shell
+    scripts set (common.sh), or ``fallback`` when a tool runs on its own."""
+    raw = os.environ.get("KIT_TIMEOUT", "").strip()
+    return float(raw) if raw else fallback
 
 
 def _safe(fn: Callable[[], Any], default: Any = None) -> Any:

@@ -54,7 +54,7 @@ both() {
         nvidia+=("$(fill "$arg" "$VENV" master nvidia "$GPUS_NVIDIA")")
         amd+=("$(fill "$arg" "$VENV_ROCM" worker amd "$GPUS_AMD")")
     done
-    run srun --het-group=0 --nodes=1 --ntasks-per-node=1 --kill-on-bad-exit=1 "${nvidia[@]}" \
+    limited srun --het-group=0 --nodes=1 --ntasks-per-node=1 --kill-on-bad-exit=1 "${nvidia[@]}" \
         : --het-group=1 --nodes=1 --ntasks-per-node=1 --kill-on-bad-exit=1 "${amd[@]}"
 }
 
@@ -73,10 +73,16 @@ step probe both @VENV@/bin/python "$KIT_DIR/probe.py" --out "$RESULTS/probe_@SID
 step preflight both @VENV@/bin/python "$KIT_DIR/preflight.py" --role @ROLE@ \
     --master-addr "$HEAD" --port "$PREFLIGHT_PORT" --out "$RESULTS/preflight"
 # Nothing below can pass without a usable GPU on each side and a network between
-# them, so stop here instead of waiting out rendezvous timeouts.
-if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+# them, so stop here instead of waiting out rendezvous timeouts. In simulation
+# (the CPU test of this script) there is no GPU to find, so only the preflight counts.
+blocking=()
+for name in "${FAILED_STEPS[@]+"${FAILED_STEPS[@]}"}"; do
+    [ "$name" = probe ] && [ -n "${GPUBRIDGE_VENDOR:-}${GPUBRIDGE_CPU_ONLY:-}" ] && continue
+    blocking+=("$name")
+done
+if [ "${#blocking[@]}" -gt 0 ]; then
     finish || true
-    die "stopping before torchrun: ${FAILED_STEPS[*]} failed; logs in $RESULTS"
+    die "stopping before torchrun: ${blocking[*]} failed; logs in $RESULTS"
 fi
 # Both components write into one directory on the shared filesystem, so the
 # summary below covers every rank of the mixed job.

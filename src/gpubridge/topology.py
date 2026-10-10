@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import socket
 import warnings
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
@@ -20,6 +19,7 @@ from gpubridge.config import (
     SPLIT_TEST_ENV,
     VENDOR_ENV,
     Config,
+    hostname,
     resolve_config,
     split_test_mode,
 )
@@ -179,7 +179,7 @@ def describe_local(
     local = PeerInfo(
         vendor=vendor,
         simulated=config.simulated,
-        hostname=socket.gethostname(),
+        hostname=hostname(config.simulated),
         bridge=bridge,
         probe=local_probe,
         problems=tuple(problems),

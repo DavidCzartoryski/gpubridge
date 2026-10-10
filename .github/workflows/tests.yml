@@ -21,6 +21,6 @@ jobs:
       - run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: uv pip install -e ".[test]"
       # shellcheck ships with ubuntu-latest; the kit's tests also run it when present.
-      - run: shellcheck scripts/*.sh scripts/gpu/*.sh scripts/gpu/*/*.sh scripts/gpu/explorer/*.sbatch
+      - run: shellcheck scripts/*.sh scripts/gpu/*.sh scripts/gpu/*/*.sh scripts/gpu/explorer/*.sbatch tests/fake_cluster/*
       - run: pytest
       - run: python examples/simulate_two_islands.py

@@ -24,6 +24,8 @@ import summarize  # noqa: E402
 SHELL_SCRIPTS = sorted(
     [*KIT.glob("*.sh"), *KIT.glob("*/*.sh"), *KIT.glob("explorer/*.sbatch")]
 )
+#: Stand-ins for sbatch, srun, scontrol, module and uv (tests/test_gpu_jobs.py).
+FAKE_CLUSTER_SCRIPTS = sorted((REPO / "tests" / "fake_cluster").iterdir())
 FAKE_PROJECT = "/projects/example-lab"
 OWN_SETTINGS = ("PROJECT_DIR", "WORK_DIR", "VENV", "VENV_ROCM", "ROCM_INDEX", "ROCM_INDEX_URL",
                 "ROCM_TORCH_VERSION", "TORCH_VERSION", "TORCH_INDEX_URL")
@@ -56,7 +58,8 @@ def dry_run(script: Path, *args: str, **env: str) -> subprocess.CompletedProcess
 
 @pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck not installed")
 def test_shellcheck_is_clean():
-    result = subprocess.run(["shellcheck", *map(str, SHELL_SCRIPTS)], cwd=REPO,
+    result = subprocess.run(["shellcheck", *map(str, SHELL_SCRIPTS + FAKE_CLUSTER_SCRIPTS)],
+                            cwd=REPO,
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout
 
@@ -309,7 +312,10 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w")
     assert result.returncode == 0, result.stderr
     out = result.stdout
-    sruns = [line for line in out.splitlines() if line.startswith("+ srun --het-group=0")]
+    launches = [line for line in out.splitlines() if "srun --het-group=0" in line]
+    # Every launch runs under coreutils timeout (STEP_TIMEOUT, common.sh).
+    assert all(line.startswith("+ timeout --kill-after=30 1200 srun ") for line in launches)
+    sruns = [line[line.index("srun "):] for line in launches]
     # probe, preflight, check, bench, a check per opt-in policy, the candidates bench,
     # then DDP training
     assert len(sruns) >= 7
@@ -376,8 +382,9 @@ def test_explorer_jobs_dry_run(job, expected):
 
 def test_amd_dry_run_with_several_gpus():
     out = dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="8").stdout
+    # common.sh exports NCCL_DEBUG=INFO; RCCL's version comes from the step's NCCL logs.
     for text in ["rocm-smi", "probe.py", "--nproc-per-node=9", "LOCAL_RANK=8\\ asks",
-                 "NCCL_DEBUG=INFO", "--nproc-per-node=8",
+                 "nccl/check_1gpu/", "--nproc-per-node=8",
                  "GPUBRIDGE_SPLIT_TEST=half", "bench_all_reduce.py", "train_n4", "tar -czf",
                  "--policy pipelined-reduce-bridge-broadcast", "--policy sharded-bridge",
                  "train_ddp_split.json"]:

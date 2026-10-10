@@ -43,7 +43,7 @@ fi
 TARGET="${TARGET:-mixed-$ROLE-$(hostname -s)}"
 RESULTS="$RESULTS_ROOT/$TARGET"
 export RESULTS
-VENV="$WORK_DIR/venv"
+VENV="${VENV:-$WORK_DIR/venv}"
 
 if [ "$SKIP_SETUP" != 1 ]; then
     step setup "$KIT_DIR/setup_env.sh" --flavor "$TORCH_FLAVOR" --venv "$VENV"
@@ -75,7 +75,7 @@ fi
 mixed_torchrun() {
     local tag=$1
     shift
-    run torchrun --nnodes=2 --nproc-per-node="$NPROC" --rdzv-backend=c10d \
+    limited torchrun --nnodes=2 --nproc-per-node="$NPROC" --rdzv-backend=c10d \
         --rdzv-endpoint="$MASTER_ADDR:$MASTER_PORT" --rdzv-id="$RUN_ID-$tag" \
         --rdzv-conf="is_host=$IS_HOST" --local-addr="$LOCAL_ADDR" "$@"
 }
