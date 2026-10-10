@@ -310,11 +310,13 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     assert result.returncode == 0, result.stderr
     out = result.stdout
     sruns = [line for line in out.splitlines() if line.startswith("+ srun --het-group=0")]
-    # probe, preflight, check, bench, then a check per opt-in policy and the candidates bench
-    assert len(sruns) >= 6
+    # probe, preflight, check, bench, a check per opt-in policy, the candidates bench,
+    # then DDP training
+    assert len(sruns) >= 7
     assert any("--policy pipelined-reduce-bridge-broadcast" in line for line in sruns[4:])
     assert any("--policy sharded-bridge" in line for line in sruns[4:])
-    assert "--write-thresholds" in sruns[-1]
+    assert "--write-thresholds" in sruns[-2]
+    assert "examples/train_synthetic.py" in sruns[-1] and "train_ddp.json" in sruns[-1]
     for line in sruns:
         nvidia, amd = line.split(" : ")
         assert "/w/venv/bin/" in nvidia and "/w/venv-rocm/" not in nvidia
@@ -355,7 +357,8 @@ def test_submit_free_and_multi_submit_every_step():
         ("04_split_4gpu.sbatch", ["check_half", "check_alternate", "bench_all_reduce.py",
                                   "--policy pipelined-reduce-bridge-broadcast",
                                   "--policy sharded-bridge", "--write-thresholds",
-                                  "--policy auto-tuned"]),
+                                  "--policy auto-tuned", "train_synthetic.py",
+                                  "train_ddp.json"]),
         ("05_multinode.sbatch", ["--policy pipelined-reduce-bridge-broadcast",
                                  "--policy sharded-bridge", "bench_phases_sharded-bridge",
                                  "--write-thresholds"]),
@@ -376,7 +379,8 @@ def test_amd_dry_run_with_several_gpus():
     for text in ["rocm-smi", "probe.py", "--nproc-per-node=9", "LOCAL_RANK=8\\ asks",
                  "NCCL_DEBUG=INFO", "--nproc-per-node=8",
                  "GPUBRIDGE_SPLIT_TEST=half", "bench_all_reduce.py", "train_n4", "tar -czf",
-                 "--policy pipelined-reduce-bridge-broadcast", "--policy sharded-bridge"]:
+                 "--policy pipelined-reduce-bridge-broadcast", "--policy sharded-bridge",
+                 "train_ddp_split.json"]:
         assert text in out, text
     assert "train_n5" not in out
 
@@ -552,6 +556,7 @@ def test_training_demo_keeps_ranks_in_sync_and_learns(tmp_path):
     assert data["params_in_sync"] is True
     assert data["loss_last"] < data["loss_first"]
     assert data["run"]["split_test"] == "half" and "warning" in data
+    assert "ddp_comm_hook" in data["grad_sync"] and data["policy"] == "reduce-bridge-broadcast"
 
 
 def test_scaling_summary_computes_efficiency(tmp_path):

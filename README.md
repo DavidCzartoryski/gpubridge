@@ -114,9 +114,9 @@ Launch the same script on every node with `torchrun`; each node detects its
 own vendor. See [`examples/all_reduce_torchrun.py`](examples/all_reduce_torchrun.py).
 
 For a fuller demo, [`examples/train_synthetic.py`](examples/train_synthetic.py)
-trains a small model with data parallelism and syncs its gradients with
-`gpubridge.all_reduce`. It reports samples/sec and checks that every rank ends
-with identical parameters:
+trains a small model with DistributedDataParallel and syncs its gradients
+through gpubridge with `gpubridge.ddp_comm_hook`. It reports samples/sec and
+checks that every rank ends with identical parameters:
 
 ```bash
 GPUBRIDGE_VENDOR=nvidia torchrun --nproc-per-node=2 examples/train_synthetic.py  # on CPU
@@ -193,6 +193,7 @@ The API follows `torch.distributed`, always on the world group.
 | `broadcast(tensor, src, *, async_op=False)` | In-place copy from global rank `src` to all ranks. |
 | `all_gather_into_tensor(output, input, *, async_op=False)` | Every rank's `input`, back to back in global rank order, in `output` (`world_size` times as many elements). |
 | `reduce_scatter_tensor(output, input, op=ReduceOp.SUM, *, async_op=False)` | Rank `r` gets slice `r` of the reduced `input` (`SUM` or `AVG`). |
+| `ddp_comm_hook(state, bucket)` | A DistributedDataParallel communication hook that averages each gradient bucket with an async gpubridge `all_reduce`. See [DistributedDataParallel](#distributeddataparallel). |
 | `barrier(*, async_op=False)` | Wait for all ranks. On GPUs, first waits for this rank's queued GPU work. |
 | `destroy()` | Tear down every group `init` created. |
 | `get_topology() -> Topology` | This rank's view of the cluster (see below). |
@@ -300,6 +301,35 @@ If an async collective fails, `wait()` raises with the original error as its
 cause, and every later collective on that rank refuses to start, because the
 process groups may be inconsistent. `destroy()` runs whatever is still queued
 before tearing down.
+
+### DistributedDataParallel
+
+DDP needs a process group that spans every rank. In a mixed job the only one
+is the Gloo world group `init()` creates, and on its own it would carry every
+gradient over Gloo. Register `gpubridge.ddp_comm_hook` and DDP keeps its
+bucketing and its overlap with backward, while each bucket is averaged by an
+async `gpubridge.all_reduce` under the active policy:
+
+```python
+from torch.nn.parallel import DistributedDataParallel
+
+topology = gpubridge.init()
+model = DistributedDataParallel(model.to(topology.device))  # default group: gpubridge's Gloo world
+model.register_comm_hook(None, gpubridge.ddp_comm_hook)
+```
+
+- DDP must span every rank, as gpubridge collectives do.
+- Gloo still carries what DDP does outside the hook: the parameter shape check
+  and the broadcast from rank 0 when DDP wraps the model, and buffer broadcasts
+  before each forward pass with `broadcast_buffers=True` (the default). A
+  model without buffers, or `broadcast_buffers=False`, keeps Gloo out of the
+  training loop.
+- If a bucket's all_reduce fails, `backward()` raises, and every later
+  collective on that rank refuses to start.
+- Tested on CPU; not validated on GPUs (HARDWARE_VALIDATION.md item 22).
+
+This is a comm hook, not a `torch.distributed` backend: FSDP2 and DeviceMesh
+can't use gpubridge yet.
 
 ### Bridge transports
 

@@ -93,4 +93,7 @@ done
 step bench_candidates mixed_torchrun candidates "$KIT_DIR/bench_all_reduce.py" \
     --out "$RESULTS/bench_candidates" --ops gpubridge --max-bytes "$BENCH_MAX_BYTES" \
     --write-thresholds "$RESULTS/thresholds.json"
+# DDP with gpubridge.ddp_comm_hook on real NVIDIA + AMD ranks (item 22).
+step train_ddp mixed_torchrun train "$REPO_DIR/examples/train_synthetic.py" \
+    --json "$RESULTS/train_ddp.json"
 finish
