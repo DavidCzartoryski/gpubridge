@@ -8,8 +8,9 @@ the same way ``transport.py`` registers bridge transports.
 
 Built in:
 
-- ``reduce-bridge-broadcast``: island collective, island leaders over the
-  bridge, island broadcast. The default for clusters with two or more islands.
+- ``reduce-bridge-broadcast``: island reduce onto each leader, island leaders
+  over the bridge, island broadcast. The default for clusters with two or
+  more islands.
 - ``native-only``: one native collective on the single island. The default for
   single-vendor clusters.
 - ``flat-gloo``: every rank stages its tensor to CPU and uses the world Gloo
@@ -91,9 +92,14 @@ class ReduceBridgeBroadcast(CollectivePolicy):
 
     all_reduce:
 
-    1. all_reduce within each island on the native backend.
+    1. reduce within each island onto its leader, on the native backend.
     2. Island leaders copy the island sum to CPU and all_reduce it over the bridge.
     3. Each leader copies the total back to its device and broadcasts it to its island.
+
+    Step 1 is a reduce, not an all_reduce, because only the leader uses the
+    island sum: the other ranks' copies would be overwritten by step 3 anyway.
+    A ring reduce moves about half the bytes of a ring all_reduce. The other
+    ranks' tensors hold unspecified values between steps 1 and 3.
 
     broadcast: from ``src`` to its island, then from that island's leader to the
     other leaders over the bridge, then from each leader to its island.
@@ -106,8 +112,9 @@ class ReduceBridgeBroadcast(CollectivePolicy):
         return layout.needs_bridge
 
     def all_reduce(self, tensor: torch.Tensor, topology: Topology) -> None:
+        leader = topology.island.leader
         with phase("island-reduce"):
-            dist.all_reduce(tensor, group=topology.island_group)
+            dist.reduce(tensor, dst=leader, group=topology.island_group)
         if topology.is_leader:
             assert topology.bridge is not None
             with phase("bridge"):
@@ -116,7 +123,7 @@ class ReduceBridgeBroadcast(CollectivePolicy):
                 if staged is not tensor:
                     tensor.copy_(staged)
         with phase("island-broadcast"):
-            dist.broadcast(tensor, src=topology.island.leader, group=topology.island_group)
+            dist.broadcast(tensor, src=leader, group=topology.island_group)
 
     def broadcast(self, tensor: torch.Tensor, src: int, topology: Topology) -> None:
         src_island = topology.layout.island_of(src)

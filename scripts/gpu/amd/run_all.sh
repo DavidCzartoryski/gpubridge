@@ -69,8 +69,8 @@ if [ "$GPUS" -ge 2 ]; then
         --nproc-per-node="$GPUS" "$KIT_DIR/check.py" --out "$RESULTS/check_split"
     checks+=("$RESULTS/check_island" "$RESULTS/check_split")
     step bench env_local_torchrun GPUBRIDGE_SPLIT_TEST=half --nproc-per-node="$GPUS" \
-        "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" \
-        --max-bytes "$BENCH_MAX_BYTES" --trials "$BENCH_TRIALS"
+        "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" --ops native,island,gpubridge \
+        --phases --max-bytes "$BENCH_MAX_BYTES" --trials "$BENCH_TRIALS"
     max=$((GPUS < SCALING_MAX_GPUS ? GPUS : SCALING_MAX_GPUS))
     for n in $(seq 1 "$max"); do
         step "train_n$n" local_torchrun --nproc-per-node="$n" \

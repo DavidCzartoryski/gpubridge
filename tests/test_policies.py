@@ -82,6 +82,38 @@ def test_every_policy_matches_flat_gloo(vendors, split, policy, expected, tmp_pa
               init_kwargs={"policy": policy})
 
 
+# ---- what reduce-bridge-broadcast sends ------------------------------------------------
+
+def _count_island_ops(topology):
+    """Counts every island-group call one all_reduce makes, by torch.distributed function."""
+    import torch.distributed as dist
+
+    calls = []
+    for name in ("all_reduce", "reduce", "broadcast"):
+        real = getattr(dist, name)
+
+        def counting(tensor, *args, _name=name, _real=real, **kwargs):
+            if kwargs.get("group") is topology.island_group:
+                calls.append((_name, kwargs.get("dst", kwargs.get("src"))))
+            return _real(tensor, *args, **kwargs)
+
+        setattr(dist, name, counting)
+    tensor = rank_tensor((6,), torch.float32, topology.rank)
+    gpubridge.all_reduce(tensor)
+    assert torch.equal(tensor, expected_sum((6,), torch.float32, topology.world_size))
+    leader = topology.island.leader
+    # One reduce onto the leader, one broadcast from it; no island all_reduce.
+    assert calls == [("reduce", leader), ("broadcast", leader)]
+
+
+@pytest.mark.parametrize("vendors", [["nvidia", "nvidia", "amd", "amd"],
+                                     ["amd", "nvidia", "nvidia", "nvidia"]],
+                         ids=["2+2", "1+3"])
+def test_reduce_bridge_broadcast_reduces_onto_the_leader(vendors, tmp_path):
+    run_ranks(vendors, _count_island_ops, tmp_path,
+              init_kwargs={"policy": "reduce-bridge-broadcast"})
+
+
 # ---- choosing and registering policies ---------------------------------------------
 
 def test_auto_is_the_default_and_keeps_todays_behavior():

@@ -44,5 +44,6 @@ step check_split_by_node multinode split "$KIT_DIR/check.py" \
     --out "$RESULTS/check_split_by_node"
 step summarize_split_by_node python "$KIT_DIR/summarize.py" "$RESULTS/check_split_by_node"
 step bench_split_by_node multinode bench "$KIT_DIR/bench_all_reduce.py" \
-    --out "$RESULTS/bench_split_by_node" --max-bytes "$BENCH_MAX_BYTES"
+    --out "$RESULTS/bench_split_by_node" --max-bytes "$BENCH_MAX_BYTES" \
+    --ops native,island,gpubridge --phases
 finish

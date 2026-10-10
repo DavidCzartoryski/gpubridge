@@ -491,6 +491,24 @@ def test_bench_times_each_island_natively_in_the_same_job(tmp_path):
     assert "gpubridge / slowest island" in summary and "gpubridge / native" not in summary
 
 
+def test_bench_reports_the_phases_of_the_gpubridge_op(tmp_path):
+    out = tmp_path / "bench"
+    result = torchrun(4, KIT / "bench_all_reduce.py", "--out", str(out), "--max-bytes", "4K",
+                      "--warmup", "1", "--trials", "3", "--ops", "island,gpubridge", "--phases",
+                      GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode == 0, result.stderr[-3000:]
+    rows = json.loads((out / "bench.json").read_text())["rows"]
+    bridged = [r for r in rows if r["op"] == "gpubridge"]
+    assert len(bridged) == 2
+    for r in bridged:
+        assert list(r["phases_ms"]) == ["island-reduce", "bridge", "island-broadcast"]
+        assert all(ms > 0 for ms in r["phases_ms"].values())
+    assert all("phases_ms" not in r for r in rows if r["op"] != "gpubridge")
+    assert "Phases of the gpubridge op (reduce-bridge-broadcast)" in (
+        out / "summary.md").read_text()
+    assert "phases_ms" not in (out / "bench.csv").read_text()
+
+
 def test_bench_size_helpers():
     assert bench_all_reduce.parse_size("1K") == 1024
     assert bench_all_reduce.parse_size("1GB") == 2**30
