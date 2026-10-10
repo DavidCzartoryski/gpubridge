@@ -17,8 +17,10 @@ item each one closes):
    on the caller's stream with no host sync in between (item 16)
 10. reduction_agreement: informational. Whether the island backend and Gloo
     agree on PRODUCT in every dtype, and on MAX/MIN with NaN (item 14)
-11. barrier: includes torch.cuda.synchronize on GPUs (item 10)
-12. destroy
+11. in_flight: the last rank reaches an all_reduce late; meanwhile every rank
+    records what gpubridge.in_flight() shows from another thread (item 23)
+12. barrier: includes torch.cuda.synchronize on GPUs (item 10)
+13. destroy
 
 Writes OUT/rank<N>.json. Run scripts/gpu/summarize.py OUT afterwards.
 
@@ -38,6 +40,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import threading
 import time
 import traceback
 from datetime import timedelta
@@ -102,6 +105,9 @@ def main() -> int:
                         help="elements in the busy-GPU tensor (default: 64M on GPU, 1M on CPU)")
     parser.add_argument("--busy-iters", type=int, default=20,
                         help="matmuls queued before the busy-GPU all_reduce")
+    parser.add_argument("--in-flight-wait", type=float, default=1.0,
+                        help="seconds before each rank looks at in_flight(); the late "
+                             "rank waits twice as long")
     parser.add_argument("--expect-init-error", metavar="REGEX",
                         help="pass only if gpubridge.init() fails on this rank with a message "
                              "matching REGEX; runs nothing else")
@@ -238,6 +244,9 @@ def main() -> int:
         with rec.stage("reduction_agreement") as entry:
             entry.update(reduction_agreement(topology, rank, device))
 
+        with rec.stage("in_flight") as entry:
+            entry.update(in_flight_while_late(rank, world, device, args.in_flight_wait))
+
         with rec.stage("barrier"):
             gpubridge.barrier()
 
@@ -247,6 +256,37 @@ def main() -> int:
         traceback.print_exc()
         rec.failed = True
     return rec.finish()
+
+
+def in_flight_while_late(rank: int, world: int, device, wait: float) -> dict:
+    """The last rank reaches an all_reduce ``2 * wait`` seconds late; after ``wait``
+    seconds every rank records ``gpubridge.in_flight()`` from another thread.
+
+    Fails only if the late rank shows a collective or an entry isn't this
+    all_reduce. Which phase each rank shows is informational: on GPUs a rank's
+    host can leave a collective once its device work is queued (item 23).
+    """
+    late = world - 1
+    seen: list[list[gpubridge.InFlight]] = []
+
+    def look() -> None:
+        time.sleep(wait)
+        seen.append(gpubridge.in_flight())
+
+    watcher = threading.Thread(target=look, daemon=True)
+    watcher.start()
+    if rank == late:
+        time.sleep(2 * wait)
+    tensor = torch.ones(16, device=device)
+    gpubridge.all_reduce(tensor)
+    sync(device)
+    watcher.join()
+    flights = [{"seq": f.seq, "op": f.op, "policy": f.policy, "phase": f.phase,
+                "phases_done": list(f.phases_done), "thread": f.thread,
+                "seconds": round(f.seconds, 3)} for f in (seen[0] if seen else [])]
+    ok = bool(seen) and all(f["op"] == "all_reduce" for f in flights)
+    return {"late_rank": late, "wait_seconds": wait, "in_flight": flights,
+            "ok": ok and (rank != late or not flights)}
 
 
 def reduction_agreement(topology: gpubridge.Topology, rank: int, device) -> dict:

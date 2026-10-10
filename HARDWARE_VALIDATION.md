@@ -191,6 +191,18 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     `train_ddp` in Explorer steps 04 (split test) and 07 (mixed NVIDIA +
     AMD), `train_ddp_split` in `amd/run_all.sh`, and the single-island
     scaling runs in step 06.
+23. **What `gpubridge.in_flight()` shows on GPUs.** It reflects the host: a
+    thread is listed while it is inside a gpubridge call. NCCL and RCCL calls
+    return once their work is queued, so on GPUs a non-leader whose island
+    collective is still waiting on the device may already have left the
+    call, while a leader blocks in the bridge's device-to-host copy or in
+    Gloo. Record what each rank shows while one rank is late.
+    *Status: works on CPU: a late rank shows nothing; the others show the
+    collective's seq, op and current phase (bridge on the waiting leader,
+    island-broadcast and island-reduce on the others), with and without
+    observers; async collectives show on the worker thread; nested phases and
+    failed calls are tracked (`tests/test_observe.py`).* *Step:* the
+    `in_flight` stage of `check.py`, in every step that runs it.
 
 ## Mixed build results
 

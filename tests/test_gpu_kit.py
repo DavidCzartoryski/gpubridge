@@ -430,10 +430,20 @@ def test_check_in_a_split_test_is_flagged_everywhere(tmp_path):
         assert "NOT a mixed-vendor result" in record["run"]["warning"]
         assert [s["name"] for s in record["stages"]] == [
             "init", "device", "dtypes", "busy_gpu", "broadcast", "reductions", "all_gather",
-            "reduce_scatter", "async", "reduction_agreement", "barrier", "destroy"]
+            "reduce_scatter", "async", "reduction_agreement", "in_flight", "barrier",
+            "destroy"]
         agreement = next(s for s in record["stages"] if s["name"] == "reduction_agreement")
         assert agreement["all_product_agree"] is True  # Gloo against Gloo on CPU
         assert agreement["backend"] == "gloo"
+    # Islands {0, 1} and {2, 3}; rank 3 is late, so its leader waits in island-reduce.
+    phases = {}
+    for record in records:
+        stage = next(s for s in record["stages"] if s["name"] == "in_flight")
+        assert stage["late_rank"] == 3
+        flights = stage["in_flight"]
+        phases[record["run"]["rank"]] = flights[0]["phase"] if flights else None
+        assert len({f["seq"] for f in flights}) <= 1
+    assert phases == {0: "bridge", 1: "island-broadcast", 2: "island-reduce", 3: None}
     assert summarize.main([str(out)]) == 0
     assert "SPLIT TEST - not a mixed-vendor result" in (out / "summary.md").read_text()
     assert json.loads((out / "summary.json").read_text())["split_test"] == "half"

@@ -5,7 +5,8 @@ Ranks are grouped into one island per vendor, each using its native backend
 default, swappable via :mod:`gpubridge.transport`), and cluster-wide collectives
 are composed from island collectives and the bridge by a collective policy
 (:mod:`gpubridge.policies`). Monitoring or profiling tools can watch every
-collective through observers (:mod:`gpubridge.observe`), and
+collective through observers (:mod:`gpubridge.observe`), :func:`in_flight`
+shows the collective each thread is inside (a debugging aid for hangs), and
 DistributedDataParallel can sync gradients through gpubridge with
 :func:`ddp_comm_hook` (:mod:`gpubridge.ddp`).
 """
@@ -34,10 +35,12 @@ from gpubridge.detect import Probe, probe
 from gpubridge.observe import (
     CollectiveObserver,
     CollectiveRecord,
+    InFlight,
     Mark,
     Phase,
     add_observer,
     elapsed_ms,
+    in_flight,
     remove_observer,
 )
 from gpubridge.policies import (
@@ -65,6 +68,7 @@ __all__ = [
     "CollectivePolicy",
     "CollectiveRecord",
     "GlooTransport",
+    "InFlight",
     "Island",
     "Layout",
     "Mark",
@@ -84,6 +88,7 @@ __all__ = [
     "destroy",
     "elapsed_ms",
     "get_topology",
+    "in_flight",
     "init",
     "is_initialized",
     "probe",

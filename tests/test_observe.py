@@ -1,5 +1,7 @@
 """Collective observers: records match across ranks, never communicate, cost nothing unwatched."""
 
+import functools
+import threading
 import time
 import warnings
 
@@ -222,6 +224,103 @@ def test_add_remove_and_destroy(tmp_path):
 def test_add_observer_needs_init():
     with pytest.raises(RuntimeError, match="not initialized"):
         gpubridge.add_observer(Keep())
+
+
+# ---- in_flight: the collective each thread is inside right now ----------------------------
+
+TWO_TWO = ["nvidia", "nvidia", "amd", "amd"]
+LATE = 2  # the rank that reaches all_reduce #1 late
+
+
+def _check_in_flight_while_a_rank_is_late(topology, watched):
+    if watched:
+        gpubridge.add_observer(Keep())
+    tensor = torch.ones(4)
+    gpubridge.all_reduce(tensor)  # #0
+    assert gpubridge.in_flight() == []
+    seen = []
+    watcher = threading.Thread(target=lambda: (time.sleep(1.0), seen.append(gpubridge.in_flight())))
+    watcher.start()
+    if topology.rank == LATE:
+        time.sleep(2.0)
+    gpubridge.all_reduce(tensor)  # #1
+    watcher.join()
+    assert gpubridge.in_flight() == []
+    (snapshot,) = seen
+    if topology.rank == LATE:
+        assert snapshot == []  # still outside gpubridge
+        return
+    (flight,) = snapshot
+    assert (flight.seq, flight.op, flight.policy, flight.thread) == (
+        1, "all_reduce", "reduce-bridge-broadcast", "MainThread")
+    assert 0.5 < flight.seconds < 2.0
+    # The nvidia island reduced and its leader waits on the bridge, the other
+    # nvidia rank for the leader's broadcast; amd can't reduce without rank 2.
+    expected = {0: ("bridge", ("island-reduce",)), 1: ("island-broadcast", ("island-reduce",)),
+                3: ("island-reduce", ())}
+    assert (flight.phase, flight.phases_done) == expected[topology.rank]
+
+
+@pytest.mark.parametrize("watched", [False, True], ids=["no observers", "observed"])
+def test_in_flight_shows_each_ranks_collective_and_phase(watched, tmp_path):
+    run_ranks(TWO_TWO, functools.partial(_check_in_flight_while_a_rank_is_late, watched=watched),
+              tmp_path)
+
+
+def _check_in_flight_async(topology):
+    tensor = torch.ones(4)
+    if topology.rank == 1:
+        time.sleep(1.0)
+        gpubridge.all_reduce(tensor)
+        return
+    work = gpubridge.all_reduce(tensor, async_op=True)
+    deadline = time.monotonic() + 5.0
+    while not (flights := gpubridge.in_flight()) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    (flight,) = flights
+    assert (flight.seq, flight.op, flight.thread, flight.phase) == (
+        0, "all_reduce", "gpubridge-async", "bridge")
+    work.wait()
+    assert gpubridge.in_flight() == []
+
+
+def test_in_flight_shows_async_collectives_on_the_worker_thread(tmp_path):
+    run_ranks(["nvidia", "amd"], _check_in_flight_async, tmp_path)
+
+
+class NestedThenFails(FlatGloo):
+    """flat-gloo that marks nested phases, looks at in_flight inside them, then fails."""
+
+    name = "test-nested-then-fails"
+    seen: list = []
+
+    def all_reduce(self, tensor, topology, op=None):
+        with observe.phase("outer"):
+            with observe.phase("inner"):
+                NestedThenFails.seen.append(gpubridge.in_flight())
+            NestedThenFails.seen.append(gpubridge.in_flight())
+            raise RuntimeError("failed inside the policy")
+
+
+def _check_in_flight_nested_and_failing(topology):
+    with pytest.raises(RuntimeError, match="failed inside the policy"):
+        gpubridge.all_reduce(torch.ones(4))
+    inner, outer = (snapshot[0] for snapshot in NestedThenFails.seen)
+    assert (inner.phase, inner.phases_done) == ("inner", ())
+    assert (outer.phase, outer.phases_done) == ("outer", ("inner",))
+    assert inner.policy == "test-nested-then-fails"
+    assert gpubridge.in_flight() == []  # a failed collective leaves no entry behind
+    gpubridge.barrier()
+    assert gpubridge.in_flight() == []
+
+
+def test_in_flight_tracks_nested_phases_and_forgets_failed_calls(tmp_path):
+    run_ranks(["nvidia"], _check_in_flight_nested_and_failing, tmp_path,
+              init_kwargs={"policy": NestedThenFails})
+
+
+def test_in_flight_is_empty_without_init():
+    assert gpubridge.in_flight() == []
 
 
 # ---- no GPU syncs ------------------------------------------------------------------------
