@@ -24,6 +24,7 @@ BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-1G}"
 BENCH_TRIALS="${BENCH_TRIALS:-10}"
 SCALING_MAX_GPUS="${SCALING_MAX_GPUS:-4}"
 SKIP_SETUP="${SKIP_SETUP:-0}"            # 1 = reuse an existing venv (e.g. on a rerun)
+PACKAGE_RESULTS="${PACKAGE_RESULTS:-1}"  # 0 = no tarball (e.g. on a cluster's shared filesystem)
 # Opt-in collective policies also checked (space-separated).
 OPT_IN_POLICIES="${OPT_IN_POLICIES:-pipelined-reduce-bridge-broadcast sharded-bridge}"
 # -------------------------------------------------------------------------------
@@ -107,5 +108,5 @@ else
 fi
 step summarize python "$KIT_DIR/summarize.py" "${checks[@]}"
 
-package_results "$RESULTS"
+[ "$PACKAGE_RESULTS" = 0 ] || package_results "$RESULTS"
 finish

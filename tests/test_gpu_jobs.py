@@ -46,6 +46,7 @@ END_TO_END = {
     "explorer/05_multinode.sbatch": "test_step_05_two_nodes",
     "explorer/06_scaling.sbatch": "test_step_06_scaling",
     "explorer/07_mixed_hetjob.sbatch": "test_step_07_mixed_hetjob",
+    "explorer/amd_node.sbatch": "test_amd_node_job",
     "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines",
     "amd/run_all.sh": "test_gpu_kit.py: test_amd_script_keeps_going_*",
 }
@@ -218,6 +219,17 @@ def test_step_07_mixed_hetjob(tmp_path):
     check = summary(out / "check")
     assert check["ok"] and check["split_test"] is None
     assert (out / "train_ddp.json").exists() and (out / "thresholds.json").exists()
+
+
+def test_amd_node_job(tmp_path):
+    # Rung 3 on Explorer: amd/run_all.sh on one AMD node, without setup or tarball.
+    code = sbatch(tmp_path, "--job-name=gpubridge-amd_node", "--nodes=1", "--gres=gpu:mi100:1",
+                  str(EXPLORER / "amd_node.sbatch"), GPUBRIDGE_VENDOR="amd", GPU_COUNT="1")
+    out = tmp_path / "results" / "amd_node"
+    assert failed(out) == {"probe", "device_map", "rccl_version"}, job_output(tmp_path)
+    assert code == 1
+    assert {"check_1gpu", "gpu_tests", "check_split_shared_gpu", "summarize"} <= set(steps(out))
+    assert not (tmp_path / "results" / "amd_node.tgz").exists()
 
 
 def loopback() -> str:
