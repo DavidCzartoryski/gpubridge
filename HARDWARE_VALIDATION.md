@@ -29,7 +29,11 @@ inside Explorer as one heterogeneous Slurm job.
    Still open: separate hosts on a real network, and the same with GPUs attached.
 2. **Version matching between builds.** Use the same PyTorch release on both
    sides, e.g. `2.x.y+cu12x` and `2.x.y+rocm6.x`, and the same Python minor
-   version, since discovery pickles objects with `all_gather_object`.
+   version, since discovery pickles objects with `all_gather_object`. Every
+   rank needs PyTorch 2.8 or later: older releases can deadlock while tearing
+   down Gloo groups
+   ([pytorch/pytorch#154976](https://github.com/pytorch/pytorch/pull/154976)
+   fixed it in 2.8). Pick both builds from 2.8 on.
    `init()` warns when releases differ but does not block. Things to find out:
    - Which release pairs actually work.
    - Whether a minor-version mismatch breaks the store or Gloo protocol.

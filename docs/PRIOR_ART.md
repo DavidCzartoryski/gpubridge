@@ -670,7 +670,7 @@ windows.
 
 - **Mixed vendors work today.** gpubridge runs each vendor's library in its
   own island and joins the islands with a CPU bridge, using stock PyTorch
-  builds (2.3 or later). In torchcomms, each communicator is still one
+  builds (2.8 or later). In torchcomms, each communicator is still one
   vendor's library.
 - **No custom build.** gpubridge is pure Python over `torch.distributed`.
   torchcomms is a C++ extension pinned to one torch release, and its ROCm
@@ -805,7 +805,7 @@ BlueField-3 per node. LLaMA-8B, TFLOPs per GPU:
   HetCCL doesn't compare with Gloo. Expect gpubridge's bridge to be the
   bottleneck for bandwidth-bound collectives.
 - **What gpubridge offers instead.**
-  - It is open source (MIT) and pure Python over stock PyTorch builds (2.3 or
+  - It is open source (MIT) and pure Python over stock PyTorch builds (2.8 or
     later, CUDA or ROCm).
   - It needs no custom build, no `LD_PRELOAD`, no RDMA-capable NIC, no
     GPUDirect or peer-memory support, and no particular network: TCP between
