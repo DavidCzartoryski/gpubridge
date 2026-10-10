@@ -691,7 +691,9 @@ windows.
 2. **Become a torchcomms backend**, so code written for DeviceMesh or FSDP2
    runs on a mixed cluster unchanged.
    *Status: not implemented. Worth revisiting when torchcomms' API stabilizes
-   and its ROCm wheels leave the nightly index.*
+   and its ROCm wheels leave the nightly index. A plain `torch.distributed`
+   backend, which reaches the same FSDP2 and DeviceMesh code, is sketched in
+   [ROADMAP.md](ROADMAP.md), section 3.*
 
 ## Positioning (proposed README paragraph)
 

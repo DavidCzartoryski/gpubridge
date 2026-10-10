@@ -329,7 +329,8 @@ model.register_comm_hook(None, gpubridge.ddp_comm_hook)
 - Tested on CPU; not validated on GPUs (HARDWARE_VALIDATION.md item 22).
 
 This is a comm hook, not a `torch.distributed` backend: FSDP2 and DeviceMesh
-can't use gpubridge yet.
+can't use gpubridge yet. [docs/ROADMAP.md](docs/ROADMAP.md) sketches that
+backend.
 
 ### Bridge transports
 
@@ -446,6 +447,9 @@ mixed hardware, such as monitoring or profiling tools:
   address that, but they are not validated on GPUs and may not be faster
   there (HARDWARE_VALIDATION.md items 17 to 21).
 - No custom kernels and no direct RDMA between vendors.
+- Designed but not implemented, each waiting on GPU results: bridge-only
+  compression, an RDMA bridge transport, and a `torch.distributed` backend for
+  FSDP2 and DeviceMesh. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Development
 
