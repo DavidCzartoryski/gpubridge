@@ -100,7 +100,7 @@ fi
 step check mixed_torchrun check "$KIT_DIR/check.py" --out "$RESULTS/check"
 step summarize python "$KIT_DIR/summarize.py" "$RESULTS/check"
 step bench mixed_torchrun bench "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" \
-    --ops island,gpubridge --phases --max-bytes "$BENCH_MAX_BYTES"
+    --ops island,gpubridge,flat-gloo --phases --max-bytes "$BENCH_MAX_BYTES"
 # Opt-in policies on the real mixed job (items 17 to 21).
 for policy in $OPT_IN_POLICIES; do
     step "check_$policy" mixed_torchrun "check-$policy" "$KIT_DIR/check.py" \

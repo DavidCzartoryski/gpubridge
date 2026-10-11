@@ -1,22 +1,29 @@
-"""all_reduce latency and bandwidth: native single-island vs gpubridge, launched by torchrun.
+"""all_reduce latency and bandwidth: native NCCL/RCCL, gpubridge and flat-gloo side by side.
 
-For each tensor size (1 KB to 1 GB by default) it times:
+Launched by torchrun. For each tensor size (1 KB to 1 GB by default, x4 per
+step) it times, by default:
 
+- ``native``: torch.distributed.all_reduce on one group of all ranks using the
+  island backend (NCCL/RCCL on GPUs, Gloo on CPU): the baseline. Only possible
+  when every rank has the same detected vendor (split tests included) and no
+  two ranks share a GPU. Otherwise, as in a real mixed job, the baseline is
+  ``island`` instead.
 - ``gpubridge``: gpubridge.all_reduce. Bridged when the job has two islands
   (a split test or a real mixed job); a plain native all_reduce otherwise.
-- ``native``: torch.distributed.all_reduce on one group of all ranks using the
-  island backend (NCCL/RCCL on GPUs, Gloo on CPU). Only possible when every
-  rank has the same detected vendor, which includes split tests, so a split
-  test measures native and bridged in the same job.
-- ``island`` (opt in with --ops): every island all_reduces on its own native
-  group at the same time (NCCL on NVIDIA, RCCL on AMD): one row per island,
-  ``island:<vendor>``. These are the per-island baselines for a real mixed
-  job, where ``native`` is impossible.
+- ``flat-gloo``: the flat-gloo policy on the same ranks (stage to CPU, Gloo
+  over every rank, copy back): what gpubridge improves on.
+- ``island`` (also opt in with --ops): every island all_reduces on its own
+  native group at the same time (NCCL on NVIDIA, RCCL on AMD): one row per
+  island, ``island:<vendor>``.
 
-Each size gets warmup runs, then timed trials until --trials or --max-seconds.
-A trial's latency is the slowest rank's (for ``island``, the slowest rank of
-that island). Bandwidth follows nccl-tests: algbw = bytes / time and
-busbw = algbw * 2(n-1)/n, with n the ranks taking part.
+Each size gets --warmup untimed runs, then timed trials until --trials or
+--max-seconds. On GPUs a trial is timed with CUDA events recorded on the
+current stream around the call (the host timer is kept as ``host_median_us``);
+on CPU with the host timer. A trial's latency is the slowest rank's (for
+``island``, the slowest rank of that island). Bandwidth follows nccl-tests:
+algbw = bytes / time and busbw = algbw * 2(n-1)/n, with n the ranks taking
+part. summary.md puts every op side by side, with gpubridge and flat-gloo as
+multiples of the baseline.
 
 --phases attaches a gpubridge observer and adds the median time of each phase
 of the gpubridge op (island-reduce, bridge, island-broadcast for
@@ -59,6 +66,7 @@ import gpubridge
 from gpubridge.config import chunk_bytes_setting
 from gpubridge.policies import (
     THRESHOLDS_FORMAT,
+    FlatGloo,
     PipelinedReduceBridgeBroadcast,
     choose_policy,
     resolve_policy,
@@ -70,8 +78,8 @@ DEFAULT_CANDIDATES = ("flat-gloo,reduce-bridge-broadcast,pipelined-reduce-bridge
 UNITS = {"K": 2**10, "M": 2**20, "G": 2**30}
 DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 FIELDS = ["op", "policy", "run_kind", "split_test", "islands", "world_size", "bytes", "dtype",
-          "trials",
-          "median_us", "p90_us", "min_us", "algbw_GBps", "busbw_GBps"]
+          "trials", "timer",
+          "median_us", "p90_us", "min_us", "algbw_GBps", "busbw_GBps", "host_median_us"]
 
 
 def parse_size(text: str) -> int:
@@ -97,28 +105,43 @@ def sizes(lo: int, hi: int, factor: int) -> list[int]:
 
 
 def time_op(op, tensor, device, *, warmup: int, trials: int,
-            max_seconds: float) -> list[list[float]]:
-    """Every rank's latency in seconds, for each timed trial."""
+            max_seconds: float) -> tuple[list[list[float]], list[list[float]]]:
+    """Every rank's latency in seconds for each timed trial: (timed, host).
+
+    ``timed`` comes from CUDA events on the current stream on GPUs, from the
+    host timer on CPU; ``host`` is always the host timer.
+    """
     for _ in range(warmup):
         op(tensor)
     sync(device)
     world = dist.get_world_size()
-    per_trial: list[list[float]] = []
+    events = device.type == "cuda"
+    timed: list[list[float]] = []
+    host: list[list[float]] = []
     spent = 0.0
-    while len(per_trial) < trials:
+    while len(timed) < trials:
         dist.barrier()
+        begin = end = None
+        if events:
+            begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            begin.record(torch.cuda.current_stream(device))
         start = time.perf_counter()
         op(tensor)
+        if end is not None:
+            end.record(torch.cuda.current_stream(device))
         sync(device)
-        elapsed = torch.tensor([time.perf_counter() - start], dtype=torch.float64)
-        gathered = [torch.zeros(1, dtype=torch.float64) for _ in range(world)]
-        dist.all_gather(gathered, elapsed)  # world group is Gloo, on CPU
-        per_trial.append([float(t) for t in gathered])
-        spent += max(per_trial[-1])
+        on_host = time.perf_counter() - start
+        timed_s = begin.elapsed_time(end) / 1e3 if begin is not None else on_host
+        mine = torch.tensor([timed_s, on_host], dtype=torch.float64)
+        gathered = [torch.zeros(2, dtype=torch.float64) for _ in range(world)]
+        dist.all_gather(gathered, mine)  # world group is Gloo, on CPU
+        timed.append([float(t[0]) for t in gathered])
+        host.append([float(t[1]) for t in gathered])
+        spent += max(timed[-1])
         # Every rank sees the same values, so every rank stops at the same trial.
-        if spent > max_seconds and len(per_trial) >= 3:
+        if spent > max_seconds and len(timed) >= 3:
             break
-    return per_trial
+    return timed, host
 
 
 def slowest(per_trial: list[list[float]], ranks=None) -> list[float]:
@@ -127,22 +150,43 @@ def slowest(per_trial: list[list[float]], ranks=None) -> list[float]:
 
 
 def row(op: str, info: dict[str, Any], nbytes: int, dtype: str, lat: list[float],
-        world: int | None = None) -> dict:
-    """One result row. ``world`` is the ranks taking part (default: all)."""
+        world: int | None = None, *, host: list[float] | None = None,
+        timer: str = "host") -> dict:
+    """One result row. ``world`` is the ranks taking part (default: all).
+
+    ``lat`` are the trials' latencies from ``timer``; ``host``, if given, the
+    same trials on the host timer.
+    """
     world = world or info["world_size"]
     median = statistics.median(lat)
     p90 = sorted(lat)[max(0, int(round(0.9 * len(lat))) - 1)]
     algbw = nbytes / median / 1e9
-    policy = info["policy"] if op == "gpubridge" else op.removeprefix("policy:") if (
-        op.startswith("policy:")) else ""
+    if op == "gpubridge":
+        policy = info["policy"]
+    elif op.startswith("policy:"):
+        policy = op.removeprefix("policy:")
+    else:
+        policy = "flat-gloo" if op == "flat-gloo" else ""
     return {
         "op": op, "policy": policy,
         "run_kind": info["kind"], "split_test": info["split_test"] or "",
         "islands": len(info["islands"]), "world_size": world, "bytes": nbytes, "dtype": dtype,
-        "trials": len(lat), "median_us": round(median * 1e6, 2), "p90_us": round(p90 * 1e6, 2),
+        "trials": len(lat), "timer": timer,
+        "median_us": round(median * 1e6, 2), "p90_us": round(p90 * 1e6, 2),
         "min_us": round(min(lat) * 1e6, 2), "algbw_GBps": round(algbw, 4),
         "busbw_GBps": round(algbw * 2 * (world - 1) / world, 4) if world > 1 else None,
+        "host_median_us": round(statistics.median(host if host else lat) * 1e6, 2),
     }
+
+
+def native_possible(topology: gpubridge.Topology) -> str | None:
+    """Why one native group over every rank can't be formed here, or None if it can."""
+    if len({peer.vendor for peer in topology.peers}) > 1:
+        return "ranks have different real vendors (NCCL and RCCL can't share a group)"
+    gpus = [(peer.hostname, peer.gpu) for peer in topology.peers if peer.gpu]
+    if len(set(gpus)) < len(gpus):
+        return "ranks share a GPU, which NCCL and RCCL refuse within one group"
+    return None
 
 
 class PhaseTimes(gpubridge.CollectiveObserver):
@@ -178,19 +222,21 @@ def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
     if info["split_test"]:
         lines += ["> **SPLIT TEST - not a mixed-vendor result.** Islands were faked from a "
                   "single-vendor job with `GPUBRIDGE_SPLIT_TEST`.", ""]
+    timers = sorted({r.get("timer", "host") for r in rows})
+    timing = ("CUDA events on the current stream" if timers == ["cuda-events"]
+              else "the host timer" if timers == ["host"] else ", ".join(timers))
     lines += [f"Run kind `{info['kind']}`, gpubridge policy `{info['policy']}`, "
               f"{info['world_size']} ranks, "
-              f"{len(info['islands'])} island(s). Latency is the median of the slowest rank.",
+              f"{len(info['islands'])} island(s). Latency is the median of the slowest rank, "
+              f"timed with {timing}.",
               ""]
     present = {r["op"] for r in rows}
     islands = sorted(op for op in present if op.startswith("island:"))
     candidates = list(dict.fromkeys(r["op"] for r in rows if r["op"].startswith("policy:")))
-    ops = [op for op in ("native", *islands, "gpubridge", *candidates) if op in present]
-    ratios = []
-    if "gpubridge" in present and "native" in present:
-        ratios.append("gpubridge / native")
-    if "gpubridge" in present and islands:
-        ratios.append("gpubridge / slowest island")
+    ops = [op for op in ("native", *islands, "gpubridge", "flat-gloo", *candidates)
+           if op in present]
+    base = "native" if "native" in present else "slowest island" if islands else None
+    ratios = [f"{op} / {base}" for op in ("gpubridge", "flat-gloo") if base and op in present]
     header = ["size"] + [f"{op} {what}" for op in ops
                          for what in ("median (us)", "busbw (GB/s)")] + ratios
     lines += ["| " + " | ".join(header) + " |", "|" + " --- |" * len(header)]
@@ -201,19 +247,19 @@ def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
     def cell(r, key):
         return "-" if r is None or r[key] is None else f"{r[key]}"
 
-    def ratio(bridge, base_us):
-        return f"{bridge['median_us'] / base_us:.2f}x" if bridge and base_us else "-"
+    def ratio(measured, base_us):
+        return f"{measured['median_us'] / base_us:.2f}x" if measured and base_us else "-"
 
     for nbytes, by_op in sorted(by_size.items()):
         cells = [human(nbytes)]
         for op in ops:
             cells += [cell(by_op.get(op), "median_us"), cell(by_op.get(op), "busbw_GBps")]
-        bridge = by_op.get("gpubridge")
-        if "gpubridge / native" in ratios:
-            cells.append(ratio(bridge, by_op.get("native", {}).get("median_us")))
-        if "gpubridge / slowest island" in ratios:
-            island_us = [by_op[op]["median_us"] for op in islands if op in by_op]
-            cells.append(ratio(bridge, max(island_us, default=None)))
+        if base == "native":
+            base_us = by_op.get("native", {}).get("median_us")
+        else:
+            base_us = max((by_op[op]["median_us"] for op in islands if op in by_op), default=None)
+        for label in ratios:
+            cells.append(ratio(by_op.get(label.split(" / ")[0]), base_us))
         lines.append("| " + " | ".join(cells) + " |")
     phased = [r for r in rows if r.get("phases_ms")]
     if phased:
@@ -287,8 +333,9 @@ def main() -> int:
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument("--max-seconds", type=float, default=20.0,
                         help="stop timing a size after this much measured time (min 3 trials)")
-    parser.add_argument("--ops", default="native,gpubridge",
-                        help="which to measure: native, island, gpubridge")
+    parser.add_argument("--ops", default="native,gpubridge,flat-gloo",
+                        help="which to measure: native, island, gpubridge, flat-gloo. native "
+                             "falls back to island where one native group is impossible")
     parser.add_argument("--policy", default="auto",
                         help="collective policy for the gpubridge op, e.g. flat-gloo")
     parser.add_argument("--timeout", type=float, default=default_timeout(1800),
@@ -312,19 +359,27 @@ def main() -> int:
     ops: dict[str, Any] = {}
     wanted = args.ops.split(",")
     if "native" in wanted:
-        detected = {peer.vendor for peer in topology.peers}
-        if len(detected) == 1:
+        why_not = native_possible(topology)
+        if why_not is None:
             # Collective: every rank creates it. Same backend as the islands.
             group = dist.new_group(list(range(topology.world_size)),
                                    backend=topology.config.island_backend,
                                    timeout=timedelta(seconds=args.timeout))
             ops["native"] = lambda t: dist.all_reduce(t, group=group)
-        elif topology.rank == 0:
-            print("native: skipped, ranks have different real vendors", file=sys.stderr)
+        else:
+            if topology.rank == 0:
+                print(f"native: not possible here ({why_not}); each island's native "
+                      "all_reduce is the baseline instead", file=sys.stderr)
+            if "island" not in wanted:
+                wanted.append("island")
     if "island" in wanted:
         ops["island"] = lambda t: dist.all_reduce(t, group=topology.island_group)
     if "gpubridge" in wanted:
         ops["gpubridge"] = gpubridge.all_reduce
+    if "flat-gloo" in wanted:
+        flat = FlatGloo()
+        flat.setup(topology)
+        ops["flat-gloo"] = lambda t: flat.all_reduce(t, topology)
     if args.candidates:
         ops.update(candidate_ops(args.candidates, topology))
 
@@ -338,14 +393,18 @@ def main() -> int:
         for name, op in ops.items():
             if phases is not None:
                 phases.records.clear()
-            per_trial = time_op(op, tensor, device, warmup=args.warmup, trials=args.trials,
-                                max_seconds=args.max_seconds)
+            per_trial, on_host = time_op(op, tensor, device, warmup=args.warmup,
+                                         trials=args.trials, max_seconds=args.max_seconds)
+            timer = "cuda-events" if device.type == "cuda" else "host"
+            nbytes_real = tensor.numel() * element
             if name == "island":
-                new = [row(f"island:{island.vendor}", info, tensor.numel() * element,
-                           args.dtype, slowest(per_trial, island.ranks), world=len(island.ranks))
+                new = [row(f"island:{island.vendor}", info, nbytes_real, args.dtype,
+                           slowest(per_trial, island.ranks), world=len(island.ranks),
+                           host=slowest(on_host, island.ranks), timer=timer)
                        for island in topology.layout.islands]
             else:
-                new = [row(name, info, tensor.numel() * element, args.dtype, slowest(per_trial))]
+                new = [row(name, info, nbytes_real, args.dtype, slowest(per_trial),
+                           host=slowest(on_host), timer=timer)]
             if name == "gpubridge" and phases is not None:
                 # time_op synchronized the device, so every mark is ready. Only the
                 # timed trials count, not the warmup.
