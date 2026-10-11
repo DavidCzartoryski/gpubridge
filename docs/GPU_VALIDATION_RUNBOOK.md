@@ -221,7 +221,8 @@ GRES type usually names the model:
    [ROCm compatibility matrix](https://rocm.docs.amd.com/en/latest/compatibility/compatibility-matrix.html).
 2. Pick the newest PyTorch release with a wheel for that ROCm line and
    Python 3.12 on [download.pytorch.org/whl](https://download.pytorch.org/whl/).
-   Index names look like `rocm6.4`.
+   Index names look like `rocm6.4`. gpubridge needs 2.8 or later; if no
+   wheel for that ROCm line is that new, gpubridge doesn't support the GPU.
 3. Set them for `setup-rocm`, e.g.
    `ROCM_TORCH_VERSION=2.9.1 ROCM_INDEX=rocm6.4`. Set `ROCM_INDEX_URL` only
    for a mirror or another index; it defaults to
