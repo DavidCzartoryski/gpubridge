@@ -60,7 +60,7 @@ step check_split_by_node multinode split "$KIT_DIR/check.py" \
 step summarize_split_by_node python "$KIT_DIR/summarize.py" "$RESULTS/check_split_by_node"
 step bench_split_by_node multinode bench "$KIT_DIR/bench_all_reduce.py" \
     --out "$RESULTS/bench_split_by_node" --max-bytes "$BENCH_MAX_BYTES" \
-    --ops native,island,gpubridge --phases
+    --ops native,island,gpubridge,flat-gloo --phases
 # Opt-in policies with the bridge crossing the network (items 17 to 21): the
 # check, and each policy's phases, so its bridge step can be read on its own.
 for policy in $OPT_IN_POLICIES; do

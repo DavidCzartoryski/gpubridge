@@ -11,8 +11,10 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 REPO = Path(__file__).resolve().parents[1]
 KIT = REPO / "scripts" / "gpu"
@@ -516,12 +518,17 @@ def test_bench_measures_native_and_bridged_in_one_split_run(tmp_path):
                       GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
     assert result.returncode == 0, result.stderr[-3000:]
     rows = json.loads((out / "bench.json").read_text())["rows"]
-    assert {r["op"] for r in rows} == {"native", "gpubridge"}
+    # By default: the native baseline, gpubridge and flat-gloo, side by side.
+    assert {r["op"] for r in rows} == {"native", "gpubridge", "flat-gloo"}
     assert {r["policy"] for r in rows if r["op"] == "gpubridge"} == {"reduce-bridge-broadcast"}
+    assert {r["policy"] for r in rows if r["op"] == "flat-gloo"} == {"flat-gloo"}
     assert {r["bytes"] for r in rows} == {1024, 4096, 16384}
     assert all(r["split_test"] == "half" and r["islands"] == 2 for r in rows)
+    assert all(r["timer"] == "host" and r["host_median_us"] > 0 for r in rows)  # CPU
     assert (out / "bench.csv").read_text().startswith("op,policy,run_kind,split_test,")
-    assert "SPLIT TEST" in (out / "summary.md").read_text()
+    summary = (out / "summary.md").read_text()
+    assert "SPLIT TEST" in summary and "timed with the host timer" in summary
+    assert "| gpubridge / native | flat-gloo / native |" in summary
 
 
 def test_bench_times_each_island_natively_in_the_same_job(tmp_path):
@@ -537,6 +544,7 @@ def test_bench_times_each_island_natively_in_the_same_job(tmp_path):
     summary = (out / "summary.md").read_text()
     assert "island:amd median (us)" in summary and "island:nvidia median (us)" in summary
     assert "gpubridge / slowest island" in summary and "gpubridge / native" not in summary
+    assert "flat-gloo" not in summary  # only what --ops asked for
 
 
 def test_bench_reports_the_phases_of_the_gpubridge_op(tmp_path):
@@ -573,6 +581,58 @@ def test_bench_size_helpers():
     trials = [[0.1, 0.4, 0.2, 0.3], [0.5, 0.1, 0.1, 0.2]]
     assert bench_all_reduce.slowest(trials) == [0.4, 0.5]
     assert bench_all_reduce.slowest(trials, (2, 3)) == [0.3, 0.2]
+    timed = bench_all_reduce.row("native", info, 2**20, "float32", [0.001, 0.002, 0.003],
+                                 host=[0.004, 0.005, 0.006], timer="cuda-events")
+    assert timed["timer"] == "cuda-events" and timed["median_us"] == 2000.0
+    assert timed["host_median_us"] == 5000.0 and timed["policy"] == ""
+    assert bench_all_reduce.row("flat-gloo", info, 2**20, "float32", [0.001])["policy"] == (
+        "flat-gloo")
+
+
+def test_bench_times_gpu_trials_with_cuda_events(tmp_path, monkeypatch):
+    # The GPU branch of time_op, on one CPU rank with fake events: the timed
+    # latency is the events' elapsed time, the host one the wall clock.
+    class FakeEvent:
+        def __init__(self, enable_timing=False):
+            assert enable_timing
+
+        def record(self, stream=None):
+            pass
+
+        def elapsed_time(self, end):
+            return 2.5  # ms
+
+    import torch.distributed as dist
+    monkeypatch.setattr(bench_all_reduce.torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(bench_all_reduce.torch.cuda, "current_stream", lambda device=None: None)
+    monkeypatch.setattr(bench_all_reduce, "sync", lambda device: None)
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path}/store", rank=0, world_size=1)
+    try:
+        calls = []
+        timed, host = bench_all_reduce.time_op(calls.append, "tensor", torch.device("cuda", 0),
+                                               warmup=2, trials=3, max_seconds=60)
+    finally:
+        dist.destroy_process_group()
+    assert len(calls) == 5  # 2 warmup, 3 timed
+    assert timed == [[0.0025]] * 3
+    assert len(host) == 3 and all(0 < t[0] < 1 for t in host)
+
+
+def _bench_topology(peers):
+    return SimpleNamespace(peers=[SimpleNamespace(vendor=v, hostname=h, gpu=g) for v, h, g in peers])
+
+
+def test_bench_native_baseline_needs_one_vendor_and_a_gpu_per_rank():
+    two_gpus = [("nvidia", "n1", "pci 0000:01:00"), ("nvidia", "n1", "pci 0000:02:00")]
+    assert bench_all_reduce.native_possible(_bench_topology(two_gpus)) is None
+    shared = [("nvidia", "n1", "pci 0000:01:00"), ("nvidia", "n1", "pci 0000:01:00")]
+    assert "share a GPU" in bench_all_reduce.native_possible(_bench_topology(shared))
+    other_host = [("nvidia", "n1", "pci 0000:01:00"), ("nvidia", "n2", "pci 0000:01:00")]
+    assert bench_all_reduce.native_possible(_bench_topology(other_host)) is None
+    mixed = [("nvidia", "n1", "pci 0000:01:00"), ("amd", "n2", "pci 0000:c1:00")]
+    assert "different real vendors" in bench_all_reduce.native_possible(_bench_topology(mixed))
+    cpu = [("nvidia", "n1", ""), ("nvidia", "n1", "")]
+    assert bench_all_reduce.native_possible(_bench_topology(cpu)) is None
 
 
 def test_training_demo_keeps_ranks_in_sync_and_learns(tmp_path):

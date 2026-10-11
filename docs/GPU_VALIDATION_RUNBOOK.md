@@ -255,12 +255,13 @@ runs each phase as one heterogeneous job step (`srun --het-group=0 ... :
 1. `probe` on each side (`probe_nvidia/`, `probe_amd/`), plus `rocm-smi` and `amd-smi` from the AMD node;
 2. `preflight`: the gpu node as master, the AMD node as worker (see [The network preflight](#the-network-preflight)). Gloo on each node then uses the interface the preflight chose there. The job stops here if either side lacks a usable GPU or no pair of interfaces connects both ways;
 3. `check`: one torchrun per node, with the c10d rendezvous on the gpu node. Both write into `check/` on the shared filesystem, so `summarize` covers every rank without copying. `run.kind` must be `gpu-mixed`, with `split_test` null;
-4. `bench` (`--ops island,gpubridge`): first each island times its own native
-   all_reduce, both at once (NCCL on the gpu node, RCCL on the AMD node; rows
-   `island:nvidia` and `island:amd`), then the bridged all_reduce across both.
-   `summary.md` adds a `gpubridge / slowest island` column. A native
-   all_reduce over every rank is impossible here, because NCCL and RCCL ranks
-   can't form one group, so the islands are the baselines.
+4. `bench` (`--ops island,gpubridge,flat-gloo`): first each island times its
+   own native all_reduce, both at once (NCCL on the gpu node, RCCL on the AMD
+   node; rows `island:nvidia` and `island:amd`), then the bridged all_reduce
+   across both, then flat-gloo across both. `summary.md` adds
+   `gpubridge / slowest island` and `flat-gloo / slowest island` columns. A
+   native all_reduce over every rank is impossible here, because NCCL and RCCL
+   ranks can't form one group, so the islands are the baselines.
 
 **Per-island baselines need 2+ GPUs per island.** With one GPU, an island's
 all_reduce has nothing to exchange, so its row only times the call itself.
@@ -483,7 +484,11 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 - `preflight/preflight-<role>.json` (steps 05 and 07): every pair of interfaces
   between the two leader nodes, whether it connects each way, MB/s each way and
   the round-trip time, and the interface each node's Gloo used.
-- `bench/bench.csv`: latency and bandwidth per size, for native and gpubridge.
+- `bench/bench.csv`, `bench.json` and `summary.md`: per size, the native
+  NCCL/RCCL baseline (over every rank, or each island's), gpubridge and
+  flat-gloo side by side: median, p90 and min latency of the slowest rank,
+  timed with CUDA events on the current stream (`host_median_us` is the host
+  timer), and algbw and busbw as nccl-tests computes them.
 - `gpu_tests.xml` and `gpu_tests.log`: the GPU-only tests (JUnit XML and
   pytest's output). A failure names the policy, op, dtype, size and mode of
   each wrong case.

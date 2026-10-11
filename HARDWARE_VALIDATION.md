@@ -117,6 +117,14 @@ inside Explorer as one heterogeneous Slurm job.
 
 11. Bridge throughput and latency compared with a single-vendor all_reduce, to
     set a baseline before any performance work.
+    *Step:* `bench_all_reduce.py`, in Explorer steps 03 to 05 and 07,
+    `amd/run_all.sh` and `mixed/node.sh`. For each size (1 KB to 1 GB, x4) it
+    runs warmup calls, then times trials with CUDA events on the current
+    stream. By default it puts three ops side by side: native NCCL/RCCL over
+    every rank (or each island's own, where one group is impossible),
+    gpubridge, and flat-gloo, with busbw as nccl-tests computes it and
+    gpubridge and flat-gloo as multiples of the native baseline.
+    *Status: runs on CPU in simulation, host-timed; no GPU numbers yet.*
 
 ## Added with later features
 
@@ -141,7 +149,7 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     a test counts one island reduce and one island broadcast per all_reduce.*
     Still open: the time saved on NCCL and RCCL, by tensor size. Small tensors
     may see none, because both ops are latency-bound there. *Step:*
-    `bench_all_reduce.py --ops native,island,gpubridge --phases` puts the
+    `bench_all_reduce.py --ops native,island,gpubridge,flat-gloo --phases` puts the
     `island-reduce` phase next to a native island all_reduce (`island:<vendor>`)
     of the same size (Explorer steps 04, 05 and 07, `amd/run_all.sh`).
 14. **Where NCCL/RCCL and Gloo agree on reductions.** gpubridge mixes the island

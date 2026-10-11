@@ -77,7 +77,7 @@ if [ "$GPUS" -ge 2 ]; then
         --nproc-per-node="$GPUS" "$KIT_DIR/check.py" --out "$RESULTS/check_split"
     checks+=("$RESULTS/check_island" "$RESULTS/check_split")
     step bench env_local_torchrun GPUBRIDGE_SPLIT_TEST=half --nproc-per-node="$GPUS" \
-        "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" --ops native,island,gpubridge \
+        "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" --ops native,island,gpubridge,flat-gloo \
         --phases --max-bytes "$BENCH_MAX_BYTES" --trials "$BENCH_TRIALS"
     # Opt-in policies (items 17 to 21), each under the same split-test check, then
     # every candidate timed side by side, writing a thresholds file for auto-tuned.
