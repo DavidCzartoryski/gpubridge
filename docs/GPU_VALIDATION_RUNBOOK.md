@@ -12,8 +12,8 @@ end to end on CPU, against a fake Slurm (`tests/fake_cluster`: sbatch, srun,
 scontrol, module, uv) and gpubridge's simulation mode: `submit.sh` through each
 Explorer job, the two-node and heterogeneous jobs on pretend nodes, and
 `mixed/node.sh` as two machines. Only the steps that need a GPU (`probe`,
-`device_map`) fail there. CI runs it on every push, so a script bug shows up
-before it can cost GPU time.
+`device_map`) fail there. CI runs it on every push (in the Python 3.12 job),
+so a script bug shows up before it can cost GPU time.
 
 **Limits on every job.**
 - `KIT_TIMEOUT` (default 300 s, set in `common.sh`): the process-group timeout

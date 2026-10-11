@@ -15,9 +15,12 @@ jobs:
       fail-fast: false
       matrix:
         # The oldest supported torch on the oldest Python, and the newest on 3.12.
+        # The fake-cluster job tests (tests/test_gpu_jobs.py, ~5 min) check the GPU
+        # kit's shell scripts, not torch, so only the 3.12 job runs them.
         include:
-          - {python-version: "3.10", torch: "torch==2.8.0"}
-          - {python-version: "3.12", torch: "torch"}
+          - {python-version: "3.10", torch: "torch==2.8.0",
+             pytest-args: "--ignore=tests/test_gpu_jobs.py"}
+          - {python-version: "3.12", torch: "torch", pytest-args: ""}
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.2.0  # setup-uv publishes no moving major tags since v8
@@ -30,5 +33,5 @@ jobs:
       - run: uv pip install -e ".[test]"
       # shellcheck ships with ubuntu-latest; the kit's tests also run it when present.
       - run: shellcheck scripts/*.sh scripts/gpu/*.sh scripts/gpu/*/*.sh scripts/gpu/explorer/*.sbatch tests/fake_cluster/*
-      - run: pytest
+      - run: pytest ${{ matrix.pytest-args }}
       - run: python examples/simulate_two_islands.py
