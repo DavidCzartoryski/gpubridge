@@ -33,7 +33,7 @@ END_TO_END = {
     "summarize.py": "every job below",
     "probe.py": "test_step_01 and 07 (fails on CPU: no GPU)",
     "device_map.py": "test_step_03 (fails on CPU: no GPU)",
-    "preflight.py": "test_step_07, the node pair, test_gpu_kit.py",
+    "preflight.py": "test_step_05, 07, the node pair, test_gpu_kit.py",
     "setup_env.sh": "test_setup_job_creates_the_cuda_venv",
     "explorer/submit.sh": "every test_step_*, and test_gpu_kit.py for 00",
     "explorer/job_env.sh": "sourced by every Explorer job",
@@ -66,6 +66,7 @@ def cluster_env(tmp_path: Path, **extra: str) -> dict[str, str]:
         "KIT_TIMEOUT": "120",
         "RDZV_PORT": str(_free_port()),
         "PREFLIGHT_PORT": str(_free_port()),
+        "PREFLIGHT_SECONDS": "0.3",
         **extra,
     })
 
@@ -195,6 +196,14 @@ def test_step_05_two_nodes(tmp_path):
     log = (tmp_path / "slurm.log").read_text()
     assert "--nodes=2" in log and "srun --nodes=2 --ntasks-per-node=1" in log
     assert (out / "thresholds.json").exists()
+    # The preflight ran first on both pretend nodes; Gloo then used its choice.
+    records = [json.loads((out / "preflight" / f"preflight-{role}.json").read_text())
+               for role in ("master", "worker")]
+    assert all(record["ok"] for record in records)
+    chosen = records[0]["chosen_ifname"]
+    assert chosen and records[1]["chosen_ifname"] == chosen  # one machine: the same name
+    logs = "".join(p.read_text() for p in (tmp_path / "work" / "logs").glob("*.out"))
+    assert f"GLOO_SOCKET_IFNAME={chosen}, as the preflight chose" in logs
 
 
 def test_step_06_scaling(tmp_path):
@@ -219,6 +228,10 @@ def test_step_07_mixed_hetjob(tmp_path):
     check = summary(out / "check")
     assert check["ok"] and check["split_test"] is None
     assert (out / "train_ddp.json").exists() and (out / "thresholds.json").exists()
+    # Every job step after the preflight runs with each side's chosen interface.
+    chosen = json.loads((out / "preflight" / "preflight-master.json").read_text())["chosen_ifname"]
+    later = (tmp_path / "slurm.log").read_text().split("preflight.py", 1)[1]
+    assert f"env GLOO_SOCKET_IFNAME={chosen}" in later
 
 
 def test_amd_node_job(tmp_path):

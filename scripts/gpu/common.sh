@@ -227,6 +227,35 @@ free_port() {
     fi
 }
 
+# preflight_ifname FILE: the interface a preflight record (preflight.py --out)
+# chose for its machine, or nothing if there is none.
+preflight_ifname() {
+    [ "$DRY_RUN" = 1 ] && return 0
+    python -c 'import json, sys; print(json.load(open(sys.argv[1])).get("chosen_ifname") or "")' \
+        "$1" 2>/dev/null || true
+}
+
+# After a preflight, Gloo uses the interfaces it chose, unless GLOO_SOCKET_IFNAME
+# was set already (the preflight then only checks that one) or USE_PREFLIGHT_IFNAME=0.
+USE_PREFLIGHT_IFNAME="${USE_PREFLIGHT_IFNAME:-1}"
+PREFLIGHT_SECONDS="${PREFLIGHT_SECONDS:-2}"  # of raw TCP data each way, per pair of interfaces
+
+# use_preflight_ifname DIR: export GLOO_SOCKET_IFNAME for the rest of a job whose
+# machines all run under one environment, if both preflight sides chose the same name.
+use_preflight_ifname() {
+    [ -z "${GLOO_SOCKET_IFNAME:-}" ] && [ "$USE_PREFLIGHT_IFNAME" = 1 ] || return 0
+    local master worker
+    master=$(preflight_ifname "$1/preflight-master.json")
+    worker=$(preflight_ifname "$1/preflight-worker.json")
+    if [ -n "$master" ] && [ "$master" = "$worker" ]; then
+        export GLOO_SOCKET_IFNAME="$master"
+        log "GLOO_SOCKET_IFNAME=$master, as the preflight chose"
+    elif [ -n "$master$worker" ]; then
+        log "the preflight chose ${master:-?} on one machine and ${worker:-?} on the other;" \
+            "GLOO_SOCKET_IFNAME stays unset, so Gloo picks"
+    fi
+}
+
 # torchrun on this machine only. Pins the rendezvous to 127.0.0.1 on a free port
 # instead of --standalone, which hangs on hosts whose own name doesn't resolve
 # (seen on macOS).

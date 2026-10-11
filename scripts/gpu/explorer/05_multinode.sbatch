@@ -2,6 +2,8 @@
 #SBATCH --job-name=gpubridge-05-multinode
 #SBATCH --time=00:30:00
 # Step 05, 2 nodes (multigpu). Submit with: scripts/gpu/explorer/submit.sh 05
+# First the network preflight: TCP both ways between the nodes' interfaces, raw
+# bandwidth, and the interface Gloo uses for the rest of the job (item 8).
 # Part A: one NCCL island spanning both nodes (native multi-node baseline).
 # Part B: TEST ONLY split by node, so the Gloo bridge crosses the network
 # between nodes (item 8), plus a native vs bridged benchmark.
@@ -14,8 +16,9 @@ source "$KIT_DIR/explorer/job_env.sh"
 
 GPUS_PER_NODE="${GPUS_PER_NODE_MULTINODE:-2}"
 RDZV_PORT="${RDZV_PORT:-29500}"
+PREFLIGHT_PORT="${PREFLIGHT_PORT:-29501}"
 BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-1G}"
-# Interfaces: empty lets NCCL/Gloo choose. VERIFY the cluster's fast interface (e.g. ib0).
+# Interfaces: empty lets NCCL choose, and Gloo use the one the preflight picks.
 [ -n "${NCCL_SOCKET_IFNAME:-}" ] && export NCCL_SOCKET_IFNAME
 [ -n "${GLOO_SOCKET_IFNAME:-}" ] && export GLOO_SOCKET_IFNAME
 
@@ -36,6 +39,18 @@ multinode() {
         --rdzv-backend=c10d --rdzv-endpoint="$HEAD:$RDZV_PORT" \
         --rdzv-id="${SLURM_JOB_ID:-local}-$tag" "$@"
 }
+
+# The first two nodes: srun task 0 is the master, on the rendezvous node.
+step preflight limited srun --nodes=2 --ntasks=2 --ntasks-per-node=1 --kill-on-bad-exit=1 \
+    python "$KIT_DIR/preflight.py" --role auto --master-addr "$HEAD" --port "$PREFLIGHT_PORT" \
+    --bandwidth-seconds "$PREFLIGHT_SECONDS" --out "$RESULTS/preflight"
+# Nothing below can work if the nodes can't talk, so stop instead of waiting out
+# rendezvous timeouts.
+if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+    finish || true
+    die "stopping before torchrun: the preflight failed; see $RESULTS/preflight.log"
+fi
+use_preflight_ifname "$RESULTS/preflight"
 
 step check_one_island multinode one "$KIT_DIR/check.py" --out "$RESULTS/check_one_island"
 step summarize_one_island python "$KIT_DIR/summarize.py" "$RESULTS/check_one_island"

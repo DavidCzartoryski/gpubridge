@@ -19,6 +19,7 @@ KIT = REPO / "scripts" / "gpu"
 sys.path.insert(0, str(KIT))
 
 import bench_all_reduce  # noqa: E402
+import preflight  # noqa: E402
 import summarize  # noqa: E402
 
 SHELL_SCRIPTS = sorted(
@@ -379,6 +380,7 @@ def test_submit_free_and_multi_submit_every_step():
                                  "--policy sharded-bridge", "bench_phases_sharded-bridge",
                                  "--write-thresholds"]),
         ("05_multinode.sbatch", ["srun", "--rdzv-backend=c10d", "check_split_by_node"]),
+        ("05_multinode.sbatch", ["preflight.py --role auto", "--bandwidth-seconds 2"]),
         ("06_scaling.sbatch", ["--nproc-per-node=4", "train_synthetic.py", "summarize.py"]),
         ("07_mixed_hetjob.sbatch", ["--het-group=1", "--rdzv-backend=c10d", "summarize.py"]),
     ],
@@ -628,19 +630,110 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def test_preflight_passes_on_loopback(tmp_path):
-    port = str(_free_port())
+def run_preflight_pair(tmp_path: Path, *extra: str, env=None) -> dict[str, dict]:
+    """Both sides of a preflight on this machine; their records by role."""
     cmd = [sys.executable, str(KIT / "preflight.py"), "--master-addr", "127.0.0.1",
-           "--port", port, "--timeout", "30", "--out", str(tmp_path)]
-    master = subprocess.Popen([*cmd, "--role", "master"], env=clean_env(),
+           "--port", str(_free_port()), "--timeout", "30", "--bandwidth-seconds", "0.3",
+           "--out", str(tmp_path), *extra]
+    master = subprocess.Popen([*cmd, "--role", "master"], env=env or clean_env(),
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    worker = subprocess.run([*cmd, "--role", "worker"], env=clean_env(),
-                            capture_output=True, text=True, timeout=60)
-    master.wait(timeout=60)
+    worker = subprocess.run([*cmd, "--role", "worker"], env=env or clean_env(),
+                            capture_output=True, text=True, timeout=120)
+    master_err = master.communicate(timeout=120)[1]
     assert worker.returncode == 0, worker.stderr
-    assert master.returncode == 0
-    record = json.loads((tmp_path / "preflight-worker.json").read_text())
-    assert [s["name"] for s in record["stages"]] == ["resolve", "interface", "tcp", "gloo"]
+    assert master.returncode == 0, master_err
+    return {role: json.loads((tmp_path / f"preflight-{role}.json").read_text())
+            for role in ("master", "worker")}
+
+
+def test_preflight_passes_on_loopback(tmp_path):
+    records = run_preflight_pair(tmp_path)
+    worker, master = records["worker"], records["master"]
+    assert [s["name"] for s in worker["stages"]] == [
+        "resolve", "interface", "tcp", "store", "interfaces", "reachability", "choose", "gloo"]
+    assert "tcp" not in [s["name"] for s in master["stages"]]
+    # Both sides agree on one pair, and Gloo ran on it.
+    assert master["chosen_ifname"] == worker["peer_ifname"]
+    assert worker["chosen_ifname"] == master["peer_ifname"]
+    assert master["pairs"] == worker["pairs"] and master["pairs"]
+    gloo = worker["stages"][-1]["result"]
+    assert gloo["GLOO_SOCKET_IFNAME"] == worker["chosen_ifname"]
+    for record in records.values():
+        bandwidth = record["bandwidth"]
+        assert bandwidth["MBps_in"] > 0 and bandwidth["MBps_out"] > 0
+        assert bandwidth["rtt_ms"] > 0 and bandwidth["streams"] == 1
+    # The other side's out is this side's in.
+    assert master["bandwidth"]["MBps_out"] == worker["bandwidth"]["MBps_in"]
+
+
+def test_preflight_measures_only_the_interface_it_is_given(tmp_path):
+    names = {name for _, name in socket.if_nameindex()}
+    lo = next(name for name in ("lo", "lo0") if name in names)
+    records = run_preflight_pair(tmp_path, env=clean_env(GLOO_SOCKET_IFNAME=lo))
+    for record in records.values():
+        assert record["chosen_ifname"] == lo
+        assert [(p["master"], p["worker"]) for p in record["pairs"]] == [(lo, lo)]
+
+
+def test_preflight_without_a_worker_fails_cleanly(tmp_path):
+    # The master alone: the store's wait for the worker times out, and the
+    # preflight reports it and writes its record instead of a traceback.
+    result = subprocess.run([sys.executable, str(KIT / "preflight.py"), "--role", "master",
+                             "--master-addr", "127.0.0.1", "--port", str(_free_port()),
+                             "--timeout", "3", "--out", str(tmp_path)],
+                            env=clean_env(), capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1
+    assert "FAILED: reachability:" in result.stderr and "Traceback" not in result.stderr
+    record = json.loads((tmp_path / "preflight-master.json").read_text())
+    assert record["ok"] is False
+    assert record["stages"][-1]["name"] == "reachability" and not record["stages"][-1]["ok"]
+
+
+def test_preflight_candidates_skip_loopback_and_container_bridges():
+    found = {"lo": "127.0.0.1", "eno1": "10.1.0.5", "ib0": "10.2.0.5",
+             "docker0": "172.17.0.1", "veth12": "10.3.0.1", "usb0": "169.254.3.1"}
+    assert preflight.candidates(found, None, loopback=False) == [
+        ("eno1", "10.1.0.5"), ("ib0", "10.2.0.5")]
+    assert ("lo", "127.0.0.1") in preflight.candidates(found, None, loopback=True)
+    assert preflight.candidates(found, "ib0", loopback=False) == [("ib0", "10.2.0.5")]
+    with pytest.raises(preflight.PreflightError, match="no IPv4 address"):
+        preflight.candidates(found, "wg0", loopback=False)
+    with pytest.raises(preflight.PreflightError, match="no candidate interface"):
+        preflight.candidates({"lo": "127.0.0.1"}, None, loopback=False)
+
+
+def _pair(master, worker, m2w=None, w2m=None, error=None):
+    pair = {"master": master, "master_address": "10.0.0.1", "worker": worker,
+            "worker_address": "10.0.0.2", "connects": error is None}
+    if error is None:
+        pair.update(MBps_master_to_worker=m2w, MBps_worker_to_master=w2m, rtt_ms=0.1)
+    else:
+        pair["error"] = error
+    return pair
+
+
+def test_preflight_chooses_the_pair_whose_slower_direction_is_fastest():
+    pairs = [_pair("eno1", "eno1", 117, 118), _pair("ib0", "ib0", 3000, 900),
+             _pair("ib1", "ib1", 1200, 1100), _pair("ib2", "ib2", error="timed out")]
+    assert preflight.choose(pairs)["master"] == "ib1"
+    with pytest.raises(preflight.PreflightError, match="ib2 10.0.0.1 <-> worker ib2"):
+        preflight.choose([_pair("ib2", "ib2", error="timed out")])
+
+
+def test_preflight_pairs_follow_the_routes():
+    # On one machine every local address routes from itself.
+    mine = [("lo0", "127.0.0.1")]
+    assert preflight.routed_pairs(mine, [("lo", "127.0.0.1")], "master") == [("lo0", "lo")]
+    assert preflight.routed_pairs(mine, [("lo", "127.0.0.1")], "worker") == [("lo", "lo0")]
+    assert preflight.routed_pairs([("eno1", "10.9.9.9")], [("lo", "127.0.0.1")], "master") == []
+
+
+def test_preflight_role_auto_follows_srun(monkeypatch):
+    monkeypatch.setenv("SLURM_PROCID", "0")
+    assert preflight.resolve_role("auto") == "master"
+    monkeypatch.setenv("SLURM_PROCID", "1")
+    assert preflight.resolve_role("auto") == "worker"
+    assert preflight.resolve_role("master") == "master"
 
 
 @pytest.mark.parametrize(
