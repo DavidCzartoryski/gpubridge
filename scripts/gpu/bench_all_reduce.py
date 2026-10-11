@@ -53,7 +53,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from gpukit import KIT_VERSION, environment, run_info, sync, write_json
+from gpukit import KIT_VERSION, default_timeout, environment, run_info, sync, write_json
 
 import gpubridge
 from gpubridge.config import chunk_bytes_setting
@@ -291,7 +291,8 @@ def main() -> int:
                         help="which to measure: native, island, gpubridge")
     parser.add_argument("--policy", default="auto",
                         help="collective policy for the gpubridge op, e.g. flat-gloo")
-    parser.add_argument("--timeout", type=float, default=1800)
+    parser.add_argument("--timeout", type=float, default=default_timeout(1800),
+                        help="group timeout (s); default KIT_TIMEOUT, else 1800")
     parser.add_argument("--phases", action="store_true",
                         help="also record the median time of each phase of the gpubridge op")
     parser.add_argument("--candidates", default=None,

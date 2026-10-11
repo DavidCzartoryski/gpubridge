@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Fake sbatch, to run the Explorer job scripts on CPU: runs the job script here,
+# right away, with SLURM_* variables made up from the options, and writes its
+# output to --output. A ":" separates the components of a heterogeneous job.
+# The first node of the job (or of component 0) is 127.0.0.1, so a script's
+# rendezvous on "the first node" works; the others are fake-node-N.
+# Appends "sbatch ARGS" and "job ID exit CODE" to $FAKE_SLURM_LOG.
+set -euo pipefail
+log="${FAKE_SLURM_LOG:-/dev/null}"
+echo "sbatch $*" >>"$log"
+job_id=$((RANDOM % 90000 + 10000))
+name="" output="" script="" component=0 gpus=0
+nodes=(1)
+for arg in "$@"; do
+    case $arg in
+    --job-name=*) name=${arg#*=} ;;
+    --output=*) output=${arg#*=} ;;
+    --nodes=*) nodes[component]=${arg#*=} ;;
+    --gres=gpu:*) [ "$component" != 0 ] || gpus=${arg##*:} ;;
+    :) component=$((component + 1)) && nodes[component]=1 ;;
+    -*) ;;
+    *) script=$arg ;;
+    esac
+done
+[ -f "$script" ] || { echo "fake sbatch: no job script in: $*" >&2; exit 1; }
+
+# nodelist FIRST COUNT: FIRST, then fake-node-1 ... for COUNT nodes in all.
+nodelist() {
+    local names=$1 i
+    for ((i = 1; i < $2; i++)); do names+=",fake-node-$i"; done
+    echo "$names"
+}
+export SLURM_JOB_ID=$job_id SLURM_JOB_NAME="${name:-$(basename "$script")}"
+export SLURM_NNODES="${nodes[0]}" SLURM_GPUS_ON_NODE=$gpus SLURM_SUBMIT_DIR=$PWD
+SLURM_JOB_NODELIST=$(nodelist 127.0.0.1 "${nodes[0]}")
+export SLURM_JOB_NODELIST
+if [ "$component" -gt 0 ]; then
+    export SLURM_HET_SIZE=$((component + 1))
+    for ((g = 0; g <= component; g++)); do
+        first=127.0.0.1
+        [ "$g" = 0 ] || first="fake-het-$g"
+        export "SLURM_JOB_NODELIST_HET_GROUP_$g=$(nodelist "$first" "${nodes[g]}")"
+    done
+fi
+output=${output//%x/$SLURM_JOB_NAME}
+output=${output//%j/$job_id}
+set +e
+if [ -n "$output" ]; then
+    mkdir -p "$(dirname "$output")"
+    bash "$script" >"$output" 2>&1
+else
+    bash "$script"
+fi
+code=$?
+set -e
+echo "job $job_id exit $code" >>"$log"
+echo "Submitted batch job $job_id"

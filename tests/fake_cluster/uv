@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Fake uv for the setup job's CPU test: records the call and succeeds, so the
+# setup scripts run end to end without downloading anything. The test supplies
+# a venv that already has torch and gpubridge.
+echo "uv $*" >>"${FAKE_SLURM_LOG:-/dev/null}"

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Fake Lmod module command: records the call and succeeds.
+echo "module $*" >>"${FAKE_SLURM_LOG:-/dev/null}"

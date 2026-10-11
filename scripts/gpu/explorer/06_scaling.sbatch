@@ -12,8 +12,10 @@ source "$REPO/scripts/gpu/common.sh" "$@"
 # shellcheck source=job_env.sh
 source "$KIT_DIR/explorer/job_env.sh"
 
-MAX_GPUS=4
-TRAIN_ARGS=(--steps 100 --warmup-steps 10 --batch-size 256 --dim 2048 --layers 6)
+MAX_GPUS="${SCALING_MAX_GPUS:-4}"
+# SCALING_TRAIN_ARGS replaces the model and run length (e.g. smaller for a CPU dry run).
+DEFAULT_TRAIN_ARGS="--steps 100 --warmup-steps 10 --batch-size 256 --dim 2048 --layers 6"
+read -ra TRAIN_ARGS <<<"${SCALING_TRAIN_ARGS:-$DEFAULT_TRAIN_ARGS}"
 
 job_setup 06_scaling
 for n in $(seq 1 "$MAX_GPUS"); do

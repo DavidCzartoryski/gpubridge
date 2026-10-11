@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Fake srun: runs the job step on this machine. --nodes=N (or --ntasks=N) starts
+# N copies at once, one per pretend node, each with SLURM_PROCID, SLURM_NODEID
+# and its own GPUBRIDGE_SIM_HOSTNAME, so gpubridge in simulation mode sees N
+# machines. A ":" separates heterogeneous components; component G also gets
+# the NAME=VALUE pairs in $FAKE_SLURM_HET_ENV_G (e.g. its simulated vendor).
+# With --kill-on-bad-exit the first failure stops the rest. Exits with the
+# first failure's code. Appends "srun ARGS" to $FAKE_SLURM_LOG.
+set -uo pipefail
+echo "srun $*" >>"${FAKE_SLURM_LOG:-/dev/null}"
+
+pids=()
+copies=0
+kill_on_bad_exit=0
+# launch GROUP COUNT CMD...: start COUNT copies of CMD in the background.
+launch() {
+    local group=$1 count=$2 i var extra=()
+    shift 2
+    var="FAKE_SLURM_HET_ENV_$group"
+    read -ra extra <<<"${!var:-}"
+    for ((i = 0; i < count; i++)); do
+        env SLURM_PROCID=$copies SLURM_NODEID=$copies SLURM_LOCALID=0 \
+            GPUBRIDGE_SIM_HOSTNAME="fake-node-$copies" "${extra[@]+"${extra[@]}"}" "$@" &
+        pids+=($!)
+        copies=$((copies + 1))
+    done
+}
+
+group=0 count=1 cmd=()
+for arg in "$@"; do
+    if [ "${#cmd[@]}" -gt 0 ]; then
+        if [ "$arg" = : ]; then
+            launch "$group" "$count" "${cmd[@]}"
+            group=$((group + 1)) count=1 cmd=()
+        else
+            cmd+=("$arg")
+        fi
+        continue
+    fi
+    case $arg in
+    --nodes=* | --ntasks=*) count=${arg#*=} ;;
+    --het-group=*) group=${arg#*=} ;;
+    --kill-on-bad-exit | --kill-on-bad-exit=1) kill_on_bad_exit=1 ;;
+    -*) ;;
+    *) cmd+=("$arg") ;;
+    esac
+done
+[ "${#cmd[@]}" -gt 0 ] && launch "$group" "$count" "${cmd[@]}"
+
+code=0
+while :; do
+    alive=0
+    for i in "${!pids[@]}"; do
+        pid=${pids[i]}
+        [ -n "$pid" ] || continue
+        if kill -0 "$pid" 2>/dev/null; then
+            alive=1
+            continue
+        fi
+        wait "$pid"
+        status=$?
+        pids[i]=""
+        if [ "$status" != 0 ] && [ "$code" = 0 ]; then
+            code=$status
+            if [ "$kill_on_bad_exit" = 1 ]; then
+                for other in "${pids[@]}"; do [ -z "$other" ] || kill "$other" 2>/dev/null; done
+            fi
+        fi
+    done
+    [ "$alive" = 1 ] || break
+    sleep 0.2
+done
+exit "$code"

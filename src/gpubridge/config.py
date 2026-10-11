@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from dataclasses import dataclass
 from typing import Literal
 
@@ -21,6 +22,10 @@ CPU_ONLY_ENV = "GPUBRIDGE_CPU_ONLY"
 #: can exercise two islands and the bridge. See :mod:`gpubridge.split_test`.
 SPLIT_TEST_ENV = "GPUBRIDGE_SPLIT_TEST"
 SPLIT_TEST_MODES = ("half", "alternate", "node")
+#: Simulation and CPU-only mode only: the machine name this rank reports, so
+#: processes on one machine can stand in for several nodes (``node`` split-test
+#: mode, the multi-node job scripts tested on CPU). Ignored on GPUs.
+SIM_HOSTNAME_ENV = "GPUBRIDGE_SIM_HOSTNAME"
 #: Chunk size of the pipelined bridge, in bytes (``4M``, ``65536`` ...). Must be
 #: the same on every rank: it decides how many bridge calls a collective makes.
 CHUNK_BYTES_ENV = "GPUBRIDGE_CHUNK_BYTES"
@@ -113,6 +118,16 @@ def is_simulated() -> bool:
     or when ``GPUBRIDGE_CPU_ONLY`` is set (CPU-only mode, vendor from the build).
     """
     return bool(os.environ.get(VENDOR_ENV, "").strip()) or is_cpu_only()
+
+
+def hostname(simulated: bool) -> str:
+    """This rank's machine name for discovery: ``GPUBRIDGE_SIM_HOSTNAME`` if
+    simulated and set, otherwise ``socket.gethostname()``."""
+    if simulated:
+        name = os.environ.get(SIM_HOSTNAME_ENV, "").strip()
+        if name:
+            return name
+    return socket.gethostname()
 
 
 @dataclass(frozen=True)

@@ -31,7 +31,7 @@ fi
 multinode() {
     local tag=$1
     shift
-    run srun --nodes="$NNODES" --ntasks-per-node=1 --kill-on-bad-exit=1 \
+    limited srun --nodes="$NNODES" --ntasks-per-node=1 --kill-on-bad-exit=1 \
         torchrun --nnodes="$NNODES" --nproc-per-node="$GPUS_PER_NODE" \
         --rdzv-backend=c10d --rdzv-endpoint="$HEAD:$RDZV_PORT" \
         --rdzv-id="${SLURM_JOB_ID:-local}-$tag" "$@"

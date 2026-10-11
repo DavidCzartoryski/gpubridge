@@ -10,7 +10,14 @@ import torch.multiprocessing as mp
 from _harness import TIMEOUT, expected_sum, rank_tensor, run_failing_init, run_ranks
 
 import gpubridge
-from gpubridge.config import SPLIT_TEST_ENV, VENDOR_ENV, resolve_config, split_test_mode
+from gpubridge.config import (
+    SIM_HOSTNAME_ENV,
+    SPLIT_TEST_ENV,
+    VENDOR_ENV,
+    hostname,
+    resolve_config,
+    split_test_mode,
+)
 from gpubridge.split_test import SplitTestWarning, banner, split_labels
 from gpubridge.topology import plan_topology
 
@@ -104,8 +111,8 @@ def test_split_test_lets_ranks_share_a_gpu(monkeypatch):
     assert resolve_config().device == torch.device("cuda", 0)
 
 
-def _check_split_run(topology, labels):
-    assert topology.split_test == "half"
+def _check_split_run(topology, labels, mode="half"):
+    assert topology.split_test == mode
     assert topology.run_kind == "split-test"
     assert topology.detected_vendor == "nvidia"
     assert topology.vendor == labels[topology.rank]
@@ -125,6 +132,24 @@ def test_split_run_forms_two_islands_and_collectives_work(tmp_path, monkeypatch)
     monkeypatch.setenv(SPLIT_TEST_ENV, "half")
     labels = ["nvidia", "nvidia", "amd", "amd"]
     run_ranks(["nvidia"] * 4, partial(_check_split_run, labels=labels), tmp_path)
+
+
+def _two_machines(rank):
+    os.environ[SIM_HOSTNAME_ENV] = f"node{rank // 2}"
+
+
+def test_node_mode_on_one_machine_with_simulated_hostnames(tmp_path, monkeypatch):
+    # How the multi-node job scripts run on CPU: two "machines" on this one.
+    monkeypatch.setenv(SPLIT_TEST_ENV, "node")
+    labels = ["nvidia", "nvidia", "amd", "amd"]
+    run_ranks(["nvidia"] * 4, partial(_check_split_run, labels=labels, mode="node"), tmp_path,
+              before_init=_two_machines)
+
+
+def test_simulated_hostname_is_ignored_on_gpus(monkeypatch):
+    monkeypatch.setenv(SIM_HOSTNAME_ENV, "node7")
+    assert hostname(simulated=True) == "node7"
+    assert hostname(simulated=False) != "node7"
 
 
 def _check_normal_run(topology):

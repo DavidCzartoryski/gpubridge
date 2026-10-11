@@ -55,11 +55,12 @@ if [ -z "${GPUBRIDGE_VENDOR:-}${GPUBRIDGE_CPU_ONLY:-}" ]; then
         --out "$RESULTS/local_rank_check" --expect-init-error "LOCAL_RANK=$GPUS asks for GPU $GPUS"
 fi
 
-# NCCL_DEBUG=INFO makes RCCL log its version: proof that "nccl" runs RCCL (item 4).
-step check_1gpu env_local_torchrun NCCL_DEBUG=INFO --nproc-per-node=1 \
-    "$KIT_DIR/check.py" --out "$RESULTS/check_1gpu"
+# At NCCL_DEBUG=INFO (common.sh), RCCL logs its version to $RESULTS/nccl/check_1gpu/:
+# proof that "nccl" runs RCCL (item 4).
+step check_1gpu local_torchrun --nproc-per-node=1 "$KIT_DIR/check.py" \
+    --out "$RESULTS/check_1gpu"
 rccl_version() {
-    run grep -m 1 -i -o "RCCL version[^,]*" "$RESULTS/check_1gpu.log"
+    run grep -h -m 1 -i -o "RCCL version[^,]*" "$RESULTS/nccl/check_1gpu/"*.log
 }
 step rccl_version rccl_version
 

@@ -47,7 +47,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import torch
-from gpukit import Record, rank_from_env, run_info, sync
+from gpukit import Record, default_timeout, rank_from_env, run_info, sync
 
 import gpubridge
 from gpubridge.collectives import SUPPORTED_DTYPES
@@ -98,7 +98,8 @@ def mismatch(tensor: torch.Tensor, expected: torch.Tensor) -> dict | None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", type=Path, required=True, help="directory for rank JSON")
-    parser.add_argument("--timeout", type=float, default=600, help="group timeout (s)")
+    parser.add_argument("--timeout", type=float, default=default_timeout(600),
+                        help="group timeout (s); default KIT_TIMEOUT, else 600")
     parser.add_argument("--dtypes", default=",".join(DTYPES), help="comma-separated")
     parser.add_argument("--policy", default="auto", help="collective policy for gpubridge.init")
     parser.add_argument("--large-numel", type=int, default=None,
