@@ -112,6 +112,7 @@ def run_failing_init(setups: Sequence[dict[str, Any]], tmp_path: Path, patterns:
     - ``cuda`` / ``hip``: values for ``torch.version.cuda`` / ``.hip``, to fake a build,
     - ``gpu``: what ``torch.cuda.is_available()`` should return,
     - ``gpus``: what ``torch.cuda.device_count()`` should return,
+    - ``gpu_identity``: the physical GPU this rank reports driving,
     - ``init_kwargs``: extra arguments for ``gpubridge.init``.
 
     Every rank's error message must match every regex in ``patterns``, and
@@ -139,6 +140,8 @@ def _failing_rank_main(
         torch.cuda.is_available = lambda: setup["gpu"]
     if "gpus" in setup:
         torch.cuda.device_count = lambda: setup["gpus"]
+    if "gpu_identity" in setup:
+        gpubridge.topology.gpu_identity = lambda device: setup["gpu_identity"]
     torch.set_num_threads(1)
     try:
         gpubridge.init(

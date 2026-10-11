@@ -366,7 +366,9 @@ def test_submit_free_and_multi_submit_every_step():
     [
         ("01_probe.sbatch", ["probe.py", "--nproc-per-node=2",
                              "--expect-init-error LOCAL_RANK=1\\ asks\\ for\\ GPU\\ 1"]),
-        ("02_split_shared_gpu.sbatch", ["--nproc-per-node=2", "check.py"]),
+        ("02_split_shared_gpu.sbatch", ["--nproc-per-node=2", "check.py",
+                                        "GPUBRIDGE_SPLIT_TEST=alternate", "--nproc-per-node=4",
+                                        "--expect-init-error would\\ share\\ a\\ GPU"]),
         ("03_single_island.sbatch", ["device_map.py", "check.py", "bench_all_reduce.py"]),
         ("04_split_4gpu.sbatch", ["check_half", "check_alternate", "bench_all_reduce.py",
                                   "--policy pipelined-reduce-bridge-broadcast",

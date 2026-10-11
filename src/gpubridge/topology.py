@@ -19,6 +19,7 @@ from gpubridge.config import (
     SPLIT_TEST_ENV,
     VENDOR_ENV,
     Config,
+    gpu_identity,
     hostname,
     resolve_config,
     split_test_mode,
@@ -116,6 +117,8 @@ class PeerInfo:
     """Name of the collective policy this rank was asked to use (``auto`` by default)."""
     policy_settings: dict[str, Any] = field(default_factory=dict)
     """That policy's :meth:`~gpubridge.CollectivePolicy.settings`, e.g. a chunk size."""
+    gpu: str = ""
+    """The physical GPU this rank drives (UUID, PCI address), or empty if unknown or on CPU."""
 
     @property
     def torch_version(self) -> str:
@@ -186,6 +189,7 @@ def describe_local(
         split_test=split,
         policy=policy_name(policy),
         policy_settings=settings,
+        gpu=gpu_identity(config.device),
     )
     return local, config
 
@@ -363,6 +367,38 @@ class Topology:
         return self.config.device
 
 
+def gpu_clashes(layout: Layout, hostnames: Sequence[str], gpus: Sequence[str]) -> list[str]:
+    """Ranks of one island that would drive the same GPU, one line per shared GPU.
+
+    An island is one NCCL/RCCL communicator, and both refuse two of its ranks
+    on one GPU. Ranks in different islands may share a GPU (split-test mode
+    does that on purpose). Ranks whose GPU is unknown (``""``) are not checked.
+    """
+    lines = []
+    for island in layout.islands:
+        by_gpu: dict[tuple[str, str], list[int]] = {}
+        for rank in island.ranks:
+            if gpus[rank]:
+                by_gpu.setdefault((hostnames[rank], gpus[rank]), []).append(rank)
+        lines += [f"  island {island.vendor!r}: ranks {ranks} on {host}, GPU {gpu}"
+                  for (host, gpu), ranks in by_gpu.items() if len(ranks) > 1]
+    return lines
+
+
+def _gpu_clash_error(lines: Sequence[str], split: str) -> str:
+    if split:
+        hint = (f"In split-test mode on one node, {SPLIT_TEST_ENV}=half with at most twice as "
+                "many ranks as GPUs gives every rank of an island its own GPU; otherwise "
+                "start no more ranks per node than it has GPUs.")
+    else:
+        hint = ("Start no more ranks per node than it has GPUs, and check that each rank "
+                "gets its own LOCAL_RANK and sees the GPUs you expect (CUDA_VISIBLE_DEVICES, "
+                "HIP_VISIBLE_DEVICES, ROCR_VISIBLE_DEVICES).")
+    return ("gpubridge cannot start: ranks of one island would share a GPU, and NCCL and "
+            "RCCL refuse two ranks of one communicator on the same GPU.\n"
+            + "\n".join(lines) + "\n" + hint)
+
+
 def build_topology(
     local: PeerInfo,
     config: Config,
@@ -403,8 +439,11 @@ def build_topology(
         labels = split_labels(vendors, [peer.hostname for peer in peers], local.split_test)
         warnings.warn(banner(local.split_test, vendors, labels), SplitTestWarning, stacklevel=3)
     layout = plan_topology(labels)
-    # Every rank sees the same layout, so every rank picks (or rejects) the same
-    # policy, before any group is created.
+    # Every rank sees the same layout and peers, so every rank fails these
+    # checks alike (or picks the same policy), before any group is created.
+    clashes = gpu_clashes(layout, [peer.hostname for peer in peers], [peer.gpu for peer in peers])
+    if clashes:
+        raise RuntimeError(_gpu_clash_error(clashes, local.split_test))
     policy_cls = choose_policy(policy, layout)
 
     # new_group is collective over the whole world: every rank creates every

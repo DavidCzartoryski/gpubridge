@@ -4,7 +4,8 @@
 # Step 02, 1 GPU (free gpu partition). Submit with: scripts/gpu/explorer/submit.sh 02
 # TEST ONLY split: 2 processes share one GPU, each its own single-rank NCCL island,
 # joined by the Gloo bridge. Covers new_group(backend="nccl") on non-member ranks
-# (item 3), device tensors through the bridge (item 6) and barrier on CUDA (item 10).
+# (item 3), device tensors through the bridge (item 6), barrier on CUDA (item 10)
+# and the check that no island puts two ranks on one GPU (item 24).
 set -euo pipefail
 REPO="${GPUBRIDGE_REPO:?submit with scripts/gpu/explorer/submit.sh}"
 # shellcheck source=../common.sh
@@ -19,6 +20,15 @@ export GPUBRIDGE_SPLIT_TEST=half
 step check local_torchrun --nproc-per-node="$PROCS" "$KIT_DIR/check.py" \
     --out "$RESULTS/check" --large-numel $((16 * 1024 * 1024))
 step summarize python "$KIT_DIR/summarize.py" "$RESULTS/check"
+# Item 24: 4 ranks with alternate put ranks 0 and 2, and 1 and 3, on this GPU in
+# one island each, which NCCL refuses. init() must fail on every rank first,
+# naming them. Real GPUs only: simulation has no GPUs to compare.
+if [ -z "${GPUBRIDGE_VENDOR:-}${GPUBRIDGE_CPU_ONLY:-}" ]; then
+    step shared_gpu_check env_local_torchrun GPUBRIDGE_SPLIT_TEST=alternate \
+        --nproc-per-node=4 "$KIT_DIR/check.py" --out "$RESULTS/shared_gpu_check" \
+        --expect-init-error "would share a GPU"
+    step summarize_shared_gpu python "$KIT_DIR/summarize.py" "$RESULTS/shared_gpu_check"
+fi
 # GPU-only correctness tests (tests/test_gpu.py): every policy against flat-gloo,
 # fp32/fp16/bf16, odd and large sizes, async on non-default streams.
 step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" -q \

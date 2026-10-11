@@ -63,7 +63,10 @@ would fail everything above it, for the same reason.
 - **Split-test mode on one NVIDIA node.** Leave `GPUBRIDGE_VENDOR` unset:
   setting it switches to CPU simulation. The vendor comes from the CUDA
   build, each rank uses `cuda:$LOCAL_RANK`, and both islands use NCCL. With
-  fewer GPUs than ranks, split-test mode lets ranks share them (step 02).
+  fewer GPUs than ranks, split-test mode lets ranks share them (step 02),
+  but never two ranks of one island: NCCL refuses that, so `init()` fails
+  first on every rank, naming them (item 24). On one node, `half` with at
+  most twice as many ranks as GPUs is always fine; every layout here passes.
   `tests/test_split_test.py` checks this on CPU: the CUDA-build path, and the
   device of each rank on a 4-GPU and a 2-GPU node.
 - **Where it went wrong.** Rung 1 failing points at the environment, driver
@@ -81,7 +84,7 @@ would fail everything above it, for the same reason.
 | 0a | - | Explorer login node | `submit.sh 00` | GPU types in `sharing`, `gpu` and `multigpu` (sinfo only): are there AMD GPUs in `sharing`? | - | seconds | free |
 | 0b | - | Explorer, CPU job | `submit.sh setup` | venv with the CUDA build of torch 2.14.1, built on a compute node | - | ~10 min | free |
 | 1 | 1 | Explorer, 1 GPU | `submit.sh 01` | the build runs on the GPU; records the hardware; a rank whose `LOCAL_RANK` has no GPU fails `init()` on every rank | prerequisite, **12** | ~2 min | free |
-| 2 | 2 | Explorer, 1 GPU | `submit.sh 02` | two single-rank NCCL islands sharing one GPU, plus the bridge | **3**, 6 (partly), 10 on CUDA | ~3 min | free |
+| 2 | 2 | Explorer, 1 GPU | `submit.sh 02` | two single-rank NCCL islands sharing one GPU, plus the bridge; a layout with two ranks of one island on the GPU is refused | **3**, 6 (partly), 10 on CUDA, 24 | ~3 min | free |
 | 3 | 1 | Explorer, 2+ GPUs | `submit.sh 03` | real NCCL island; each rank drives its own GPU | **5** on NVIDIA, baseline | ~5 min | free* |
 | 4 | 2 | Explorer, 4 GPUs | `submit.sh 04` | two 2-GPU NCCL islands and the bridge, both layouts; native vs bridged benchmark | **3, 6, 7**, 9 (data), **11**, 13 | ~10 min | free* |
 | 5 | 2 | Explorer, 2 nodes | `submit.sh 05` | NCCL across nodes; the bridge crossing the network between nodes | **8**, 11 and 13 across nodes | ~10 min | free* |
@@ -473,6 +476,7 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 | 01: `build_supports_gpus` fails | wheel without kernels for this GPU | set `CUDA_INDEX` (cu126 for V100; cu128/cu130 for newer GPUs), rerun setup |
 | 01: no GPU visible | job didn't get a GPU, or driver problem | check `nvidia-smi.txt` and `slurm-job.txt` in the results |
 | 01/AMD: `local_rank_check` fails | init() succeeded with more processes than GPUs, or failed for another reason | read `expected_init_error` in `local_rank_check/rank*.json`; if init succeeded, the visible-device count isn't what PyTorch reports (item 12) |
+| 02: `shared_gpu_check` fails | init() succeeded with two ranks of one island on the GPU, or failed for another reason | read `expected_init_error` in `shared_gpu_check/rank*.json`; if init succeeded, PyTorch reported neither a UUID nor a PCI address for the GPU, so ranks went unchecked (item 24) |
 | `init` stuck (summary says "stuck in this stage") | new_group / NCCL init problem (item 3) | read `rank*.stacks.txt` and the NCCL/RCCL log lines at the end of `<step>.log` (all of them in `nccl/<step>/`); this is a real finding, file it |
 | `steps.jsonl` says `"timed_out": true` | the launch ran past `STEP_TIMEOUT` | read `<step>.log` and `rank*.stacks.txt`; raise `STEP_TIMEOUT` only if the step was still making progress |
 | `busy_gpu` wrong values | stream ordering bug in the bridge (item 6) | serious; keep the JSON and open an issue |
