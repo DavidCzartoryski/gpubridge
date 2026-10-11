@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import torch
 from _harness import rank_tensor, run_failing_init, run_ranks
-from _staging import LazyPipelined, LazyStaging
+from _staging import CallerStreamStaging, LazyPipelined, LazyStaging
 
 import gpubridge
 from gpubridge import ReduceOp
@@ -99,6 +99,38 @@ def test_the_lazy_staging_catches_a_missing_wait(tmp_path, monkeypatch):
     run_ranks(["nvidia", "amd"], partial(_check_forgetful, results=str(results)), tmp_path,
               init_kwargs={"policy": ForgetfulPipelined})
     assert json.loads(results.read_text()) is False
+
+
+@pytest.mark.parametrize("then", ["receive", "send and receive"])
+def test_the_next_collective_waits_for_a_slots_last_copy_back(then):
+    """A collective returns before its copies back have run; the next one must not reuse their slots first.
+
+    The first collective only receives (a broadcast on a leader outside the
+    source's island) into two of the three slots, so it never waits for a
+    copy back itself. The second collective, which may come from another
+    stream, then receives into slot 0 on the host, or copies its own chunk
+    into it on the device. Either way it must wait for the first collective's
+    copy back out of slot 0.
+    """
+    policy = PipelinedReduceBridgeBroadcast(chunk_bytes=16)  # 4 float32 per chunk
+    staging = policy.staging = CallerStreamStaging(16, policy.SLOTS)
+    arrivals = iter([1.0, 2.0, 3.0, 4.0])  # what the bridge brings, one value per chunk
+
+    def receive(host):
+        host.fill_(next(arrivals))
+
+    first = torch.zeros(8)  # two chunks
+    policy._pipeline(first, receive, send=False, receive=True)
+    second = torch.full((8,), 10.0)
+    if then == "receive":
+        policy._pipeline(second, receive, send=False, receive=True)
+        want = [3.0] * 4 + [4.0] * 4
+    else:
+        policy._pipeline(second, lambda host: host.add_(next(arrivals)), send=True, receive=True)
+        want = [13.0] * 4 + [14.0] * 4
+    staging.run_caller_stream()
+    assert first.tolist() == [1.0] * 4 + [2.0] * 4
+    assert second.tolist() == want
 
 
 def _check_direct_staging(topology):

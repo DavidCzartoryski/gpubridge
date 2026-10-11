@@ -79,9 +79,12 @@ Steps 04, 06, 07 and the AMD script train with DDP and `gpubridge.ddp_comm_hook`
 Steps 02, 04 and the AMD script also run the GPU-only tests, `pytest -m gpu
 tests/test_gpu.py` (step `gpu_tests`, results in `gpu_tests.xml`): every
 bridge policy against `flat-gloo` bit for bit for every op, fp32/fp16/bf16, odd
-and large sizes; non-contiguous tensors refused; and sync and async
-collectives called from non-default streams behind queued GPU work (items 6,
-15 and 16). On one GPU they run two ranks sharing it.
+and large sizes; non-contiguous tensors refused; sync and async
+collectives called from non-default streams behind queued GPU work; the
+pipelined policy's pinned slots reused by the next collective while copies
+back out of them are held back; and a result read right after
+`is_completed()` (items 6, 15, 16 and 17). On one GPU they run two ranks
+sharing it.
 Times exclude queue waits. For cost, multiply by the provider's current hourly
 rate; for example, at a hypothetical $3/h, step 7 costs about $1.50.
 

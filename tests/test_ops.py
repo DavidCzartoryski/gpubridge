@@ -19,6 +19,7 @@ from gpubridge import ReduceOp
 from gpubridge.collectives import SUPPORTED_DTYPES
 from gpubridge.config import SPLIT_TEST_ENV
 from gpubridge.policies import AUTO, FlatGloo, choose_policy, resolve_policy
+from gpubridge.work import Work
 
 FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 OP_NAMES = {ReduceOp.SUM: "sum", ReduceOp.AVG: "avg", ReduceOp.MAX: "max", ReduceOp.MIN: "min"}
@@ -293,6 +294,24 @@ def _check_async_failure(topology):
 def test_a_failed_async_collective_stops_later_ones(tmp_path):
     run_ranks(["nvidia", "amd"], _check_async_failure, tmp_path,
               init_kwargs={"policy": Exploding})
+
+
+def test_is_completed_waits_for_the_gpu_work_too():
+    """The worker finishes once it has queued the last kernels; is_completed() also asks their event."""
+
+    class Event:
+        passed = False
+
+        def query(self):
+            return self.passed
+
+    work = Work("all_reduce", torch.device("cpu"), None)
+    assert not work.is_completed()
+    work._event = event = Event()
+    work._finish(None)
+    assert not work.is_completed()
+    event.passed = True
+    assert work.is_completed()
 
 
 class TalksAsync(Keep):
