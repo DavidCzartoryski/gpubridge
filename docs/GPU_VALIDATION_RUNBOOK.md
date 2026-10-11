@@ -87,7 +87,7 @@ would fail everything above it, for the same reason.
 | 2 | 2 | Explorer, 1 GPU | `submit.sh 02` | two single-rank NCCL islands sharing one GPU, plus the bridge; a layout with two ranks of one island on the GPU is refused | **3**, 6 (partly), 10 on CUDA, 24 | ~3 min | free |
 | 3 | 1 | Explorer, 2+ GPUs | `submit.sh 03` | real NCCL island; each rank drives its own GPU | **5** on NVIDIA, baseline | ~5 min | free* |
 | 4 | 2 | Explorer, 4 GPUs | `submit.sh 04` | two 2-GPU NCCL islands and the bridge, both layouts; native vs bridged benchmark | **3, 6, 7**, 9 (data), **11**, 13 | ~10 min | free* |
-| 5 | 2 | Explorer, 2 nodes | `submit.sh 05` | NCCL across nodes; the bridge crossing the network between nodes | **8**, 11 and 13 across nodes | ~10 min | free* |
+| 5 | 2 | Explorer, 2 nodes | `submit.sh 05` | the network preflight between the nodes (interfaces, raw bandwidth); NCCL across nodes; the bridge crossing the network between nodes | **8**, 11 and 13 across nodes | ~10 min | free* |
 | 6 | 2 | Explorer, 4 GPUs | `submit.sh 06` | training throughput and scaling 1 to 4 GPUs (table for the multigpu request) | - | ~10 min | free* |
 | 7 | 3 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11, 12, 13 | 20-30 min | ~0.5 h of the hourly rate |
 | 7 alt | 3 | Explorer `sharing`, 1 AMD GPU | `submit.sh setup-rocm`, then `submit.sh amd` | rung 3 inside Explorer, **if** step 0a finds AMD GPUs in `sharing`: `amd/run_all.sh` on the node, without setup or tarball. Dry-run only until then | **4, 5** on AMD, 6, 7, 10 on ROCm, 12 | ~15 min + ~15 min ROCm setup | free |
@@ -151,7 +151,10 @@ as of 2026-10-06; **verify each one**:
 | `PARTITION_MIXED_NVIDIA`, `GPUS_MIXED_NVIDIA`, `GPUS_MIXED_AMD` | `gpu`, `1`, `1` | step 07's GPUs per side |
 | `SETUP_MODULES` | `explorer` | loaded before installing: it routes compute nodes through the proxy. Set it to `""` to load nothing |
 | `MODULES` | empty | modules for steps 01 to 07; none needed: the PyTorch wheel bundles CUDA/ROCm and uv brings Python |
-| `NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME` | empty (auto) | name of the fast interconnect interface for steps 05 and 07, e.g. `ib0` |
+| `NCCL_SOCKET_IFNAME` | empty (auto) | name of the fast interconnect interface for steps 05 and 07, e.g. `ib0` |
+| `GLOO_SOCKET_IFNAME` | empty: the preflight chooses | in steps 05 and 07, the interface Gloo uses on every node; the preflight then measures only it. Unset, each node uses the interface the preflight chose for it |
+| `USE_PREFLIGHT_IFNAME` | `1` | `0` leaves `GLOO_SOCKET_IFNAME` unset after the preflight, so Gloo picks by hostname |
+| `PREFLIGHT_SECONDS` | `2` | seconds of raw TCP data each way per pair of interfaces in the preflight |
 
 Also check:
 
@@ -250,7 +253,7 @@ runs each phase as one heterogeneous job step (`srun --het-group=0 ... :
 --het-group=1 ...`), each side with its own venv's `python` or `torchrun`:
 
 1. `probe` on each side (`probe_nvidia/`, `probe_amd/`), plus `rocm-smi` and `amd-smi` from the AMD node;
-2. `preflight`: the gpu node as master, the AMD node as worker. The job stops here if either side lacks a usable GPU or Gloo can't connect;
+2. `preflight`: the gpu node as master, the AMD node as worker (see [The network preflight](#the-network-preflight)). Gloo on each node then uses the interface the preflight chose there. The job stops here if either side lacks a usable GPU or no pair of interfaces connects both ways;
 3. `check`: one torchrun per node, with the c10d rendezvous on the gpu node. Both write into `check/` on the shared filesystem, so `summarize` covers every rank without copying. `run.kind` must be `gpu-mixed`, with `split_test` null;
 4. `bench` (`--ops island,gpubridge`): first each island times its own native
    all_reduce, both at once (NCCL on the gpu node, RCCL on the AMD node; rows
@@ -270,8 +273,34 @@ Also check with RC before the first real run:
 - `sharing`'s walltime and preemption rules;
 - which ROCm build supports the AMD GPUs; see below.
 
-Interface names may differ between the two partitions' nodes, so leave
-`GLOO_SOCKET_IFNAME` empty unless the preflight's interface check fails.
+Interface names may differ between the two partitions' nodes, which is why
+the preflight chooses one per node. Set `GLOO_SOCKET_IFNAME` only to force an
+interface that exists on both.
+
+#### The network preflight
+
+`scripts/gpu/preflight.py` runs on the two leader nodes before any torchrun:
+step 05's two nodes in `multigpu`, step 07's `gpu` and `sharing` nodes, and
+`mixed/node.sh`'s two machines. In order:
+
+1. `resolve`, `interface`, `tcp`: the master's address resolves, a given
+   `GLOO_SOCKET_IFNAME` exists, and the worker reaches the master's port.
+2. `interfaces`: each node's candidates, the interfaces with an IPv4 address,
+   minus loopback, link-local addresses and container bridges (or only
+   `GLOO_SOCKET_IFNAME`'s).
+3. `reachability`: the pairs of interfaces, one per node, that the kernels
+   route between. For each pair, a TCP connection each way (a Gloo pair
+   connects in whichever direction its addresses decide), then over the first
+   one the round-trip time and raw TCP bandwidth one way and then the other,
+   over one stream, as Gloo uses one connection per pair of ranks.
+4. `choose`: the pair that connects both ways and whose slower direction is
+   fastest. Each node's interface in it becomes its `GLOO_SOCKET_IFNAME`.
+5. `gloo`: a real two-rank Gloo group on the chosen interfaces.
+
+`preflight/preflight-<role>.json` records every pair (both connections,
+MB/s each way, round-trip time) and, for the chosen one, `chosen_ifname`,
+`peer_ifname` and `bandwidth` from that node's side. These are host network
+numbers, measured before any GPU work.
 
 #### Choosing the ROCm build
 
@@ -413,12 +442,15 @@ ROLE=master MASTER_ADDR=100.64.0.1 bash scripts/gpu/mixed/node.sh
 ROLE=worker MASTER_ADDR=100.64.0.1 bash scripts/gpu/mixed/node.sh
 ```
 
-`node.sh` sets up the venv. Then it runs `preflight.py`, which checks:
+`node.sh` sets up the venv. Then it runs `preflight.py` on the overlay
+interface (`IFNAME`), which checks:
 
 1. the address resolves
 2. the interface exists
 3. TCP reaches the master
-4. a real two-machine Gloo handshake succeeds
+4. TCP connects both ways between the two overlay interfaces, and the raw
+   bandwidth over them
+5. a real two-machine Gloo handshake succeeds
 
 The preflight **stops with a specific message before torchrun starts** if any
 check fails. After that, the script runs the correctness check and a bridged
@@ -448,6 +480,9 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
   NCCL/RCCL logs.
 - `nccl/<step>/<host>.<pid>.log`: NCCL/RCCL's `NCCL_DEBUG=INFO` output, one file
   per rank.
+- `preflight/preflight-<role>.json` (steps 05 and 07): every pair of interfaces
+  between the two leader nodes, whether it connects each way, MB/s each way and
+  the round-trip time, and the interface each node's Gloo used.
 - `bench/bench.csv`: latency and bandwidth per size, for native and gpubridge.
 - `gpu_tests.xml` and `gpu_tests.log`: the GPU-only tests (JUnit XML and
   pytest's output). A failure names the policy, op, dtype, size and mode of
@@ -472,7 +507,8 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 | setup: "this looks like a Slurm login node" | `setup_env.sh` was run outside a job | use `submit.sh setup`, or run it inside `srun --pty bash` |
 | 00: no AMD GPU type found in `sharing` | no AMD nodes there, or an unrecognized type name | read `gres-sharing.txt`; if the AMD GPUs are there under another name, set `GPU_TYPE_AMD` to it; otherwise use step 8 |
 | 07: "not a heterogeneous job" | the script was submitted with plain `sbatch` | submit with `submit.sh 07` |
-| 07: stops after `preflight` | no route between the `gpu` and `sharing` nodes, or a GPU the build can't run | read `preflight-*.json` and `probe_*/probe.json`; set `GLOO_SOCKET_IFNAME` if the interface check failed |
+| 05 or 07: stops after `preflight` | no pair of interfaces connects the nodes both ways, or (07) a GPU the build can't run | read `pairs` in `preflight/preflight-*.json` (which connection failed, from which address) and `probe_*/probe.json`; a pair that connects one way only means a firewall between the partitions |
+| 05 or 07: the preflight chose a slow interface | the fast one didn't connect both ways, or isn't routed between the nodes | compare the pairs' MB/s in `preflight-*.json`; set `GLOO_SOCKET_IFNAME` to force one |
 | 01: `build_supports_gpus` fails | wheel without kernels for this GPU | set `CUDA_INDEX` (cu126 for V100; cu128/cu130 for newer GPUs), rerun setup |
 | 01: no GPU visible | job didn't get a GPU, or driver problem | check `nvidia-smi.txt` and `slurm-job.txt` in the results |
 | 01/AMD: `local_rank_check` fails | init() succeeded with more processes than GPUs, or failed for another reason | read `expected_init_error` in `local_rank_check/rank*.json`; if init succeeded, the visible-device count isn't what PyTorch reports (item 12) |
@@ -485,7 +521,7 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 | `async` wrong values | the worker's stream didn't wait for the caller's, or `wait()` didn't order the caller's stream (item 16) | serious; keep the JSON and open an issue |
 | `reduction_agreement` shows `product_agree` false | NCCL/RCCL and Gloo disagree on PRODUCT for that dtype (item 14) | not a failure: it's the evidence item 14 asks for; record it |
 | timeouts during large all_reduces | NCCL/RCCL watchdog vs a slow bridge (item 9) | raise `KIT_TIMEOUT` (or `--timeout`); note the `all_reduce_seconds` of `busy_gpu` |
-| 05: rendezvous never completes | wrong interface or blocked ports between nodes | set `NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` (e.g. `ib0`) |
+| 05: rendezvous never completes after the preflight passed | NCCL picked an interface the other node can't reach | set `NCCL_SOCKET_IFNAME` to the preflight's `chosen_ifname` (e.g. `ib0`) |
 | 03/AMD: `device_map` mismatch | visible-devices variable maps to a different GPU (item 5) | record it; check scheduler GPU binding |
 | AMD: `rccl_version` fails | RCCL didn't log, or this isn't a ROCm build | check `nccl/check_1gpu/` and `probe/probe.json` (`torch_hip`) |
 | mixed: preflight `resolve` / `tcp` fails | wrong address, or overlay down | `tailscale status`; use `tailscale ip -4` of the master |

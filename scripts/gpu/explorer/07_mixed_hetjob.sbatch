@@ -21,10 +21,11 @@ GPUS_AMD="${GPUS_MIXED_AMD:-1}"
 RDZV_PORT="${RDZV_PORT:-29500}"
 PREFLIGHT_PORT="${PREFLIGHT_PORT:-29501}"
 BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-1G}"
-# Interfaces: empty lets NCCL/Gloo choose. Names may differ between the two
-# partitions' nodes; set them only if the preflight's interface check says so.
+# Interfaces: empty lets NCCL choose, and Gloo on each node use the interface
+# the preflight picks there (names may differ between the two partitions).
 [ -n "${NCCL_SOCKET_IFNAME:-}" ] && export NCCL_SOCKET_IFNAME
 [ -n "${GLOO_SOCKET_IFNAME:-}" ] && export GLOO_SOCKET_IFNAME
+IFNAME_NVIDIA="" IFNAME_AMD=""  # filled in after the preflight
 
 if [ "$DRY_RUN" = 1 ]; then
     HEAD="<gpu-node>"
@@ -50,6 +51,8 @@ fill() {
 # when the other fails, so neither is left waiting for a rendezvous.
 both() {
     local nvidia=() amd=() arg
+    if [ -n "$IFNAME_NVIDIA" ]; then nvidia=(env "GLOO_SOCKET_IFNAME=$IFNAME_NVIDIA"); fi
+    if [ -n "$IFNAME_AMD" ]; then amd=(env "GLOO_SOCKET_IFNAME=$IFNAME_AMD"); fi
     for arg in "$@"; do
         nvidia+=("$(fill "$arg" "$VENV" master nvidia "$GPUS_NVIDIA")")
         amd+=("$(fill "$arg" "$VENV_ROCM" worker amd "$GPUS_AMD")")
@@ -71,7 +74,8 @@ capture "$RESULTS/rocm-smi.txt" srun --het-group=1 --ntasks=1 rocm-smi
 capture "$RESULTS/amd-smi-static.txt" srun --het-group=1 --ntasks=1 amd-smi static
 step probe both @VENV@/bin/python "$KIT_DIR/probe.py" --out "$RESULTS/probe_@SIDE@"
 step preflight both @VENV@/bin/python "$KIT_DIR/preflight.py" --role @ROLE@ \
-    --master-addr "$HEAD" --port "$PREFLIGHT_PORT" --out "$RESULTS/preflight"
+    --master-addr "$HEAD" --port "$PREFLIGHT_PORT" --bandwidth-seconds "$PREFLIGHT_SECONDS" \
+    --out "$RESULTS/preflight"
 # Nothing below can pass without a usable GPU on each side and a network between
 # them, so stop here instead of waiting out rendezvous timeouts. In simulation
 # (the CPU test of this script) there is no GPU to find, so only the preflight counts.
@@ -83,6 +87,13 @@ done
 if [ "${#blocking[@]}" -gt 0 ]; then
     finish || true
     die "stopping before torchrun: ${blocking[*]} failed; logs in $RESULTS"
+fi
+# Gloo on each node uses the interface the preflight chose there.
+if [ -z "${GLOO_SOCKET_IFNAME:-}" ] && [ "$USE_PREFLIGHT_IFNAME" = 1 ]; then
+    IFNAME_NVIDIA=$(preflight_ifname "$RESULTS/preflight/preflight-master.json")
+    IFNAME_AMD=$(preflight_ifname "$RESULTS/preflight/preflight-worker.json")
+    log "GLOO_SOCKET_IFNAME: ${IFNAME_NVIDIA:-unset} on the gpu node," \
+        "${IFNAME_AMD:-unset} on the AMD node, as the preflight chose"
 fi
 # Both components write into one directory on the shared filesystem, so the
 # summary below covers every rank of the mixed job.

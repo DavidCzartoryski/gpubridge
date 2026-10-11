@@ -100,6 +100,13 @@ inside Explorer as one heterogeneous Slurm job.
 
 8. **Gloo networking.** Leaders on different nodes reach each other on the right
    interface; set `GLOO_SOCKET_IFNAME` on nodes with several NICs.
+   *Status:* `scripts/gpu/preflight.py` chooses it by measurement: TCP both
+   ways between every routed pair of interfaces of the two leader nodes, raw
+   bandwidth each way over one stream, then a Gloo group on the pair whose
+   slower direction is fastest. Steps 05 and 07 run it first and export each
+   node's choice. Works on CPU on one machine (`tests/test_gpu_kit.py`,
+   `tests/test_gpu_jobs.py`). Still open: Explorer's real interfaces between
+   `multigpu` nodes and between `gpu` and `sharing`.
 9. **Timeouts.** While leaders work over the bridge, the other ranks wait inside
    an island broadcast. With large tensors the bridge step can be slow enough to
    trip the NCCL/RCCL watchdog. Check whether the `timeout` passed to `init()` is
