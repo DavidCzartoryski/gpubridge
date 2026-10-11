@@ -254,6 +254,24 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     observers; async collectives show on the worker thread; nested phases and
     failed calls are tracked (`tests/test_observe.py`).* *Step:* the
     `in_flight` stage of `check.py`, in every step that runs it.
+24. **No island puts two ranks on one GPU.** NCCL and RCCL refuse two ranks
+    of one communicator on the same GPU, and an island is one communicator.
+    Split-test mode lets ranks share GPUs, so a layout such as 4 ranks on a
+    2-GPU node with `alternate` would fail inside NCCL. `init()` compares the
+    ranks of each island by the GPU each one drives (its UUID and PCI
+    address: device indices differ between processes under
+    `CUDA_VISIBLE_DEVICES` or Slurm's GPU binding) and fails on every rank,
+    before creating any group, naming the ranks. Every layout in the runbook
+    passes: steps 02 (two single-rank islands share the GPU), 04 (a GPU per
+    rank, both layouts) and 05, the AMD script, the GPU-only tests, and
+    `half` on a 2-GPU node with up to 4 ranks. The only NCCL/RCCL groups
+    gpubridge creates are the island groups; the world group, the bridge and
+    the sharded bridge's links use Gloo.
+    *Status: works on CPU with faked GPU identities
+    (`tests/test_split_test.py`).* Still open: that PyTorch reports a UUID or
+    PCI address on both vendors (without either, ranks go unchecked and NCCL's
+    own error appears instead). *Step:* Explorer step 02, `shared_gpu_check`:
+    4 ranks on its one GPU with `alternate` must fail `init()` on every rank.
 
 ## Mixed build results
 

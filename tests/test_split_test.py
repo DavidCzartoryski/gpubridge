@@ -3,6 +3,7 @@
 import os
 import warnings
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,15 +12,17 @@ from _harness import TIMEOUT, expected_sum, rank_tensor, run_failing_init, run_r
 
 import gpubridge
 from gpubridge.config import (
+    CPU_ONLY_ENV,
     SIM_HOSTNAME_ENV,
     SPLIT_TEST_ENV,
     VENDOR_ENV,
+    gpu_identity,
     hostname,
     resolve_config,
     split_test_mode,
 )
 from gpubridge.split_test import SplitTestWarning, banner, split_labels
-from gpubridge.topology import plan_topology
+from gpubridge.topology import gpu_clashes, plan_topology
 
 
 @pytest.fixture(autouse=True)
@@ -144,6 +147,105 @@ def test_node_mode_on_one_machine_with_simulated_hostnames(tmp_path, monkeypatch
     labels = ["nvidia", "nvidia", "amd", "amd"]
     run_ranks(["nvidia"] * 4, partial(_check_split_run, labels=labels, mode="node"), tmp_path,
               before_init=_two_machines)
+
+
+def test_split_on_cuda_builds_needs_no_vendor_variable(tmp_path, monkeypatch):
+    # As on an NVIDIA node: the vendor comes from the CUDA build, not GPUBRIDGE_VENDOR.
+    monkeypatch.setenv(SPLIT_TEST_ENV, "half")
+    labels = ["nvidia", "nvidia", "amd", "amd"]
+    run_ranks(["nvidia"] * 4, partial(_check_split_run, labels=labels), tmp_path,
+              fake_builds=True)
+
+
+@pytest.mark.parametrize(("gpus", "devices"), [(4, [0, 1, 2, 3]), (2, [0, 1, 0, 1])])
+def test_split_on_one_node_maps_ranks_to_gpus(gpus, devices, monkeypatch):
+    # One multi-GPU NVIDIA node: each rank its own GPU; with fewer GPUs than
+    # ranks, split-test mode wraps around so ranks share them. Both islands use NCCL.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: gpus)
+    monkeypatch.delenv(VENDOR_ENV, raising=False)
+    monkeypatch.delenv(CPU_ONLY_ENV, raising=False)
+    monkeypatch.setenv(SPLIT_TEST_ENV, "half")
+    for local_rank, index in enumerate(devices):
+        monkeypatch.setenv("LOCAL_RANK", str(local_rank))
+        config = resolve_config()
+        assert config.device == torch.device("cuda", index)
+        assert config.island_backend == "nccl" and not config.simulated
+
+
+def _props(uuid="", domain=0, bus=0, device=0):
+    return SimpleNamespace(uuid=uuid, pci_domain_id=domain, pci_bus_id=bus, pci_device_id=device)
+
+
+@pytest.mark.parametrize(("props", "want"), [
+    (_props("GPU-6b3b5f8c", 0, 0x3B, 0), "uuid GPU-6b3b5f8c, pci 0000:3b:00"),
+    (_props("00000000-0000-0000-0000-000000000000", 1, 0xC1, 0), "pci 0001:c1:00"),
+    (_props("GPU-6b3b5f8c"), "uuid GPU-6b3b5f8c"),  # PCI address all zero: unknown
+    (SimpleNamespace(uuid="GPU-6b3b5f8c"), "uuid GPU-6b3b5f8c"),  # no PCI fields
+    (_props(), ""),
+])
+def test_gpu_identity_is_the_physical_gpu(props, want, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: props)
+    assert gpu_identity(torch.device("cuda", 0)) == want
+
+
+def test_gpu_identity_is_empty_when_unknown(monkeypatch):
+    assert gpu_identity(torch.device("cpu")) == ""
+
+    def fails(device):
+        raise RuntimeError("no driver")
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", fails)
+    assert gpu_identity(torch.device("cuda", 0)) == ""
+
+
+@pytest.mark.parametrize(("per_node", "gpus", "mode", "nodes", "clash"), [
+    (4, 4, "half", 1, False),       # step 04
+    (4, 4, "alternate", 1, False),  # step 04
+    (2, 1, "half", 1, False),       # step 02: two single-rank islands share the GPU
+    (2, 2, "half", 1, False),       # a 2-GPU node, a GPU per rank (the GPU tests, rung 2)
+    (4, 2, "half", 1, False),       # a 2-GPU node, two ranks per GPU: each half has its own
+    (4, 2, "alternate", 1, True),   # ... but alternate puts ranks 0 and 2 on GPU 0
+    (6, 2, "half", 1, True),        # more than twice as many ranks as GPUs
+    (4, 4, "node", 2, False),       # step 05
+    (4, 4, None, 2, False),         # one island over two nodes: same PCI address, other host
+    (2, 1, None, 1, True),          # no split test: two ranks on one GPU
+])
+def test_ranks_of_one_island_never_share_a_gpu(per_node, gpus, mode, nodes, clash):
+    # Local rank r drives GPU r % gpus, as split-test mode wraps them.
+    world = per_node * nodes
+    hosts = [f"node{rank // per_node}" for rank in range(world)]
+    ids = [f"pci 0000:{rank % per_node % gpus:02x}:00" for rank in range(world)]
+    labels = split_labels(["nvidia"] * world, hosts, mode) if mode else ["nvidia"] * world
+    lines = gpu_clashes(plan_topology(labels), hosts, ids)
+    assert bool(lines) == clash, lines
+    if (per_node, gpus, mode) == (4, 2, "alternate"):
+        assert lines == ["  island 'nvidia': ranks [0, 2] on node0, GPU pci 0000:00:00",
+                         "  island 'amd': ranks [1, 3] on node0, GPU pci 0000:01:00"]
+
+
+def test_ranks_whose_gpu_is_unknown_are_not_checked():
+    assert gpu_clashes(plan_topology(["nvidia"] * 2), ["node0"] * 2, ["", ""]) == []
+
+
+def test_a_layout_that_shares_a_gpu_fails_init_on_every_rank(tmp_path):
+    # Four ranks on a 2-GPU node with alternate: NCCL would refuse both islands.
+    env = {VENDOR_ENV: "nvidia", SPLIT_TEST_ENV: "alternate"}
+    setups = [{"env": env, "gpu_identity": f"pci 0000:{rank % 2:02x}:00"} for rank in range(4)]
+    run_failing_init(setups, tmp_path, [
+        "ranks of one island would share a GPU", r"ranks \[0, 2\]", r"ranks \[1, 3\]",
+        f"{SPLIT_TEST_ENV}=half with at most twice as many ranks as GPUs"])
+
+
+def _on_two_gpus(rank):
+    gpubridge.topology.gpu_identity = lambda device: f"pci 0000:{rank % 2:02x}:00"
+
+
+def test_half_on_a_two_gpu_node_passes_the_check(tmp_path, monkeypatch):
+    monkeypatch.setenv(SPLIT_TEST_ENV, "half")
+    labels = ["nvidia", "nvidia", "amd", "amd"]
+    run_ranks(["nvidia"] * 4, partial(_check_split_run, labels=labels), tmp_path,
+              before_init=_on_two_gpus)
 
 
 def test_simulated_hostname_is_ignored_on_gpus(monkeypatch):

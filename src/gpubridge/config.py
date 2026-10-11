@@ -186,6 +186,30 @@ def resolve_config() -> Config:
     return Config(simulated=False, island_backend=GPU_BACKEND, device=torch.device("cuda", index))
 
 
+def gpu_identity(device: torch.device) -> str:
+    """The physical GPU behind ``device``, the same in every process that drives it.
+
+    A device index is not: with ``CUDA_VISIBLE_DEVICES`` or Slurm's per-task
+    GPU binding, ``cuda:0`` can be a different GPU in every process. The UUID
+    and the PCI address are. Empty for CPU devices, or when neither is known
+    (an all-zero value counts as unknown), so the GPU goes unchecked.
+    """
+    if device.type != "cuda":
+        return ""
+    try:
+        props = torch.cuda.get_device_properties(device)
+    except Exception:  # noqa: BLE001 - only a check: never stop init() here
+        return ""
+    parts = []
+    uuid = str(getattr(props, "uuid", "") or "")
+    if uuid.strip("0-"):
+        parts.append(f"uuid {uuid}")
+    pci = [getattr(props, f"pci_{name}_id", None) for name in ("domain", "bus", "device")]
+    if None not in pci and any(pci):
+        parts.append("pci {:04x}:{:02x}:{:02x}".format(*pci))
+    return ", ".join(parts)
+
+
 def _no_such_gpu(local_rank: str | None, index: int, count: int) -> str:
     asked = f"LOCAL_RANK={local_rank}" if local_rank is not None else "The current CUDA device"
     gpus = f"{count} GPU{'s' if count != 1 else ''}"
