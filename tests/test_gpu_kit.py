@@ -371,7 +371,10 @@ def test_submit_free_and_multi_submit_every_step():
                              "--expect-init-error LOCAL_RANK=1\\ asks\\ for\\ GPU\\ 1"]),
         ("02_split_shared_gpu.sbatch", ["--nproc-per-node=2", "check.py",
                                         "GPUBRIDGE_SPLIT_TEST=alternate", "--nproc-per-node=4",
-                                        "--expect-init-error would\\ share\\ a\\ GPU"]),
+                                        "--expect-init-error would\\ share\\ a\\ GPU",
+                                        # its own limit, not STEP_TIMEOUT
+                                        "timeout --kill-after=30 60 env "
+                                        "GPUBRIDGE_SPLIT_TEST=alternate"]),
         ("03_single_island.sbatch", ["device_map.py", "check.py", "bench_all_reduce.py"]),
         ("04_split_4gpu.sbatch", ["check_half", "check_alternate", "bench_all_reduce.py",
                                   "--policy pipelined-reduce-bridge-broadcast",
@@ -381,7 +384,8 @@ def test_submit_free_and_multi_submit_every_step():
         ("05_multinode.sbatch", ["--policy pipelined-reduce-bridge-broadcast",
                                  "--policy sharded-bridge", "bench_phases_sharded-bridge",
                                  "--write-thresholds"]),
-        ("05_multinode.sbatch", ["srun", "--rdzv-backend=c10d", "check_split_by_node"]),
+        ("05_multinode.sbatch", ["srun", "--rdzv-backend=c10d", "check_split_by_node",
+                                 "--kill-on-bad-exit=1 bash KIT/node_ifname.sh torchrun"]),
         ("05_multinode.sbatch", ["preflight.py --role auto", "--bandwidth-seconds 2"]),
         ("06_scaling.sbatch", ["--nproc-per-node=4", "train_synthetic.py", "summarize.py"]),
         ("07_mixed_hetjob.sbatch", ["--het-group=1", "--rdzv-backend=c10d", "summarize.py"]),
@@ -391,6 +395,7 @@ def test_explorer_jobs_dry_run(job, expected):
     result = dry_run(KIT / "explorer" / job)
     assert result.returncode == 0, result.stderr
     for text in expected:
+        text = text.replace("KIT/", f"{KIT}/")
         assert text in result.stdout, (text, result.stdout)
 
 
@@ -488,6 +493,9 @@ def test_check_can_expect_init_to_fail_on_every_rank(pattern, ok, tmp_path):
         (stage,) = record["stages"]
         assert stage["name"] == "expected_init_error"
         assert "doesn't apply" in stage["message"]
+    for rank in range(2):  # in the log too, where negative_step looks (common.sh)
+        assert f"rank {rank}: init() failed: " in result.stderr
+    assert result.stderr.count("doesn't apply to this cluster") >= 2
     assert summarize.main([str(out)]) == (0 if ok else 1)
 
 
@@ -498,6 +506,8 @@ def test_check_expecting_an_init_error_fails_when_init_succeeds(tmp_path):
     assert result.returncode == 1
     for record in read_ranks(out):
         assert "init() succeeded" in record["stages"][0]["error"]
+    assert "rank 1: init() succeeded; this run expected it to fail" in result.stderr
+    assert "LOCAL_RANK" not in result.stderr  # nothing a negative_step could mistake for it
 
 
 def test_check_without_split_is_not_flagged(tmp_path):
@@ -525,10 +535,12 @@ def test_bench_measures_native_and_bridged_in_one_split_run(tmp_path):
     assert {r["bytes"] for r in rows} == {1024, 4096, 16384}
     assert all(r["split_test"] == "half" and r["islands"] == 2 for r in rows)
     assert all(r["timer"] == "host" and r["host_median_us"] > 0 for r in rows)  # CPU
-    assert (out / "bench.csv").read_text().startswith("op,policy,run_kind,split_test,")
+    assert all(r["baseline"] == "native" for r in rows)
+    assert (out / "bench.csv").read_text().startswith("op,policy,baseline,run_kind,split_test,")
     summary = (out / "summary.md").read_text()
     assert "SPLIT TEST" in summary and "timed with the host timer" in summary
     assert "| gpubridge / native | flat-gloo / native |" in summary
+    assert "fewer ranks" not in summary
 
 
 def test_bench_times_each_island_natively_in_the_same_job(tmp_path):
@@ -541,10 +553,22 @@ def test_bench_times_each_island_natively_in_the_same_job(tmp_path):
     assert {(r["op"], r["world_size"]) for r in rows} == {
         ("island:nvidia", 2), ("island:amd", 2), ("gpubridge", 4)}
     assert {r["bytes"] for r in rows} == {1024, 4096}
+    assert {r["baseline"] for r in rows} == {"island-native (fewer ranks, best case)"}
     summary = (out / "summary.md").read_text()
     assert "island:amd median (us)" in summary and "island:nvidia median (us)" in summary
-    assert "gpubridge / slowest island" in summary and "gpubridge / native" not in summary
+    assert "| gpubridge / island-native (fewer ranks, best case) |" in summary
+    assert "gpubridge / native" not in summary
+    assert "not a like-for-like comparison" in summary
     assert "flat-gloo" not in summary  # only what --ops asked for
+
+
+@pytest.mark.parametrize(("ops", "baseline"), [
+    (["native", "gpubridge", "flat-gloo"], "native"),
+    (["island", "gpubridge", "flat-gloo"], "island-native (fewer ranks, best case)"),  # fallback
+    (["gpubridge"], "none"),
+])
+def test_every_bench_row_names_its_baseline(ops, baseline):
+    assert bench_all_reduce.baseline_of(ops) == baseline
 
 
 def test_bench_reports_the_phases_of_the_gpubridge_op(tmp_path):
@@ -722,6 +746,7 @@ def test_preflight_passes_on_loopback(tmp_path):
         bandwidth = record["bandwidth"]
         assert bandwidth["MBps_in"] > 0 and bandwidth["MBps_out"] > 0
         assert bandwidth["rtt_ms"] > 0 and bandwidth["streams"] == 1
+        assert "one stream driven from Python; may understate fast links" in bandwidth["note"]
     # The other side's out is this side's in.
     assert master["bandwidth"]["MBps_out"] == worker["bandwidth"]["MBps_in"]
 

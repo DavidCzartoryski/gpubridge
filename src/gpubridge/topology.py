@@ -117,8 +117,8 @@ class PeerInfo:
     """Name of the collective policy this rank was asked to use (``auto`` by default)."""
     policy_settings: dict[str, Any] = field(default_factory=dict)
     """That policy's :meth:`~gpubridge.CollectivePolicy.settings`, e.g. a chunk size."""
-    gpu: str = ""
-    """The physical GPU this rank drives (UUID, PCI address), or empty if unknown or on CPU."""
+    gpu: str | None = None
+    """The physical GPU this rank drives (UUID, PCI address); empty if unknown, None on CPU."""
 
     @property
     def torch_version(self) -> str:
@@ -367,22 +367,46 @@ class Topology:
         return self.config.device
 
 
-def gpu_clashes(layout: Layout, hostnames: Sequence[str], gpus: Sequence[str]) -> list[str]:
+def gpu_clashes(
+    layout: Layout, hostnames: Sequence[str], gpus: Sequence[str | None]
+) -> list[str]:
     """Ranks of one island that would drive the same GPU, one line per shared GPU.
 
     An island is one NCCL/RCCL communicator, and both refuse two of its ranks
     on one GPU. Ranks in different islands may share a GPU (split-test mode
-    does that on purpose). Ranks whose GPU is unknown (``""``) are not checked.
+    does that on purpose). CPU ranks (None) are not checked, and neither is an
+    island with a rank whose GPU is unknown (``""``); see :func:`unchecked_islands`.
     """
     lines = []
     for island in layout.islands:
+        if any(gpus[rank] == "" for rank in island.ranks):
+            continue
         by_gpu: dict[tuple[str, str], list[int]] = {}
         for rank in island.ranks:
-            if gpus[rank]:
-                by_gpu.setdefault((hostnames[rank], gpus[rank]), []).append(rank)
+            gpu = gpus[rank]
+            if gpu is not None:
+                by_gpu.setdefault((hostnames[rank], gpu), []).append(rank)
         lines += [f"  island {island.vendor!r}: ranks {ranks} on {host}, GPU {gpu}"
                   for (host, gpu), ranks in by_gpu.items() if len(ranks) > 1]
     return lines
+
+
+def unchecked_islands(layout: Layout, gpus: Sequence[str | None]) -> list[str]:
+    """Islands that :func:`gpu_clashes` skips, one line each with the ranks whose GPU is unknown."""
+    lines = []
+    for island in layout.islands:
+        unknown = [rank for rank in island.ranks if gpus[rank] == ""]
+        if unknown:
+            lines.append(f"  island {island.vendor!r}: ranks {unknown}")
+    return lines
+
+
+def _unchecked_warning(lines: Sequence[str]) -> str:
+    return ("gpubridge could not check that ranks of these islands drive different GPUs: "
+            "the ranks named report neither a GPU UUID nor a PCI address (some ROCm builds "
+            "of PyTorch don't).\n" + "\n".join(lines) + "\nIf two ranks of one island "
+            "share a GPU, NCCL or RCCL will refuse it when the island first communicates; "
+            "give each rank its own GPU.")
 
 
 def _gpu_clash_error(lines: Sequence[str], split: str) -> str:
@@ -441,7 +465,11 @@ def build_topology(
     layout = plan_topology(labels)
     # Every rank sees the same layout and peers, so every rank fails these
     # checks alike (or picks the same policy), before any group is created.
-    clashes = gpu_clashes(layout, [peer.hostname for peer in peers], [peer.gpu for peer in peers])
+    gpus = [peer.gpu for peer in peers]
+    unchecked = unchecked_islands(layout, gpus)
+    if unchecked and rank == 0:
+        warnings.warn(_unchecked_warning(unchecked), stacklevel=3)
+    clashes = gpu_clashes(layout, [peer.hostname for peer in peers], gpus)
     if clashes:
         raise RuntimeError(_gpu_clash_error(clashes, local.split_test))
     policy_cls = choose_policy(policy, layout)

@@ -340,12 +340,16 @@ def expect_init_error(rec: Record, args: argparse.Namespace) -> int:
         try:
             gpubridge.init(timeout=timedelta(seconds=args.timeout), policy=args.policy)
         except RuntimeError as exc:
+            # Into the step's log too, where negative_step (common.sh) looks for it.
+            print(f"rank {rank_from_env()}: init() failed: {exc}", file=sys.stderr, flush=True)
             entry["message"] = str(exc)
             entry["ok"] = re.search(args.expect_init_error, str(exc)) is not None
             if not entry["ok"]:
                 entry["error"] = f"init() failed, but not with {args.expect_init_error!r}"
         else:
             gpubridge.destroy()
+            print(f"rank {rank_from_env()}: init() succeeded; this run expected it to fail",
+                  file=sys.stderr, flush=True)
             entry["ok"] = False
             entry["error"] = "init() succeeded; this run expected it to fail"
     return rec.finish()

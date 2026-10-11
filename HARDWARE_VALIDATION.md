@@ -103,10 +103,13 @@ inside Explorer as one heterogeneous Slurm job.
    *Status:* `scripts/gpu/preflight.py` chooses it by measurement: TCP both
    ways between every routed pair of interfaces of the two leader nodes, raw
    bandwidth each way over one stream, then a Gloo group on the pair whose
-   slower direction is fastest. Steps 05 and 07 run it first and export each
-   node's choice. Works on CPU on one machine (`tests/test_gpu_kit.py`,
-   `tests/test_gpu_jobs.py`). Still open: Explorer's real interfaces between
-   `multigpu` nodes and between `gpu` and `sharing`.
+   slower direction is fastest. Steps 05 and 07 run it first and give each
+   node its own choice, even when the two names differ. The bandwidth is one
+   TCP stream driven from Python, a lower bound that may understate fast
+   links. Works on CPU on one machine (`tests/test_gpu_kit.py`,
+   `tests/test_gpu_jobs.py`, where two different names are faked). Still
+   open: Explorer's real interfaces between `multigpu` nodes and between
+   `gpu` and `sharing`.
 9. **Timeouts.** While leaders work over the bridge, the other ranks wait inside
    an island broadcast. With large tensors the bridge step can be slow enough to
    trip the NCCL/RCCL watchdog. Check whether the `timeout` passed to `init()` is
@@ -123,7 +126,9 @@ inside Explorer as one heterogeneous Slurm job.
     stream. By default it puts three ops side by side: native NCCL/RCCL over
     every rank (or each island's own, where one group is impossible),
     gpubridge, and flat-gloo, with busbw as nccl-tests computes it and
-    gpubridge and flat-gloo as multiples of the native baseline.
+    gpubridge and flat-gloo as multiples of the baseline. Every row names its
+    baseline; each island's own is labeled `island-native (fewer ranks, best
+    case)`, since it is not a like-for-like comparison.
     *Status: runs on CPU in simulation, host-timed; no GPU numbers yet.*
 
 ## Added with later features
@@ -283,10 +288,15 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     gpubridge creates are the island groups; the world group, the bridge and
     the sharded bridge's links use Gloo.
     *Status: works on CPU with faked GPU identities
-    (`tests/test_split_test.py`).* Still open: that PyTorch reports a UUID or
-    PCI address on both vendors (without either, ranks go unchecked and NCCL's
-    own error appears instead). *Step:* Explorer step 02, `shared_gpu_check`:
-    4 ranks on its one GPU with `alternate` must fail `init()` on every rank.
+    (`tests/test_split_test.py`).* A GPU that reports neither a UUID nor a
+    PCI address (some ROCm builds) can't be compared: `init()` then warns on
+    rank 0, naming the island, and skips that island's check instead of
+    failing; tested on CPU with every rank reporting nothing. Still open: that
+    PyTorch reports a UUID or PCI address on both vendors. *Step:* Explorer
+    step 02, `shared_gpu_check`: 4 ranks on its one GPU with `alternate` must
+    fail `init()` on every rank with the duplicate-GPU error, within 60 s;
+    `steps.jsonl` records `"expected failure confirmed"` or `"check did not
+    fire"`.
 
 ## Mixed build results
 

@@ -22,7 +22,7 @@ from gpubridge.config import (
     split_test_mode,
 )
 from gpubridge.split_test import SplitTestWarning, banner, split_labels
-from gpubridge.topology import gpu_clashes, plan_topology
+from gpubridge.topology import gpu_clashes, plan_topology, unchecked_islands
 
 
 @pytest.fixture(autouse=True)
@@ -190,7 +190,7 @@ def test_gpu_identity_is_the_physical_gpu(props, want, monkeypatch):
 
 
 def test_gpu_identity_is_empty_when_unknown(monkeypatch):
-    assert gpu_identity(torch.device("cpu")) == ""
+    assert gpu_identity(torch.device("cpu")) is None  # not a GPU at all
 
     def fails(device):
         raise RuntimeError("no driver")
@@ -224,8 +224,23 @@ def test_ranks_of_one_island_never_share_a_gpu(per_node, gpus, mode, nodes, clas
                          "  island 'amd': ranks [1, 3] on node0, GPU pci 0000:01:00"]
 
 
-def test_ranks_whose_gpu_is_unknown_are_not_checked():
-    assert gpu_clashes(plan_topology(["nvidia"] * 2), ["node0"] * 2, ["", ""]) == []
+@pytest.mark.parametrize(("gpus", "unchecked"), [
+    (["", ""], ["  island 'nvidia': ranks [0, 1]"]),
+    (["pci 0000:00:00", "pci 0000:00:00", ""], ["  island 'nvidia': ranks [2]"]),
+    ([None, None], []),  # CPU ranks: nothing to check
+])
+def test_an_island_with_an_unknown_gpu_is_not_checked(gpus, unchecked):
+    layout = plan_topology(["nvidia"] * len(gpus))
+    assert gpu_clashes(layout, ["node0"] * len(gpus), gpus) == []
+    assert unchecked_islands(layout, gpus) == unchecked
+
+
+def test_only_the_island_with_an_unknown_gpu_goes_unchecked():
+    layout = plan_topology(["nvidia", "nvidia", "amd", "amd"])
+    gpus = ["pci 0000:00:00", "pci 0000:00:00", "", ""]
+    assert gpu_clashes(layout, ["node0"] * 4, gpus) == [
+        "  island 'nvidia': ranks [0, 1] on node0, GPU pci 0000:00:00"]
+    assert unchecked_islands(layout, gpus) == ["  island 'amd': ranks [2, 3]"]
 
 
 def test_a_layout_that_shares_a_gpu_fails_init_on_every_rank(tmp_path):
@@ -246,6 +261,34 @@ def test_half_on_a_two_gpu_node_passes_the_check(tmp_path, monkeypatch):
     labels = ["nvidia", "nvidia", "amd", "amd"]
     run_ranks(["nvidia"] * 4, partial(_check_split_run, labels=labels), tmp_path,
               before_init=_on_two_gpus)
+
+
+_WARNINGS: list[str] = []
+
+
+def _no_gpu_identity(rank):
+    # As on a ROCm build whose GPUs report neither a UUID nor a PCI address.
+    gpubridge.topology.gpu_identity = lambda device: ""
+    warnings.simplefilter("always")
+    warnings.showwarning = lambda message, *args, **kwargs: _WARNINGS.append(str(message))
+
+
+def _check_unchecked_run(topology):
+    _check_split_run(topology, ["nvidia", "amd", "nvidia", "amd"], mode="alternate")
+    skipped = [w for w in _WARNINGS if "could not check that ranks" in w]
+    if topology.rank == 0:
+        assert len(skipped) == 1, _WARNINGS
+        assert "island 'nvidia': ranks [0, 2]" in skipped[0]
+        assert "island 'amd': ranks [1, 3]" in skipped[0]
+    else:
+        assert skipped == []
+
+
+def test_init_warns_and_skips_the_check_when_no_rank_knows_its_gpu(tmp_path, monkeypatch):
+    # The layout that fails above on a 2-GPU node, but no rank can say which GPU
+    # it drives: init() must warn, not fail.
+    monkeypatch.setenv(SPLIT_TEST_ENV, "alternate")
+    run_ranks(["nvidia"] * 4, _check_unchecked_run, tmp_path, before_init=_no_gpu_identity)
 
 
 def test_simulated_hostname_is_ignored_on_gpus(monkeypatch):

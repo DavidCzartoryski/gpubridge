@@ -186,16 +186,17 @@ def resolve_config() -> Config:
     return Config(simulated=False, island_backend=GPU_BACKEND, device=torch.device("cuda", index))
 
 
-def gpu_identity(device: torch.device) -> str:
+def gpu_identity(device: torch.device) -> str | None:
     """The physical GPU behind ``device``, the same in every process that drives it.
 
     A device index is not: with ``CUDA_VISIBLE_DEVICES`` or Slurm's per-task
     GPU binding, ``cuda:0`` can be a different GPU in every process. The UUID
-    and the PCI address are. Empty for CPU devices, or when neither is known
-    (an all-zero value counts as unknown), so the GPU goes unchecked.
+    and the PCI address are. None for CPU devices. Empty when the GPU reports
+    neither (an all-zero value counts as unknown), as on some ROCm builds; init()
+    then warns that it can't check that island for shared GPUs.
     """
     if device.type != "cuda":
-        return ""
+        return None
     try:
         props = torch.cuda.get_device_properties(device)
     except Exception:  # noqa: BLE001 - only a check: never stop init() here

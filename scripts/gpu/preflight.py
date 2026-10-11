@@ -23,7 +23,8 @@ Checks, in order:
    whichever direction its addresses decide. Over the first connection: the
    round-trip time, then raw TCP bandwidth one way and then the other,
    ``--bandwidth-seconds`` each, over one stream (Gloo uses one connection per
-   pair of ranks).
+   pair of ranks). One TCP stream driven from Python can understate a fast
+   link (100 Gb/s Ethernet, IPoIB): read the numbers as a lower bound.
 7. ``choose``: the pair that connects both ways and whose slower direction is
    fastest. Each side's interface in it is that side's GLOO_SOCKET_IFNAME (the
    names may differ between the machines).
@@ -33,8 +34,9 @@ Checks, in order:
 
 Exit code 0 on success. Writes OUT/preflight-<role>.json when --out is given,
 with ``chosen_ifname``, the chosen pair's ``bandwidth`` from this side (MB/s in
-and out, round-trip time) and every pair's numbers. The Explorer jobs export
-``chosen_ifname`` as GLOO_SOCKET_IFNAME for the rest of the job.
+and out, round-trip time, and a ``note`` on how it was measured) and every
+pair's numbers. The Explorer jobs then run each machine's later job steps with
+its own ``chosen_ifname`` as GLOO_SOCKET_IFNAME.
 """
 
 from __future__ import annotations
@@ -53,6 +55,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+BANDWIDTH_NOTE = ("raw TCP over one stream driven from Python; may understate fast links "
+                  "(100 Gb/s Ethernet, IPoIB), so read it as a lower bound")
 HINT_FLAT_NETWORK = (
     "gpubridge needs a flat network between the machines: every TCP port open in "
     "both directions. Put both machines on one Tailscale tailnet (or a WireGuard "
@@ -483,6 +487,7 @@ def main() -> int:
             "rtt_ms": chosen["rtt_ms"],
             "seconds_each_way": args.bandwidth_seconds,
             "streams": 1,
+            "note": BANDWIDTH_NOTE,
         }
         print(f"preflight [{role}] GLOO_SOCKET_IFNAME={chosen[role]} (the {other} uses "
               f"{chosen[other]})", flush=True)

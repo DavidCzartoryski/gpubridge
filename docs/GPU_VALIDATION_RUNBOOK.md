@@ -67,6 +67,12 @@ would fail everything above it, for the same reason.
   but never two ranks of one island: NCCL refuses that, so `init()` fails
   first on every rank, naming them (item 24). On one node, `half` with at
   most twice as many ranks as GPUs is always fine; every layout here passes.
+  If PyTorch reports neither a UUID nor a PCI address for a GPU (some ROCm
+  builds), `init()` warns that the island goes unchecked instead of failing.
+  Step 02's `shared_gpu_check` runs that layout on purpose, with its own
+  60 s limit (`SHARED_GPU_CHECK_SECONDS`), and passes only if the duplicate-GPU
+  error appears: `steps.jsonl` records `"result": "expected failure
+  confirmed"` or `"check did not fire"`.
   `tests/test_split_test.py` checks this on CPU: the CUDA-build path, and the
   device of each rank on a 4-GPU and a 2-GPU node.
 - **Where it went wrong.** Rung 1 failing points at the environment, driver
@@ -152,8 +158,9 @@ as of 2026-10-06; **verify each one**:
 | `SETUP_MODULES` | `explorer` | loaded before installing: it routes compute nodes through the proxy. Set it to `""` to load nothing |
 | `MODULES` | empty | modules for steps 01 to 07; none needed: the PyTorch wheel bundles CUDA/ROCm and uv brings Python |
 | `NCCL_SOCKET_IFNAME` | empty (auto) | name of the fast interconnect interface for steps 05 and 07, e.g. `ib0` |
-| `GLOO_SOCKET_IFNAME` | empty: the preflight chooses | in steps 05 and 07, the interface Gloo uses on every node; the preflight then measures only it. Unset, each node uses the interface the preflight chose for it |
+| `GLOO_SOCKET_IFNAME` | empty: the preflight chooses | in steps 05 and 07, the interface Gloo uses on every node; the preflight then measures only it. Unset, each node uses the interface the preflight chose for it, even when the two nodes' names differ |
 | `USE_PREFLIGHT_IFNAME` | `1` | `0` leaves `GLOO_SOCKET_IFNAME` unset after the preflight, so Gloo picks by hostname |
+| `SHARED_GPU_CHECK_SECONDS` | `60` | step 02's limit for its deliberate failing run, which fails within seconds when the check works |
 | `PREFLIGHT_SECONDS` | `2` | seconds of raw TCP data each way per pair of interfaces in the preflight |
 
 Also check:
@@ -258,10 +265,12 @@ runs each phase as one heterogeneous job step (`srun --het-group=0 ... :
 4. `bench` (`--ops island,gpubridge,flat-gloo`): first each island times its
    own native all_reduce, both at once (NCCL on the gpu node, RCCL on the AMD
    node; rows `island:nvidia` and `island:amd`), then the bridged all_reduce
-   across both, then flat-gloo across both. `summary.md` adds
-   `gpubridge / slowest island` and `flat-gloo / slowest island` columns. A
-   native all_reduce over every rank is impossible here, because NCCL and RCCL
-   ranks can't form one group, so the islands are the baselines.
+   across both, then flat-gloo across both. A native all_reduce over every
+   rank is impossible here, because NCCL and RCCL ranks can't form one group,
+   so the baseline is each island's own, labeled `island-native (fewer ranks,
+   best case)` in every row and in the `gpubridge / ...` and `flat-gloo / ...`
+   columns of `summary.md`. It is the slowest island at each size: fewer ranks
+   and no bridge, so a best case, not a like-for-like comparison.
 
 **Per-island baselines need 2+ GPUs per island.** With one GPU, an island's
 all_reduce has nothing to exchange, so its row only times the call itself.
@@ -295,13 +304,18 @@ step 05's two nodes in `multigpu`, step 07's `gpu` and `sharing` nodes, and
    one the round-trip time and raw TCP bandwidth one way and then the other,
    over one stream, as Gloo uses one connection per pair of ranks.
 4. `choose`: the pair that connects both ways and whose slower direction is
-   fastest. Each node's interface in it becomes its `GLOO_SOCKET_IFNAME`.
+   fastest. Each node's interface in it becomes its `GLOO_SOCKET_IFNAME` for
+   the rest of the job. Where the two names differ, step 05 starts each
+   node's torchrun through `node_ifname.sh`, which sets that node's own name;
+   step 07 sets each component's.
 5. `gloo`: a real two-rank Gloo group on the chosen interfaces.
 
 `preflight/preflight-<role>.json` records every pair (both connections,
 MB/s each way, round-trip time) and, for the chosen one, `chosen_ifname`,
 `peer_ifname` and `bandwidth` from that node's side. These are host network
-numbers, measured before any GPU work.
+numbers, measured before any GPU work. The bandwidth is one TCP stream driven
+from Python, so it may understate a fast link (100 Gb/s Ethernet, IPoIB):
+read it as a lower bound. The record's `bandwidth.note` says so too.
 
 #### Choosing the ROCm build
 
@@ -517,7 +531,7 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 | 01: `build_supports_gpus` fails | wheel without kernels for this GPU | set `CUDA_INDEX` (cu126 for V100; cu128/cu130 for newer GPUs), rerun setup |
 | 01: no GPU visible | job didn't get a GPU, or driver problem | check `nvidia-smi.txt` and `slurm-job.txt` in the results |
 | 01/AMD: `local_rank_check` fails | init() succeeded with more processes than GPUs, or failed for another reason | read `expected_init_error` in `local_rank_check/rank*.json`; if init succeeded, the visible-device count isn't what PyTorch reports (item 12) |
-| 02: `shared_gpu_check` fails | init() succeeded with two ranks of one island on the GPU, or failed for another reason | read `expected_init_error` in `shared_gpu_check/rank*.json`; if init succeeded, PyTorch reported neither a UUID nor a PCI address for the GPU, so ranks went unchecked (item 24) |
+| 02: `shared_gpu_check` fails, `"result": "check did not fire"` | init() succeeded with two ranks of one island on the GPU, failed for another reason, or hung past `SHARED_GPU_CHECK_SECONDS` | read `shared_gpu_check.log` and `expected_init_error` in `shared_gpu_check/rank*.json`; if the log has init()'s "could not check" warning, PyTorch reported neither a UUID nor a PCI address for the GPU, so the island went unchecked (item 24) |
 | `init` stuck (summary says "stuck in this stage") | new_group / NCCL init problem (item 3) | read `rank*.stacks.txt` and the NCCL/RCCL log lines at the end of `<step>.log` (all of them in `nccl/<step>/`); this is a real finding, file it |
 | `steps.jsonl` says `"timed_out": true` | the launch ran past `STEP_TIMEOUT` | read `<step>.log` and `rank*.stacks.txt`; raise `STEP_TIMEOUT` only if the step was still making progress |
 | `busy_gpu` wrong values | stream ordering bug in the bridge (item 6) | serious; keep the JSON and open an issue |
