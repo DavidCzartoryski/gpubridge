@@ -12,14 +12,18 @@ The protocol, as the pipeline uses it:
 - :meth:`Staging.begin` once, before the first copy: the copy streams wait for
   the work already queued on the caller's stream (the island step).
 - :meth:`Staging.to_host` copies a chunk into a host slot and returns an event.
-  ``after`` is the event of the last host-to-device copy out of that slot; the
-  copy waits for it on the device, so a slot is never overwritten while it is
-  still being read.
+  ``after`` is the event of the last host-to-device copy out of that slot,
+  from this collective or an earlier one; the copy waits for it on the device,
+  so a slot is never overwritten while it is still being read.
 - :meth:`Staging.wait_host` blocks the host until one event has passed. It is
-  the only host wait: the bridge needs the chunk in host memory.
+  the only host wait. Before the bridge reads a slot, its copy out must have
+  passed; before the bridge only receives into a slot, the slot's last copy
+  back must have, since the host is about to overwrite it.
 - :meth:`Staging.to_device` copies a slot back into its chunk and returns an event.
 - :meth:`Staging.end` makes the caller's stream wait for the last copy back,
-  so what comes next (the island broadcast) sees every chunk. No host wait.
+  so what comes next (the island broadcast) sees every chunk. No host wait,
+  so copies back may still be running when the collective returns: the
+  pipeline keeps each slot's last copy-back event for the next collective.
 
 Nothing here synchronizes the whole device.
 """

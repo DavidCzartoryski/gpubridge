@@ -15,9 +15,12 @@ Stream semantics on GPUs, matching ``torch.distributed`` with NCCL:
   for the worker's stream, so the caching allocator won't reuse them early.
 - **Outputs.** :meth:`Work.wait` blocks the host until the worker has run the
   collective, then makes the caller's current stream wait on an event recorded
-  after it. Kernels queued on the caller's stream after ``wait()`` see the
-  result. The future from :meth:`Work.get_future` is created with the rank's
-  device, so ``future.wait()`` and ``future.value()`` synchronize the same way.
+  after it on the worker's stream. Kernels queued on the caller's stream after
+  ``wait()`` see the result. :meth:`Work.is_completed` turns True only once
+  that event has passed, i.e. the GPU work is done too, so the result can then
+  be used on any stream without ``wait()``, as with NCCL. The future from
+  :meth:`Work.get_future` is created with the rank's device, so
+  ``future.wait()`` and ``future.value()`` synchronize the same way.
 - **Between call and wait**, don't read or write the tensors.
 
 The bridge steps of a collective block the worker thread on host copies, not
@@ -49,8 +52,15 @@ class Work:
         self._future: torch.futures.Future = torch.futures.Future(devices=devices)
 
     def is_completed(self) -> bool:
-        """Whether the collective has finished on this rank's worker thread. Never blocks."""
-        return self._done.is_set()
+        """Whether the collective has finished on this rank, GPU work included. Never blocks.
+
+        The worker thread finishes as soon as it has queued the last kernels
+        (the island broadcast), so on GPUs this also asks the event recorded
+        after them, like ``torch.distributed`` with NCCL.
+        """
+        if not self._done.is_set():
+            return False
+        return self._event is None or self._event.query()
 
     def wait(self, timeout: timedelta | float | None = None) -> bool:
         """Block until the collective finishes; on GPUs, order the current stream after it.

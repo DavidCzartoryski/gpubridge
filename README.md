@@ -325,6 +325,8 @@ Stream semantics on GPUs follow `torch.distributed` with NCCL:
   `record_stream`, so the caching allocator won't reuse them early.
 - `wait()` blocks the host until the worker has run the collective, then makes
   the caller's current stream wait on an event recorded after it.
+  `is_completed()` turns True only once that event has passed (the GPU work
+  is done too), so after it the result can be used on any stream.
   `get_future()` returns a future created with the rank's device, so
   `future.wait()` synchronizes the same way.
 - Between the call and `wait()`, don't read or write the tensors.

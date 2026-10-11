@@ -426,6 +426,11 @@ class PipelinedReduceBridgeBroadcast(ReduceBridgeBroadcast):
     def __init__(self, chunk_bytes: int | None = None) -> None:
         self.chunk_bytes = chunk_bytes
         self.staging: _staging.Staging | None = None
+        #: The last copy back out of each host slot, kept from one collective to
+        #: the next: a collective returns without waiting for its copies back
+        #: (only the caller's stream waits for them), so the next one, perhaps
+        #: from another stream, must not reuse a slot before they are done.
+        self.copied_back: list[Any] = [None] * self.SLOTS
 
     @classmethod
     def settings(cls) -> dict[str, Any]:
@@ -442,6 +447,7 @@ class PipelinedReduceBridgeBroadcast(ReduceBridgeBroadcast):
         if self.staging is not None:
             self.staging.close()
             self.staging = None
+        self.copied_back = [None] * self.SLOTS
 
     def all_reduce(self, tensor: torch.Tensor, topology: Topology,
                    op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
@@ -487,7 +493,7 @@ class PipelinedReduceBridgeBroadcast(ReduceBridgeBroadcast):
         step = max(1, self.chunk_bytes // tensor.element_size())
         chunks = [flat[lo:lo + step] for lo in range(0, flat.numel(), step)]
         copied_out: list[Any] = [None] * len(chunks)  # chunk k is in host memory
-        copied_back: list[Any] = [None] * slots       # last copy back out of each slot
+        copied_back = self.copied_back                # last copy back out of each slot
         last_back = None
 
         def copy_out(k: int) -> None:
@@ -502,7 +508,8 @@ class PipelinedReduceBridgeBroadcast(ReduceBridgeBroadcast):
                 copy_out(k + 1)  # overlaps this chunk's bridge step
             host = staging.slot(k % slots, chunk)
             # Before the bridge touches the slot: its data has arrived (send), or
-            # the copy back of the chunk that used it last is done (receive only).
+            # the copy back of the chunk that used it last, in this collective or
+            # an earlier one, is done (receive only).
             staging.wait_host(copied_out[k] if send else copied_back[k % slots])
             bridge_step(host)
             if receive:

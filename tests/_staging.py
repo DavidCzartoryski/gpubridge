@@ -90,6 +90,29 @@ class LazyStaging(Staging):
             event.complete()
 
 
+class CallerStreamStaging(LazyStaging):
+    """LazyStaging whose end() leaves the copies back queued, as a GPU does.
+
+    On a GPU, end() only makes the caller's stream wait, so a collective
+    returns with its copies back still queued. :meth:`run_caller_stream` is
+    the caller's stream reaching those waits later.
+    """
+
+    def __init__(self, chunk_bytes: int, slots: int) -> None:
+        super().__init__(chunk_bytes, slots)
+        self.caller_waits: list[LazyEvent] = []
+
+    def end(self, event):
+        self.log.append(("end", event.label if event else None))
+        if event is not None:
+            self.caller_waits.append(event)
+
+    def run_caller_stream(self) -> None:
+        for event in self.caller_waits:
+            event.complete()
+        self.caller_waits.clear()
+
+
 class LazyPipelined(PipelinedReduceBridgeBroadcast):
     """The pipelined policy on LazyStaging."""
 
