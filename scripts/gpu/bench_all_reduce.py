@@ -234,8 +234,9 @@ def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
     timers = sorted({r.get("timer", "host") for r in rows})
     timing = ("CUDA events on the current stream" if timers == ["cuda-events"]
               else "the host timer" if timers == ["host"] else ", ".join(timers))
+    staging = "pinned (`GPUBRIDGE_PINNED_STAGING`)" if info.get("pinned_staging") else "pageable"
     lines += [f"Run kind `{info['kind']}`, gpubridge policy `{info['policy']}`, "
-              f"{info['world_size']} ranks, "
+              f"bridge staging {staging}, {info['world_size']} ranks, "
               f"{len(info['islands'])} island(s). Latency is the median of the slowest rank, "
               f"timed with {timing}.",
               ""]

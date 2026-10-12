@@ -197,6 +197,12 @@ def test_step_05_two_nodes(tmp_path):
     assert code == 0 and failed(out) == set(), job_output(tmp_path)
     assert summary(out / "check_one_island")["ok"]
     assert summary(out / "check_split_by_node")["split_test"] == "node"
+    # The pinned-staging A/B: same check and benchmark with GPUBRIDGE_PINNED_STAGING=1.
+    assert summary(out / "check_pinned")["ok"]
+    for path in (out / "check_pinned").glob("rank*.json"):
+        assert json.loads(path.read_text())["run"]["pinned_staging"] is True
+    assert "bridge staging pinned" in (out / "bench_pinned" / "summary.md").read_text()
+    assert "bridge staging pageable" in (out / "bench_split_by_node" / "summary.md").read_text()
     log = (tmp_path / "slurm.log").read_text()
     assert "--nodes=2" in log and "srun --nodes=2 --ntasks-per-node=1" in log
     assert (out / "thresholds.json").exists()

@@ -79,6 +79,13 @@ if [ "$GPUS" -ge 2 ]; then
     step bench env_local_torchrun GPUBRIDGE_SPLIT_TEST=half --nproc-per-node="$GPUS" \
         "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" --ops native,island,gpubridge,flat-gloo \
         --phases --max-bytes "$BENCH_MAX_BYTES" --trials "$BENCH_TRIALS"
+    # Pinned staging for the default bridge (item 25), against the pageable copies above.
+    step check_pinned env_local_torchrun GPUBRIDGE_SPLIT_TEST=half GPUBRIDGE_PINNED_STAGING=1 \
+        --nproc-per-node="$GPUS" "$KIT_DIR/check.py" --out "$RESULTS/check_pinned"
+    checks+=("$RESULTS/check_pinned")
+    step bench_pinned env_local_torchrun GPUBRIDGE_SPLIT_TEST=half GPUBRIDGE_PINNED_STAGING=1 \
+        --nproc-per-node="$GPUS" "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench_pinned" \
+        --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES" --trials "$BENCH_TRIALS"
     # Opt-in policies (items 17 to 21), each under the same split-test check, then
     # every candidate timed side by side, writing a thresholds file for auto-tuned.
     for policy in $OPT_IN_POLICIES; do

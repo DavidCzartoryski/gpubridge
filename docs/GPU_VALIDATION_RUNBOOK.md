@@ -111,6 +111,11 @@ Steps 04, 05, 07 and the AMD script also check every opt-in policy in
 `OPT_IN_POLICIES` (the pipelined and sharded policies) and write
 `thresholds.json` (items 17 to 21); step 05 also times each one's phases.
 Opt-in policies are not validated on GPUs until those steps pass.
+The same steps then rerun the check and the gpubridge benchmark with
+`GPUBRIDGE_PINNED_STAGING=1` (`check_pinned`, `bench_pinned`; item 25), so one
+allocation compares the default bridge's pageable copies with pinned staging:
+read `bench_pinned/summary.md` next to the pageable benchmark's gpubridge rows
+and `bridge` phase. `validation_tables.py` shows each benchmark's staging.
 Steps 04, 06, 07 and the AMD script train with DDP and `gpubridge.ddp_comm_hook`
 (`examples/train_synthetic.py`, item 22).
 Steps 02, 04 and the AMD script also run the GPU-only tests, `pytest -m gpu

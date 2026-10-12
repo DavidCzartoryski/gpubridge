@@ -33,6 +33,14 @@ export GPUBRIDGE_SPLIT_TEST=half
 # to a native island all_reduce of the same size (item 13).
 step bench local_torchrun --nproc-per-node="$GPUS" "$KIT_DIR/bench_all_reduce.py" \
     --out "$RESULTS/bench" --max-bytes "$BENCH_MAX_BYTES" --ops native,island,gpubridge,flat-gloo --phases
+# Pinned staging for the default bridge (item 25): the same check and gpubridge
+# benchmark with GPUBRIDGE_PINNED_STAGING=1, to compare with the pageable copies above.
+step check_pinned env_local_torchrun GPUBRIDGE_PINNED_STAGING=1 --nproc-per-node="$GPUS" \
+    "$KIT_DIR/check.py" --out "$RESULTS/check_pinned"
+step summarize_pinned python "$KIT_DIR/summarize.py" "$RESULTS/check_pinned"
+step bench_pinned env_local_torchrun GPUBRIDGE_PINNED_STAGING=1 --nproc-per-node="$GPUS" \
+    "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench_pinned" --max-bytes "$BENCH_MAX_BYTES" \
+    --ops gpubridge --phases
 # Opt-in policies (items 17 to 21): the same check under each, then one benchmark
 # that times every candidate side by side and writes a thresholds file, then the
 # check again under auto-tuned with that file.

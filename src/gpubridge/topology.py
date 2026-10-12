@@ -16,11 +16,13 @@ from torch.distributed import ProcessGroup
 from gpubridge.config import (
     CPU_ONLY_ENV,
     GPU_BACKEND,
+    PINNED_STAGING_ENV,
     SPLIT_TEST_ENV,
     VENDOR_ENV,
     Config,
     gpu_identity,
     hostname,
+    pinned_staging_setting,
     resolve_config,
     split_test_mode,
 )
@@ -119,6 +121,8 @@ class PeerInfo:
     """That policy's :meth:`~gpubridge.CollectivePolicy.settings`, e.g. a chunk size."""
     gpu: str | None = None
     """The physical GPU this rank drives (UUID, PCI address); empty if unknown, None on CPU."""
+    pinned_staging: bool = False
+    """This rank's ``GPUBRIDGE_PINNED_STAGING``: stage the default bridge in pinned memory."""
 
     @property
     def torch_version(self) -> str:
@@ -156,6 +160,11 @@ def describe_local(
     split = split_test_mode() or ""
     local_probe = probe()
     problems: list[str] = []
+    try:
+        pinned = pinned_staging_setting()
+    except ValueError as exc:
+        pinned = False
+        problems.append(str(exc))
     vendor: str | None
     try:
         vendor = detect_vendor()
@@ -190,6 +199,7 @@ def describe_local(
         policy=policy_name(policy),
         policy_settings=settings,
         gpu=gpu_identity(config.device),
+        pinned_staging=pinned,
     )
     return local, config
 
@@ -202,7 +212,8 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
     Raises:
         RuntimeError: if any rank reported problems, if some ranks run on CPU and
             others on GPUs, or if ranks picked different bridge transports,
-            collective policies, policy settings or split-test modes.
+            collective policies, policy settings, split-test modes or pinned
+            staging.
     """
     failing = [(rank, peer) for rank, peer in enumerate(peers) if peer.problems]
     if failing:
@@ -260,6 +271,14 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
             f"Ranks disagree on {SPLIT_TEST_ENV}: {detail}. Set it to the same value on "
             "every rank, or on none."
         )
+    pinned = [rank for rank, peer in enumerate(peers) if peer.pinned_staging]
+    if pinned and len(pinned) != len(peers):
+        off = [rank for rank, peer in enumerate(peers) if not peer.pinned_staging]
+        raise RuntimeError(
+            f"Ranks disagree on {PINNED_STAGING_ENV}: on for ranks {pinned}, off for ranks "
+            f"{off}. Set it to the same value on every rank, so a run is one "
+            "configuration or the other."
+        )
     # CUDA and ROCm builds of one release differ only in the local version
     # suffix, e.g. 2.5.1+cu124 and 2.5.1+rocm6.2.
     releases = sorted({peer.torch_version.split("+")[0] for peer in peers}, key=_release_key)
@@ -310,6 +329,11 @@ class Topology:
     def policy_settings(self) -> dict[str, Any]:
         """The policy's settings, identical on every rank (discovery checked)."""
         return self.peers[self.rank].policy_settings
+
+    @property
+    def pinned_staging(self) -> bool:
+        """Whether ``GPUBRIDGE_PINNED_STAGING`` is on: the same on every rank (discovery checks)."""
+        return self.peers[self.rank].pinned_staging
 
     @property
     def bridge_group(self) -> ProcessGroup | None:

@@ -65,7 +65,13 @@ SLOT_CHUNK_BYTES = 1024 * 1024
 BF16_EXACT = 256
 #: GPUBRIDGE_* settings a developer's shell might carry; each job sets its own.
 OWN_ENV = ("GPUBRIDGE_VENDOR", "GPUBRIDGE_CPU_ONLY", "GPUBRIDGE_SPLIT_TEST",
-           "GPUBRIDGE_CHUNK_BYTES", "GPUBRIDGE_THRESHOLDS", "GPUBRIDGE_POLICY")
+           "GPUBRIDGE_CHUNK_BYTES", "GPUBRIDGE_THRESHOLDS", "GPUBRIDGE_POLICY",
+           "GPUBRIDGE_PINNED_STAGING")
+#: The default bridge with opt-in pinned staging.
+PINNED = {"GPUBRIDGE_PINNED_STAGING": "1"}
+#: Every bridge policy, plus reduce-bridge-broadcast with pinned staging: (tag, policy, env).
+VARIANTS = (*((policy, policy, {}) for policy in BRIDGE_POLICIES),
+            ("reduce-bridge-broadcast-pinned", "reduce-bridge-broadcast", PINNED))
 
 
 # ---- data and expected results ---------------------------------------------------
@@ -158,9 +164,16 @@ def _rank_main(rank: int, world: int, fn: Callable[[int, int, Path], None], tmp_
     fn(rank, world, tmp_path)
 
 
-def init(tmp_path: Path, tag: str, rank: int, world: int, policy: str) -> gpubridge.Topology:
-    return gpubridge.init(init_method=f"file://{tmp_path}/rendezvous-{tag}", rank=rank,
-                          world_size=world, timeout=TIMEOUT, policy=policy)
+def init(tmp_path: Path, tag: str, rank: int, world: int, policy: str,
+         env: dict[str, str] | None = None) -> gpubridge.Topology:
+    """gpubridge.init, with ``env`` set while it reads its settings."""
+    os.environ.update(env or {})
+    try:
+        return gpubridge.init(init_method=f"file://{tmp_path}/rendezvous-{tag}", rank=rank,
+                              world_size=world, timeout=TIMEOUT, policy=policy)
+    finally:
+        for name in env or {}:
+            os.environ.pop(name)
 
 
 # ---- the checks ------------------------------------------------------------------
@@ -258,7 +271,7 @@ def compare_policies(rank: int, world: int, tmp_path: Path, *, numels: tuple[int
     """Each bridge policy against flat-gloo, plus the analytic result for every case."""
     bad = Mismatches(rank)
     digests: dict[str, dict[str, str]] = {}
-    runs = [(policy, policy, {}) for policy in (REFERENCE, *BRIDGE_POLICIES)]
+    runs = [(REFERENCE, REFERENCE, {}), *VARIANTS]
     runs.append(("pipelined-odd-chunk", "pipelined-reduce-bridge-broadcast",
                  {"GPUBRIDGE_CHUNK_BYTES": ODD_CHUNK_BYTES}))
     for tag, policy, env in runs:
@@ -333,13 +346,14 @@ def streams(rank: int, world: int, tmp_path: Path, *, numel: int, iters: int) ->
     is large enough that the island reduce takes a while, so a device-to-host
     copy that didn't wait for the input or for the island reduce would stage
     stale or partial data and the sums would be wrong. The pipelined policy
-    copies into pinned slots with ``non_blocking=True`` and those copies wait
-    for the same queue, so a bridge step that read a slot before the host had
-    waited for its copy's event would send stale bytes and fail here too.
+    copies into pinned slots with ``non_blocking=True``, as does the default
+    bridge with pinned staging, and those copies wait for the same queue, so a
+    bridge step that read host memory before the host had waited for its
+    copy's event would send stale bytes and fail here too.
     """
     bad = Mismatches(rank)
-    for policy in BRIDGE_POLICIES:
-        topology = init(tmp_path, f"streams-{policy}", rank, world, policy)
+    for tag, policy, env in VARIANTS:
+        topology = init(tmp_path, f"streams-{tag}", rank, world, policy, env)
         try:
             device = topology.device
             side, other = new_stream(device), new_stream(device)
@@ -353,7 +367,7 @@ def streams(rank: int, world: int, tmp_path: Path, *, numel: int, iters: int) ->
                 gpubridge.all_reduce(tensor)
                 got = tensor.clone()
             sync(device)
-            bad.equal(f"{policy} sync on a side stream", got, want)
+            bad.equal(f"{tag} sync on a side stream", got, want)
 
             # Async from a side stream, waited on another: the worker's stream
             # must wait for the side stream, and wait() must order the other one.
@@ -366,7 +380,7 @@ def streams(rank: int, world: int, tmp_path: Path, *, numel: int, iters: int) ->
                 work.wait()
                 got = tensor.clone()
             sync(device)
-            bad.equal(f"{policy} async, side stream to another", got, want)
+            bad.equal(f"{tag} async, side stream to another", got, want)
 
             # Several async collectives in flight, waited in order on the default stream.
             tensors, works = [], []
@@ -379,7 +393,7 @@ def streams(rank: int, world: int, tmp_path: Path, *, numel: int, iters: int) ->
             for i, (tensor, work) in enumerate(zip(tensors, works, strict=True)):
                 work.wait()
                 want_i = torch.stack([rank_values(r + i, 4099) for r in range(world)]).sum(0)
-                bad.equal(f"{policy} async #{i} in flight", tensor, want_i.to(torch.float16))
+                bad.equal(f"{tag} async #{i} in flight", tensor, want_i.to(torch.float16))
 
             # Async broadcast from the last rank, on a side stream.
             with on(side):
@@ -387,7 +401,7 @@ def streams(rank: int, world: int, tmp_path: Path, *, numel: int, iters: int) ->
                 gpubridge.broadcast(tensor, world - 1, async_op=True).wait()
                 got = tensor.clone()
             sync(device)
-            bad.equal(f"{policy} async broadcast on a side stream", got,
+            bad.equal(f"{tag} async broadcast on a side stream", got,
                       rank_data(world - 1, numel, torch.bfloat16, device))
         finally:
             gpubridge.destroy()
@@ -441,8 +455,8 @@ def completion(rank: int, world: int, tmp_path: Path, *, numel: int) -> None:
     ``wait()``, must be complete.
     """
     bad = Mismatches(rank)
-    for policy in BRIDGE_POLICIES:
-        topology = init(tmp_path, f"completion-{policy}", rank, world, policy)
+    for tag, policy, env in VARIANTS:
+        topology = init(tmp_path, f"completion-{tag}", rank, world, policy, env)
         try:
             device = topology.device
             want = expected_reduce("sum", world, numel, torch.float32).to(device)
@@ -453,10 +467,44 @@ def completion(rank: int, world: int, tmp_path: Path, *, numel: int) -> None:
                 time.sleep(0.0002)
             got = tensor.clone()  # no wait(): is_completed() said the result is ready
             sync(device)
-            bad.equal(f"{policy} read right after is_completed()", got, want)
+            bad.equal(f"{tag} read right after is_completed()", got, want)
             work.wait()
         finally:
             gpubridge.destroy()
+    bad.raise_if_any()
+
+
+def pinned_reuse(rank: int, world: int, tmp_path: Path, *, numel: int) -> None:
+    """The default bridge's pinned buffer (``GPUBRIDGE_PINNED_STAGING``), reused at once.
+
+    A collective returns once its copy back out of the pinned buffer is queued,
+    not done. The next broadcast starts right away, on the same stream or
+    another, at the same size (the buffer is reused: its copy out must wait for
+    that copy back on the device) or twice the size (the buffer is replaced:
+    the host must wait for the copy back first). The tensors are large, so the
+    copy back takes long enough for a copy out on another stream, on the other
+    copy engine, to overlap it if nothing ordered them.
+    """
+    bad = Mismatches(rank)
+    topology = init(tmp_path, "pinned-reuse", rank, world, "reduce-bridge-broadcast", PINNED)
+    try:
+        device = topology.device
+        side, other = new_stream(device), new_stream(device)
+        for case, then, scale in (("the same stream", side, 1), ("another stream", other, 1),
+                                  ("another stream, twice the size", other, 2)):
+            with on(side):
+                first = rank_data(rank, numel, torch.float32, device)
+                gpubridge.broadcast(first, 0)
+            with on(then):
+                second = rank_data(rank + 1, scale * numel, torch.float32, device)
+                gpubridge.broadcast(second, 0)
+            sync(device)
+            bad.equal(f"broadcast, then another on {case}: first", first,
+                      rank_values(0, numel).float())
+            bad.equal(f"broadcast, then another on {case}: second", second,
+                      rank_values(1, scale * numel).float())
+    finally:
+        gpubridge.destroy()
     bad.raise_if_any()
 
 
@@ -488,6 +536,12 @@ def test_bridge_copies_wait_for_the_callers_stream_and_the_island_reduce(tmp_pat
 @requires_gpu
 def test_pinned_slots_are_not_reused_before_their_copies_back(tmp_path):
     spawn(partial(slot_reuse, iters=80), gpu_ranks(), tmp_path, SPLIT)
+
+
+@pytest.mark.gpu
+@requires_gpu
+def test_the_pinned_bridge_buffer_is_not_reused_before_its_copy_back(tmp_path):
+    spawn(partial(pinned_reuse, numel=LARGE_NUMEL // 4), gpu_ranks(), tmp_path, SPLIT)
 
 
 @pytest.mark.gpu
@@ -539,3 +593,4 @@ def test_gpu_test_logic_in_simulation(tmp_path):
     each(partial(streams, numel=10_007, iters=0), 4, "streams")
     each(partial(slot_reuse, iters=0), 4, "slots")
     each(partial(completion, numel=100_003), 2, "completion")
+    each(partial(pinned_reuse, numel=10_007), 4, "pinned")
