@@ -499,7 +499,12 @@ def main() -> int:
         print(f"\npreflight [{role}] FAILED: {exc}\n", file=sys.stderr, flush=True)
     if args.out:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from gpukit import write_json
+        from gpukit import environment, write_json
+        record["argv"] = sys.argv
+        try:  # versions, GPUs and settings, as in every kit record
+            record["environment"] = environment()
+        except Exception as exc:  # noqa: BLE001 - the record matters more
+            record["environment"] = {"error": f"{type(exc).__name__}: {exc}"}
         write_json(args.out / f"preflight-{role}.json", record)
     return 0 if record["ok"] else 1
 
