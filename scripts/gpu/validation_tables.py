@@ -379,8 +379,8 @@ def _staging(bench: dict[str, Any]) -> str:
     """How the gpubridge op's bridge reached host memory: pinned, pageable, or (UCX)
     the path its transport took."""
     run = bench.get("run", {})
-    if run.get("bridge_path") in ("direct", "staged"):
-        return f"ucx {run['bridge_path']}"
+    if run.get("bridge") == "ucx" and run.get("bridge_path"):
+        return f"ucx {run['bridge_path']}"  # e.g. "ucx direct", or "ucx direct+staged"
     return "pinned" if run.get("pinned_staging") else "pageable"
 
 

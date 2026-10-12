@@ -39,6 +39,7 @@ struct Op {
     ucs_status_t status = UCS_OK;
     int peer = -1;            // -1 for a receive (any peer: the tag says which)
     size_t bytes = 0;
+    size_t received = 0;      // a receive's actual length, once complete
     bool send = false;
 };
 
@@ -87,11 +88,19 @@ ucs_memory_type_t to_ucs(int memory_type) {
     }
 }
 
+void cancel_all(Handle* h, double timeout_s);
+
 int64_t track(Handle* h, ucs_status_ptr_t result, int peer, size_t bytes, bool send) {
     if (UCS_PTR_IS_ERR(result)) {
-        return fail(h, kFailed, "UCX %s of %zu bytes%s failed to start: %s",
-                    send ? "send" : "receive", bytes, send ? " to a peer" : "",
-                    ucs_status_string(UCS_PTR_STATUS(result)));
+        // Whatever this step already posted can't complete as intended: cancel it now,
+        // so no request outlives the buffers it points to, and refuse later calls.
+        cancel_all(h, 1.0);
+        int code = fail(h, kFailed, "UCX %s of %zu bytes%s failed to start: %s",
+                        send ? "send" : "receive", bytes, send ? " to a peer" : "",
+                        ucs_status_string(UCS_PTR_STATUS(result)));
+        h->broken = true;
+        h->ops.clear();
+        return code;
     }
     Op op;
     op.request = result;  // null: already complete
@@ -109,7 +118,14 @@ int progress_until(Handle* h, const std::vector<int64_t>& ids, double deadline) 
         for (int64_t id : ids) {
             Op& op = h->ops[static_cast<size_t>(id)];
             if (op.request == nullptr) continue;
-            ucs_status_t status = ucp_request_check_status(op.request);
+            ucs_status_t status;
+            if (op.send) {
+                status = ucp_request_check_status(op.request);
+            } else {
+                ucp_tag_recv_info_t info{};
+                status = ucp_tag_recv_request_test(op.request, &info);
+                if (status == UCS_OK) op.received = info.length;
+            }
             if (status == UCS_INPROGRESS) {
                 pending = true;
                 continue;
@@ -117,6 +133,16 @@ int progress_until(Handle* h, const std::vector<int64_t>& ids, double deadline) 
             op.status = status;
             ucp_request_free(op.request);
             op.request = nullptr;
+        }
+        for (int64_t id : ids) {
+            const Op& op = h->ops[static_cast<size_t>(id)];
+            if (!op.send && op.request == nullptr && op.status == UCS_OK &&
+                op.received != op.bytes) {
+                return fail(h, kFailed,
+                            "a UCX message of %zu bytes arrived where %zu were expected: the "
+                            "leaders don't agree on how to split messages", op.received,
+                            op.bytes);
+            }
         }
         for (int64_t id : ids) {
             const Op& op = h->ops[static_cast<size_t>(id)];
@@ -289,13 +315,18 @@ int64_t gb_ucx_recv(void* handle, void* buffer, size_t bytes, uint64_t tag, int 
     auto* h = static_cast<Handle*>(handle);
     if (h->broken) return fail(h, kFailed, "the UCX bridge already failed: %s", h->error.c_str());
     ucp_request_param_t param{};
+    ucp_tag_recv_info_t info{};  // filled only if it completes right away
+    param.op_attr_mask = UCP_OP_ATTR_FIELD_RECV_INFO;
+    param.recv_info.tag_info = &info;
     if (memory_type != kDetect) {
-        param.op_attr_mask = UCP_OP_ATTR_FIELD_MEMORY_TYPE;
+        param.op_attr_mask |= UCP_OP_ATTR_FIELD_MEMORY_TYPE;
         param.memory_type = to_ucs(memory_type);
     }
     ucs_status_ptr_t result = ucp_tag_recv_nbx(h->worker, buffer, bytes, tag,
                                                ~static_cast<ucp_tag_t>(0), &param);
-    return track(h, result, -1, bytes, false);
+    int64_t id = track(h, result, -1, bytes, false);
+    if (id >= 0 && result == nullptr) h->ops[static_cast<size_t>(id)].received = info.length;
+    return id;
 }
 
 // Wait for operations `ids` (from gb_ucx_send / gb_ucx_recv), at most `timeout_s`.
@@ -343,10 +374,9 @@ int gb_ucx_close(void* handle, double timeout_s) {
         while (ucp_request_check_status(request) == UCS_INPROGRESS && now() < deadline) {
             if (ucp_worker_progress(h->worker) == 0) sched_yield();
         }
-        if (ucp_request_check_status(request) == UCS_INPROGRESS) {
-            ucp_request_cancel(h->worker, request);
-            result = kTimedOut;
-        }
+        // Past the deadline the flush is abandoned: freeing the request lets UCX drop
+        // it, and destroying the worker below tears the endpoint down.
+        if (ucp_request_check_status(request) == UCS_INPROGRESS) result = kTimedOut;
         ucp_request_free(request);
     }
     ucp_worker_destroy(h->worker);

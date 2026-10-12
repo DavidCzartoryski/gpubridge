@@ -426,11 +426,11 @@ memory first.
 #### The UCX bridge (experimental, **not validated on GPUs or RDMA hardware**)
 
 `init(bridge="ucx")` carries the bridge over [UCX](https://openucx.org), which
-picks InfiniBand or RoCE verbs where they exist and TCP elsewhere. Where
-the local UCX is built for the GPU's memory type (CUDA or ROCm) and the NIC
-and drivers allow it, leaders' GPU tensors go straight from GPU memory to GPU
-memory (GPUDirect RDMA on NVIDIA, peer memory or dma-buf on AMD); where they
-don't, the transport stages through pinned host memory. It is a small C++
+picks InfiniBand or RoCE verbs where they exist and TCP elsewhere. Where the
+local UCX is built for the GPU's memory type (CUDA or ROCm), leaders hand their
+GPU tensors to UCX directly, and UCX is designed to use GPUDirect RDMA (or peer
+memory or dma-buf on AMD) where the NIC and drivers allow it; where the memory
+type isn't supported, the transport stages through pinned host memory. It is a small C++
 library over UCX's C API, loaded with ctypes and built on first use or with:
 
 ```bash
@@ -557,8 +557,8 @@ mixed hardware, such as monitoring or profiling tools:
   other.
 - With NaN in the data, `MAX` and `MIN` follow whatever NCCL/RCCL and Gloo do,
   which may differ (HARDWARE_VALIDATION.md item 14).
-- **Cross-vendor bandwidth is limited by design.** The bridge copies data to
-  host memory and sends it with Gloo over TCP. The RDMA-based systems
+- **Cross-vendor bandwidth is limited by design.** By default the bridge
+  copies data to host memory and sends it with Gloo over TCP. The RDMA-based systems
   published in 2026 report much higher cross-vendor bandwidth (see
   [docs/PRIOR_ART.md](docs/PRIOR_ART.md#three-2026-papers-mixed-vendor-collectives-over-rdma)).
   gpubridge trades that for running on stock PyTorch builds over any network.
@@ -569,9 +569,9 @@ mixed hardware, such as monitoring or profiling tools:
   GPUs and may not be faster there (HARDWARE_VALIDATION.md items 17 to 21 and
   25). None of them changes the limit above: all still go through host
   memory and Gloo.
-- No custom kernels. The experimental UCX bridge (`bridge="ucx"`) can move
-  GPU memory to GPU memory over RDMA, but it has run only on CPU over TCP so
-  far (HARDWARE_VALIDATION.md items 26 and 27).
+- No custom kernels. The experimental UCX bridge (`bridge="ucx"`) is meant to
+  move GPU memory over RDMA, but it has run only on CPU over TCP so far
+  (HARDWARE_VALIDATION.md items 26 and 27).
 - Designed but not implemented, each waiting on GPU results: bridge-only
   compression and a `torch.distributed` backend for FSDP2 and DeviceMesh. See
   [docs/ROADMAP.md](docs/ROADMAP.md).

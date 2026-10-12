@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import logging
 import os
+import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Sequence
@@ -36,6 +39,7 @@ TIMED_OUT, PEER_FAILED = -2, -3
 
 _lock = threading.Lock()
 _library: ctypes.CDLL | None = None
+log = logging.getLogger("gpubridge")
 
 
 class Unavailable(RuntimeError):
@@ -66,10 +70,34 @@ def _ucx_flags() -> tuple[list[str], list[str]]:
             [f for f in flags if not f.startswith("-I")])
 
 
+def _compiler() -> str | None:
+    return os.environ.get("CXX") or shutil.which("c++") or shutil.which("g++")
+
+
+def _ucx_version_text(cflags: list[str]) -> str:
+    """The UCX headers' version, so two UCX builds at the same path never share a library."""
+    for flag in [*cflags, "-I/usr/include"]:
+        header = Path(flag[2:]) / "ucp" / "api" / "ucp_version.h"
+        if header.is_file():
+            return header.read_text()
+    return ""
+
+
 def library_path() -> Path:
-    """Where the library for this source and UCX lives once built."""
+    """Where the library for this source, compiler, UCX and machine lives once built.
+
+    The cache is often a home directory shared by every node of a cluster, and in a
+    mixed job each side builds against its own UCX: anything that could change the
+    result is part of the name.
+    """
     cflags, ldflags = _ucx_flags()
-    key = hashlib.sha256(SOURCE.read_bytes() + " ".join(cflags + ldflags).encode()).hexdigest()
+    compiler = _compiler() or ""
+    version = subprocess.run([compiler, "--version"], capture_output=True, text=True).stdout \
+        if compiler else ""
+    parts = [SOURCE.read_bytes(), " ".join(cflags + ldflags).encode(), version.encode(),
+             _ucx_version_text(cflags).encode(), platform.machine().encode(),
+             " ".join(platform.libc_ver()).encode()]
+    key = hashlib.sha256(b"\0".join(parts)).hexdigest()
     base = Path(os.environ.get(LIB_DIR_ENV) or Path.home() / ".cache" / "gpubridge")
     return base / f"libgpubridge_ucx-{key[:16]}.so"
 
@@ -82,7 +110,7 @@ def build(*, force: bool = False) -> Path:
     """
     if not sys.platform.startswith("linux"):
         raise Unavailable(f"the UCX bridge is Linux only (this is {sys.platform})")
-    compiler = os.environ.get("CXX") or shutil.which("c++") or shutil.which("g++")
+    compiler = _compiler()
     if compiler is None:
         raise Unavailable("no C++ compiler (c++ or g++, or set CXX) to build the UCX bridge")
     path = library_path()
@@ -90,7 +118,10 @@ def build(*, force: bool = False) -> Path:
         return path
     cflags, ldflags = _ucx_flags()
     path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_suffix(f".{os.getpid()}.tmp")
+    # A unique name per build: two nodes sharing the cache can have the same pid.
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    partial = Path(name)
     command = [compiler, "-std=c++17", "-O2", "-fPIC", "-shared", *cflags, str(SOURCE),
                "-o", str(partial), *ldflags]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -141,7 +172,12 @@ def load(*, build_if_missing: bool = True) -> ctypes.CDLL:
             try:
                 _library = _declare(ctypes.CDLL(str(path)))
             except OSError as exc:
-                raise Unavailable(f"loading {path} failed: {exc}") from None
+                if not build_if_missing:
+                    raise Unavailable(f"loading {path} failed: {exc}") from None
+                try:  # a damaged cached build: rebuild it once
+                    _library = _declare(ctypes.CDLL(str(build(force=True))))
+                except OSError as again:
+                    raise Unavailable(f"loading {path} failed: {again}") from None
         return _library
 
 
@@ -209,4 +245,6 @@ class Worker:
     def close(self, timeout: float = 10.0) -> None:
         if self._handle is not None:
             handle, self._handle = self._handle, None
-            self._lib.gb_ucx_close(handle, timeout)
+            if self._lib.gb_ucx_close(handle, timeout) != 0:
+                log.warning("gpubridge: UCX endpoints didn't finish closing within %g s; the "
+                            "worker was torn down anyway", timeout)

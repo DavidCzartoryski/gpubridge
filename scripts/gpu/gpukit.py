@@ -40,7 +40,7 @@ REPO = Path(__file__).resolve().parents[2]
 
 #: The environment variables a record may hold: an allowlist, by exact name or
 #: prefix. Nothing else from the environment is recorded.
-ENV_PREFIXES = ("GPUBRIDGE_", "NCCL_", "RCCL_", "GLOO_", "TORCH_")
+ENV_PREFIXES = ("GPUBRIDGE_", "NCCL_", "RCCL_", "GLOO_", "TORCH_", "UCX_")
 ENV_NAMES = frozenset({
     "CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",
     "LOCAL_RANK", "RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK",

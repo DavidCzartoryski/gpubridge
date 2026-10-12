@@ -234,7 +234,11 @@ def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
     timers = sorted({r.get("timer", "host") for r in rows})
     timing = ("CUDA events on the current stream" if timers == ["cuda-events"]
               else "the host timer" if timers == ["host"] else ", ".join(timers))
-    staging = "pinned (`GPUBRIDGE_PINNED_STAGING`)" if info.get("pinned_staging") else "pageable"
+    if info.get("bridge") == "ucx" and info.get("bridge_path"):
+        staging = f"by UCX ({info['bridge_path']})"
+    else:
+        staging = ("pinned (`GPUBRIDGE_PINNED_STAGING`)" if info.get("pinned_staging")
+                   else "pageable")
     lines += [f"Run kind `{info['kind']}`, gpubridge policy `{info['policy']}`, "
               f"bridge `{info.get('bridge', 'gloo')}`, "
               f"bridge staging {staging}, {info['world_size']} ranks, "
@@ -441,8 +445,11 @@ def main() -> int:
                           f"busbw {r['busbw_GBps']} GB/s  ({r['trials']} trials)", flush=True)
         del tensor
 
+    # Every leader's own path (a mixed job's two sides may differ), not just rank 0's.
+    paths: list[str | None] = [None] * topology.world_size
+    dist.all_gather_object(paths, getattr(topology.bridge, "last_path", None))
+    info["bridge_path"] = "+".join(sorted({p for p in paths if p})) or None
     if topology.rank == 0:
-        info["bridge_path"] = getattr(topology.bridge, "last_path", None)
         args.out.mkdir(parents=True, exist_ok=True)
         with open(args.out / "bench.csv", "w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=FIELDS, extrasaction="ignore")

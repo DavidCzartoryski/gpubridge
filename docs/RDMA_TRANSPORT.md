@@ -1,7 +1,8 @@
 # An RDMA bridge transport over UCX
 
-**Status: design, with a host-memory implementation in progress. Nothing here
-has run on RDMA hardware or on a GPU.** This document turns
+**Status: implemented as an experimental transport (host and device paths),
+tested on CPU over TCP only. Nothing here has run on RDMA hardware or on a
+GPU.** This document turns
 [ROADMAP.md section 2](ROADMAP.md#2-an-rdma-bridge-transport) into a plan
 that can be built and tested without RDMA hardware, then checked on it.
 
@@ -116,18 +117,18 @@ transport, registered as `bridge="ucx"`:
 
 **Lifecycle.** One context and one worker per leader per link, owned by the
 transport object; endpoints live until `close()`. Collectives on a rank run
-one at a time (sync calls wait for queued async ones), so a single-threaded
-worker (`UCS_THREAD_MODE_SINGLE`), driven only from the thread running the
-collective, is enough.
+one at a time (sync calls wait for queued async ones), but sync ones run on
+the caller's thread and async ones on gpubridge's worker thread, so the worker
+uses `UCS_THREAD_MODE_SERIALIZED`: any thread, one at a time.
 
 **Teardown order** (`close()`, called by `gpubridge.destroy()`):
-1. Make sure no request is outstanding (every operation completes or fails
-   inside the collective that posted it, so there are none by design; a
-   leftover one is cancelled and reported).
-2. Close every endpoint with `ucp_ep_close_nbx` in flush mode, progressing the
-   worker until each close completes or the timeout passes, then force-close
-   what's left. Flush mode lets a peer still finishing its last receive get
-   its data first.
+1. Cancel any request still outstanding (every operation completes or fails
+   inside the collective that posted it, so normally there are none).
+2. Close every endpoint with `ucp_ep_close_nbx`, flushing (forced for an
+   endpoint that already failed), and progress the worker until each close
+   completes or the timeout passes. Flushing lets a peer still finishing its
+   last receive get its data first. A close still running at the timeout is
+   abandoned, logged as a warning, and torn down with the worker.
 3. Destroy the worker, then the context.
 
 ## 4. Stream ordering on GPUs
@@ -153,8 +154,10 @@ their host staging and pass the tensor straight through. The rules:
   island broadcast that follows is queued on the same stream, behind the
   reductions. A receive that lands directly in the caller's tensor is complete
   when UCX reports it, before any later kernel on any stream is launched.
-- Scratch buffers come from the caching allocator on the current stream, so
-  reuse across collectives is ordered by the allocator.
+- Scratch buffers come from the caching allocator on the current stream. UCX's
+  writes into them are not stream-ordered, so what makes their reuse safe is
+  that the host waits on the stream (above) after allocating them and before
+  posting any receive into them.
 
 ## 5. Chunking, pipelining and the algorithm
 
@@ -177,19 +180,26 @@ that carry the step and chunk number, so UCX can keep the link busy and use
 its rendezvous protocol per chunk. The pipelined policy keeps working as it
 is: it hands the transport one chunk at a time.
 
-**Tags.** A 64-bit tag holds the link number, a sequence number of the
-collective on this link, the step and the chunk. Receives match on the full
-tag, so a late message from one collective can never land in the next.
+**Tags.** A 64-bit tag holds a sequence number of the collective on this link,
+the step, the sending leader and the chunk; each link has its own worker, so
+links never see each other's messages. Receives match on the full tag, so a
+late message from one collective can never land in the next. Every receive
+also checks the length that arrived against the length posted.
+
+**Settings that decide message counts** (`GPUBRIDGE_UCX_CHUNK_BYTES`) travel
+with each leader's address, and creation fails on every rank if two leaders
+disagree, as with the UCX version.
 
 ## 6. Errors and timeouts
 
 - Every wait has a deadline: the timeout `init()` gave its groups. A collective
-  that passes it raises `RuntimeError` naming the operation, the peer and how
-  many bytes were outstanding. It does not hang.
+  that passes it raises an error saying how many operations and bytes were
+  outstanding. It does not hang.
 - An endpoint error (a peer died or the link dropped) fails the operation that
   saw it at once, with UCX's status text, instead of waiting for the deadline.
-- A failure leaves the transport unusable: later calls raise at once, and
-  `close()` force-closes. Like a NCCL error, the job is expected to stop; the
+- A failure (a timeout, a failed peer, or a send or receive that fails to
+  start) cancels what that step had posted and leaves the transport unusable:
+  later calls raise at once, and `close()` force-closes failed endpoints. Like a NCCL error, the job is expected to stop; the
   other leaders see an endpoint error or their own deadline. Ranks that aren't
   leaders are in an island collective at that point and get NCCL's or Gloo's
   own timeout, as with the Gloo bridge today.
@@ -222,8 +232,9 @@ on both CUDA and ROCm builds.
   before, and `bridge="ucx"` fails `init()` on every rank with a message
   saying what's missing (no compiler, no UCX, build error) and suggesting
   `bridge="gloo"`.
-- The probe records whether the library is built, the UCX version, and the
-  memory types it supports.
+- `python -m gpubridge.ucx info` prints the UCX version and the memory types it
+  supports; run records carry the path each leader took (`run.bridge_path`,
+  gathered from every leader) and the `UCX_*` settings.
 
 **Decision recorded:** this departs from the "torch C++ extension" in the
 original plan, for the reasons above. If a later step needs ATen types in C++
@@ -234,7 +245,8 @@ extension can be added next to this library then.
 
 - **CI (Linux, GitHub Actions):** a job installs `libucx-dev` from Ubuntu,
   builds the library, and runs the transport tests with `UCX_TLS=tcp,self`
-  (and once with UCX's own choice) between processes on one runner. The other
+  between processes on one runner. The test of UCX's own transport choice
+  skips there (section 10) and runs in the Linux containers. The other
   jobs, and macOS, skip them cleanly when the library can't be built.
 - **Bit for bit:** every transport-agnostic policy test that runs on the Gloo
   bridge also runs on `bridge="ucx"`, against `flat-gloo`, with the same exact
@@ -247,8 +259,8 @@ extension can be added next to this library then.
 - **Soft-RoCE:** tried on GitHub's runners (`modprobe rdma_rxe`, then `rdma
   link add`): not possible there, see section 10. `GPUBRIDGE_TEST_UCX_TLS=rc,self`
   runs the transport tests over verbs on any machine that has them.
-- **GPU and real RDMA:** tests marked `gpu` (and `rdma`) are written now and
-  skipped without the hardware: device tensors on the device path, stream
+- **GPU and real RDMA:** tests marked `gpu` are written now and skipped
+  without the hardware: device tensors on the device path, stream
   ordering behind queued kernels, the pinned-staging fallback, and a check
   that the run record says which path was used.
 - **Containers:** the pinned two-core Linux containers the project already

@@ -339,3 +339,45 @@ def test_leaders_with_different_ucx_versions_fail_init_on_every_rank(tmp_path):
     import torch.multiprocessing as mp
 
     mp.spawn(_mismatched_version, args=(str(tmp_path / "rdzv"),), nprocs=3)
+
+
+@needs_ucx
+def test_leaders_with_different_chunk_sizes_fail_init_on_every_rank(tmp_path):
+    good = {VENDOR_ENV: "nvidia", **TCP}
+    run_failing_init(
+        [{"env": {**good, CHUNK_BYTES_ENV: "16"}, "init_kwargs": {"bridge": "ucx"}},
+         {"env": {**good, VENDOR_ENV: "amd"}, "init_kwargs": {"bridge": "ucx"}}],
+        tmp_path,
+        [r"could not be set up", rf"{CHUNK_BYTES_ENV} is 16 here but 4194304 on rank 1"],
+    )
+
+
+def _short_message(rank, path):
+    os.environ.update(TCP)
+    worker = ucx.Worker(2)
+    with open(f"{path}.{rank}", "wb") as f:
+        f.write(worker.address())
+    other = f"{path}.{1 - rank}"
+    deadline = time.monotonic() + 30
+    while not os.path.exists(other) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.2)
+    with open(other, "rb") as f:
+        worker.connect(1 - rank, f.read())
+    buffer = torch.zeros(4, dtype=torch.int32)
+    try:
+        if rank == 0:  # 8 bytes, where rank 1 expects 16
+            worker.wait([worker.send(1, buffer.data_ptr(), 8, 77)], time.monotonic() + 10)
+        else:
+            request = worker.recv(buffer.data_ptr(), 16, 77)
+            with pytest.raises(ucx.UcxError, match="8 bytes arrived where 16 were expected"):
+                worker.wait([request], time.monotonic() + 10)
+    finally:
+        worker.close(timeout=1.0)
+
+
+@needs_ucx
+def test_a_message_shorter_than_its_receive_is_an_error_not_garbage(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(_short_message, args=(str(tmp_path / "addr"),), nprocs=2)

@@ -172,18 +172,24 @@ class UcxTransport(BridgeTransport):
         worker = ucx.Worker(len(members))
         try:
             major, minor, release = ucx.version()
-            mine = f"{major}.{minor}.{release}|" + base64.b64encode(worker.address()).decode()
+            # The chunk size decides how many messages each step sends: leaders that
+            # disagreed would match the wrong messages, so it is checked like the version.
+            mine = (f"{major}.{minor}.{release}|{chunk}|"
+                    + base64.b64encode(worker.address()).decode())
             store.set(f"{key}/addr/{rank}", mine)
             others = [m for m in members if m != rank]
             entries = _wait_for(store, [f"{key}/addr/{m}" for m in others], deadline,
                                 "the other bridge members' UCX addresses",
                                 failures=[f"{key}/status/{m}" for m in others])
             for member, entry in zip(others, entries, strict=True):
-                version, address = entry.split("|", 1)
+                version, their_chunk, address = entry.split("|", 2)
                 if version.split(".")[:2] != [str(major), str(minor)]:
                     raise RuntimeError(f"UCX {major}.{minor}.{release} here but {version} on "
                                        f"rank {member}; the bridge needs the same UCX major "
                                        "and minor version on every leader")
+                if int(their_chunk) != chunk:
+                    raise RuntimeError(f"{CHUNK_BYTES_ENV} is {chunk} here but {their_chunk} "
+                                       f"on rank {member}; set the same value on every rank")
                 worker.connect(members.index(member), base64.b64decode(address))
             transport = cls(worker, members, rank, timeout, chunk)
             transport._handshake(deadline)
