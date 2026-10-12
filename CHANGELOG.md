@@ -5,6 +5,19 @@ release so far is an alpha that is **validated on CPU only**. Nothing has run
 on a GPU yet: [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what
 still needs real hardware. Numbers in parentheses are pull requests.
 
+## [Unreleased]
+
+### Added
+
+- An experimental UCX bridge, `init(bridge="ucx")` (**not validated on GPUs or
+  RDMA hardware**; tested on CPU over UCX's TCP transport). It carries the
+  leaders' bridge over InfiniBand or RoCE where UCX finds them. Leaders hand
+  GPU tensors to UCX directly where its build has their memory type, and
+  flush the NIC's writes into the GPU after every receive, since UCX doesn't.
+  Elsewhere, GPU tensors are staged through pinned host memory. It is a small
+  C++ library over UCX, built on first use (`python -m gpubridge.ucx build`).
+  Design and open questions: docs/RDMA_TRANSPORT.md (#35).
+
 ## [0.3.0-alpha] - 2026-10-12
 
 CPU-validated, with the GPU validation kit ready for a first GPU run. Not on
@@ -123,6 +136,7 @@ CPU-validated, GPU validation pending.
 - A CPU-only matrix showing CUDA and ROCm builds of PyTorch can share one job
   (#1, #4), and prior-art notes (#2, #6).
 
+[Unreleased]: https://github.com/DavidCzartoryski/gpubridge/compare/v0.3.0-alpha...main
 [0.3.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.3.0-alpha
 [0.2.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.2.0-alpha
 [0.1.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.1.0-alpha
