@@ -9,14 +9,15 @@ still needs real hardware. Numbers in parentheses are pull requests.
 
 ### Added
 
-- An experimental UCX bridge, `init(bridge="ucx")` (**not validated on GPUs or
-  RDMA hardware**; tested on CPU over UCX's TCP transport). It carries the
-  leaders' bridge over InfiniBand or RoCE where UCX finds them. Leaders hand
-  GPU tensors to UCX directly where its build has their memory type, and
-  flush the NIC's writes into the GPU after every receive, since UCX doesn't.
-  Elsewhere, GPU tensors are staged through pinned host memory. It is a small
-  C++ library over UCX, built on first use (`python -m gpubridge.ucx build`).
-  Design and open questions: docs/RDMA_TRANSPORT.md (#35).
+- An opt-in UCX bridge transport, `init(bridge="ucx")`, **not validated on
+  GPUs or RDMA hardware** (tested on CPU over UCX's TCP transport only); the
+  Gloo bridge stays the default. It carries the leaders' bridge over
+  InfiniBand or RoCE where UCX finds them. Leaders hand GPU tensors to UCX
+  directly where its build has their memory type, and flush the NIC's writes
+  into the GPU after every receive, since UCX doesn't. Elsewhere, GPU tensors
+  are staged through pinned host memory. It is a small C++ library over UCX,
+  built on first use (`python -m gpubridge.ucx build`). Design and open
+  questions: docs/RDMA_TRANSPORT.md (#35).
 
 ## [0.3.0-alpha] - 2026-10-12
 
