@@ -37,8 +37,10 @@ except ucx.Unavailable as exc:
 needs_ucx = pytest.mark.skipif(UNAVAILABLE is not None,
                                reason=f"UCX bridge unavailable: {UNAVAILABLE}")
 
-#: Over TCP between the processes, as between two hosts.
-TCP = {"UCX_TLS": "tcp,self", "UCX_WARN_UNUSED_ENV_VARS": "n"}
+#: Over TCP between the processes, as between two hosts. GPUBRIDGE_TEST_UCX_TLS
+#: picks other transports, e.g. "rc,self" over Soft-RoCE in CI's experimental job.
+TCP = {"UCX_TLS": os.environ.get("GPUBRIDGE_TEST_UCX_TLS", "tcp,self"),
+       "UCX_WARN_UNUSED_ENV_VARS": "n"}
 
 #: (vendors, island labels if patched): 2, 3 and 4 leaders.
 LAYOUTS = {
