@@ -230,6 +230,30 @@ def test_step_05_two_nodes(tmp_path):
     assert {row["policy"] for row in data["predicted"]} >= {"sharded-bridge"}
 
 
+def test_a_two_node_rendezvous_never_looks_up_the_host_name(tmp_path):
+    # Steps 05 and 07 start one torchrun per pretend node with a c10d rendezvous
+    # on 127.0.0.1. Unless told its address, torchrun uses socket.getfqdn() for
+    # the node hosting the rendezvous's store; on macOS that can name an address
+    # that doesn't resolve (the reverse name of ::1), and the other node waits
+    # until it times out. Here getfqdn() names one that never resolves, on any
+    # machine, and the rendezvous must still complete through the fake srun.
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(
+        "import socket\nsocket.getfqdn = lambda name='': 'unresolvable.invalid'\n")
+    worker = tmp_path / "worker.py"
+    worker.write_text("import os\nprint(os.environ['RANK'], os.environ['MASTER_ADDR'])\n")
+    env = cluster_env(tmp_path, PYTHONPATH=str(site))
+    result = subprocess.run(
+        ["srun", "--nodes=2", "--ntasks-per-node=1", "--kill-on-bad-exit=1", sys.executable,
+         "-m", "torch.distributed.run", "--nnodes=2", "--nproc-per-node=1",
+         "--rdzv-backend=c10d", f"--rdzv-endpoint=127.0.0.1:{_free_port()}",
+         "--rdzv-id=fqdn", "--rdzv-conf=join_timeout=60", str(worker)],
+        env=env, capture_output=True, text=True, timeout=180)
+    assert result.returncode == 0, result.stderr[-4000:]
+    assert sorted(result.stdout.split("\n")[:-1]) == ["0 127.0.0.1", "1 127.0.0.1"]
+
+
 @pytest.mark.parametrize(("names", "extra", "seen"), [
     (("ib0", "eth1"), {}, ["node 0: ib0", "node 1: eth1"]),  # e.g. two partitions
     (("ib0", "ib0"), {}, ["node 0: ib0", "node 1: ib0"]),
