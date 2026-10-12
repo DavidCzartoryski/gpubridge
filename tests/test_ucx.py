@@ -38,7 +38,7 @@ needs_ucx = pytest.mark.skipif(UNAVAILABLE is not None,
                                reason=f"UCX bridge unavailable: {UNAVAILABLE}")
 
 #: Over TCP between the processes, as between two hosts. GPUBRIDGE_TEST_UCX_TLS
-#: picks other transports, e.g. "rc,self" over Soft-RoCE in CI's experimental job.
+#: picks other transports, e.g. "rc,self" on a machine with RDMA.
 TCP = {"UCX_TLS": os.environ.get("GPUBRIDGE_TEST_UCX_TLS", "tcp,self"),
        "UCX_WARN_UNUSED_ENV_VARS": "n"}
 
@@ -161,9 +161,15 @@ def test_every_policy_on_the_ucx_bridge_matches_flat_gloo(vendors, labels, polic
 
 
 @needs_ucx
-def test_the_ucx_bridge_with_ucxs_own_choice_of_transport(tmp_path):
+def test_the_ucx_bridge_with_ucxs_own_choice_of_transport(tmp_path, monkeypatch):
     # No UCX_TLS: UCX picks among the transports that can report a failed peer
-    # (not shared memory, which can't), as it would on a cluster.
+    # (not shared memory, which can't), as it would on a cluster. Some machines
+    # have a device UCX finds but can't use (GitHub's runners do); skip there.
+    monkeypatch.delenv("UCX_TLS", raising=False)
+    try:
+        ucx.Worker(1).close()
+    except ucx.UcxError as exc:
+        pytest.skip(f"UCX's default transports don't initialize here: {exc}")
     env = {"UCX_WARN_UNUSED_ENV_VARS": "n"}
     run_ranks(LAYOUTS["2+2"][0],
               partial(_check_matches_flat_gloo, policy="reduce-bridge-broadcast"), tmp_path,

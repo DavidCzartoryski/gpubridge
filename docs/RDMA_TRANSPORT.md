@@ -244,9 +244,9 @@ extension can be added next to this library then.
   message; teardown with an operation outstanding; large tensors, odd sizes,
   every dtype; the chunked path with a tiny chunk size; MAX and MIN; three and
   four leaders (the ring).
-- **Soft-RoCE:** an experimental CI job tries `modprobe rdma_rxe` and
-  `rdma link add` on the GitHub runner and, if it works, runs the tests over
-  verbs (`UCX_TLS=rc,self`). Result recorded in section 10.
+- **Soft-RoCE:** tried on GitHub's runners (`modprobe rdma_rxe`, then `rdma
+  link add`): not possible there, see section 10. `GPUBRIDGE_TEST_UCX_TLS=rc,self`
+  runs the transport tests over verbs on any machine that has them.
 - **GPU and real RDMA:** tests marked `gpu` (and `rdma`) are written now and
   skipped without the hardware: device tensors on the device path, stream
   ordering behind queued kernels, the pinned-staging fallback, and a check
@@ -273,9 +273,18 @@ extension can be added next to this library then.
 
 ## 10. Results so far
 
-- Host-memory path over TCP: see the transport tests in CI (step 7b and 7c).
-- Soft-RoCE on GitHub's runners: to be recorded after the experimental job
-  runs.
+- Host-memory path over TCP: every bridge policy on two, three and four
+  leaders, bit for bit against `flat-gloo`, in Linux containers (UCX 1.18.1)
+  and in CI on GitHub's Ubuntu runners (UCX 1.16).
+- Soft-RoCE on GitHub's runners (tried 2026-10-12): **not possible.** They run
+  an Azure kernel (6.17.0-1022-azure) without `rdma_rxe`, even after installing
+  `linux-modules-extra` for it. So CI can't exercise verbs; that has to wait for
+  real hardware or a self-hosted runner.
+- The same runners expose an RDMA-capable device that UCX's `rc` transport
+  finds but can't use (`ibv_create_srq() failed: Operation not supported`), and
+  UCX's default transport choice then fails to initialize. CI pins
+  `UCX_TLS=tcp,self`, and the transport's error now says to set `UCX_TLS` or
+  `UCX_NET_DEVICES` when this happens. Expect the same on some cloud VMs.
 - Nothing has run on RDMA hardware or a GPU.
 
 ## Plan

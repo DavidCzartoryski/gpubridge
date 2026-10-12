@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"library: {ucx.library_path()}\nUCX {major}.{minor}.{release}\n"
               f"memory types: {types}")
         return 0
-    except ucx.Unavailable as exc:
+    except (ucx.Unavailable, ucx.UcxError) as exc:
         print(f"UCX bridge unavailable: {exc}", file=sys.stderr)
         return 1
 

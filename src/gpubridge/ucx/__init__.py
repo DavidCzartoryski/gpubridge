@@ -160,7 +160,10 @@ class Worker:
         error = ctypes.create_string_buffer(512)
         handle = self._lib.gb_ucx_create(members, error, len(error))
         if not handle:
-            raise UcxError(error.value.decode())
+            raise UcxError(
+                f"{error.value.decode()}. UCX uses every transport it finds; if one of them "
+                "can't actually be used here (common on cloud VMs), set UCX_TLS (e.g. "
+                "tcp,self, or rc,self on InfiniBand) or UCX_NET_DEVICES")
         self._handle: int | None = handle
 
     def _check(self, result: int) -> int:

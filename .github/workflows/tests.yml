@@ -43,6 +43,10 @@ jobs:
     name: ucx bridge (3.12)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # The runners expose an RDMA device UCX finds but can't use (ibv_create_srq
+      # fails), so its default transport choice can't initialize there.
+      UCX_TLS: tcp,self
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.2.0
@@ -55,40 +59,3 @@ jobs:
       - run: uv pip install -e ".[test]"
       - run: python -m gpubridge.ucx build && python -m gpubridge.ucx info
       - run: pytest tests/test_ucx.py -rs
-
-  soft-roce:
-    # Experimental: can a GitHub runner load Soft-RoCE (rdma_rxe), so the UCX
-    # bridge runs over verbs without RDMA hardware? The result is recorded in
-    # docs/RDMA_TRANSPORT.md; a failure here doesn't fail the workflow.
-    name: ucx bridge over Soft-RoCE (experimental)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.2.0
-        with:
-          python-version: "3.12"
-          activate-environment: true
-      - run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libucx-dev ucx-utils rdma-core ibverbs-utils iproute2
-          sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" || echo "no linux-modules-extra for $(uname -r)"
-      - name: Load rdma_rxe and add a Soft-RoCE device
-        run: |
-          uname -r
-          sudo modprobe rdma_rxe
-          netdev=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
-          sudo rdma link add rxe0 type rxe netdev "$netdev"
-          rdma link
-          ibv_devices
-          ibv_devinfo -d rxe0 | head -n 20
-          ucx_info -d | grep -E "Transport|Device" | sort -u
-      - run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: uv pip install -e ".[test]"
-      - run: python -m gpubridge.ucx build
-      - name: UCX bridge tests over verbs (rc) on rxe0
-        env:
-          GPUBRIDGE_TEST_UCX_TLS: "rc,self"
-          UCX_NET_DEVICES: "rxe0:1"
-        run: pytest tests/test_ucx.py -rs -k "matches_flat_gloo or large"
