@@ -332,6 +332,26 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     steps 04, 05 and 07 and `amd/run_all.sh`, right after the pageable
     benchmark in the same allocation (`bench`, or `bench_split_by_node` in
     step 05); compare their gpubridge rows and `bridge` phases.
+26. **The UCX bridge (`bridge="ucx"`) is correct on GPUs, between real NVIDIA
+    and AMD leaders.** Each side builds the library against its own UCX
+    (CUDA-built on NVIDIA, ROCm-built on AMD); the handshake refuses
+    mismatched UCX versions. GPU tensors go to UCX directly where its build
+    has the memory type, and through pinned host memory where it doesn't; the
+    run record says which (`run.bridge_path`). Check results bit for bit
+    against `flat-gloo`, and that `direct` is what was used where GPUDirect
+    RDMA (or ROCm peer memory, or dma-buf) is available.
+    *Status: works on CPU over UCX's TCP transport, every bridge policy on two,
+    three and four leaders (`tests/test_ucx.py`); the device path's GPU tests
+    are written (`tests/test_gpu.py`). Nothing has run on RDMA hardware.*
+    *Step:* `ucx_build` and `check_ucx` in Explorer steps 05 and 07, with
+    `UCX_BRIDGE=1`. See [docs/RDMA_TRANSPORT.md](docs/RDMA_TRANSPORT.md) for
+    the questions to settle first (InfiniBand on the GPU nodes, GPUDirect
+    RDMA, a UCX module).
+27. **The UCX bridge against the Gloo bridge.** The bridge phase over UCX
+    (RDMA where available) next to the Gloo bridge's, at each size, and against
+    the preflight's TCP prediction, which RDMA should beat.
+    *Status: not run.* *Step:* `bench_ucx` in steps 05 and 07 with
+    `UCX_BRIDGE=1`; compare with the Gloo benchmark of the same job.
 
 ## Mixed build results
 

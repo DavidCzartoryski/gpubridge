@@ -229,6 +229,9 @@ def run_info(topology: gpubridge.Topology) -> dict[str, Any]:
             for island in topology.layout.islands
         ],
         "bridge": topology.peers[topology.rank].bridge,
+        # bridge="ucx" on a leader: the path its last collective took (host, direct
+        # or staged); scripts refresh it after their collectives. None otherwise.
+        "bridge_path": getattr(topology.bridge, "last_path", None),
         "policy": topology.policy_name,
         # GPUBRIDGE_PINNED_STAGING: the default bridge stages through pinned memory.
         "pinned_staging": topology.pinned_staging,

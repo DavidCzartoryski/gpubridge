@@ -109,6 +109,8 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
     23: ("What `gpubridge.in_flight()` shows on GPUs", [stage("in_flight", GPU_KINDS)]),
     24: ("No island puts two ranks on one GPU", [Step("shared_gpu_check")]),
     25: ("Pinned staging for the default bridge", [Step("check_pinned"), Step("bench_pinned")]),
+    26: ("The UCX bridge is correct on GPUs", [Step("ucx_build"), Step("check_ucx")]),
+    27: ("The UCX bridge against the Gloo bridge", [Step("bench_ucx")]),
 }
 
 
@@ -362,7 +364,7 @@ def bench_rows(jobs: list[Job]) -> list[dict[str, Any]]:
                 base = baseline_us(by_op, baseline)
                 row = {"job": job.name, "bench": directory, "simulated": job.simulated,
                        "run_kind": bench.get("run", {}).get("kind"),
-                       "staging": _staging(bench),
+                       "bridge": _bridge(bench), "staging": _staging(bench),
                        "timer": next(iter(by_op.values())).get("timer", "host"),
                        "baseline": baseline, "bytes": size, "baseline_us": base}
                 for op in ("gpubridge", "flat-gloo"):
@@ -374,7 +376,16 @@ def bench_rows(jobs: list[Job]) -> list[dict[str, Any]]:
 
 
 def _staging(bench: dict[str, Any]) -> str:
-    return "pinned" if bench.get("run", {}).get("pinned_staging") else "pageable"
+    """How the gpubridge op's bridge reached host memory: pinned, pageable, or (UCX)
+    the path its transport took."""
+    run = bench.get("run", {})
+    if run.get("bridge_path") in ("direct", "staged"):
+        return f"ucx {run['bridge_path']}"
+    return "pinned" if run.get("pinned_staging") else "pageable"
+
+
+def _bridge(bench: dict[str, Any]) -> str:
+    return bench.get("run", {}).get("bridge") or "gloo"
 
 
 def predicted_bridge_ms(nbytes: int, islands: int, mbps: float, rtt_ms: float) -> float:
@@ -404,7 +415,8 @@ def prediction_rows(jobs: list[Job]) -> list[dict[str, Any]]:
                 predicted = predicted_bridge_ms(r["bytes"], r["islands"], mbps,
                                                 bandwidth["rtt_ms"])
                 rows.append({"job": job.name, "bench": directory, "simulated": job.simulated,
-                             "policy": r.get("policy"), "staging": _staging(bench),
+                             "policy": r.get("policy"), "bridge": _bridge(bench),
+                             "staging": _staging(bench),
                              "bytes": r["bytes"],
                              "MBps": mbps, "rtt_ms": bandwidth["rtt_ms"],
                              "predicted_ms": round(predicted, 3),
@@ -477,9 +489,11 @@ def markdown(tables: dict[str, Any]) -> str:
               "Median latency of the slowest rank. `island-native (fewer ranks, best case)` "
               "is each island's own all_reduce: a lower bound, not like for like.", ""]
     lines += table(
-        ["Job / bench", "Run kind", "Staging", "Timer", "Size", "Baseline", "Baseline (us)",
-         "gpubridge (us)", "flat-gloo (us)", "gpubridge / baseline", "flat-gloo / baseline"],
-        [[sim(r, f"{r['job']}/{r['bench']}"), r["run_kind"], r["staging"], r["timer"],
+        ["Job / bench", "Run kind", "Bridge", "Staging", "Timer", "Size", "Baseline",
+         "Baseline (us)", "gpubridge (us)", "flat-gloo (us)", "gpubridge / baseline",
+         "flat-gloo / baseline"],
+        [[sim(r, f"{r['job']}/{r['bench']}"), r["run_kind"], r["bridge"], r["staging"],
+          r["timer"],
           human(r["bytes"]), r["baseline"], r["baseline_us"], r["gpubridge_us"], r["flat-gloo_us"],
           r["gpubridge_over_baseline"], r["flat-gloo_over_baseline"]]
          for r in tables["benchmarks"]])
@@ -487,11 +501,14 @@ def markdown(tables: dict[str, Any]) -> str:
               "Predicted: (p-1) round trips plus 2(p-1)/p of the tensor over the preflight's "
               "slower direction, p = number of islands. Measured: the benchmark's `bridge` "
               "phase on the slowest leader, which also includes the copies to and from the "
-              "host. See the runbook's \"Predicted vs measured\".", ""]
+              "host. The preflight measures TCP from Python, so for the UCX bridge over "
+              "RDMA a ratio well below 1 is the point, not an error. See the runbook's "
+              "\"Predicted vs measured\".", ""]
     lines += table(
-        ["Job / bench", "Policy", "Staging", "Size", "MB/s (slower way)", "Round trip (ms)",
-         "Predicted (ms)", "Measured (ms)", "Measured / predicted"],
-        [[sim(r, f"{r['job']}/{r['bench']}"), r["policy"], r["staging"], human(r["bytes"]),
+        ["Job / bench", "Policy", "Bridge", "Staging", "Size", "MB/s (slower way)",
+         "Round trip (ms)", "Predicted (ms)", "Measured (ms)", "Measured / predicted"],
+        [[sim(r, f"{r['job']}/{r['bench']}"), r["policy"], r["bridge"], r["staging"],
+          human(r["bytes"]),
           r["MBps"], r["rtt_ms"], r["predicted_ms"], r["measured_ms"],
           r["measured_over_predicted"]]
          for r in tables["predicted"]])

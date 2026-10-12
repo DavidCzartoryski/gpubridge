@@ -419,7 +419,33 @@ picked different transports fails at `init()` instead of hanging. Policies
 with more than one bridge link, such as `sharded-bridge`, make the extra links
 with the same transport through `create_groups`.
 `tests/_transports.py` has a working example that carries the bridge over a
-c10d `FileStore`.
+c10d `FileStore`. A transport that sets `device_tensors = True` also takes GPU
+tensors; the default policy then hands them over without copying to host
+memory first.
+
+#### The UCX bridge (experimental, **not validated on GPUs or RDMA hardware**)
+
+`init(bridge="ucx")` carries the bridge over [UCX](https://openucx.org), which
+picks InfiniBand or RoCE verbs where they exist and TCP elsewhere. Where
+the local UCX is built for the GPU's memory type (CUDA or ROCm) and the NIC
+and drivers allow it, leaders' GPU tensors go straight from GPU memory to GPU
+memory (GPUDirect RDMA on NVIDIA, peer memory or dma-buf on AMD); where they
+don't, the transport stages through pinned host memory. It is a small C++
+library over UCX's C API, loaded with ctypes and built on first use or with:
+
+```bash
+python -m gpubridge.ucx build    # needs a C++ compiler and UCX (UCX_HOME, or pkg-config ucx)
+python -m gpubridge.ucx info     # UCX version and the memory types it supports
+```
+
+Linux only, and optional: nothing is compiled at install time, and without UCX
+every other bridge works as before while `bridge="ucx"` fails `init()` on every
+rank saying what's missing. Each leader can run its own UCX build (CUDA-built
+on NVIDIA, ROCm-built on AMD); the handshake refuses UCX versions whose major
+or minor differ. `GPUBRIDGE_UCX_CHUNK_BYTES` (default `4M`) sets the message
+size. On CPU it is tested over UCX's TCP transport with every bridge policy;
+the design, the GPU-memory rules and what's still open are in
+[docs/RDMA_TRANSPORT.md](docs/RDMA_TRANSPORT.md).
 
 ### Observing collectives
 
@@ -543,11 +569,12 @@ mixed hardware, such as monitoring or profiling tools:
   GPUs and may not be faster there (HARDWARE_VALIDATION.md items 17 to 21 and
   25). None of them changes the limit above: all still go through host
   memory and Gloo.
-- No custom kernels and no direct RDMA between vendors. A GPU-to-GPU transport
-  would plug in through `BridgeTransport`.
+- No custom kernels. The experimental UCX bridge (`bridge="ucx"`) can move
+  GPU memory to GPU memory over RDMA, but it has run only on CPU over TCP so
+  far (HARDWARE_VALIDATION.md items 26 and 27).
 - Designed but not implemented, each waiting on GPU results: bridge-only
-  compression, an RDMA bridge transport, and a `torch.distributed` backend for
-  FSDP2 and DeviceMesh. See [docs/ROADMAP.md](docs/ROADMAP.md).
+  compression and a `torch.distributed` backend for FSDP2 and DeviceMesh. See
+  [docs/ROADMAP.md](docs/ROADMAP.md).
 - No GPU numbers yet: everything above is tested on CPU (see
   [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)).
 

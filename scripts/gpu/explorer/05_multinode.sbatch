@@ -71,6 +71,19 @@ step summarize_pinned python "$KIT_DIR/summarize.py" "$RESULTS/check_pinned"
 step bench_pinned multinode bench-pinned "$KIT_DIR/bench_all_reduce.py" \
     --out "$RESULTS/bench_pinned" --max-bytes "$BENCH_MAX_BYTES" --ops gpubridge --phases
 unset GPUBRIDGE_PINNED_STAGING
+# The UCX bridge (docs/RDMA_TRANSPORT.md), opt-in with UCX_BRIDGE=1: built on
+# both nodes, then the check and the gpubridge benchmark over bridge="ucx", next
+# to the Gloo bridge's above (items 26 and 27).
+if [ "$UCX_BRIDGE" = 1 ]; then
+    step ucx_build limited srun --nodes=2 --ntasks-per-node=1 --kill-on-bad-exit=1 \
+        python -m gpubridge.ucx build
+    step check_ucx multinode check-ucx "$KIT_DIR/check.py" --out "$RESULTS/check_ucx" \
+        --bridge ucx
+    step summarize_ucx python "$KIT_DIR/summarize.py" "$RESULTS/check_ucx"
+    step bench_ucx multinode bench-ucx "$KIT_DIR/bench_all_reduce.py" \
+        --out "$RESULTS/bench_ucx" --max-bytes "$BENCH_MAX_BYTES" --ops gpubridge --phases \
+        --bridge ucx
+fi
 # Opt-in policies with the bridge crossing the network (items 17 to 21): the
 # check, and each policy's phases, so its bridge step can be read on its own.
 for policy in $OPT_IN_POLICIES; do
