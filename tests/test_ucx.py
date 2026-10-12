@@ -310,3 +310,26 @@ def test_the_default_policy_hands_gpu_tensors_to_a_device_transport(
         tensor = torch.ones(3)
         assert policy._to_host(tensor) is tensor
         policy._to_device(tensor, tensor)  # nothing to copy back
+
+
+def _mismatched_version(rank, init_file):
+    os.environ.update({VENDOR_ENV: "nvidia" if rank == 0 else "amd", **TCP})
+    if rank == 1:
+        real = ucx.version
+        ucx.version = lambda: (real()[0], real()[1] + 1, 0)
+    try:
+        gpubridge.init(init_method=f"file://{init_file}", rank=rank, world_size=3,
+                       bridge="ucx", timeout=timedelta(seconds=60))
+    except RuntimeError as exc:
+        assert "same UCX major and minor version" in str(exc), str(exc)
+        assert not gpubridge.is_initialized()
+    else:
+        gpubridge.destroy()
+        raise AssertionError(f"rank {rank}: init() succeeded with mismatched UCX versions")
+
+
+@needs_ucx
+def test_leaders_with_different_ucx_versions_fail_init_on_every_rank(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(_mismatched_version, args=(str(tmp_path / "rdzv"),), nprocs=3)
