@@ -375,11 +375,12 @@ def predicted_bridge_ms(nbytes: int, islands: int, mbps: float, rtt_ms: float) -
     """What the preflight's numbers predict for the bridge's Gloo all_reduce.
 
     The leaders' ring all_reduce sends 2(p-1)/p of the tensor each way, with p
-    leaders (one per island): the whole tensor for two islands. Add one
-    round trip for the ring's steps. ``mbps`` is the slower direction, in MB/s.
+    leaders (one per island): the whole tensor for two islands. Its 2(p-1)
+    steps take about half a round trip each: (p-1) round trips, one for two
+    islands. ``mbps`` is the slower direction, in MB/s.
     """
     factor = 2 * (islands - 1) / islands
-    return rtt_ms + factor * nbytes / (mbps * 1e6) * 1e3
+    return (islands - 1) * rtt_ms + factor * nbytes / (mbps * 1e6) * 1e3
 
 
 def prediction_rows(jobs: list[Job]) -> list[dict[str, Any]]:
@@ -476,7 +477,7 @@ def markdown(tables: dict[str, Any]) -> str:
           r["gpubridge_over_baseline"], r["flat-gloo_over_baseline"]]
          for r in tables["benchmarks"]])
     lines += ["", "## Predicted vs measured bridge time", "",
-              "Predicted: one round trip plus 2(p-1)/p of the tensor over the preflight's "
+              "Predicted: (p-1) round trips plus 2(p-1)/p of the tensor over the preflight's "
               "slower direction, p = number of islands. Measured: the benchmark's `bridge` "
               "phase on the slowest leader, which also includes the copies to and from the "
               "host. See the runbook's \"Predicted vs measured\".", ""]

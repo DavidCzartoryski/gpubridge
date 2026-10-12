@@ -477,6 +477,37 @@ def test_check_in_a_split_test_is_flagged_everywhere(tmp_path):
     assert json.loads((out / "summary.json").read_text())["split_test"] == "half"
 
 
+@pytest.mark.parametrize("delayed", [0, 2])  # island A's leader, island B's leader
+def test_in_flight_stage_does_not_need_ranks_to_arrive_together(delayed, tmp_path):
+    # One rank reaches the in_flight stage 1.5 s after the others, as after a slow
+    # previous stage on a loaded machine. Every rank must still record its view
+    # while the late rank is missing.
+    wrapper = tmp_path / "check_skewed.py"
+    wrapper.write_text(f"""import sys, time
+sys.path.insert(0, {str(KIT)!r})
+sys.argv[0] = {str(KIT / "check.py")!r}
+import check
+stage = check.in_flight_while_late
+
+def skewed(rank, *args, **kwargs):
+    if rank == {delayed}:
+        time.sleep(1.5)
+    return stage(rank, *args, **kwargs)
+
+check.in_flight_while_late = skewed
+sys.exit(check.main())
+""")
+    out = tmp_path / "check"
+    result = torchrun(4, wrapper, "--out", str(out), GPUBRIDGE_VENDOR="nvidia",
+                      GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode == 0, result.stderr[-3000:]
+    phases = {}
+    for record in read_ranks(out):
+        flights = next(s for s in record["stages"] if s["name"] == "in_flight")["in_flight"]
+        phases[record["run"]["rank"]] = flights[0]["phase"] if flights else None
+    assert phases == {0: "bridge", 1: "island-broadcast", 2: "island-reduce", 3: None}
+
+
 @pytest.mark.parametrize(
     ("pattern", "ok"),
     [("doesn't apply to this cluster", True), ("LOCAL_RANK", False)],
@@ -519,6 +550,10 @@ def test_check_without_split_is_not_flagged(tmp_path):
     for record in read_ranks(out):
         assert record["run"]["split_test"] is None
         assert "warning" not in record["run"]
+    # One island: rank 0 waits inside the all_reduce, the late rank 1 shows nothing.
+    flights = [next(s for s in record["stages"] if s["name"] == "in_flight")["in_flight"]
+               for record in read_ranks(out)]
+    assert [f["op"] for f in flights[0]] == ["all_reduce"] and flights[1] == []
     summarize.main([str(out)])
     assert "SPLIT TEST" not in (out / "summary.md").read_text()
 
@@ -787,8 +822,9 @@ def test_redact_replaces_paths_users_and_url_credentials(monkeypatch):
 def test_predicted_bridge_time_is_a_round_trip_plus_the_ring_traffic():
     # Two islands: the whole tensor each way. 100 MB at 100 MB/s is a second.
     assert validation_tables.predicted_bridge_ms(10**8, 2, 100.0, 0.5) == pytest.approx(1000.5)
-    # Four islands send 2(p-1)/p = 1.5 times the tensor.
+    # Four islands send 2(p-1)/p = 1.5 times the tensor, and wait p-1 = 3 round trips.
     assert validation_tables.predicted_bridge_ms(10**8, 4, 100.0, 0.0) == pytest.approx(1500)
+    assert validation_tables.predicted_bridge_ms(10**8, 4, 100.0, 0.5) == pytest.approx(1501.5)
 
 
 def test_verdict_counts_only_gpu_runs():

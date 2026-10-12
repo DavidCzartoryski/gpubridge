@@ -286,7 +286,11 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     island-broadcast and island-reduce on the others), with and without
     observers; async collectives show on the worker thread; nested phases and
     failed calls are tracked (`tests/test_observe.py`).* *Step:* the
-    `in_flight` stage of `check.py`, in every step that runs it.
+    `in_flight` stage of `check.py`, in every step that runs it. The late rank
+    joins only once every other rank's view has stayed the same for
+    `--in-flight-settle` seconds (1 by default), in an order the job's store
+    enforces, so a loaded machine changes how long the stage takes, not what
+    it records.
 24. **No island puts two ranks on one GPU.** NCCL and RCCL refuse two ranks
     of one communicator on the same GPU, and an island is one communicator.
     Split-test mode lets ranks share GPUs, so a layout such as 4 ranks on a
