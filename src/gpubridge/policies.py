@@ -242,10 +242,39 @@ class ReduceBridgeBroadcast(CollectivePolicy):
 
     reduce_scatter_tensor: island reduce onto the leader, bridge all_reduce of
     the whole input, then each leader scatters its island members' slices.
+
+    Leaders copy to host memory with ``.cpu()`` (pageable) by default. With
+    ``GPUBRIDGE_PINNED_STAGING=1`` the bridge steps of all_reduce, broadcast and
+    reduce_scatter_tensor go through one pinned buffer per leader instead
+    (:class:`gpubridge.staging.PinnedBridgeStaging`), so one allocation can
+    compare the two. all_gather_into_tensor keeps pageable buffers.
     """
 
     name = "reduce-bridge-broadcast"
     reduce_ops = frozenset({"sum", "max", "min"})
+    #: Pinned staging, when ``GPUBRIDGE_PINNED_STAGING`` is on and this rank is a GPU
+    #: leader; None otherwise, and always None in subclasses that set up their own.
+    staging_buffer: _staging.BridgeStaging | None = None
+
+    def setup(self, topology: Topology) -> None:
+        if topology.pinned_staging and topology.layout.needs_bridge and topology.is_leader:
+            self.staging_buffer = _staging.make_bridge_staging(topology.device)
+
+    def close(self) -> None:
+        if self.staging_buffer is not None:
+            self.staging_buffer.close()
+            self.staging_buffer = None
+
+    def _to_host(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.staging_buffer is not None:
+            return self.staging_buffer.to_host(tensor)
+        return _stage_to_host(tensor)
+
+    def _to_device(self, tensor: torch.Tensor, host: torch.Tensor) -> None:
+        if self.staging_buffer is not None:
+            self.staging_buffer.to_device(tensor, host)
+        elif host is not tensor:
+            tensor.copy_(host)
 
     @classmethod
     def applies_to(cls, layout: Layout) -> bool:
@@ -263,10 +292,9 @@ class ReduceBridgeBroadcast(CollectivePolicy):
         if topology.is_leader:
             assert topology.bridge is not None
             with phase("bridge"):
-                staged = _stage_to_host(tensor)
+                staged = self._to_host(tensor)
                 _bridge_all_reduce(topology.bridge, staged, op)
-                if staged is not tensor:
-                    tensor.copy_(staged)
+                self._to_device(tensor, staged)
         with phase("island-broadcast"):
             dist.broadcast(tensor, src=leader, group=topology.island_group)
 
@@ -279,10 +307,10 @@ class ReduceBridgeBroadcast(CollectivePolicy):
         if topology.is_leader:
             assert topology.bridge is not None
             with phase("bridge"):
-                staged = _stage_to_host(tensor)
+                staged = self._to_host(tensor)
                 topology.bridge.broadcast(staged, src=src_island.leader)
-                if not in_src_island and staged is not tensor:
-                    tensor.copy_(staged)
+                if not in_src_island:
+                    self._to_device(tensor, staged)
         if not in_src_island:
             with phase("island-broadcast"):
                 dist.broadcast(tensor, src=topology.island.leader, group=topology.island_group)
@@ -320,10 +348,9 @@ class ReduceBridgeBroadcast(CollectivePolicy):
         if topology.is_leader:
             assert topology.bridge is not None
             with phase("bridge"):
-                staged = _stage_to_host(work)
+                staged = self._to_host(work)
                 topology.bridge.all_reduce(staged)
-                if staged is not work:
-                    work.copy_(staged)
+                self._to_device(work, staged)
         with phase("island-scatter"):
             slices = work.view(world, -1)
             dist.scatter(output.view(-1),

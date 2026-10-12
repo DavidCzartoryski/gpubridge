@@ -1,4 +1,4 @@
-"""A staging layer that checks the pipelined bridge's ordering on CPU.
+"""Staging layers that check the bridge's copy ordering on CPU.
 
 A GPU runs queued copies whenever it gets to them, so the pipeline may only
 rely on the events it waits for. LazyStaging makes that literal: a copy runs
@@ -15,7 +15,7 @@ from collections import deque
 import torch
 
 from gpubridge.policies import PipelinedReduceBridgeBroadcast
-from gpubridge.staging import Staging
+from gpubridge.staging import PinnedBridgeStaging, Staging
 
 
 class LazyEvent:
@@ -122,3 +122,52 @@ class LazyPipelined(PipelinedReduceBridgeBroadcast):
         super().setup(topology)
         if self.staging is not None:
             self.staging = LazyStaging(self.chunk_bytes, self.SLOTS)
+
+
+class LazyPinned(PinnedBridgeStaging):
+    """PinnedBridgeStaging's protocol on lazy copies, with a log of every call.
+
+    Two pretend streams; :attr:`stream` names the current one, as a caller's
+    stream and an async worker's would be. A copy runs only when something
+    waits for it, or for a later copy on its stream. :meth:`run_streams` is
+    the device getting to everything still queued.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(torch.device("cpu"))
+        self.log: list = []
+        self.streams = {"caller": LazyStream(self.log), "other": LazyStream(self.log)}
+        self.stream = "caller"
+        self.copies = 0
+
+    def _allocate(self, nbytes):
+        self.log.append(("allocate", nbytes))
+        return torch.empty(nbytes, dtype=torch.uint8)
+
+    def _copy(self, dst, src, after):
+        self.copies += 1
+        label = f"copy{self.copies}"
+        self.log.append(("copy", label, after.label if after else None))
+        return self.streams[self.stream].enqueue(label, lambda: dst.copy_(src), after)
+
+    def _wait(self, event):
+        self.log.append(("wait", event.label))
+        event.complete()
+
+    def run_streams(self) -> None:
+        for stream in self.streams.values():
+            if stream.queue:
+                stream.run_through(stream.queue[-1][0])
+
+
+class EagerCopyBack(LazyPinned):
+    """LazyPinned whose copies back run at once.
+
+    On a GPU the island broadcast that follows is queued behind the copy back
+    on the same stream; on CPU it is a host call that wouldn't wait for a lazy
+    copy. Copies out stay lazy, so the bridge still needs to_host's wait.
+    """
+
+    def to_device(self, tensor, host):
+        super().to_device(tensor, host)
+        self._wait(self.copied_back)

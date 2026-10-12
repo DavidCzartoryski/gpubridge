@@ -108,6 +108,7 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
          [Step(r"train_ddp(_split)?"), Step(r"train_n\d+")]),
     23: ("What `gpubridge.in_flight()` shows on GPUs", [stage("in_flight", GPU_KINDS)]),
     24: ("No island puts two ranks on one GPU", [Step("shared_gpu_check")]),
+    25: ("Pinned staging for the default bridge", [Step("check_pinned"), Step("bench_pinned")]),
 }
 
 
@@ -361,6 +362,7 @@ def bench_rows(jobs: list[Job]) -> list[dict[str, Any]]:
                 base = baseline_us(by_op, baseline)
                 row = {"job": job.name, "bench": directory, "simulated": job.simulated,
                        "run_kind": bench.get("run", {}).get("kind"),
+                       "staging": _staging(bench),
                        "timer": next(iter(by_op.values())).get("timer", "host"),
                        "baseline": baseline, "bytes": size, "baseline_us": base}
                 for op in ("gpubridge", "flat-gloo"):
@@ -369,6 +371,10 @@ def bench_rows(jobs: list[Job]) -> list[dict[str, Any]]:
                     row[f"{op}_over_baseline"] = round(us / base, 2) if us and base else None
                 rows.append(row)
     return rows
+
+
+def _staging(bench: dict[str, Any]) -> str:
+    return "pinned" if bench.get("run", {}).get("pinned_staging") else "pageable"
 
 
 def predicted_bridge_ms(nbytes: int, islands: int, mbps: float, rtt_ms: float) -> float:
@@ -398,7 +404,8 @@ def prediction_rows(jobs: list[Job]) -> list[dict[str, Any]]:
                 predicted = predicted_bridge_ms(r["bytes"], r["islands"], mbps,
                                                 bandwidth["rtt_ms"])
                 rows.append({"job": job.name, "bench": directory, "simulated": job.simulated,
-                             "policy": r.get("policy"), "bytes": r["bytes"],
+                             "policy": r.get("policy"), "staging": _staging(bench),
+                             "bytes": r["bytes"],
                              "MBps": mbps, "rtt_ms": bandwidth["rtt_ms"],
                              "predicted_ms": round(predicted, 3),
                              "measured_ms": phases["bridge"],
@@ -470,10 +477,10 @@ def markdown(tables: dict[str, Any]) -> str:
               "Median latency of the slowest rank. `island-native (fewer ranks, best case)` "
               "is each island's own all_reduce: a lower bound, not like for like.", ""]
     lines += table(
-        ["Job / bench", "Run kind", "Timer", "Size", "Baseline", "Baseline (us)",
+        ["Job / bench", "Run kind", "Staging", "Timer", "Size", "Baseline", "Baseline (us)",
          "gpubridge (us)", "flat-gloo (us)", "gpubridge / baseline", "flat-gloo / baseline"],
-        [[sim(r, f"{r['job']}/{r['bench']}"), r["run_kind"], r["timer"], human(r["bytes"]),
-          r["baseline"], r["baseline_us"], r["gpubridge_us"], r["flat-gloo_us"],
+        [[sim(r, f"{r['job']}/{r['bench']}"), r["run_kind"], r["staging"], r["timer"],
+          human(r["bytes"]), r["baseline"], r["baseline_us"], r["gpubridge_us"], r["flat-gloo_us"],
           r["gpubridge_over_baseline"], r["flat-gloo_over_baseline"]]
          for r in tables["benchmarks"]])
     lines += ["", "## Predicted vs measured bridge time", "",
@@ -482,10 +489,11 @@ def markdown(tables: dict[str, Any]) -> str:
               "phase on the slowest leader, which also includes the copies to and from the "
               "host. See the runbook's \"Predicted vs measured\".", ""]
     lines += table(
-        ["Job / bench", "Policy", "Size", "MB/s (slower way)", "Round trip (ms)",
+        ["Job / bench", "Policy", "Staging", "Size", "MB/s (slower way)", "Round trip (ms)",
          "Predicted (ms)", "Measured (ms)", "Measured / predicted"],
-        [[sim(r, f"{r['job']}/{r['bench']}"), r["policy"], human(r["bytes"]), r["MBps"],
-          r["rtt_ms"], r["predicted_ms"], r["measured_ms"], r["measured_over_predicted"]]
+        [[sim(r, f"{r['job']}/{r['bench']}"), r["policy"], r["staging"], human(r["bytes"]),
+          r["MBps"], r["rtt_ms"], r["predicted_ms"], r["measured_ms"],
+          r["measured_over_predicted"]]
          for r in tables["predicted"]])
     return redact("\n".join(lines) + "\n")
 

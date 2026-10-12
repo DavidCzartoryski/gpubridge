@@ -63,6 +63,14 @@ step summarize_split_by_node python "$KIT_DIR/summarize.py" "$RESULTS/check_spli
 step bench_split_by_node multinode bench "$KIT_DIR/bench_all_reduce.py" \
     --out "$RESULTS/bench_split_by_node" --max-bytes "$BENCH_MAX_BYTES" \
     --ops native,island,gpubridge,flat-gloo --phases
+# Pinned staging for the default bridge (item 25), with the bridge crossing the
+# network: the same check and gpubridge benchmark with GPUBRIDGE_PINNED_STAGING=1.
+export GPUBRIDGE_PINNED_STAGING=1
+step check_pinned multinode check-pinned "$KIT_DIR/check.py" --out "$RESULTS/check_pinned"
+step summarize_pinned python "$KIT_DIR/summarize.py" "$RESULTS/check_pinned"
+step bench_pinned multinode bench-pinned "$KIT_DIR/bench_all_reduce.py" \
+    --out "$RESULTS/bench_pinned" --max-bytes "$BENCH_MAX_BYTES" --ops gpubridge --phases
+unset GPUBRIDGE_PINNED_STAGING
 # Opt-in policies with the bridge crossing the network (items 17 to 21): the
 # check, and each policy's phases, so its bridge step can be read on its own.
 for policy in $OPT_IN_POLICIES; do

@@ -1,4 +1,9 @@
-"""Host staging for the pipelined bridge: reusable host buffers, copy streams and events.
+"""Host staging for the bridge: reusable pinned host buffers, copy streams and events.
+
+Two users. The pipelined policy (below) stages chunk by chunk through several
+slots. reduce-bridge-broadcast, the default, copies with pageable ``.cpu()``
+unless ``GPUBRIDGE_PINNED_STAGING`` is on; then it stages the whole tensor
+through one pinned buffer (:class:`PinnedBridgeStaging`).
 
 The pipelined policy splits a leader's bridge step into chunks so that, on
 GPUs, the device-to-host copy of chunk k+1, the bridge step of chunk k and the
@@ -136,6 +141,98 @@ class CudaStaging(Staging):
 
     def close(self) -> None:
         self.buffers.clear()
+
+
+class BridgeStaging(abc.ABC):
+    """Host staging for one leader's whole-tensor bridge step (reduce-bridge-broadcast).
+
+    The protocol: :meth:`to_host` returns a host copy of the tensor once the
+    host may read it, the bridge reads and writes that copy, and
+    :meth:`to_device` queues the copy back. The host buffer is reused by the
+    next collective only after the copy back out of it has passed.
+    """
+
+    @abc.abstractmethod
+    def to_host(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Copy ``tensor`` to host memory; return the copy once the host may read it."""
+
+    @abc.abstractmethod
+    def to_device(self, tensor: torch.Tensor, host: torch.Tensor) -> None:
+        """Queue the copy of ``host`` (from :meth:`to_host`) back into ``tensor``."""
+
+    def close(self) -> None:  # noqa: B027 - optional hook
+        """Release the buffer."""
+
+
+class PinnedBridgeStaging(BridgeStaging):
+    """One pinned host buffer, grown to the largest tensor staged so far.
+
+    Copies run on the caller's current stream (the worker's, for async
+    collectives), so they are ordered after the island step and before the
+    island broadcast like the pageable copies they replace. The host waits on
+    an event recorded after the copy out, before the bridge reads the buffer:
+    only for that copy and the work queued before it, never the whole device.
+    The copy back is not waited for. Its event is kept, and the next
+    collective's copy out waits for it on the device (on any stream), so the
+    buffer is never overwritten while a copy back still reads it; the host
+    then waits on that copy out before the bridge writes the buffer. Before a
+    larger buffer replaces it, the host waits for the last copy back.
+
+    The device operations are the three methods at the end, so tests can run
+    the protocol on CPU with copies that happen only when waited for.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.buffer: torch.Tensor | None = None
+        self.copied_back: Event | None = None
+
+    def to_host(self, tensor: torch.Tensor) -> torch.Tensor:
+        nbytes = tensor.numel() * tensor.element_size()
+        if self.buffer is None or self.buffer.numel() < nbytes:
+            if self.copied_back is not None:
+                self._wait(self.copied_back)  # the old buffer may still be read
+            self.buffer = self._allocate(nbytes)
+            self.copied_back = None
+        host = self.buffer[:nbytes].view(tensor.dtype).view(tensor.shape)
+        self._wait(self._copy(host, tensor, after=self.copied_back))  # before Gloo reads it
+        return host
+
+    def to_device(self, tensor: torch.Tensor, host: torch.Tensor) -> None:
+        self.copied_back = self._copy(tensor, host, after=None)
+
+    def close(self) -> None:
+        if self.copied_back is not None:
+            self._wait(self.copied_back)
+        self.buffer = None
+        self.copied_back = None
+
+    # ---- device operations ----------------------------------------------------------
+
+    def _allocate(self, nbytes: int) -> torch.Tensor:
+        return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+
+    def _copy(self, dst: torch.Tensor, src: torch.Tensor, after: Event | None) -> Event:
+        """Queue ``dst.copy_(src)`` on the current stream, after ``after`` if given."""
+        stream = torch.cuda.current_stream(self.device)
+        if after is not None:
+            stream.wait_event(after)
+        dst.copy_(src, non_blocking=True)
+        done = torch.cuda.Event()
+        done.record(stream)
+        return done
+
+    def _wait(self, event: Event) -> None:
+        """Block the host until ``event`` has passed."""
+        event.synchronize()
+
+
+def make_bridge_staging(device: torch.device) -> BridgeStaging | None:
+    """Pinned staging for ``device``'s bridge step; None on CPU, where there is nothing to
+    copy. Tests replace this to run and check the protocol on CPU."""
+    if device.type == "cuda":
+        return PinnedBridgeStaging(device)
+    return None
 
 
 def make_staging(device: torch.device, chunk_bytes: int, slots: int) -> Staging:

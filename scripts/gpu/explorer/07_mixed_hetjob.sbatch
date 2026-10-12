@@ -101,6 +101,13 @@ step check mixed_torchrun check "$KIT_DIR/check.py" --out "$RESULTS/check"
 step summarize python "$KIT_DIR/summarize.py" "$RESULTS/check"
 step bench mixed_torchrun bench "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" \
     --ops island,gpubridge,flat-gloo --phases --max-bytes "$BENCH_MAX_BYTES"
+# Pinned staging for the default bridge (item 25) on real NVIDIA + AMD leaders.
+export GPUBRIDGE_PINNED_STAGING=1
+step check_pinned mixed_torchrun check-pinned "$KIT_DIR/check.py" --out "$RESULTS/check_pinned"
+step summarize_pinned python "$KIT_DIR/summarize.py" "$RESULTS/check_pinned"
+step bench_pinned mixed_torchrun bench-pinned "$KIT_DIR/bench_all_reduce.py" \
+    --out "$RESULTS/bench_pinned" --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES"
+unset GPUBRIDGE_PINNED_STAGING
 # Opt-in policies on the real mixed job (items 17 to 21).
 for policy in $OPT_IN_POLICIES; do
     step "check_$policy" mixed_torchrun "check-$policy" "$KIT_DIR/check.py" \

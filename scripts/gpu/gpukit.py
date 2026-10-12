@@ -230,6 +230,8 @@ def run_info(topology: gpubridge.Topology) -> dict[str, Any]:
         ],
         "bridge": topology.peers[topology.rank].bridge,
         "policy": topology.policy_name,
+        # GPUBRIDGE_PINNED_STAGING: the default bridge stages through pinned memory.
+        "pinned_staging": topology.pinned_staging,
     }
     if topology.split_test:
         info["warning"] = (

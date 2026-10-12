@@ -314,6 +314,24 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     fail `init()` on every rank with the duplicate-GPU error, within 60 s;
     `steps.jsonl` records `"expected failure confirmed"` or `"check did not
     fire"`.
+25. **Pinned staging for the default bridge pays off, and stays correct.**
+    With `GPUBRIDGE_PINNED_STAGING=1`, the leaders of
+    `reduce-bridge-broadcast` copy into one pinned host buffer with
+    `non_blocking=True`, wait on that copy's event (not the whole device)
+    before Gloo reads it, and leave the copy back queued; the next
+    collective's copy out waits for it on the device, and a larger tensor
+    replaces the buffer only after it. Check that results stay bit for bit
+    those of `flat-gloo`, including back-to-back collectives on different
+    streams, and whether the `bridge` phase gets shorter than with pageable
+    `.cpu()` copies, at which sizes.
+    *Status: works on CPU, where the copies are checked with lazy pretend
+    streams that run a copy only when something waits for it
+    (`tests/test_pinned_staging.py`); the GPU tests are written
+    (`tests/test_gpu.py`: every op against `flat-gloo`, streams, completion,
+    buffer reuse).* *Step:* `check_pinned` and `bench_pinned` in Explorer
+    steps 04, 05 and 07 and `amd/run_all.sh`, right after the pageable
+    benchmark in the same allocation (`bench`, or `bench_split_by_node` in
+    step 05); compare their gpubridge rows and `bridge` phases.
 
 ## Mixed build results
 

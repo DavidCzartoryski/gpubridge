@@ -32,11 +32,29 @@ CHUNK_BYTES_ENV = "GPUBRIDGE_CHUNK_BYTES"
 #: Path of a thresholds file for the ``auto-tuned`` policy, as written by
 #: ``scripts/gpu/bench_all_reduce.py --write-thresholds``.
 THRESHOLDS_ENV = "GPUBRIDGE_THRESHOLDS"
+#: Set to ``1`` to stage the default bridge's copies (reduce-bridge-broadcast)
+#: through one pinned host buffer per leader instead of pageable ``.cpu()``
+#: copies. Off by default; must match on every rank. Not validated on GPUs.
+PINNED_STAGING_ENV = "GPUBRIDGE_PINNED_STAGING"
 
 #: Backend of the global discovery group and the cross-vendor bridge. Both run on CPU.
 CPU_BACKEND = "gloo"
 #: Backend of islands on real GPUs. On ROCm builds of PyTorch, "nccl" runs RCCL.
 GPU_BACKEND = "nccl"
+
+
+def _flag(name: str) -> bool:
+    """Whether environment variable ``name`` is set to a true value.
+
+    Raises:
+        ValueError: if it holds something other than a boolean word.
+    """
+    value = os.environ.get(name, "").strip().lower()
+    if value in ("", "0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"{name}={os.environ[name]!r} is not a boolean; use 1 or 0")
 
 
 def is_cpu_only() -> bool:
@@ -45,12 +63,16 @@ def is_cpu_only() -> bool:
     Raises:
         ValueError: if the variable holds something other than a boolean word.
     """
-    value = os.environ.get(CPU_ONLY_ENV, "").strip().lower()
-    if value in ("", "0", "false", "no", "off"):
-        return False
-    if value in ("1", "true", "yes", "on"):
-        return True
-    raise ValueError(f"{CPU_ONLY_ENV}={os.environ[CPU_ONLY_ENV]!r} is not a boolean; use 1 or 0")
+    return _flag(CPU_ONLY_ENV)
+
+
+def pinned_staging_setting() -> bool:
+    """Return True when ``GPUBRIDGE_PINNED_STAGING`` is set to a true value.
+
+    Raises:
+        ValueError: if the variable holds something other than a boolean word.
+    """
+    return _flag(PINNED_STAGING_ENV)
 
 
 def split_test_mode() -> str | None:

@@ -382,13 +382,17 @@ def test_submit_free_and_multi_submit_every_step():
                                   "--policy pipelined-reduce-bridge-broadcast",
                                   "--policy sharded-bridge", "--write-thresholds",
                                   "--policy auto-tuned", "train_synthetic.py",
-                                  "train_ddp.json"]),
+                                  "train_ddp.json", "[check_pinned]",
+                                  "env GPUBRIDGE_PINNED_STAGING=1 torchrun",
+                                  "bench_pinned --max-bytes"]),
         ("05_multinode.sbatch", ["--policy pipelined-reduce-bridge-broadcast",
                                  "--policy sharded-bridge", "bench_phases_sharded-bridge",
                                  "--write-thresholds"]),
         ("05_multinode.sbatch", ["srun", "--rdzv-backend=c10d", "check_split_by_node",
                                  "--kill-on-bad-exit=1 bash KIT/node_ifname.sh torchrun"]),
         ("05_multinode.sbatch", ["preflight.py --role auto", "--bandwidth-seconds 2"]),
+        ("05_multinode.sbatch", ["[check_pinned]", "[bench_pinned]", "check-pinned"]),
+        ("07_mixed_hetjob.sbatch", ["[check_pinned]", "[bench_pinned]"]),
         ("06_scaling.sbatch", ["--nproc-per-node=4", "train_synthetic.py", "summarize.py"]),
         ("07_mixed_hetjob.sbatch", ["--het-group=1", "--rdzv-backend=c10d", "summarize.py"]),
     ],
@@ -408,7 +412,7 @@ def test_amd_dry_run_with_several_gpus():
                  "nccl/check_1gpu/", "--nproc-per-node=8",
                  "GPUBRIDGE_SPLIT_TEST=half", "bench_all_reduce.py", "train_n4", "tar -czf",
                  "--policy pipelined-reduce-bridge-broadcast", "--policy sharded-bridge",
-                 "train_ddp_split.json"]:
+                 "train_ddp_split.json", "GPUBRIDGE_PINNED_STAGING=1", "bench_pinned"]:
         assert text in out, text
     assert "train_n5" not in out
 
@@ -930,6 +934,7 @@ def test_tables_from_a_results_tree(tmp_path):
     assert [r["bytes"] for r in bench] == [2**20, 64 * 2**20, 256 * 2**20]
     assert {(r["baseline"], r["gpubridge_over_baseline"], r["flat-gloo_over_baseline"])
             for r in bench} == {("native", 15.0, 30.0)}
+    assert {r["staging"] for r in tables["benchmarks"]} == {"pageable"}
 
     predicted = next(r for r in tables["predicted"]
                      if r["bytes"] == 64 * 2**20 and not r["simulated"])

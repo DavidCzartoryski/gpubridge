@@ -289,6 +289,21 @@ how many messages a collective sends, so every rank reports them during
 discovery, and `init()` fails on every rank if they differ or if one is
 invalid.
 
+**Pinned staging (opt-in, not validated on GPUs).** By default the leaders of
+`reduce-bridge-broadcast` copy to host memory with `.cpu()`, into pageable
+memory. With `GPUBRIDGE_PINNED_STAGING=1` they copy into one pinned host
+buffer per leader instead, grown to the largest tensor bridged so far and
+released by `destroy()`. The copy out runs with `non_blocking=True` on the
+current stream, and the host waits on an event recorded after it, not on the
+whole device, before Gloo reads the buffer. The copy back is not waited for;
+the next collective's copy out waits for it on the device. This covers the
+bridge steps of all_reduce, broadcast and reduce_scatter_tensor (also when
+`auto-tuned` picks this policy); all_gather_into_tensor keeps pageable
+buffers, the pipelined policy always uses pinned memory, and the other
+policies ignore the setting. Every rank must set the same value; `init()`
+fails on every rank otherwise. It exists so one GPU allocation can compare
+the two (the GPU kit's `check_pinned` and `bench_pinned` steps).
+
 ```python
 gpubridge.init(policy="flat-gloo")     # e.g. to rule out NCCL/RCCL while debugging
 ```
@@ -524,9 +539,10 @@ mixed hardware, such as monitoring or profiling tools:
 - On the default path, cross-vendor traffic goes through one leader per
   island, its CPU and Gloo, with no chunking, overlap or pinned memory. The
   opt-in `pipelined-reduce-bridge-broadcast` and `sharded-bridge` policies
-  address that, but they are not validated on GPUs and may not be faster
-  there (HARDWARE_VALIDATION.md items 17 to 21). Neither changes the limit
-  above: both still go through host memory and Gloo.
+  and `GPUBRIDGE_PINNED_STAGING` address that, but they are not validated on
+  GPUs and may not be faster there (HARDWARE_VALIDATION.md items 17 to 21 and
+  25). None of them changes the limit above: all still go through host
+  memory and Gloo.
 - No custom kernels and no direct RDMA between vendors. A GPU-to-GPU transport
   would plug in through `BridgeTransport`.
 - Designed but not implemented, each waiting on GPU results: bridge-only
