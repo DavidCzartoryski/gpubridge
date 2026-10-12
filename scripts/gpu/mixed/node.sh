@@ -83,6 +83,6 @@ mixed_torchrun() {
 step check mixed_torchrun check "$KIT_DIR/check.py" --out "$RESULTS/check"
 step summarize python "$KIT_DIR/summarize.py" --partial "$RESULTS/check"
 step bench mixed_torchrun bench "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" \
-    --max-bytes "$BENCH_MAX_BYTES"
+    --max-bytes "$BENCH_MAX_BYTES" --phases
 package_results "$RESULTS"
 finish

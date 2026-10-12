@@ -13,7 +13,8 @@ On CPU, in simulation mode:
     GPUBRIDGE_VENDOR=nvidia torchrun --nproc-per-node=2 examples/train_synthetic.py
 
 On GPUs, the same command without GPUBRIDGE_VENDOR. scripts/gpu uses it for
-the scaling run (1 to 4 GPUs) with --json to record the result.
+the scaling run (1 to 4 GPUs) with --json to record the result, along with
+every rank's versions, GPU and settings as the kit records them.
 """
 
 from __future__ import annotations
@@ -21,7 +22,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import statistics
+import sys
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -44,6 +47,21 @@ def make_model(dim: int, layers: int, classes: int) -> nn.Module:
 def wait(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def environment() -> dict:
+    """This process's versions, GPUs and settings: the GPU kit's record when the
+    kit is in this checkout (scripts/gpu/gpukit.py: allowlisted env vars, no
+    paths or user names), else the basics."""
+    kit = Path(__file__).resolve().parents[1] / "scripts" / "gpu"
+    if (kit / "gpukit.py").exists():
+        sys.path.insert(0, str(kit))
+        from gpukit import environment as kit_environment
+
+        return kit_environment()
+    return {"hostname": socket.gethostname(), "gpubridge": gpubridge.__version__,
+            "torch": torch.__version__, "torch_cuda": torch.version.cuda,
+            "torch_hip": torch.version.hip}
 
 
 def main() -> None:
@@ -105,6 +123,9 @@ def main() -> None:
     dist.all_gather_object(checksums, checksum)
     in_sync = all(c == checksums[0] for c in checksums)
     samples_per_sec = world * args.batch_size * args.steps / float(elapsed)
+    environments: list[dict | None] = [None] * world
+    if args.json:
+        dist.all_gather_object(environments, environment())
 
     if rank == 0:
         result = {
@@ -124,6 +145,12 @@ def main() -> None:
             "loss_first": round(losses[0], 4),
             "loss_last": round(losses[-1], 4),
             "params_in_sync": in_sync,
+            "warmup_steps": args.warmup_steps,
+            "lr": args.lr,
+            "timeout_s": args.timeout,
+            # Rank 0's, in the kit's layout, then every rank's.
+            "environment": environments[0],
+            "environments": environments,
         }
         if topology.split_test:
             result["warning"] = "SPLIT TEST: not a mixed-vendor result."
@@ -131,7 +158,7 @@ def main() -> None:
               f"loss {losses[0]:.3f} -> {losses[-1]:.3f}, params in sync: {in_sync}")
         if args.json:
             args.json.parent.mkdir(parents=True, exist_ok=True)
-            args.json.write_text(json.dumps(result, indent=2))
+            args.json.write_text(json.dumps(result, indent=2, default=str))
     gpubridge.destroy()
     if not in_sync:
         raise SystemExit("parameters diverged across ranks")

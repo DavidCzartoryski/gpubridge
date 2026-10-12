@@ -12,6 +12,17 @@ AMD machine, and a real mixed job between two cloud machines. If Explorer's
 `sharing` partition turns out to have AMD GPUs, the mixed job can instead run
 inside Explorer as one heterogeneous Slurm job.
 
+**GPU results:** none yet. After GPU runs,
+[`scripts/gpu/validation_tables.py`](scripts/gpu/validation_tables.py) turns
+the kit's results into the tables for this file: what each job ran on (hosts,
+GPUs, driver, torch, CUDA or ROCm, NCCL or RCCL, gpubridge commit, interface),
+a verdict per item below from the steps and stages that test it, the
+preflight's network numbers, benchmark ratios against their named baseline,
+and the predicted against the measured bridge time. Runs in CPU simulation
+never count towards an item. The tables number hosts instead of naming them
+and show no paths, so they can go here as they are. See the runbook's
+[The validation tables](docs/GPU_VALIDATION_RUNBOOK.md#the-validation-tables).
+
 ## Blocking: can the job start at all?
 
 1. **CUDA-PyTorch and ROCm-PyTorch processes rendezvous in one job.** Both
@@ -128,7 +139,9 @@ inside Explorer as one heterogeneous Slurm job.
     gpubridge, and flat-gloo, with busbw as nccl-tests computes it and
     gpubridge and flat-gloo as multiples of the baseline. Every row names its
     baseline; each island's own is labeled `island-native (fewer ranks, best
-    case)`, since it is not a like-for-like comparison.
+    case)`, since it is not a like-for-like comparison. Where a preflight ran,
+    `validation_tables.py` sets the bridge phase against the time the
+    preflight's bandwidth predicts (runbook, "Predicted vs measured").
     *Status: runs on CPU in simulation, host-timed; no GPU numbers yet.*
 
 ## Added with later features

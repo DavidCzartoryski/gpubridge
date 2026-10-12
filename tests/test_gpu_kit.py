@@ -6,6 +6,7 @@ under torchrun on CPU in simulation mode, including split-test runs.
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -23,6 +24,7 @@ sys.path.insert(0, str(KIT))
 import bench_all_reduce  # noqa: E402
 import preflight  # noqa: E402
 import summarize  # noqa: E402
+import validation_tables  # noqa: E402
 
 SHELL_SCRIPTS = sorted(
     [*KIT.glob("*.sh"), *KIT.glob("*/*.sh"), *KIT.glob("explorer/*.sbatch")]
@@ -670,6 +672,13 @@ def test_training_demo_keeps_ranks_in_sync_and_learns(tmp_path):
     assert data["loss_last"] < data["loss_first"]
     assert data["run"]["split_test"] == "half" and "warning" in data
     assert "ddp_comm_hook" in data["grad_sync"] and data["policy"] == "reduce-bridge-broadcast"
+    # Every rank's versions and settings, as the kit records them.
+    assert len({env["pid"] for env in data["environments"]}) == 2
+    assert data["environment"] == data["environments"][0]
+    for env in data["environments"]:
+        assert env["torch"] == torch.__version__ and env["git_commit"]
+        assert env["env"]["GPUBRIDGE_VENDOR"] == "nvidia"
+    assert data["timeout_s"] > 0 and data["warmup_steps"] == 5
 
 
 def test_scaling_summary_computes_efficiency(tmp_path):
@@ -706,6 +715,215 @@ def test_summary_flags_a_shared_gpu_outside_a_split_test(tmp_path):
         (tmp_path / f"rank{rank}.json").write_text(
             json.dumps(_fake_rank(rank, 2, "0000:01:00.0", split="half")))
     assert summarize.main([str(tmp_path)]) == 0
+
+
+def test_environment_names_versions_driver_and_interfaces(monkeypatch):
+    import gpukit
+
+    monkeypatch.setenv("GLOO_SOCKET_IFNAME", "ib0")
+    monkeypatch.delenv("NCCL_SOCKET_IFNAME", raising=False)
+    env = gpukit.environment()
+    assert env["interfaces"] == {"GLOO_SOCKET_IFNAME": "ib0", "NCCL_SOCKET_IFNAME": "auto"}
+    assert env["git_commit"] and env["git_dirty"] in (True, False)
+    for key in ("torch", "torch_cuda", "torch_hip", "rocm_version", "collective_library",
+                "nccl_version", "driver_version", "devices", "hostname"):
+        assert key in env
+    if not torch.version.cuda and not torch.version.hip:  # a CPU build of PyTorch
+        assert env["collective_library"] is None and env["driver_version"] is None
+
+
+#: Must never reach a record: credentials, who ran it, where the project lives.
+SECRETS = {
+    "GPUBRIDGE_API_TOKEN": "tok-0a1b2c3d", "NCCL_SECRET_KEY": "key-4e5f6a7b",
+    "GLOO_PASSWORD": "pw-8c9d0e1f", "AWS_SECRET_ACCESS_KEY": "aws-2a3b4c5d",
+    "SLURM_JOB_USER": "someuser", "SLURM_JOB_ACCOUNT": "example-lab-account",
+    "TORCH_INDEX_URL": "https://bob:hunter2@pypi.example.org/simple",
+    "GPUBRIDGE_REPO_DIR": f"{FAKE_PROJECT}/gpubridge",
+}
+
+
+def test_records_hold_only_allowlisted_env_vars_and_no_secrets(tmp_path):
+    env = {**SECRETS, "GPUBRIDGE_VENDOR": "nvidia", "SLURM_JOB_ID": "4242"}
+    probe = subprocess.run([sys.executable, str(KIT / "probe.py"), "--out", str(tmp_path)],
+                           env=clean_env(**env), capture_output=True, text=True, timeout=120)
+    train = torchrun(2, REPO / "examples" / "train_synthetic.py", "--steps", "2",
+                     "--warmup-steps", "1", "--dim", "16", "--batch-size", "4",
+                     "--json", str(tmp_path / "train.json"), **env)
+    assert train.returncode == 0, train.stderr[-3000:]
+    for name in ("probe.json", "train.json"):
+        text = (tmp_path / name).read_text()
+        for secret in ("tok-0a1b2c3d", "key-4e5f6a7b", "pw-8c9d0e1f", "aws-2a3b4c5d",
+                       "someuser", "example-lab", "hunter2", FAKE_PROJECT, str(Path.home())):
+            assert secret not in text, (name, secret, probe.stderr[-2000:])
+        for env_record in [json.loads(text)["environment"]]:
+            recorded = env_record["env"]
+            assert recorded["GPUBRIDGE_VENDOR"] == "nvidia" and recorded["SLURM_JOB_ID"] == "4242"
+            assert recorded["TORCH_INDEX_URL"] == "https://***@pypi.example.org/simple"
+            assert recorded["GPUBRIDGE_REPO_DIR"] == "$PROJECT_DIR/gpubridge"
+            assert not set(recorded) & {"GPUBRIDGE_API_TOKEN", "NCCL_SECRET_KEY",
+                                        "GLOO_PASSWORD", "AWS_SECRET_ACCESS_KEY",
+                                        "SLURM_JOB_USER", "SLURM_JOB_ACCOUNT", "HOME", "USER",
+                                        "PATH"}
+
+
+def test_redact_replaces_paths_users_and_url_credentials(monkeypatch):
+    import gpukit
+
+    monkeypatch.setenv("HOME", "/home/someuser")
+    monkeypatch.setattr(gpukit, "_user", lambda: "someuser")
+    assert gpukit.redact("/projects/example-lab/gpubridge/results/x.json") == (
+        "$PROJECT_DIR/gpubridge/results/x.json")
+    assert gpukit.redact("/home/someuser/venv/bin/python") == "~/venv/bin/python"
+    assert gpukit.redact("/home/someusers/x") == "/home/someusers/x"
+    assert gpukit.redact("/scratch/someuser/out /scratch/someusers") == (
+        "/scratch/$USER/out /scratch/someusers")
+    assert gpukit.redact("git+https://u:t@host/r@abc") == "git+https://***@host/r@abc"
+    assert gpukit.scrub({"argv": ["--out", "/projects/x/r"], "n": 1}) == {
+        "argv": ["--out", "$PROJECT_DIR/r"], "n": 1}
+
+
+# ---- validation_tables.py ------------------------------------------------------------
+
+def test_predicted_bridge_time_is_a_round_trip_plus_the_ring_traffic():
+    # Two islands: the whole tensor each way. 100 MB at 100 MB/s is a second.
+    assert validation_tables.predicted_bridge_ms(10**8, 2, 100.0, 0.5) == pytest.approx(1000.5)
+    # Four islands send 2(p-1)/p = 1.5 times the tensor.
+    assert validation_tables.predicted_bridge_ms(10**8, 4, 100.0, 0.0) == pytest.approx(1500)
+
+
+def test_verdict_counts_only_gpu_runs():
+    evidence = validation_tables.Evidence
+    assert validation_tables.verdict([]) == "not run"
+    assert validation_tables.verdict([evidence("a", True, True)]) == "simulation only"
+    assert validation_tables.verdict(
+        [evidence("a", True, False), evidence("b", True, False), evidence("c", False, True)]
+    ) == "pass (2)"
+    assert validation_tables.verdict(
+        [evidence("a", True, False), evidence("b", False, False)]) == "FAIL (1 of 2)"
+
+
+def test_tables_cover_every_hardware_validation_item():
+    text = (REPO / "HARDWARE_VALIDATION.md").read_text().split("## Mixed build results")[0]
+    numbers = {int(m) for m in re.findall(r"^(\d+)\. ", text, flags=re.MULTILINE)}
+    assert numbers == set(validation_tables.ITEMS)
+
+
+def test_every_step_the_tables_look_for_is_one_a_job_runs():
+    runs = [dry_run(KIT / "explorer" / job) for job in sorted(
+        p.name for p in (KIT / "explorer").glob("0*.sbatch"))]
+    runs += [dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="4"),
+             dry_run(KIT / "mixed" / "node.sh", ROLE="master", MASTER_ADDR="10.0.0.1",
+                     GPU_COUNT="2")]
+    names = set(re.findall(r"^\+ \[([^\]]+)\]", "".join(r.stdout for r in runs),
+                           flags=re.MULTILINE))
+    for _, tests in validation_tables.ITEMS.values():
+        for test in tests:
+            if isinstance(test, validation_tables.Step):
+                assert any(re.fullmatch(test.pattern, n) for n in names), test.pattern
+
+
+GPU_ENV = {"hostname": "gpu-a", "devices": [{"name": "NVIDIA H200"}], "driver_version": "570.86",
+           "torch": "2.8.0+cu128", "torch_cuda": "12.8", "torch_hip": None,
+           "collective_library": "nccl", "nccl_version": "2.26.2", "git_commit": "abc1234",
+           "git_dirty": False, "interfaces": {"GLOO_SOCKET_IFNAME": "ib0"}, "env": {}}
+
+
+def _job(root: Path, name: str, steps: list[tuple[str, int]], env: dict, device: str) -> Path:
+    """A job's results as the kit leaves them: steps.jsonl and the steps' records."""
+    job = root / name
+    job.mkdir(parents=True)
+    (job / "steps.jsonl").write_text("".join(
+        json.dumps({"step": step, "exit_code": code,
+                    **({"result": "expected failure confirmed"} if step == "shared_gpu_check"
+                       else {})}) + "\n" for step, code in steps))
+    for rank, host in enumerate(("gpu-a", "gpu-b")):
+        (job / "check_split_by_node").mkdir(exist_ok=True)
+        (job / "check_split_by_node" / f"rank{rank}.json").write_text(json.dumps({
+            "script": "scripts/gpu/check.py", "environment": {**env, "hostname": host},
+            "run": {"kind": "split-test", "device": device},
+            "stages": [{"name": "init", "ok": True}, {"name": "barrier", "ok": True}]}))
+    for role, host, ifname, out, back in (("master", "gpu-a", "ib0", 1000.0, 800.0),
+                                          ("worker", "gpu-b", "ib1", 800.0, 1000.0)):
+        (job / "preflight").mkdir(exist_ok=True)
+        (job / "preflight" / f"preflight-{role}.json").write_text(json.dumps({
+            "role": role, "hostname": host, "chosen_ifname": ifname, "environment": env,
+            "bandwidth": {"MBps_out": out, "MBps_in": back, "rtt_ms": 0.5}}))
+    rows = []
+    for size in (2**20, 64 * 2**20, 256 * 2**20):
+        ms = size / 2**20  # 1 ms per MiB, so ratios are easy to check
+        rows += [{"op": "native", "bytes": size, "median_us": ms * 100, "islands": 2},
+                 {"op": "gpubridge", "bytes": size, "median_us": ms * 1500, "islands": 2,
+                  "policy": "reduce-bridge-broadcast", "phases_ms": {"bridge": ms}},
+                 {"op": "flat-gloo", "bytes": size, "median_us": ms * 3000, "islands": 2}]
+    (job / "bench_phases_x").mkdir()
+    (job / "bench_phases_x" / "bench.json").write_text(json.dumps({
+        "environment": env, "run": {"kind": "split-test", "device": device},
+        "baseline": "native", "rows": rows}))
+    return job
+
+
+def test_tables_from_a_results_tree(tmp_path):
+    passed = [("preflight", 0), ("check_split_by_node", 0), ("bench_phases_x", 0),
+              ("shared_gpu_check", 0)]
+    _job(tmp_path, "explorer/05_multinode", passed, GPU_ENV, "cuda:0")
+    # A simulation run whose steps all failed must not change any verdict.
+    _job(tmp_path, "sim/05_multinode", [(name, 1) for name, _ in passed],
+         {**GPU_ENV, "env": {"GPUBRIDGE_VENDOR": "nvidia"}}, "cpu")
+    assert validation_tables.main([str(tmp_path)]) == 0
+    tables = json.loads((tmp_path / "validation_tables.json").read_text())
+    md = (tmp_path / "validation_tables.md").read_text()
+
+    real, sim = tables["runs"]
+    assert not real["simulated"] and sim["simulated"]
+    assert real["hosts"] == "host 1, host 2" and real["gpus"] == "NVIDIA H200"
+    assert (real["driver"], real["toolkit"], real["collectives"], real["gpubridge"],
+            real["gloo_ifname"]) == ("570.86", "CUDA 12.8", "NCCL 2.26.2", "abc1234", "ib0")
+    assert real["negative_steps"] == {"shared_gpu_check": "expected failure confirmed"}
+
+    verdicts = {row["item"]: row["verdict"] for row in tables["items"]}
+    assert verdicts[8] == "pass (2)"  # the preflight and check_split_by_node
+    assert verdicts[10] == "pass (1)" and verdicts[24] == "pass (1)"
+    assert verdicts[1] == "not run"  # needs a real mixed run, not a split test
+    assert verdicts[22] == "not run"
+
+    network = tables["network"][0]
+    assert (network["master"], network["worker"]) == ("host 1 ib0", "host 2 ib1")
+    assert (network["MBps_master_to_worker"], network["MBps_worker_to_master"]) == (1000, 800)
+
+    bench = [r for r in tables["benchmarks"] if not r["simulated"]]
+    assert [r["bytes"] for r in bench] == [2**20, 64 * 2**20, 256 * 2**20]
+    assert {(r["baseline"], r["gpubridge_over_baseline"], r["flat-gloo_over_baseline"])
+            for r in bench} == {("native", 15.0, 30.0)}
+
+    predicted = next(r for r in tables["predicted"]
+                     if r["bytes"] == 64 * 2**20 and not r["simulated"])
+    assert predicted["MBps"] == 800  # the slower direction
+    assert predicted["predicted_ms"] == pytest.approx(0.5 + 64 * 2**20 / 800e6 * 1e3, abs=1e-3)
+    assert predicted["measured_ms"] == 64
+
+    assert "never count towards an item" in md
+    assert "| sim/05_multinode (simulation) |" in md
+    assert "explorer/05_multinode/shared_gpu_check: expected failure confirmed" in md
+    assert "## Predicted vs measured bridge time" in md
+    # Safe to publish: no hostname, no path.
+    out = md + (tmp_path / "validation_tables.json").read_text()
+    assert "gpu-a" not in out and "gpu-b" not in out and str(tmp_path) not in out
+
+
+def test_tables_name_the_island_baseline(tmp_path):
+    job = _job(tmp_path, "amd/target", [("bench", 0)], GPU_ENV, "cuda:0")
+    bench = json.loads((job / "bench_phases_x" / "bench.json").read_text())
+    del bench["baseline"]  # a bench.json from before it named its baseline
+    bench["rows"] = [{**r, "op": "island:nvidia"} if r["op"] == "native" else r
+                     for r in bench["rows"]]
+    (job / "bench_phases_x" / "bench.json").write_text(json.dumps(bench))
+    rows = validation_tables.build([tmp_path])["benchmarks"]
+    assert {r["baseline"] for r in rows} == {"island-native (fewer ranks, best case)"}
+
+
+def test_tables_need_job_results(tmp_path, capsys):
+    assert validation_tables.main([str(tmp_path)]) == 1
+    assert "no job results" in capsys.readouterr().err
 
 
 def _free_port() -> int:
@@ -749,6 +967,8 @@ def test_preflight_passes_on_loopback(tmp_path):
         assert "one stream driven from Python; may understate fast links" in bandwidth["note"]
     # The other side's out is this side's in.
     assert master["bandwidth"]["MBps_out"] == worker["bandwidth"]["MBps_in"]
+    for record in records.values():
+        assert record["environment"]["hostname"] and "--out" in record["argv"]
 
 
 def test_preflight_measures_only_the_interface_it_is_given(tmp_path):

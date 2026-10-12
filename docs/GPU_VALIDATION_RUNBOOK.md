@@ -122,6 +122,9 @@ pipelined policy's pinned slots reused by the next collective while copies
 back out of them are held back; and a result read right after
 `is_completed()` (items 6, 15, 16 and 17). On one GPU they run two ranks
 sharing it.
+After the steps, `scripts/gpu/validation_tables.py` builds HARDWARE_VALIDATION.md's
+tables from every job's results, with the bridge time each preflight predicts
+next to the one measured ([The validation tables](#the-validation-tables)).
 Times exclude queue waits. For cost, multiply by the provider's current hourly
 rate; for example, at a hypothetical $3/h, step 7 costs about $1.50.
 
@@ -483,8 +486,11 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 ## Reading results
 
 - `results/<target>/<step>/rank<N>.json`: one record per rank. It holds:
-  - `environment`: host, GPUs with PCI bus ids, driver-visible devices, torch,
-    CUDA/HIP and NCCL/RCCL versions, relevant env vars, `gpubridge.probe()`;
+  - `environment`: host, GPUs with PCI bus ids, driver-visible devices, the
+    GPU driver, torch, CUDA or ROCm (and HIP), NCCL or RCCL and its version,
+    the gpubridge commit (`git_dirty` if tracked files had changes), the Gloo
+    and NCCL interfaces (`auto` when unset), allowlisted env vars,
+    `gpubridge.probe()`;
   - `run`: kind, split mode, islands, device;
   - `stages`: pass/fail per stage, with full tracebacks on failure;
   - `rank<N>.stacks.txt`: a stack dump if the rank hung in a stage.
@@ -506,6 +512,58 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 - `gpu_tests.xml` and `gpu_tests.log`: the GPU-only tests (JUnit XML and
   pytest's output). A failure names the policy, op, dtype, size and mode of
   each wrong case.
+- `train-n<N>.json`, `train_ddp*.json`: the training run's throughput, losses
+  and settings, with every rank's `environment`.
+
+Every JSON record a GPU script writes carries the same `environment` and its
+settings: `check.py`, `probe.py` and `device_map.py` records, `bench.json`,
+`preflight-<role>.json` and the training records.
+
+What a record may hold from the environment is an allowlist (`ENV_NAMES` and
+`ENV_PREFIXES` in `gpukit.py`): `GPUBRIDGE_*`, `NCCL_*`, `RCCL_*`, `GLOO_*`,
+`TORCH_*`, the visible-devices and rank variables, and a short list of
+`SLURM_*` ones (job id, partition, nodes, task ids, GPUs). A name with
+`TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `AUTH`, `USER`,
+`HOME` or `ACCOUNT` in it is never recorded, whatever its prefix. Every string
+a kit record holds, tracebacks and command lines included, is redacted before
+it is written: `/projects/<name>` and `PROJECT_DIR` become `$PROJECT_DIR`, the
+home directory `~`, the user name as a path segment `$USER`, and credentials in
+a URL `***`. The step logs (`<step>.log`), stack dumps (`rank*.stacks.txt`)
+and NCCL/RCCL logs are not redacted: keep them, and the results tarballs, out
+of anything public.
+
+### The validation tables
+
+`scripts/gpu/validation_tables.py` turns results into the tables
+HARDWARE_VALIDATION.md needs. Copy every job's results into one place (for
+the mixed job, both machines' `results/mixed-*` side by side) and run:
+
+    python scripts/gpu/validation_tables.py results/explorer results/amd/<target> results/mixed
+
+Each directory with a `steps.jsonl` is one job. It writes
+`validation_tables.md` and `validation_tables.json` into the first path (or
+`--out`), with these sections:
+
+- **Runs**: per job, steps passed and failed, the deliberate failing runs'
+  results, and what it ran on: hosts, GPU models, driver, torch, CUDA or
+  ROCm, NCCL or RCCL, gpubridge commit, Gloo interface.
+- **Items**: each HARDWARE_VALIDATION.md item, the steps and `check.py`
+  stages that test it, and a verdict: `not run`, `simulation only`,
+  `pass (n)` or `FAIL (k of n)`. A stage counts only in runs of the kind its
+  item needs (a split test never closes item 1).
+- **Network**: the preflight's chosen interfaces, MB/s each way, round trip.
+- **Benchmarks**: gpubridge and flat-gloo against the row's named baseline at
+  1 MiB, 64 MiB and the largest size.
+- **Predicted vs measured**: below.
+
+Runs in CPU simulation (`GPUBRIDGE_VENDOR` or `GPUBRIDGE_CPU_ONLY` set, or a
+CPU device) are marked `(simulation)` everywhere and never count towards an
+item.
+
+The tables are safe to commit publicly: hosts appear as `host 1`, `host 2`,
+... in order of first appearance (the same host has the same number in every
+section), and no path is shown. The raw results keep the real hostnames;
+publish the tables, not the results.
 
 `run.kind` values:
 
@@ -515,6 +573,39 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 | `gpu-single-vendor` | real GPUs, one vendor, no bridge |
 | `split-test` | islands faked with `GPUBRIDGE_SPLIT_TEST`: never a mixed-vendor result |
 | `cpu` | simulation or CPU-only mode |
+
+## Predicted vs measured
+
+Predict the bridge's time from the preflight before reading the benchmark. In
+reduce-bridge-broadcast, the island leaders run one Gloo all_reduce among
+themselves. A ring all_reduce over p leaders sends 2(p-1)/p of the tensor each
+way: the whole tensor for two islands. With B the preflight's slower direction
+in MB/s (1 MB = 10^6 bytes) and RTT its round trip in ms:
+
+    predicted bridge ms = RTT + 2(p-1)/p * bytes / (B * 10^6) * 1000
+
+For example, two islands, 64 MiB, a link the preflight measured at 1000 MB/s
+and 0.3 ms: 0.3 + 67.1, about 67 ms.
+
+The benchmark's `--phases` runs (step 05's `bench` and `bench_phases_*`, step
+07, `mixed/node.sh`) time the `bridge` phase on the slowest leader, and
+`validation_tables.py` puts it next to the prediction as "measured /
+predicted". Split tests on one node have no preflight, so no prediction. How
+to read the ratio:
+
+- **About 1**: the bridge runs at the speed the preflight measured; the
+  network is the limit.
+- **Well above 1 at large sizes**: something besides the wire costs time. The
+  `bridge` phase also includes the copies from the GPU to the host and back,
+  so compare it with a host copy of the same size, then look at CPU load on
+  the leaders.
+- **Well above 1 at small sizes only**: per-call overhead, not bandwidth; the
+  round trip dominates the prediction there.
+- **Below 1**: the preflight understated the link. It measures one TCP stream
+  driven from Python, which may not fill 100 Gb/s Ethernet or IPoIB. Policies
+  that split or overlap the transfer (`sharded-bridge`,
+  `pipelined-reduce-bridge-broadcast`) can also beat it, so for them the
+  prediction is closer to an upper bound.
 
 ## If a step fails
 

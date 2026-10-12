@@ -37,6 +37,7 @@ END_TO_END = {
     "device_map.py": "test_step_03 (fails on CPU: no GPU)",
     "preflight.py": "test_step_05, 07, the node pair, test_gpu_kit.py",
     "node_ifname.sh": "test_step_05, test_each_node_uses_its_own_preflight_choice",
+    "validation_tables.py": "test_step_05, test_gpu_kit.py",
     "setup_env.sh": "test_setup_job_creates_the_cuda_venv",
     "explorer/submit.sh": "every test_step_*, and test_gpu_kit.py for 00",
     "explorer/job_env.sh": "sourced by every Explorer job",
@@ -211,6 +212,16 @@ def test_step_05_two_nodes(tmp_path):
     torchruns = [line for line in log.splitlines()
                  if line.startswith("srun ") and "torchrun" in line]
     assert torchruns and all("node_ifname.sh torchrun" in line for line in torchruns)
+    # The validation tables from this job: all simulation, so no item counts.
+    tables = subprocess.run([sys.executable, str(KIT / "validation_tables.py"), str(out)],
+                            capture_output=True, text=True, timeout=120)
+    assert tables.returncode == 0, tables.stderr
+    data = json.loads((out / "validation_tables.json").read_text())
+    assert [run["simulated"] for run in data["runs"]] == [True]
+    verdicts = {row["item"]: row["verdict"] for row in data["items"]}
+    assert verdicts[8] == "simulation only" and verdicts[1] == "not run"
+    assert data["network"][0]["master"].endswith(chosen)
+    assert {row["policy"] for row in data["predicted"]} >= {"sharded-bridge"}
 
 
 @pytest.mark.parametrize(("names", "extra", "seen"), [
