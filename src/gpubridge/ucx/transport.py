@@ -1,9 +1,21 @@
 """``bridge="ucx"``: the island leaders' bridge over UCX (docs/RDMA_TRANSPORT.md).
 
-The host-memory path: policies stage tensors to host memory as for Gloo, and
-this transport moves them between leaders with UCX tagged messages, over
-whatever UCX picks (InfiniBand or RoCE verbs, shared memory, TCP). The
-reductions run here, with torch ops on the received data.
+Leaders' tensors move with UCX tagged messages, over whatever UCX picks
+(InfiniBand or RoCE verbs, TCP). The reductions run here, with torch ops on
+the received data. Three paths, chosen per call and recorded in
+:attr:`UcxTransport.last_path`:
+
+- ``host``: a host tensor (as Gloo gets it; the pipelined and sharded
+  policies always stage to host memory).
+- ``direct``: a GPU tensor, when this rank's UCX was built for that memory
+  type (``cuda`` or ``rocm``). UCX reads and writes GPU memory itself, with
+  GPUDirect RDMA where the NIC and drivers allow it. The host waits on an
+  event recorded on the caller's stream before each step posts its messages,
+  so no send reads data a queued kernel (the island reduce, a reduction) is
+  still writing.
+- ``staged``: a GPU tensor when UCX can't take that memory type: the
+  transport stages it through one pinned host buffer
+  (:class:`gpubridge.staging.PinnedBridgeStaging`) and runs the host path.
 
 - all_reduce: with two leaders, an exchange and one local reduction (both get
   the same bits, since addition, max and min are commutative); with more, a
@@ -33,6 +45,7 @@ from torch.distributed import ReduceOp
 
 from gpubridge import ucx
 from gpubridge.config import parse_size
+from gpubridge.staging import PinnedBridgeStaging
 from gpubridge.transport import BridgeTransport, register_transport
 
 #: Chunk size of every UCX message, e.g. ``4M`` or ``65536``.
@@ -73,6 +86,21 @@ def _pieces(nbytes: int, chunk: int) -> list[tuple[int, int]]:
         (0, 0)]
 
 
+def choose_path(device_type: str, hip: bool, memory_types: set[str]) -> tuple[str, int]:
+    """(path, UCX memory type) for a tensor on ``device_type``: see the module docstring.
+
+    ``hip`` says whether this is a ROCm build (its GPU tensors are ``cuda``
+    tensors to torch but ROCm memory to UCX); ``memory_types`` is what this
+    rank's UCX supports.
+    """
+    if device_type == "cpu":
+        return "host", ucx.HOST
+    kind, memory = ("rocm", ucx.ROCM) if hip else ("cuda", ucx.CUDA)
+    if kind in memory_types:
+        return "direct", memory
+    return "staged", ucx.HOST
+
+
 def _segments(numel: int, parts: int) -> list[tuple[int, int]]:
     """(start, length) in elements of ``parts`` near-equal segments."""
     base, extra = divmod(numel, parts)
@@ -86,6 +114,7 @@ class UcxTransport(BridgeTransport):
 
     name = "ucx"
     reduce_ops = frozenset({"sum", "max", "min"})
+    device_tensors = True
 
     #: Links created in this process, the same count on every rank (creation is
     #: collective and in the same order everywhere), so store keys never collide.
@@ -99,6 +128,12 @@ class UcxTransport(BridgeTransport):
         self.timeout = timeout.total_seconds()
         self.chunk_bytes = chunk_bytes
         self._seq = 0
+        #: Memory types this rank's UCX supports ("host", "cuda", "rocm").
+        self.memory_types = worker.memory_types()
+        #: The path of the last collective: "host", "direct" or "staged".
+        self.last_path: str | None = None
+        self._memory = ucx.HOST
+        self._staging: PinnedBridgeStaging | None = None
 
     # ---- creation ---------------------------------------------------------------------
 
@@ -181,39 +216,67 @@ class UcxTransport(BridgeTransport):
         return [i for i in range(len(self.members)) if i != self.index]
 
     def _start(self, tensor: torch.Tensor) -> tuple[int, float]:
-        if tensor.device.type != "cpu" or not tensor.is_contiguous():
-            raise ValueError("the UCX bridge carries contiguous host tensors")
+        if not tensor.is_contiguous():
+            raise ValueError("the UCX bridge carries contiguous tensors")
+        self.last_path, self._memory = choose_path(tensor.device.type,
+                                                   bool(torch.version.hip), self.memory_types)
         self._seq += 1
         return self._seq, time.monotonic() + self.timeout
+
+    def _ready(self, tensor: torch.Tensor) -> None:
+        """Before posting messages on GPU memory: wait for the work queued on the
+        caller's stream (only up to now, not the whole device)."""
+        if self.last_path == "direct":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(tensor.device))
+            event.synchronize()
+
+    def _staged(self, tensor: torch.Tensor, run) -> None:
+        """Run ``run(host_tensor)`` on a pinned host copy of a GPU ``tensor``, then copy back."""
+        if self._staging is None:
+            self._staging = PinnedBridgeStaging(tensor.device)
+        host = self._staging.to_host(tensor)
+        run(host)
+        self._staging.to_device(tensor, host)
 
     def _send(self, peer: int, view: torch.Tensor, seq: int, step: int) -> list[int]:
         nbytes = view.numel() * view.element_size()
         return [self.worker.send(peer, view.data_ptr() + offset, length,
-                                 tag(seq, step, self.index, i))
+                                 tag(seq, step, self.index, i), self._memory)
                 for i, (offset, length) in enumerate(_pieces(nbytes, self.chunk_bytes))]
 
     def _recv(self, peer: int, view: torch.Tensor, seq: int, step: int) -> list[int]:
         nbytes = view.numel() * view.element_size()
-        return [self.worker.recv(view.data_ptr() + offset, length, tag(seq, step, peer, i))
+        return [self.worker.recv(view.data_ptr() + offset, length, tag(seq, step, peer, i),
+                                 self._memory)
                 for i, (offset, length) in enumerate(_pieces(nbytes, self.chunk_bytes))]
 
     def all_reduce(self, tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
-        size = len(self.members)
-        if size == 1:
+        if len(self.members) == 1:
             return
         seq, deadline = self._start(tensor)
+        if self.last_path == "staged":
+            self._staged(tensor, lambda host: self._all_reduce(host, op, seq, deadline))
+        else:
+            self._all_reduce(tensor, op, seq, deadline)
+
+    def _all_reduce(self, tensor: torch.Tensor, op: ReduceOp.RedOpType, seq: int,
+                    deadline: float) -> None:
+        size = len(self.members)
         reduce = _REDUCE[op]
         flat = tensor.view(-1)
         if size == 2:
             (peer,) = self._peers()
             scratch = torch.empty_like(flat)
+            self._ready(flat)
             ids = self._recv(peer, scratch, seq, 0) + self._send(peer, flat, seq, 0)
             self.worker.wait(ids, deadline)
             reduce(flat, scratch)
             return
         right, left = (self.index + 1) % size, (self.index - 1) % size
         segments = _segments(flat.numel(), size)
-        scratch = torch.empty(max(length for _, length in segments), dtype=flat.dtype)
+        scratch = torch.empty(max(length for _, length in segments), dtype=flat.dtype,
+                              device=flat.device)
 
         def segment(i: int) -> torch.Tensor:
             start, length = segments[i % size]
@@ -222,11 +285,13 @@ class UcxTransport(BridgeTransport):
         for step in range(size - 1):  # reduce-scatter
             incoming = segment(self.index - step - 1)
             buffer = scratch[:incoming.numel()]
+            self._ready(flat)  # the last step's reduction is done before its result is sent
             ids = self._recv(left, buffer, seq, step) + self._send(
                 right, segment(self.index - step), seq, step)
             self.worker.wait(ids, deadline)
             reduce(incoming, buffer)
         for step in range(size - 1):  # all-gather: this member now owns segment index + 1
+            self._ready(flat)
             ids = self._recv(left, segment(self.index - step), seq, size + step) + self._send(
                 right, segment(self.index + 1 - step), seq, size + step)
             self.worker.wait(ids, deadline)
@@ -235,8 +300,15 @@ class UcxTransport(BridgeTransport):
         if len(self.members) == 1:
             return
         seq, deadline = self._start(tensor)
+        if self.last_path == "staged":
+            self._staged(tensor, lambda host: self._broadcast(host, src, seq, deadline))
+        else:
+            self._broadcast(tensor, src, seq, deadline)
+
+    def _broadcast(self, tensor: torch.Tensor, src: int, seq: int, deadline: float) -> None:
         root = self.members.index(src)
         flat = tensor.view(-1)
+        self._ready(flat)
         if self.index == root:
             ids = [i for peer in self._peers() for i in self._send(peer, flat, seq, 0)]
         else:
@@ -244,6 +316,9 @@ class UcxTransport(BridgeTransport):
         self.worker.wait(ids, deadline)
 
     def close(self) -> None:
+        if self._staging is not None:
+            self._staging.close()
+            self._staging = None
         self.worker.close(timeout=min(10.0, self.timeout))
 
 

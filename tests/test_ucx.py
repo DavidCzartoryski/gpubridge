@@ -264,3 +264,49 @@ def test_teardown_with_an_operation_outstanding(tmp_path):
     env = {**TCP, "GB_RDZV": str(tmp_path / "rdzv")}
     run_ranks(["nvidia", "amd"], _check_teardown, tmp_path,
               before_init=partial(_label_islands, None, env), init_kwargs={"bridge": "ucx"})
+
+
+# ---- the device path (its GPU side is in tests/test_gpu.py) ----------------------------
+
+@pytest.mark.parametrize(("device", "hip", "types", "want"), [
+    ("cpu", False, {"host"}, ("host", ucx.HOST)),
+    ("cuda", False, {"host", "cuda"}, ("direct", ucx.CUDA)),
+    ("cuda", True, {"host", "rocm"}, ("direct", ucx.ROCM)),
+    ("cuda", False, {"host"}, ("staged", ucx.HOST)),  # UCX built without CUDA
+    ("cuda", True, {"host", "cuda"}, ("staged", ucx.HOST)),  # a ROCm build, CUDA-only UCX
+])
+def test_gpu_tensors_go_direct_only_where_ucx_has_their_memory_type(device, hip, types, want):
+    assert ucx_transport.choose_path(device, hip, types) == want
+
+
+class _Bridge:
+    def __init__(self, device_tensors):
+        self.device_tensors = device_tensors
+
+
+@pytest.mark.parametrize(("device", "device_tensors", "pinned", "direct", "staged"), [
+    ("cuda", True, False, True, False),   # bridge="ucx" on a GPU leader: no host copy
+    ("cuda", True, True, True, False),    # ... even with pinned staging asked for
+    ("cuda", False, True, False, True),   # the Gloo bridge: pinned staging as asked
+    ("cpu", True, False, False, False),   # simulation: tensors are on the host anyway
+])
+def test_the_default_policy_hands_gpu_tensors_to_a_device_transport(
+        device, device_tensors, pinned, direct, staged, monkeypatch):
+    from types import SimpleNamespace
+
+    from gpubridge import staging
+    from gpubridge.policies import ReduceBridgeBroadcast
+
+    monkeypatch.setattr(staging, "make_bridge_staging", lambda device: object())
+    topology = SimpleNamespace(
+        layout=SimpleNamespace(needs_bridge=True), is_leader=True,
+        device=SimpleNamespace(type=device), bridge=_Bridge(device_tensors),
+        pinned_staging=pinned)
+    policy = ReduceBridgeBroadcast()
+    policy.setup(topology)
+    assert policy.direct_bridge is direct
+    assert (policy.staging_buffer is not None) is staged
+    if direct:
+        tensor = torch.ones(3)
+        assert policy._to_host(tensor) is tensor
+        policy._to_device(tensor, tensor)  # nothing to copy back

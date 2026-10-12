@@ -1,10 +1,12 @@
 """Bridge transports: how island leaders exchange data across vendors.
 
-The bridge only ever moves CPU tensors between island leaders, so anything
+By default the bridge moves CPU tensors between island leaders, so anything
 that can sum and broadcast a CPU tensor among a fixed set of processes can
-carry it. Gloo is the default. Another transport (MPI, UCX, an RDMA path)
-plugs in by subclassing :class:`BridgeTransport` and registering it, without
-touching the reduce-bridge-broadcast logic in ``collectives.py``.
+carry it (a transport with ``device_tensors`` also takes GPU tensors). Gloo is
+the default; ``bridge="ucx"`` (:mod:`gpubridge.ucx.transport`) is the other
+built-in one. Another transport (MPI, an RDMA path) plugs in by subclassing
+:class:`BridgeTransport` and registering it, without touching the
+reduce-bridge-broadcast logic in ``collectives.py``.
 """
 
 from __future__ import annotations
@@ -34,6 +36,12 @@ class BridgeTransport(abc.ABC):
     #: ``"min"`` if listed. Only a transport that lists one is called with it, as
     #: ``all_reduce(tensor, op=ReduceOp.MAX)``; SUM always comes without ``op``.
     reduce_ops: ClassVar[frozenset[str]] = frozenset({"sum"})
+
+    #: True if :meth:`all_reduce` and :meth:`broadcast` also take tensors in GPU
+    #: memory and order them against the caller's stream themselves. The default
+    #: policy then hands GPU tensors straight to the transport instead of copying
+    #: them to host memory first. Transports without it only ever see host tensors.
+    device_tensors: ClassVar[bool] = False
 
     @classmethod
     @abc.abstractmethod

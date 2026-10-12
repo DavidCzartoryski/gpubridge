@@ -44,6 +44,7 @@ import torch
 import torch.multiprocessing as mp
 
 import gpubridge
+from gpubridge import ucx
 from gpubridge.policies import implements
 
 requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA or ROCm GPU")
@@ -69,9 +70,26 @@ OWN_ENV = ("GPUBRIDGE_VENDOR", "GPUBRIDGE_CPU_ONLY", "GPUBRIDGE_SPLIT_TEST",
            "GPUBRIDGE_PINNED_STAGING")
 #: The default bridge with opt-in pinned staging.
 PINNED = {"GPUBRIDGE_PINNED_STAGING": "1"}
-#: Every bridge policy, plus reduce-bridge-broadcast with pinned staging: (tag, policy, env).
+#: An ``env`` key that init() passes as the bridge transport instead of setting it.
+BRIDGE = "bridge"
+
+
+def _ucx_available() -> bool:
+    try:
+        ucx.build()
+    except ucx.Unavailable:
+        return False
+    return True
+
+
+UCX = _ucx_available()
+#: Every bridge policy, reduce-bridge-broadcast with pinned staging, and, where
+#: the UCX bridge builds, the default and pipelined policies over it: (tag, policy, env).
 VARIANTS = (*((policy, policy, {}) for policy in BRIDGE_POLICIES),
-            ("reduce-bridge-broadcast-pinned", "reduce-bridge-broadcast", PINNED))
+            ("reduce-bridge-broadcast-pinned", "reduce-bridge-broadcast", PINNED),
+            *((("ucx", "reduce-bridge-broadcast", {BRIDGE: "ucx"}),
+               ("ucx-pipelined", "pipelined-reduce-bridge-broadcast", {BRIDGE: "ucx"}))
+              if UCX else ()))
 
 
 # ---- data and expected results ---------------------------------------------------
@@ -166,13 +184,16 @@ def _rank_main(rank: int, world: int, fn: Callable[[int, int, Path], None], tmp_
 
 def init(tmp_path: Path, tag: str, rank: int, world: int, policy: str,
          env: dict[str, str] | None = None) -> gpubridge.Topology:
-    """gpubridge.init, with ``env`` set while it reads its settings."""
-    os.environ.update(env or {})
+    """gpubridge.init, with ``env`` set while it reads its settings (and ``env[BRIDGE]``,
+    if given, as the bridge transport)."""
+    settings = {k: v for k, v in (env or {}).items() if k != BRIDGE}
+    os.environ.update(settings)
     try:
         return gpubridge.init(init_method=f"file://{tmp_path}/rendezvous-{tag}", rank=rank,
-                              world_size=world, timeout=TIMEOUT, policy=policy)
+                              world_size=world, timeout=TIMEOUT, policy=policy,
+                              bridge=(env or {}).get(BRIDGE, "gloo"))
     finally:
-        for name in env or {}:
+        for name in settings:
             os.environ.pop(name)
 
 
@@ -275,8 +296,7 @@ def compare_policies(rank: int, world: int, tmp_path: Path, *, numels: tuple[int
     runs.append(("pipelined-odd-chunk", "pipelined-reduce-bridge-broadcast",
                  {"GPUBRIDGE_CHUNK_BYTES": ODD_CHUNK_BYTES}))
     for tag, policy, env in runs:
-        os.environ.update(env)
-        topology = init(tmp_path, tag, rank, world, policy)
+        topology = init(tmp_path, tag, rank, world, policy, env)
         try:
             assert topology.split_test == "half" and len(topology.layout.islands) == 2
             digests[tag] = {}
@@ -286,8 +306,6 @@ def compare_policies(rank: int, world: int, tmp_path: Path, *, numels: tuple[int
                 check_refuses_non_contiguous(topology, bad)
         finally:
             gpubridge.destroy()
-            for name in env:
-                os.environ.pop(name)
     reference = digests.pop(REFERENCE)
     for tag, cases in digests.items():
         bad.check(f"{tag} ran every case", set(cases) == set(reference),
@@ -474,6 +492,36 @@ def completion(rank: int, world: int, tmp_path: Path, *, numel: int) -> None:
     bad.raise_if_any()
 
 
+def ucx_device_path(rank: int, world: int, tmp_path: Path, *, numel: int) -> None:
+    """bridge="ucx" says which path a GPU tensor took, and the result is right either way.
+
+    ``direct`` where this rank's UCX supports the GPU's memory type (CUDA or
+    ROCm), ``staged`` through pinned host memory where it doesn't. On CPU (the
+    simulation self-test) tensors are on the host.
+    """
+    bad = Mismatches(rank)
+    topology = init(tmp_path, "ucx-path", rank, world, "reduce-bridge-broadcast",
+                    {BRIDGE: "ucx"})
+    try:
+        device = topology.device
+        tensor = rank_data(rank, numel, torch.float32, device)
+        gpubridge.all_reduce(tensor)
+        sync(device)
+        bad.equal("ucx all_reduce", tensor,
+                  expected_reduce("sum", world, numel, torch.float32).to(device))
+        bridge = topology.bridge
+        if bridge is not None:
+            kind = "rocm" if torch.version.hip else "cuda"
+            want = ("host" if device.type == "cpu"
+                    else "direct" if kind in bridge.memory_types else "staged")
+            bad.check("ucx path", bridge.last_path == want,
+                      f"{bridge.last_path}, expected {want} (UCX memory types "
+                      f"{sorted(bridge.memory_types)})")
+    finally:
+        gpubridge.destroy()
+    bad.raise_if_any()
+
+
 def pinned_reuse(rank: int, world: int, tmp_path: Path, *, numel: int) -> None:
     """The default bridge's pinned buffer (``GPUBRIDGE_PINNED_STAGING``), reused at once.
 
@@ -540,6 +588,13 @@ def test_pinned_slots_are_not_reused_before_their_copies_back(tmp_path):
 
 @pytest.mark.gpu
 @requires_gpu
+@pytest.mark.skipif(not UCX, reason="the UCX bridge can't be built here")
+def test_the_ucx_bridge_takes_gpu_tensors_directly_or_says_it_staged_them(tmp_path):
+    spawn(partial(ucx_device_path, numel=LARGE_NUMEL // 4), gpu_ranks(), tmp_path, SPLIT)
+
+
+@pytest.mark.gpu
+@requires_gpu
 def test_the_pinned_bridge_buffer_is_not_reused_before_its_copy_back(tmp_path):
     spawn(partial(pinned_reuse, numel=LARGE_NUMEL // 4), gpu_ranks(), tmp_path, SPLIT)
 
@@ -594,3 +649,5 @@ def test_gpu_test_logic_in_simulation(tmp_path):
     each(partial(slot_reuse, iters=0), 4, "slots")
     each(partial(completion, numel=100_003), 2, "completion")
     each(partial(pinned_reuse, numel=10_007), 4, "pinned")
+    if UCX:
+        each(partial(ucx_device_path, numel=10_007), 4, "ucx-path")
