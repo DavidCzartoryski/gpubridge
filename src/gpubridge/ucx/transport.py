@@ -1,0 +1,262 @@
+"""``bridge="ucx"``: the island leaders' bridge over UCX (docs/RDMA_TRANSPORT.md).
+
+The host-memory path: policies stage tensors to host memory as for Gloo, and
+this transport moves them between leaders with UCX tagged messages, over
+whatever UCX picks (InfiniBand or RoCE verbs, shared memory, TCP). The
+reductions run here, with torch ops on the received data.
+
+- all_reduce: with two leaders, an exchange and one local reduction (both get
+  the same bits, since addition, max and min are commutative); with more, a
+  ring (reduce-scatter, then all-gather), so every element is reduced in one
+  fixed order and then copied.
+- broadcast: the source leader sends to each of the others.
+
+Every message is split into chunks of ``GPUBRIDGE_UCX_CHUNK_BYTES`` (4 MiB by
+default), all posted at once. Every wait has the deadline ``init()`` gave its
+groups; a timeout or a failed peer raises, and the transport refuses later
+calls.
+"""
+
+from __future__ import annotations
+
+import base64
+import itertools
+import os
+import time
+from collections.abc import Sequence
+from datetime import timedelta
+from typing import ClassVar
+
+import torch
+import torch.distributed as dist
+from torch.distributed import ReduceOp
+
+from gpubridge import ucx
+from gpubridge.config import parse_size
+from gpubridge.transport import BridgeTransport, register_transport
+
+#: Chunk size of every UCX message, e.g. ``4M`` or ``65536``.
+CHUNK_BYTES_ENV = "GPUBRIDGE_UCX_CHUNK_BYTES"
+DEFAULT_CHUNK_BYTES = 4 * 2**20
+#: The deadline when ``init()`` gave none: torch's default group timeout.
+DEFAULT_TIMEOUT = timedelta(minutes=30)
+#: The tag step of the connection handshake.
+HANDSHAKE = 0xFFF
+
+_REDUCE = {ReduceOp.SUM: torch.Tensor.add_,
+           ReduceOp.MAX: lambda a, b: torch.maximum(a, b, out=a),
+           ReduceOp.MIN: lambda a, b: torch.minimum(a, b, out=a)}
+
+
+def tag(seq: int, step: int, sender: int, chunk: int) -> int:
+    """A 64-bit message tag: collective number, step, sending member, chunk."""
+    return ((seq & 0xFFFFFF) << 40) | ((step & 0xFFF) << 28) | ((sender & 0xFF) << 20) | (
+        chunk & 0xFFFFF)
+
+
+def chunk_bytes_setting() -> int:
+    raw = os.environ.get(CHUNK_BYTES_ENV, "").strip()
+    if not raw:
+        return DEFAULT_CHUNK_BYTES
+    try:
+        size = parse_size(raw)
+    except ValueError as exc:
+        raise ValueError(f"{CHUNK_BYTES_ENV}: {exc}") from None
+    if size < 8 or size % 8:
+        raise ValueError(f"{CHUNK_BYTES_ENV}={raw!r} must be a positive multiple of 8 bytes")
+    return size
+
+
+def _pieces(nbytes: int, chunk: int) -> list[tuple[int, int]]:
+    """(offset, length) of each chunk of a ``nbytes`` buffer; one empty piece for 0 bytes."""
+    return [(offset, min(chunk, nbytes - offset)) for offset in range(0, nbytes, chunk)] or [
+        (0, 0)]
+
+
+def _segments(numel: int, parts: int) -> list[tuple[int, int]]:
+    """(start, length) in elements of ``parts`` near-equal segments."""
+    base, extra = divmod(numel, parts)
+    bounds = list(itertools.accumulate([base + (i < extra) for i in range(parts)], initial=0))
+    return [(bounds[i], bounds[i + 1] - bounds[i]) for i in range(parts)]
+
+
+@register_transport
+class UcxTransport(BridgeTransport):
+    """The bridge between island leaders over UCX. One instance per leader per link."""
+
+    name = "ucx"
+    reduce_ops = frozenset({"sum", "max", "min"})
+
+    #: Links created in this process, the same count on every rank (creation is
+    #: collective and in the same order everywhere), so store keys never collide.
+    _links: ClassVar[itertools.count] = itertools.count()
+
+    def __init__(self, worker: ucx.Worker, members: Sequence[int], rank: int,
+                 timeout: timedelta, chunk_bytes: int) -> None:
+        self.worker = worker
+        self.members = list(members)
+        self.index = self.members.index(rank)
+        self.timeout = timeout.total_seconds()
+        self.chunk_bytes = chunk_bytes
+        self._seq = 0
+
+    # ---- creation ---------------------------------------------------------------------
+
+    @classmethod
+    def create(cls, ranks: Sequence[int], *, timeout: timedelta | None = None
+               ) -> UcxTransport | None:
+        timeout = timeout or DEFAULT_TIMEOUT
+        link = next(cls._links)
+        store = dist.distributed_c10d._get_default_store()
+        key = f"gpubridge/ucx/{link}"
+        members, rank = list(ranks), dist.get_rank()
+        deadline = time.monotonic() + timeout.total_seconds()
+        transport, error = None, None
+        if rank in members:
+            try:
+                transport = cls._connect(store, key, members, rank, timeout, deadline)
+            except Exception as exc:  # noqa: BLE001 - reported to every rank below
+                error = f"{type(exc).__name__}: {exc}"
+            store.set(f"{key}/status/{rank}", "ok" if error is None else error)
+        # Every rank, member or not, learns whether every member connected.
+        statuses = _wait_for(store, [f"{key}/status/{m}" for m in members], deadline,
+                             "every bridge member to report on its UCX connection")
+        failed = [(m, s) for m, s in zip(members, statuses, strict=True) if s != "ok"]
+        if failed:
+            if transport is not None:
+                transport.close()
+            detail = "\n".join(f"  rank {m}: {s}" for m, s in failed)
+            raise RuntimeError(f"The UCX bridge between ranks {members} could not be set up; "
+                               f'use bridge="gloo" to run without it.\n{detail}')
+        return transport
+
+    @classmethod
+    def _connect(cls, store, key: str, members: list[int], rank: int, timeout: timedelta,
+                 deadline: float) -> UcxTransport:
+        chunk = chunk_bytes_setting()
+        worker = ucx.Worker(len(members))
+        try:
+            major, minor, release = ucx.version()
+            mine = f"{major}.{minor}.{release}|" + base64.b64encode(worker.address()).decode()
+            store.set(f"{key}/addr/{rank}", mine)
+            others = [m for m in members if m != rank]
+            entries = _wait_for(store, [f"{key}/addr/{m}" for m in others], deadline,
+                                "the other bridge members' UCX addresses",
+                                failures=[f"{key}/status/{m}" for m in others])
+            for member, entry in zip(others, entries, strict=True):
+                version, address = entry.split("|", 1)
+                if version.split(".")[:2] != [str(major), str(minor)]:
+                    raise RuntimeError(f"UCX {major}.{minor}.{release} here but {version} on "
+                                       f"rank {member}; the bridge needs the same UCX major "
+                                       "and minor version on every leader")
+                worker.connect(members.index(member), base64.b64decode(address))
+            transport = cls(worker, members, rank, timeout, chunk)
+            transport._handshake(deadline)
+            return transport
+        except BaseException:
+            worker.close(timeout=1.0)
+            raise
+
+    def _handshake(self, deadline: float) -> None:
+        """One small message each way with every other member, so a link that can't
+        carry data fails now, not in the first collective."""
+        hello = torch.tensor([self.index], dtype=torch.int64)
+        replies = {}
+        ids = []
+        for peer in self._peers():
+            replies[peer] = torch.full((1,), -1, dtype=torch.int64)
+            ids.append(self.worker.recv(replies[peer].data_ptr(), 8,
+                                        tag(0, HANDSHAKE, peer, 0)))
+            ids.append(self.worker.send(peer, hello.data_ptr(), 8,
+                                        tag(0, HANDSHAKE, self.index, 0)))
+        self.worker.wait(ids, deadline)
+        for peer, reply in replies.items():
+            if int(reply.item()) != peer:
+                raise RuntimeError(f"UCX handshake with bridge member {peer} returned "
+                                   f"{int(reply.item())}")
+
+    # ---- collectives ------------------------------------------------------------------
+
+    def _peers(self) -> list[int]:
+        return [i for i in range(len(self.members)) if i != self.index]
+
+    def _start(self, tensor: torch.Tensor) -> tuple[int, float]:
+        if tensor.device.type != "cpu" or not tensor.is_contiguous():
+            raise ValueError("the UCX bridge carries contiguous host tensors")
+        self._seq += 1
+        return self._seq, time.monotonic() + self.timeout
+
+    def _send(self, peer: int, view: torch.Tensor, seq: int, step: int) -> list[int]:
+        nbytes = view.numel() * view.element_size()
+        return [self.worker.send(peer, view.data_ptr() + offset, length,
+                                 tag(seq, step, self.index, i))
+                for i, (offset, length) in enumerate(_pieces(nbytes, self.chunk_bytes))]
+
+    def _recv(self, peer: int, view: torch.Tensor, seq: int, step: int) -> list[int]:
+        nbytes = view.numel() * view.element_size()
+        return [self.worker.recv(view.data_ptr() + offset, length, tag(seq, step, peer, i))
+                for i, (offset, length) in enumerate(_pieces(nbytes, self.chunk_bytes))]
+
+    def all_reduce(self, tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
+        size = len(self.members)
+        if size == 1:
+            return
+        seq, deadline = self._start(tensor)
+        reduce = _REDUCE[op]
+        flat = tensor.view(-1)
+        if size == 2:
+            (peer,) = self._peers()
+            scratch = torch.empty_like(flat)
+            ids = self._recv(peer, scratch, seq, 0) + self._send(peer, flat, seq, 0)
+            self.worker.wait(ids, deadline)
+            reduce(flat, scratch)
+            return
+        right, left = (self.index + 1) % size, (self.index - 1) % size
+        segments = _segments(flat.numel(), size)
+        scratch = torch.empty(max(length for _, length in segments), dtype=flat.dtype)
+
+        def segment(i: int) -> torch.Tensor:
+            start, length = segments[i % size]
+            return flat[start:start + length]
+
+        for step in range(size - 1):  # reduce-scatter
+            incoming = segment(self.index - step - 1)
+            buffer = scratch[:incoming.numel()]
+            ids = self._recv(left, buffer, seq, step) + self._send(
+                right, segment(self.index - step), seq, step)
+            self.worker.wait(ids, deadline)
+            reduce(incoming, buffer)
+        for step in range(size - 1):  # all-gather: this member now owns segment index + 1
+            ids = self._recv(left, segment(self.index - step), seq, size + step) + self._send(
+                right, segment(self.index + 1 - step), seq, size + step)
+            self.worker.wait(ids, deadline)
+
+    def broadcast(self, tensor: torch.Tensor, src: int) -> None:
+        if len(self.members) == 1:
+            return
+        seq, deadline = self._start(tensor)
+        root = self.members.index(src)
+        flat = tensor.view(-1)
+        if self.index == root:
+            ids = [i for peer in self._peers() for i in self._send(peer, flat, seq, 0)]
+        else:
+            ids = self._recv(root, flat, seq, 0)
+        self.worker.wait(ids, deadline)
+
+    def close(self) -> None:
+        self.worker.close(timeout=min(10.0, self.timeout))
+
+
+def _wait_for(store, keys: list[str], deadline: float, what: str,
+              failures: Sequence[str] = ()) -> list[str]:
+    """The values of ``keys`` once all exist. Gives up at ``deadline``, or as soon as one of
+    ``failures`` (a member's status key) holds an error."""
+    while True:
+        if store.check(keys):
+            return [store.get(k).decode() for k in keys]
+        for failure in failures:
+            if store.check([failure]) and store.get(failure).decode() != "ok":
+                raise RuntimeError(f"a bridge member failed first: {store.get(failure).decode()}")
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"timed out waiting for {what}")
+        time.sleep(0.01)

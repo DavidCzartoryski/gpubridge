@@ -194,6 +194,11 @@ tag, so a late message from one collective can never land in the next.
   leaders are in an island collective at that point and get NCCL's or Gloo's
   own timeout, as with the Gloo bridge today.
 - Creation errors fail `init()` on every rank (section 3).
+- Endpoints use UCX's peer error handling, so that a dead peer fails an
+  operation at once. UCX's shared-memory transports can't report a failed
+  peer, so UCX never uses them for the bridge: two leaders on one machine (a
+  split test) talk over TCP or verbs loopback. Leaders normally sit on
+  different hosts, where this changes nothing.
 
 ## 7. Build and packaging
 
@@ -229,7 +234,7 @@ extension can be added next to this library then.
 
 - **CI (Linux, GitHub Actions):** a job installs `libucx-dev` from Ubuntu,
   builds the library, and runs the transport tests with `UCX_TLS=tcp,self`
-  (and once with shared memory) between processes on one runner. The other
+  (and once with UCX's own choice) between processes on one runner. The other
   jobs, and macOS, skip them cleanly when the library can't be built.
 - **Bit for bit:** every transport-agnostic policy test that runs on the Gloo
   bridge also runs on `bridge="ucx"`, against `flat-gloo`, with the same exact
