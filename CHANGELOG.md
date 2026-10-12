@@ -5,6 +5,16 @@ release so far is an alpha that is **validated on CPU only**. Nothing has run
 on a GPU yet: [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what
 still needs real hardware. Numbers in parentheses are pull requests.
 
+## [Unreleased]
+
+### Fixed
+
+- The two-node job tests (Explorer steps 05 and 07) no longer hang on machines
+  whose own name doesn't resolve, such as macOS, where `socket.getfqdn()` can
+  return the reverse name of `::1`. The test harness's fake `srun` gives each
+  pretend node torchrun's `--local-addr=127.0.0.1`; the job scripts are
+  unchanged (#36).
+
 ## [0.3.0-alpha] - 2026-10-12
 
 CPU-validated, with the GPU validation kit ready for a first GPU run. Not on
@@ -123,6 +133,7 @@ CPU-validated, GPU validation pending.
 - A CPU-only matrix showing CUDA and ROCm builds of PyTorch can share one job
   (#1, #4), and prior-art notes (#2, #6).
 
+[Unreleased]: https://github.com/DavidCzartoryski/gpubridge/compare/v0.3.0-alpha...main
 [0.3.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.3.0-alpha
 [0.2.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.2.0-alpha
 [0.1.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.1.0-alpha
