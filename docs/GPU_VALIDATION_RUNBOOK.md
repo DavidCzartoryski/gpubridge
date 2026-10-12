@@ -582,7 +582,11 @@ themselves. A ring all_reduce over p leaders sends 2(p-1)/p of the tensor each
 way: the whole tensor for two islands. With B the preflight's slower direction
 in MB/s (1 MB = 10^6 bytes) and RTT its round trip in ms:
 
-    predicted bridge ms = RTT + 2(p-1)/p * bytes / (B * 10^6) * 1000
+    predicted bridge ms = (p-1) * RTT + 2(p-1)/p * bytes / (B * 10^6) * 1000
+
+The latency part is one RTT for two islands. With p leaders in a ring, the
+all_reduce takes 2(p-1) steps, each about half a round trip, so it is roughly
+(p-1) x RTT.
 
 For example, two islands, 64 MiB, a link the preflight measured at 1000 MB/s
 and 0.3 ms: 0.3 + 67.1, about 67 ms.
