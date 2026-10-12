@@ -14,6 +14,9 @@
 #                    waste the rest of a paid session. NCCL/RCCL write their
 #                    NCCL_DEBUG=INFO output to $RESULTS/nccl/NAME/; if the step
 #                    fails, the end of each of those logs is added to NAME.log
+#   negative_step NAME SECONDS REGEX CMD
+#                    a step that checks something fails as it should; passes only
+#                    if CMD exits 0 and REGEX appears in its output, within SECONDS
 #   limited CMD      run CMD under coreutils timeout (STEP_TIMEOUT), or print it
 #   finish      print the step table; exit non-zero if any step failed
 #   load_env_file F  read NAME=value settings from file F, if it exists
@@ -138,6 +141,16 @@ step() {
     NCCL_DEBUG_FILE="$nccl_dir/%h.%p.log" "$@" 2>&1 | tee "$RESULTS/$name.log"
     code=${PIPESTATUS[0]}
     set -e
+    local result=""
+    if [ -n "${STEP_EXPECT:-}" ]; then  # set by negative_step
+        if [ "$code" = 0 ] && grep -q -E -e "$STEP_EXPECT" "$RESULTS/$name.log"; then
+            result="expected failure confirmed"
+        else
+            result="check did not fire"
+            [ "$code" != 0 ] || code=1
+        fi
+        log "step $name: $result" 2>&1 | tee -a "$RESULTS/$name.log"
+    fi
     if [ "$code" = 124 ]; then
         timed_out=true
         log "step $name ran out of time (STEP_TIMEOUT=${STEP_TIMEOUT}s)" 2>&1 |
@@ -147,8 +160,9 @@ step() {
         nccl_report "$nccl_dir" >>"$RESULTS/$name.log"
     fi
     rmdir "$nccl_dir" "$RESULTS/nccl" 2>/dev/null || true  # only if empty (CPU runs)
-    printf '{"step": "%s", "exit_code": %d, "seconds": %d, "log": "%s.log", "timed_out": %s}\n' \
-        "$name" "$code" "$(($(date +%s) - start))" "$name" "$timed_out" >>"$RESULTS/steps.jsonl"
+    printf '{"step": "%s", "exit_code": %d, "seconds": %d, "log": "%s.log", "timed_out": %s%s}\n' \
+        "$name" "$code" "$(($(date +%s) - start))" "$name" "$timed_out" \
+        "${result:+, \"result\": \"$result\"}" >>"$RESULTS/steps.jsonl"
     if [ "$code" = 0 ]; then
         PASSED_STEPS+=("$name")
     else
@@ -157,6 +171,19 @@ step() {
             "NCCL/RCCL logs: $RESULTS/$name.log"
     fi
     return 0
+}
+
+# negative_step NAME SECONDS REGEX CMD...: a step whose CMD checks that something
+# fails the way it should, e.g. check.py --expect-init-error REGEX. It passes only
+# if CMD exits 0 and REGEX appears in its output: failing for another reason, or
+# hanging, doesn't count. CMD gets its own limit of SECONDS instead of STEP_TIMEOUT.
+# steps.jsonl gives the step a "result": "expected failure confirmed", or "check
+# did not fire".
+negative_step() {
+    local name=$1 STEP_EXPECT=$3
+    local -x STEP_TIMEOUT=$2
+    shift 3
+    step "$name" "$@"
 }
 
 finish() {
@@ -240,8 +267,11 @@ preflight_ifname() {
 USE_PREFLIGHT_IFNAME="${USE_PREFLIGHT_IFNAME:-1}"
 PREFLIGHT_SECONDS="${PREFLIGHT_SECONDS:-2}"  # of raw TCP data each way, per pair of interfaces
 
-# use_preflight_ifname DIR: export GLOO_SOCKET_IFNAME for the rest of a job whose
-# machines all run under one environment, if both preflight sides chose the same name.
+# use_preflight_ifname DIR: after a preflight between two nodes (preflight.py --role
+# auto, so node 0 is the master), make Gloo use the interfaces it chose. If both
+# nodes chose the same name, export GLOO_SOCKET_IFNAME for the rest of the job.
+# Otherwise export IFNAME_BY_NODE ("<node 0's> <node 1's>"): job steps started on
+# both nodes through node_ifname.sh then set it to each node's own choice.
 use_preflight_ifname() {
     [ -z "${GLOO_SOCKET_IFNAME:-}" ] && [ "$USE_PREFLIGHT_IFNAME" = 1 ] || return 0
     local master worker
@@ -250,9 +280,13 @@ use_preflight_ifname() {
     if [ -n "$master" ] && [ "$master" = "$worker" ]; then
         export GLOO_SOCKET_IFNAME="$master"
         log "GLOO_SOCKET_IFNAME=$master, as the preflight chose"
+    elif [ -n "$master" ] && [ -n "$worker" ]; then
+        export IFNAME_BY_NODE="$master $worker"
+        log "GLOO_SOCKET_IFNAME per node, as the preflight chose: $master on node 0" \
+            "(the master), $worker on node 1"
     elif [ -n "$master$worker" ]; then
-        log "the preflight chose ${master:-?} on one machine and ${worker:-?} on the other;" \
-            "GLOO_SOCKET_IFNAME stays unset, so Gloo picks"
+        log "the preflight chose an interface on only one node (${master:-none} on the" \
+            "master, ${worker:-none} on the worker); GLOO_SOCKET_IFNAME stays unset, so Gloo picks"
     fi
 }
 

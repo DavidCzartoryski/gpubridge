@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from test_gpu_kit import KIT, REPO, _free_port, clean_env, steps
 
 FAKE_CLUSTER = REPO / "tests" / "fake_cluster"
@@ -34,6 +36,7 @@ END_TO_END = {
     "probe.py": "test_step_01 and 07 (fails on CPU: no GPU)",
     "device_map.py": "test_step_03 (fails on CPU: no GPU)",
     "preflight.py": "test_step_05, 07, the node pair, test_gpu_kit.py",
+    "node_ifname.sh": "test_step_05, test_each_node_uses_its_own_preflight_choice",
     "setup_env.sh": "test_setup_job_creates_the_cuda_venv",
     "explorer/submit.sh": "every test_step_*, and test_gpu_kit.py for 00",
     "explorer/job_env.sh": "sourced by every Explorer job",
@@ -204,6 +207,44 @@ def test_step_05_two_nodes(tmp_path):
     assert chosen and records[1]["chosen_ifname"] == chosen  # one machine: the same name
     logs = "".join(p.read_text() for p in (tmp_path / "work" / "logs").glob("*.out"))
     assert f"GLOO_SOCKET_IFNAME={chosen}, as the preflight chose" in logs
+    # Every torchrun goes through node_ifname.sh, for nodes whose names differ (below).
+    torchruns = [line for line in log.splitlines()
+                 if line.startswith("srun ") and "torchrun" in line]
+    assert torchruns and all("node_ifname.sh torchrun" in line for line in torchruns)
+
+
+@pytest.mark.parametrize(("names", "extra", "seen"), [
+    (("ib0", "eth1"), {}, ["node 0: ib0", "node 1: eth1"]),  # e.g. two partitions
+    (("ib0", "ib0"), {}, ["node 0: ib0", "node 1: ib0"]),
+    (("ib0", "eth1"), {"GLOO_SOCKET_IFNAME": "bond0"}, ["node 0: bond0", "node 1: bond0"]),
+    (("ib0", "eth1"), {"USE_PREFLIGHT_IFNAME": "0"}, ["node 0: unset", "node 1: unset"]),
+])
+def test_each_node_uses_its_own_preflight_choice(names, extra, seen, tmp_path):
+    # What step 05 does after its preflight, with records from two nodes that
+    # chose different names: each node's job steps, started by srun as
+    # multinode() starts torchrun, see their own node's choice.
+    records = tmp_path / "preflight"
+    records.mkdir()
+    for role, name in zip(("master", "worker"), names):
+        (records / f"preflight-{role}.json").write_text(
+            json.dumps({"ok": True, "chosen_ifname": name}))
+    script = tmp_path / "job.sh"
+    script.write_text(f"""set -euo pipefail
+source {KIT}/common.sh
+use_preflight_ifname {records}
+srun --nodes=2 --ntasks-per-node=1 --kill-on-bad-exit=1 bash {KIT}/node_ifname.sh \\
+    bash -c 'echo "node $SLURM_NODEID: ${{GLOO_SOCKET_IFNAME:-unset}}"'
+""")
+    env = cluster_env(tmp_path, **extra)
+    env["PATH"] = f"{Path(sys.executable).parent}{os.pathsep}{env['PATH']}"  # python, as in a job
+    if "GLOO_SOCKET_IFNAME" not in extra:
+        env.pop("GLOO_SOCKET_IFNAME", None)
+    result = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True,
+                            timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert sorted(result.stdout.splitlines()) == seen
+    if names == ("ib0", "eth1") and not extra:
+        assert "ib0 on node 0 (the master), eth1 on node 1" in result.stderr
 
 
 def test_step_06_scaling(tmp_path):
@@ -312,6 +353,40 @@ finish || true
         assert "ran out of time" in (results / "slow.log").read_text()
     else:
         assert records["slow"]["exit_code"] == 0
+
+
+def test_a_negative_step_passes_only_on_the_expected_error(tmp_path):
+    script = tmp_path / "job.sh"
+    script.write_text(f"""set -euo pipefail
+source {KIT}/common.sh
+RESULTS={tmp_path}/results
+ERROR="would share a GPU"
+negative_step fired 60 "$ERROR" \\
+    echo "rank 0: init() failed: ranks of one island would share a GPU"
+negative_step quiet 60 "$ERROR" echo "rank 0: init() failed: no GPU"
+negative_step other_failure 60 "$ERROR" bash -c 'echo "would share a GPU"; exit 1'
+negative_step hangs 1 "$ERROR" limited sleep 3
+step plain true
+echo "STEP_TIMEOUT=$STEP_TIMEOUT after"
+finish || true
+""")
+    result = subprocess.run(["bash", str(script)], env=clean_env(), capture_output=True,
+                            text=True, timeout=120)
+    results = tmp_path / "results"
+    records = {r["step"]: r for r in map(json.loads,
+                                         (results / "steps.jsonl").read_text().splitlines())}
+    assert records["fired"]["exit_code"] == 0, result.stderr
+    assert records["fired"]["result"] == "expected failure confirmed"
+    assert "step fired: expected failure confirmed" in (results / "fired.log").read_text()
+    # Exit 0 without the error, or the error but a failed command, or a hang: no pass.
+    for name in ("quiet", "other_failure", "hangs"):
+        assert records[name]["exit_code"] != 0, name
+        assert records[name]["result"] == "check did not fire", name
+    assert "result" not in records["plain"]
+    if shutil.which("timeout"):  # coreutils; not on macOS
+        assert records["hangs"]["exit_code"] == 124 and records["hangs"]["timed_out"]
+        assert "STEP_TIMEOUT=1s" in (results / "hangs.log").read_text()
+    assert "STEP_TIMEOUT=1200 after" in result.stdout  # only the step had the short limit
 
 
 def test_kit_tools_default_to_the_kit_timeout(monkeypatch):

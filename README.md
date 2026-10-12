@@ -97,9 +97,10 @@ links at once), never what a collective computes, and `auto` never picks them.
 4. Each rank computes the same islands, leaders and bridge from that shared
    map. If two ranks of one island would drive the same GPU (compared by UUID
    and PCI address), `init()` raises on every rank, since NCCL and RCCL refuse
-   that. Every rank calls `new_group` for every group in the same order, as
-   `torch.distributed` requires, and the bridge transport is created the same
-   way.
+   that. If a GPU reports neither (some ROCm builds), rank 0 warns that its
+   island goes unchecked instead. Every rank calls `new_group` for every group
+   in the same order, as `torch.distributed` requires, and the bridge
+   transport is created the same way.
 
 ## Install
 

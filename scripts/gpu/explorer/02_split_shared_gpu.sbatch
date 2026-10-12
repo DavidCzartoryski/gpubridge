@@ -14,6 +14,9 @@ source "$REPO/scripts/gpu/common.sh" "$@"
 source "$KIT_DIR/explorer/job_env.sh"
 
 PROCS=2   # ranks sharing the GPU
+# The deliberate failing run below fails within seconds when the check works.
+SHARED_GPU_CHECK_SECONDS="${SHARED_GPU_CHECK_SECONDS:-60}"
+SHARED_GPU_ERROR="would share a GPU"
 
 job_setup 02_split_shared_gpu
 export GPUBRIDGE_SPLIT_TEST=half
@@ -22,11 +25,13 @@ step check local_torchrun --nproc-per-node="$PROCS" "$KIT_DIR/check.py" \
 step summarize python "$KIT_DIR/summarize.py" "$RESULTS/check"
 # Item 24: 4 ranks with alternate put ranks 0 and 2, and 1 and 3, on this GPU in
 # one island each, which NCCL refuses. init() must fail on every rank first,
-# naming them. Real GPUs only: simulation has no GPUs to compare.
+# naming them: the step passes only if that error shows. Real GPUs only:
+# simulation has no GPUs to compare.
 if [ -z "${GPUBRIDGE_VENDOR:-}${GPUBRIDGE_CPU_ONLY:-}" ]; then
-    step shared_gpu_check env_local_torchrun GPUBRIDGE_SPLIT_TEST=alternate \
-        --nproc-per-node=4 "$KIT_DIR/check.py" --out "$RESULTS/shared_gpu_check" \
-        --expect-init-error "would share a GPU"
+    negative_step shared_gpu_check "$SHARED_GPU_CHECK_SECONDS" "$SHARED_GPU_ERROR" \
+        env_local_torchrun GPUBRIDGE_SPLIT_TEST=alternate --nproc-per-node=4 \
+        "$KIT_DIR/check.py" --out "$RESULTS/shared_gpu_check" \
+        --expect-init-error "$SHARED_GPU_ERROR"
     step summarize_shared_gpu python "$KIT_DIR/summarize.py" "$RESULTS/shared_gpu_check"
 fi
 # GPU-only correctness tests (tests/test_gpu.py): every policy against flat-gloo,

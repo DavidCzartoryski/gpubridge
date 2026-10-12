@@ -7,7 +7,9 @@ step) it times, by default:
   island backend (NCCL/RCCL on GPUs, Gloo on CPU): the baseline. Only possible
   when every rank has the same detected vendor (split tests included) and no
   two ranks share a GPU. Otherwise, as in a real mixed job, the baseline is
-  ``island`` instead.
+  ``island`` instead, labeled "island-native (fewer ranks, best case)": each
+  island all_reduces over fewer ranks and crosses no bridge, so it is a lower
+  bound rather than a like-for-like comparison.
 - ``gpubridge``: gpubridge.all_reduce. Bridged when the job has two islands
   (a split test or a real mixed job); a plain native all_reduce otherwise.
 - ``flat-gloo``: the flat-gloo policy on the same ranks (stage to CPU, Gloo
@@ -22,8 +24,8 @@ current stream around the call (the host timer is kept as ``host_median_us``);
 on CPU with the host timer. A trial's latency is the slowest rank's (for
 ``island``, the slowest rank of that island). Bandwidth follows nccl-tests:
 algbw = bytes / time and busbw = algbw * 2(n-1)/n, with n the ranks taking
-part. summary.md puts every op side by side, with gpubridge and flat-gloo as
-multiples of the baseline.
+part. Every row names the baseline of its run (``baseline``), and summary.md
+puts every op side by side, with gpubridge and flat-gloo as multiples of it.
 
 --phases attaches a gpubridge observer and adds the median time of each phase
 of the gpubridge op (island-reduce, bridge, island-broadcast for
@@ -77,9 +79,11 @@ DEFAULT_CANDIDATES = ("flat-gloo,reduce-bridge-broadcast,pipelined-reduce-bridge
 
 UNITS = {"K": 2**10, "M": 2**20, "G": 2**30}
 DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
-FIELDS = ["op", "policy", "run_kind", "split_test", "islands", "world_size", "bytes", "dtype",
-          "trials", "timer",
+FIELDS = ["op", "policy", "baseline", "run_kind", "split_test", "islands", "world_size", "bytes",
+          "dtype", "trials", "timer",
           "median_us", "p90_us", "min_us", "algbw_GBps", "busbw_GBps", "host_median_us"]
+#: The baseline when there is no ``native`` row: each island on its own.
+ISLAND_BASELINE = "island-native (fewer ranks, best case)"
 
 
 def parse_size(text: str) -> int:
@@ -217,6 +221,11 @@ def slowest_phases(mine: dict[str, float]) -> dict[str, float]:
     return {name: round(max(m[name] for m in everyone if name in m), 4) for name in names}
 
 
+def baseline_of(ops) -> str:
+    """What the gpubridge and flat-gloo rows of a run with these ops are compared with."""
+    return "native" if "native" in ops else ISLAND_BASELINE if "island" in ops else "none"
+
+
 def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
     lines = []
     if info["split_test"]:
@@ -235,8 +244,14 @@ def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
     candidates = list(dict.fromkeys(r["op"] for r in rows if r["op"].startswith("policy:")))
     ops = [op for op in ("native", *islands, "gpubridge", "flat-gloo", *candidates)
            if op in present]
-    base = "native" if "native" in present else "slowest island" if islands else None
+    base = "native" if "native" in present else ISLAND_BASELINE if islands else None
     ratios = [f"{op} / {base}" for op in ("gpubridge", "flat-gloo") if base and op in present]
+    if base == ISLAND_BASELINE:
+        lines += [f"Baseline: **{ISLAND_BASELINE}**, the slowest island's own native "
+                  "all_reduce at each size. One native group over every rank wasn't measured "
+                  "here, and each island reduces over fewer ranks with no bridge, so this is a "
+                  "best case for any all_reduce across the islands, not a like-for-like "
+                  "comparison.", ""]
     header = ["size"] + [f"{op} {what}" for op in ops
                          for what in ("median (us)", "busbw (GB/s)")] + ratios
     lines += ["| " + " | ".join(header) + " |", "|" + " --- |" * len(header)]
@@ -383,6 +398,7 @@ def main() -> int:
     if args.candidates:
         ops.update(candidate_ops(args.candidates, topology))
 
+    baseline = baseline_of(ops)
     phases = PhaseTimes() if args.phases else None
     if phases is not None:
         gpubridge.add_observer(phases)
@@ -405,6 +421,8 @@ def main() -> int:
             else:
                 new = [row(name, info, nbytes_real, args.dtype, slowest(per_trial),
                            host=slowest(on_host), timer=timer)]
+            for r in new:
+                r["baseline"] = baseline
             if name == "gpubridge" and phases is not None:
                 # time_op synchronized the device, so every mark is ready. Only the
                 # timed trials count, not the warmup.
@@ -425,7 +443,8 @@ def main() -> int:
             writer.writerows(rows)
         write_json(args.out / "bench.json", {
             "kit_version": KIT_VERSION, "script": "scripts/gpu/bench_all_reduce.py",
-            "argv": sys.argv, "run": info, "environment": environment(), "rows": rows,
+            "argv": sys.argv, "run": info, "environment": environment(), "baseline": baseline,
+            "rows": rows,
         })
         table = summary_table(rows, info)
         (args.out / "summary.md").write_text(f"# {args.out.name}: all_reduce benchmark\n\n{table}")

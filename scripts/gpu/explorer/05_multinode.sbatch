@@ -30,11 +30,13 @@ else
     HEAD=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 fi
 
-# One torchrun per node via srun; c10d rendezvous on the first node.
+# One torchrun per node via srun; c10d rendezvous on the first node. node_ifname.sh
+# gives each node its own preflight choice when the two nodes' names differ.
 multinode() {
     local tag=$1
     shift
     limited srun --nodes="$NNODES" --ntasks-per-node=1 --kill-on-bad-exit=1 \
+        bash "$KIT_DIR/node_ifname.sh" \
         torchrun --nnodes="$NNODES" --nproc-per-node="$GPUS_PER_NODE" \
         --rdzv-backend=c10d --rdzv-endpoint="$HEAD:$RDZV_PORT" \
         --rdzv-id="${SLURM_JOB_ID:-local}-$tag" "$@"
