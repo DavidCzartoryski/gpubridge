@@ -15,6 +15,7 @@
 
 #include <sched.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
@@ -383,6 +384,17 @@ int gb_ucx_close(void* handle, double timeout_s) {
     ucp_cleanup(h->context);
     delete h;
     return result;
+}
+
+// Makes a NIC's writes into an AMD GPU's memory visible to its kernels, given the
+// address of the GPU's HDP flush register (hipDeviceAttributeHdpMemFlushCntl):
+// a write of 1 and a read back, as hipDeviceFlushGPUDirectRDMAWrites does, for
+// HIP releases without that function. Volatile, so neither access is dropped.
+void gb_ucx_hdp_flush(void* reg) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);  // after the completion was seen
+    volatile uint32_t* flush = static_cast<volatile uint32_t*>(reg);
+    *flush = 1u;
+    static_cast<void>(*flush);
 }
 
 }  // extern "C"

@@ -119,7 +119,8 @@ and `bridge` phase. `validation_tables.py` shows each benchmark's staging.
 With `UCX_BRIDGE=1`, steps 05 and 07 also run the check and the gpubridge
 benchmark over the UCX bridge (`check_ucx`, `bench_ucx`; items 26 and 27); the
 run records say whether GPU tensors went to UCX directly or through pinned host
-memory (`run.bridge_path`).
+memory (`run.bridge_path`), and how received data was flushed into the GPU
+(`run.bridge_flush`).
 Steps 04, 06, 07 and the AMD script train with DDP and `gpubridge.ddp_comm_hook`
 (`examples/train_synthetic.py`, item 22).
 Steps 02, 04 and the AMD script also run the GPU-only tests, `pytest -m gpu

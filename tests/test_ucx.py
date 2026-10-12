@@ -104,6 +104,16 @@ def test_without_ucx_the_bridge_says_why():
 
 # ---- every policy on it, bit for bit --------------------------------------------------
 
+@needs_ucx
+def test_the_hdp_flush_helper_writes_one_to_the_register():
+    # gpubridge.ucx.gdr hands it an AMD GPU's HDP flush register; here, a host word.
+    import ctypes
+
+    register = ctypes.c_uint32(7)
+    ucx.load().gb_ucx_hdp_flush(ctypes.addressof(register))
+    assert register.value == 1
+
+
 def _label_islands(labels, env, rank):
     os.environ.update(env)
     if labels:

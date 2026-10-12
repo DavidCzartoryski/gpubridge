@@ -147,17 +147,101 @@ their host staging and pass the tensor straight through. The rules:
   any kernel the caller queued. The host wait is for that event only, not the
   whole device.
 - **Reductions run on the current stream** with ordinary torch ops, into the
-  caller's tensor, after each receive completes. Before the next step sends
-  data that a reduction just produced, the transport waits on an event
-  recorded after it, as above.
+  caller's tensor, after each receive completes and its data has been flushed
+  into the GPU (below). Before the next step sends data that a reduction just
+  produced, the transport waits on an event recorded after it, as above.
 - **After the last receive and reduction,** nothing waits on the host: the
   island broadcast that follows is queued on the same stream, behind the
-  reductions. A receive that lands directly in the caller's tensor is complete
-  when UCX reports it, before any later kernel on any stream is launched.
+  reductions. A receive that lands directly in the caller's tensor is flushed
+  before the collective returns, so it is visible to any kernel launched
+  afterwards, on any stream.
 - Scratch buffers come from the caching allocator on the current stream. UCX's
   writes into them are not stream-ordered, so what makes their reuse safe is
   that the host waits on the stream (above) after allocating them and before
   posting any receive into them.
+
+### GPUDirect RDMA write visibility
+
+When the NIC writes received data into GPU memory (GPUDirect RDMA on NVIDIA,
+peer memory or dma-buf on AMD), the CPU can see the receive complete before
+the GPU's kernels can see the data. UCX reports a receive complete when its
+completion entry reaches host memory; the data's writes to the GPU travel a
+different path and can still be in flight inside the GPU. NVIDIA's GPUDirect
+RDMA guide ([Synchronization and memory ordering](https://docs.nvidia.com/cuda/gpudirect-rdma/index.html#synchronization-and-memory-ordering))
+says a kernel may observe stale or out-of-order data until the writes have
+completed with respect to the CPU thread that launches it. Nothing in it says
+a completion entry the CPU polled establishes that, and NCCL assumes it
+doesn't. A reduction launched right after the receive could then add the
+scratch buffer's old contents.
+
+**What NCCL and RCCL do** (read 2026-10-12, NCCL 2.32.3, RCCL rocm-7.2.4):
+- After a receive into GPU memory completes, NCCL's IB transport posts a
+  "flush": a 1-byte RDMA READ of the received buffer on a queue pair connected
+  to itself (`iflush`). The read can't complete before the earlier writes
+  have reached GPU memory, and NCCL tells the GPU the data is there only after
+  the read completes.
+- NCCL flushes on GPUs before Hopper (compute capability below 9.0), and on
+  Grace (C2C) systems with a PCIe NIC; it treats Hopper and later as ordering
+  these writes themselves. `NCCL_GDR_FLUSH_DISABLE=1` turns the flush off and
+  `NCCL_NET_FORCE_FLUSH=1` forces it (neither is in NCCL's documented
+  variables). Its Windows NetworkDirect transport has no loopback queue pair
+  and calls `cudaDeviceFlushGPUDirectRDMAWrites` instead.
+- RCCL always flushes on AMD GPUs, with the same loopback read (of a dedicated
+  uncached GPU buffer, by default).
+
+**What UCX does: nothing, for CUDA or ROCm.** In UCX 1.18.1 and master
+(2026-10-12), a rendezvous receive completes on the local completion of its
+RDMA READ (get zcopy, `src/ucp/rndv/rndv_get.c`) or when the sender's
+completion message arrives (put zcopy, `src/ucp/rndv/rndv_rtr.c`), with no
+loopback read, no `cuFlushGPUDirectRDMAWrites` and no HDP flush anywhere in
+`src/ucp`, `src/uct/ib`, `src/uct/cuda` or `src/uct/rocm`. The flush before a
+rendezvous put's completion message (`UCX_RNDV_PUT_FORCE_FLUSH`) is about
+remote completion, not about the GPU seeing the data. UCX's pipelined
+protocols that land data in a host buffer and then copy it to the GPU with
+`cuMemcpyAsync` or an HSA copy are stream-ordered and need nothing. (With
+GPU fragment buffers, `UCX_RNDV_FRAG_MEM_TYPES` including `cuda` as by
+default, the NIC writes a GPU fragment first and UCX's own copy out of it
+faces the same question; gpubridge can't flush between the two.)
+
+**What gpubridge does.** After every step whose receives land in GPU memory
+on the direct path, the transport flushes before any kernel can read them:
+before the step's reduction, and before returning (the island broadcast and
+the caller's kernels come next). `gpubridge.ucx.gdr` decides how, once per
+GPU:
+- **CUDA:** `cuFlushGPUDirectRDMAWrites(CURRENT_CTX, TO_OWNER)` through the
+  driver library (`libcuda.so.1`, CUDA 11.3 and later), with the GPU's context
+  current. It blocks until the writes are visible to that GPU. A GPU whose
+  `CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING` is at least `OWNER`
+  (expected on Hopper and later) needs no flush, and the transport skips it.
+- **ROCm:** `hipDeviceFlushGPUDirectRDMAWrites` where the HIP runtime PyTorch
+  loaded has it (merged on ROCm's develop branch on 2026-10-02, in no release
+  yet). Otherwise the transport does what that function does: write 1 to the
+  GPU's HDP flush register (its address from `hipDeviceGetAttribute` with
+  `hipDeviceAttributeHdpMemFlushCntl`) and read it back, in a small C function
+  in the UCX library. HIP's own code says AMD GPUs never order these writes by
+  themselves.
+- **Neither possible** (a CUDA GPU that doesn't order the writes and has no
+  host flush, a driver older than CUDA 11.3, no HDP register): that GPU's
+  tensors take the staged path, with a warning.
+- The run records say which (`run.bridge_flush`, next to `run.bridge_path`).
+
+**Open, for hardware validation (item 26):**
+- Where the hardware has more than one write path, the CUDA driver documents
+  that it reports ordering for all devices and that `cuFlushGPUDirectRDMAWrites`
+  does nothing, leaving ordering across paths to the user. That is likely
+  NCCL's Grace (C2C) case with a PCIe NIC, where NCCL still flushes with its
+  loopback read; gpubridge does not.
+- AMD hasn't published that an HDP flush covers writes from a NIC; RCCL's
+  default is the loopback read. The HIP function gpubridge prefers is AMD's
+  own answer, but it isn't released yet.
+- How long a flush takes on Ampere or MI-series GPUs is unmeasured; it runs
+  once per received step, so it adds latency to small messages.
+- `test_data_ucx_writes_into_gpu_memory_is_what_the_next_kernel_reads`
+  (`tests/test_gpu.py`) checks each result with a kernel launched right after
+  the collective returns, with new values every iteration. It exercises NIC
+  writes only when UCX uses a network transport between the leaders: across
+  nodes, or on one node with `GPUBRIDGE_TEST_UCX_TLS=rc,cuda_copy` (or
+  `rc,rocm_copy`).
 
 ## 5. Chunking, pipelining and the algorithm
 
@@ -261,8 +345,14 @@ extension can be added next to this library then.
   runs the transport tests over verbs on any machine that has them.
 - **GPU and real RDMA:** tests marked `gpu` are written now and skipped
   without the hardware: device tensors on the device path, stream
-  ordering behind queued kernels, the pinned-staging fallback, and a check
-  that the run record says which path was used.
+  ordering behind queued kernels, the pinned-staging fallback, a check
+  that the run record says which path was used, and fresh data after every
+  receive (section 4).
+- **The flush, on CPU** (`tests/test_gdr_flush.py`): a fake UCX worker whose
+  receives into "GPU memory" land only at the next flush, so every collective
+  on two, three and four leaders gives the right answer only if each receive
+  is flushed before anything reads it; and the choice of flush against fake
+  CUDA drivers and HIP runtimes.
 - **Containers:** the pinned two-core Linux containers the project already
   uses for CPU tests, with `libucx-dev` installed.
 
@@ -297,6 +387,9 @@ extension can be added next to this library then.
   UCX's default transport choice then fails to initialize. CI pins
   `UCX_TLS=tcp,self`, and the transport's error now says to set `UCX_TLS` or
   `UCX_NET_DEVICES` when this happens. Expect the same on some cloud VMs.
+- GPUDirect RDMA write visibility (2026-10-12): UCX doesn't flush the NIC's
+  writes into GPU memory before reporting a receive complete, for CUDA or ROCm
+  memory, so the transport does (section 4).
 - Nothing has run on RDMA hardware or a GPU.
 
 ## Plan

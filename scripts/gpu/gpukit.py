@@ -232,6 +232,9 @@ def run_info(topology: gpubridge.Topology) -> dict[str, Any]:
         # bridge="ucx" on a leader: the path its last collective took (host, direct
         # or staged); scripts refresh it after their collectives. None otherwise.
         "bridge_path": getattr(topology.bridge, "last_path", None),
+        # ... and, on the direct path, how the NIC's writes into the GPU were flushed
+        # (or why its tensors were staged instead).
+        "bridge_flush": getattr(topology.bridge, "flush_method", None),
         "policy": topology.policy_name,
         # GPUBRIDGE_PINNED_STAGING: the default bridge stages through pinned memory.
         "pinned_staging": topology.pinned_staging,

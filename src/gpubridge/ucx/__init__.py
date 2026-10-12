@@ -151,6 +151,7 @@ def _declare(lib: ctypes.CDLL) -> ctypes.CDLL:
     lib.gb_ucx_recv.restype = c.c_int64
     lib.gb_ucx_wait.argtypes = [c.c_void_p, c.POINTER(c.c_int64), c.c_int, c.c_double]
     lib.gb_ucx_close.argtypes = [c.c_void_p, c.c_double]
+    lib.gb_ucx_hdp_flush.argtypes, lib.gb_ucx_hdp_flush.restype = [c.c_void_p], None
     for name in ("gb_ucx_memory_types", "gb_ucx_address", "gb_ucx_connect", "gb_ucx_wait",
                  "gb_ucx_close"):
         getattr(lib, name).restype = c.c_int

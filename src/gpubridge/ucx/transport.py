@@ -12,10 +12,13 @@ the received data. Three paths, chosen per call and recorded in
   GPUDirect RDMA where the NIC and drivers allow it. The host waits on an
   event recorded on the caller's stream before each step posts its messages,
   so no send reads data a queued kernel (the island reduce, a reduction) is
-  still writing.
-- ``staged``: a GPU tensor when UCX can't take that memory type: the
-  transport stages it through one pinned host buffer
-  (:class:`gpubridge.staging.PinnedBridgeStaging`) and runs the host path.
+  still writing. After each step's receives complete, the transport flushes
+  the NIC's writes into the GPU (:mod:`gpubridge.ucx.gdr`) before any kernel
+  can read them; :attr:`UcxTransport.flush_method` says how.
+- ``staged``: a GPU tensor when UCX can't take that memory type, or when that
+  flush is needed and impossible on this GPU: the transport stages it through
+  one pinned host buffer (:class:`gpubridge.staging.PinnedBridgeStaging`) and
+  runs the host path.
 
 - all_reduce: with two leaders, an exchange and one local reduction (both get
   the same bits, since addition, max and min are commutative); with more, a
@@ -47,6 +50,7 @@ from gpubridge import ucx
 from gpubridge.config import parse_size
 from gpubridge.staging import PinnedBridgeStaging
 from gpubridge.transport import BridgeTransport, register_transport
+from gpubridge.ucx import gdr
 
 #: Chunk size of every UCX message, e.g. ``4M`` or ``65536``.
 CHUNK_BYTES_ENV = "GPUBRIDGE_UCX_CHUNK_BYTES"
@@ -132,7 +136,12 @@ class UcxTransport(BridgeTransport):
         self.memory_types = worker.memory_types()
         #: The path of the last collective: "host", "direct" or "staged".
         self.last_path: str | None = None
+        #: For the last collective's GPU, when UCX has its memory type: how the NIC's writes
+        #: into it are flushed (gdr.Flush.method), or why it was staged instead. Else None.
+        self.flush_method: str | None = None
         self._memory = ucx.HOST
+        self._flushes: dict[int, gdr.Flush] = {}
+        self._flush: gdr.Flush | None = None
         self._staging: PinnedBridgeStaging | None = None
 
     # ---- creation ---------------------------------------------------------------------
@@ -224,10 +233,23 @@ class UcxTransport(BridgeTransport):
     def _start(self, tensor: torch.Tensor) -> tuple[int, float]:
         if not tensor.is_contiguous():
             raise ValueError("the UCX bridge carries contiguous tensors")
-        self.last_path, self._memory = choose_path(tensor.device.type,
-                                                   bool(torch.version.hip), self.memory_types)
+        path, memory = choose_path(tensor.device.type, bool(torch.version.hip),
+                                   self.memory_types)
+        self._flush = self.flush_method = None
+        if path == "direct":
+            self._flush = self._flush_for(tensor.device)
+            self.flush_method = self._flush.method
+            if not self._flush.available:
+                path, memory = "staged", ucx.HOST
+        self.last_path, self._memory = path, memory
         self._seq += 1
         return self._seq, time.monotonic() + self.timeout
+
+    def _flush_for(self, device: torch.device) -> gdr.Flush:
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        if index not in self._flushes:
+            self._flushes[index] = gdr.for_device(index, bool(torch.version.hip))
+        return self._flushes[index]
 
     def _ready(self, tensor: torch.Tensor) -> None:
         """Before posting messages on GPU memory: wait for the work queued on the
@@ -236,6 +258,14 @@ class UcxTransport(BridgeTransport):
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream(tensor.device))
             event.synchronize()
+
+    def _wait(self, ids: list[int], deadline: float, *, received: bool = True) -> None:
+        """Wait for one step's messages. After receives on the direct path, flush the NIC's
+        writes into GPU memory, so the kernels launched next (a reduction, the island
+        broadcast, the caller's) can't read stale data (docs/RDMA_TRANSPORT.md, section 4)."""
+        self.worker.wait(ids, deadline)
+        if received and self.last_path == "direct":
+            self._flush()
 
     def _staged(self, tensor: torch.Tensor, run) -> None:
         """Run ``run(host_tensor)`` on a pinned host copy of a GPU ``tensor``, then copy back."""
@@ -276,7 +306,7 @@ class UcxTransport(BridgeTransport):
             scratch = torch.empty_like(flat)
             self._ready(flat)
             ids = self._recv(peer, scratch, seq, 0) + self._send(peer, flat, seq, 0)
-            self.worker.wait(ids, deadline)
+            self._wait(ids, deadline)
             reduce(flat, scratch)
             return
         right, left = (self.index + 1) % size, (self.index - 1) % size
@@ -294,13 +324,13 @@ class UcxTransport(BridgeTransport):
             self._ready(flat)  # the last step's reduction is done before its result is sent
             ids = self._recv(left, buffer, seq, step) + self._send(
                 right, segment(self.index - step), seq, step)
-            self.worker.wait(ids, deadline)
+            self._wait(ids, deadline)
             reduce(incoming, buffer)
         for step in range(size - 1):  # all-gather: this member now owns segment index + 1
             self._ready(flat)
             ids = self._recv(left, segment(self.index - step), seq, size + step) + self._send(
                 right, segment(self.index + 1 - step), seq, size + step)
-            self.worker.wait(ids, deadline)
+            self._wait(ids, deadline)
 
     def broadcast(self, tensor: torch.Tensor, src: int) -> None:
         if len(self.members) == 1:
@@ -319,7 +349,7 @@ class UcxTransport(BridgeTransport):
             ids = [i for peer in self._peers() for i in self._send(peer, flat, seq, 0)]
         else:
             ids = self._recv(root, flat, seq, 0)
-        self.worker.wait(ids, deadline)
+        self._wait(ids, deadline, received=self.index != root)
 
     def close(self) -> None:
         if self._staging is not None:

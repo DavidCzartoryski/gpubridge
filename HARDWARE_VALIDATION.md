@@ -339,10 +339,18 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     has the memory type, and through pinned host memory where it doesn't; the
     run record says which (`run.bridge_path`). Check results bit for bit
     against `flat-gloo`, and that `direct` is what was used where GPUDirect
-    RDMA (or ROCm peer memory, or dma-buf) is available.
+    RDMA (or ROCm peer memory, or dma-buf) is available. On the direct path
+    the transport flushes the NIC's writes into the GPU after every receive
+    (`run.bridge_flush` says how; UCX doesn't, see docs/RDMA_TRANSPORT.md
+    section 4): check that received data is fresh with the NIC writing GPU
+    memory (`test_data_ucx_writes_into_gpu_memory_is_what_the_next_kernel_reads`
+    with `GPUBRIDGE_TEST_UCX_TLS=rc,cuda_copy`, or across nodes), and how long
+    a flush takes.
     *Status: works on CPU over UCX's TCP transport, every bridge policy on two,
-    three and four leaders (`tests/test_ucx.py`); the device path's GPU tests
-    are written (`tests/test_gpu.py`). Nothing has run on RDMA hardware.*
+    three and four leaders (`tests/test_ucx.py`); the flush's placement is
+    tested on CPU against a fake worker whose receives land only when flushed
+    (`tests/test_gdr_flush.py`); the device path's GPU tests are written
+    (`tests/test_gpu.py`). Nothing has run on RDMA hardware.*
     *Step:* `ucx_build` and `check_ucx` in Explorer steps 05 and 07, with
     `UCX_BRIDGE=1`. See [docs/RDMA_TRANSPORT.md](docs/RDMA_TRANSPORT.md) for
     the questions to settle first (InfiniBand on the GPU nodes, GPUDirect

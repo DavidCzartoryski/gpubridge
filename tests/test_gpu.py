@@ -522,6 +522,56 @@ def ucx_device_path(rank: int, world: int, tmp_path: Path, *, numel: int) -> Non
     bad.raise_if_any()
 
 
+def ucx_fresh_data(rank: int, world: int, tmp_path: Path, *, numel: int, iters: int) -> None:
+    """What UCX writes into GPU memory is what the next kernel reads.
+
+    On the direct path the NIC writes received data into GPU memory, and the
+    CPU can see a receive complete before kernels can see that data; the
+    transport flushes after every receive (docs/RDMA_TRANSPORT.md, section 4).
+    Each iteration sends new values, so a reduction or copy that read a
+    buffer's earlier contents would give an earlier iteration's numbers.
+    Kernels check every result right after its collective returns, with no
+    host synchronization in between; the counts are read back at the end. The
+    NIC writes GPU memory only when UCX uses a network transport for it: across
+    nodes, or on one node with ``GPUBRIDGE_TEST_UCX_TLS`` naming one (e.g.
+    ``rc,cuda_copy``). Otherwise UCX copies with CUDA or ROCm IPC, and this
+    checks the ordering only.
+    """
+    bad = Mismatches(rank)
+    topology = init(tmp_path, "ucx-fresh", rank, world, "reduce-bridge-broadcast",
+                    {BRIDGE: "ucx"})
+    try:
+        device = topology.device
+        total = expected_reduce("sum", world, numel, torch.float32).to(device)
+        root = rank_values(0, numel).float().to(device)
+        wrong = torch.zeros(2, iters, dtype=torch.int64, device=device)
+        for it in range(iters):  # every value stays below 2**24: exact in float32
+            tensor = rank_data(rank, numel, torch.float32, device) + it
+            gpubridge.all_reduce(tensor)
+            wrong[0, it] = (tensor != total + world * it).sum()
+            tensor = rank_data(rank, numel, torch.float32, device) + it
+            gpubridge.broadcast(tensor, 0)
+            wrong[1, it] = (tensor != root + it).sum()
+        sync(device)
+        for row, op in enumerate(("all_reduce", "broadcast")):
+            stale = [(it, n) for it, n in enumerate(wrong[row].tolist()) if n]
+            bad.check(f"ucx {op}, read right after it returned", not stale,
+                      f"(iteration, wrong elements): {stale[:10]}")
+        bridge = topology.bridge
+        if bridge is not None:
+            print(f"rank {rank}: UCX path {bridge.last_path}, flush {bridge.flush_method}",
+                  flush=True)
+            # Direct: how it flushes. Host: nothing to flush. Staged: why, if UCX had
+            # the memory type but no flush was possible.
+            if bridge.last_path in ("direct", "host"):
+                bad.check("ucx flush recorded",
+                          (bridge.flush_method is None) == (bridge.last_path == "host"),
+                          f"path {bridge.last_path}, flush {bridge.flush_method}")
+    finally:
+        gpubridge.destroy()
+    bad.raise_if_any()
+
+
 def pinned_reuse(rank: int, world: int, tmp_path: Path, *, numel: int) -> None:
     """The default bridge's pinned buffer (``GPUBRIDGE_PINNED_STAGING``), reused at once.
 
@@ -595,6 +645,15 @@ def test_the_ucx_bridge_takes_gpu_tensors_directly_or_says_it_staged_them(tmp_pa
 
 @pytest.mark.gpu
 @requires_gpu
+@pytest.mark.skipif(not UCX, reason="the UCX bridge can't be built here")
+def test_data_ucx_writes_into_gpu_memory_is_what_the_next_kernel_reads(tmp_path):
+    tls = os.environ.get("GPUBRIDGE_TEST_UCX_TLS")
+    spawn(partial(ucx_fresh_data, numel=LARGE_NUMEL // 4, iters=30), gpu_ranks(), tmp_path,
+          {**SPLIT, **({"UCX_TLS": tls} if tls else {})})
+
+
+@pytest.mark.gpu
+@requires_gpu
 def test_the_pinned_bridge_buffer_is_not_reused_before_its_copy_back(tmp_path):
     spawn(partial(pinned_reuse, numel=LARGE_NUMEL // 4), gpu_ranks(), tmp_path, SPLIT)
 
@@ -651,3 +710,4 @@ def test_gpu_test_logic_in_simulation(tmp_path):
     each(partial(pinned_reuse, numel=10_007), 4, "pinned")
     if UCX:
         each(partial(ucx_device_path, numel=10_007), 4, "ucx-path")
+        each(partial(ucx_fresh_data, numel=10_007, iters=3), 4, "ucx-fresh")

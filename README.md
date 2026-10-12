@@ -429,8 +429,11 @@ memory first.
 picks InfiniBand or RoCE verbs where they exist and TCP elsewhere. Where the
 local UCX is built for the GPU's memory type (CUDA or ROCm), leaders hand their
 GPU tensors to UCX directly, and UCX is designed to use GPUDirect RDMA (or peer
-memory or dma-buf on AMD) where the NIC and drivers allow it; where the memory
-type isn't supported, the transport stages through pinned host memory. It is a small C++
+memory or dma-buf on AMD) where the NIC and drivers allow it. After each
+receive into GPU memory, the transport flushes the NIC's writes before any
+kernel reads them (`cuFlushGPUDirectRDMAWrites`, or an HDP flush on AMD), since
+UCX doesn't. Where the memory type isn't supported, or a needed flush isn't
+possible, the transport stages through pinned host memory. It is a small C++
 library over UCX's C API, loaded with ctypes and built on first use or with:
 
 ```bash

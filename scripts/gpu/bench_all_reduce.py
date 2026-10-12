@@ -445,10 +445,13 @@ def main() -> int:
                           f"busbw {r['busbw_GBps']} GB/s  ({r['trials']} trials)", flush=True)
         del tensor
 
-    # Every leader's own path (a mixed job's two sides may differ), not just rank 0's.
-    paths: list[str | None] = [None] * topology.world_size
-    dist.all_gather_object(paths, getattr(topology.bridge, "last_path", None))
-    info["bridge_path"] = "+".join(sorted({p for p in paths if p})) or None
+    # Every leader's own path and GPUDirect RDMA flush (a mixed job's two sides may
+    # differ), not just rank 0's.
+    paths: list[tuple[str | None, str | None]] = [(None, None)] * topology.world_size
+    dist.all_gather_object(paths, (getattr(topology.bridge, "last_path", None),
+                                   getattr(topology.bridge, "flush_method", None)))
+    info["bridge_path"] = "+".join(sorted({p for p, _ in paths if p})) or None
+    info["bridge_flush"] = "; ".join(sorted({f for _, f in paths if f})) or None
     if topology.rank == 0:
         args.out.mkdir(parents=True, exist_ok=True)
         with open(args.out / "bench.csv", "w", newline="") as fh:

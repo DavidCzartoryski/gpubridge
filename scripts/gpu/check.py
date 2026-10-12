@@ -255,6 +255,7 @@ def main() -> int:
                                               args.timeout))
 
         rec.data["run"]["bridge_path"] = getattr(topology.bridge, "last_path", None)
+        rec.data["run"]["bridge_flush"] = getattr(topology.bridge, "flush_method", None)
         with rec.stage("barrier"):
             gpubridge.barrier()
 
