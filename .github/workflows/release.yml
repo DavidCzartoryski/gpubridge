@@ -1,0 +1,48 @@
+name: release
+
+# For a version tag (v0.3.0-alpha, ...): check the tag matches the package
+# version, build the sdist and wheel, and check them with twine. Publishing to
+# PyPI uses trusted publishing (no token stored here) and stays off until the
+# repository variable PUBLISH_TO_PYPI is "true", so pushing a tag never
+# publishes by accident. CHANGELOG.md says what each release contains.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0  # setup-uv publishes no moving major tags since v8
+        with:
+          python-version: "3.12"
+      - run: python scripts/check_release_tag.py "$GITHUB_REF_NAME"
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    if: vars.PUBLISH_TO_PYPI == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The PyPI trusted publisher names this workflow file and this environment.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/gpubridge/
+    permissions:
+      id-token: write  # trusted publishing: PyPI accepts this job's OIDC token
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

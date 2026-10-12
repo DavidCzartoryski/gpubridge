@@ -10,6 +10,19 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
+keywords = ["pytorch", "distributed", "nccl", "rccl", "cuda", "rocm", "gpu", "multi-vendor"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+]
 dependencies = [
     # On GPU nodes, install the CUDA or ROCm build of torch first; pip and uv
     # leave an existing install alone as long as it meets this floor. Before
@@ -20,6 +33,12 @@ dependencies = [
     # which torch does not install.
     "numpy",
 ]
+
+[project.urls]
+Homepage = "https://github.com/DavidCzartoryski/gpubridge"
+Changelog = "https://github.com/DavidCzartoryski/gpubridge/blob/main/CHANGELOG.md"
+Issues = "https://github.com/DavidCzartoryski/gpubridge/issues"
+"Hardware validation" = "https://github.com/DavidCzartoryski/gpubridge/blob/main/HARDWARE_VALIDATION.md"
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
