@@ -1,13 +1,17 @@
 name: release
 
 # For a version tag (v0.3.0-alpha, ...): check the tag matches the package
-# version, build the sdist and wheel, and check them with twine. Publishing to
-# PyPI uses trusted publishing (no token stored here) and stays off until the
-# repository variable PUBLISH_TO_PYPI is "true", so pushing a tag never
-# publishes by accident. CHANGELOG.md says what each release contains.
+# version, build the sdist and wheel, and check them with twine. Pull requests
+# and manual runs do the same build and check (without the tag check), so this
+# workflow is tested before any tag; only a tag push can reach the publish job.
+# Publishing to PyPI uses trusted publishing (no token stored here) and stays
+# off until the repository variable PUBLISH_TO_PYPI is "true", so pushing a tag
+# never publishes by accident. CHANGELOG.md says what each release contains.
 on:
   push:
     tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,7 +25,8 @@ jobs:
       - uses: astral-sh/setup-uv@v10.2.0  # setup-uv publishes no moving major tags since v8
         with:
           python-version: "3.12"
-      - run: python scripts/check_release_tag.py "$GITHUB_REF_NAME"
+      - if: github.ref_type == 'tag'
+        run: python scripts/check_release_tag.py "$GITHUB_REF_NAME"
       - run: uv build
       - run: uvx twine check --strict dist/*
       - uses: actions/upload-artifact@v7
@@ -31,7 +36,9 @@ jobs:
 
   publish:
     needs: build
-    if: vars.PUBLISH_TO_PYPI == 'true'
+    if: >-
+      github.event_name == 'push' && github.ref_type == 'tag' &&
+      vars.PUBLISH_TO_PYPI == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # The PyPI trusted publisher names this workflow file and this environment.

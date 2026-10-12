@@ -5,7 +5,7 @@ release so far is an alpha that is **validated on CPU only**. Nothing has run
 on a GPU yet: [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what
 still needs real hardware. Numbers in parentheses are pull requests.
 
-## [0.3.0-alpha] - unreleased
+## [0.3.0-alpha] - 2026-10-12
 
 CPU-validated, with the GPU validation kit ready for a first GPU run. Not on
 PyPI.
@@ -34,6 +34,9 @@ PyPI.
 - GPU-only correctness tests, `pytest -m gpu tests/test_gpu.py`: every policy
   against `flat-gloo` bit for bit, every op and dtype, stream ordering,
   pinned buffer reuse, `is_completed()` (#24, #32).
+- A release workflow: every pull request and version tag builds the sdist and
+  wheel and checks them with twine, and a tag must match the package version.
+  Publishing to PyPI (trusted publishing) stays off until enabled (#34).
 
 ### Fixed
 
@@ -120,6 +123,6 @@ CPU-validated, GPU validation pending.
 - A CPU-only matrix showing CUDA and ROCm builds of PyTorch can share one job
   (#1, #4), and prior-art notes (#2, #6).
 
-[0.3.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/compare/v0.2.0-alpha...main
+[0.3.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.3.0-alpha
 [0.2.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.2.0-alpha
 [0.1.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.1.0-alpha

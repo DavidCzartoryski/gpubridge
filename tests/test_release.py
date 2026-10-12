@@ -33,9 +33,25 @@ def test_the_tag_must_match_pyproject(capsys):
     assert "pyproject.toml says" in capsys.readouterr().err
 
 
+WORKFLOW = REPO / ".github" / "workflows" / "release.yml"
+
+
 def test_pushing_a_tag_never_publishes_on_its_own():
-    workflow = (REPO / ".github" / "workflows" / "release.yml").read_text()
+    workflow = WORKFLOW.read_text()
     publish = workflow[workflow.index("  publish:"):]
-    assert "if: vars.PUBLISH_TO_PYPI == 'true'" in publish
+    gate = " ".join(publish[publish.index("if: >-"):publish.index("runs-on")].split())
+    assert gate == ("if: >- github.event_name == 'push' && github.ref_type == 'tag' && "
+                    "vars.PUBLISH_TO_PYPI == 'true'")
     assert "id-token: write" in publish and "id-token" not in workflow[:workflow.index("  publish:")]
     assert "password" not in workflow and "secrets." not in workflow  # trusted publishing only
+
+
+def test_pull_requests_run_the_build_but_never_the_publish_job():
+    workflow = WORKFLOW.read_text()
+    triggers = workflow[workflow.index("\non:"):workflow.index("\npermissions:")]
+    assert "pull_request:" in triggers and "workflow_dispatch:" in triggers
+    build = workflow[workflow.index("  build:"):workflow.index("  publish:")]
+    lines = build.splitlines()
+    check = next(i for i, line in enumerate(lines) if "check_release_tag.py" in line)
+    assert lines[check - 1].strip() == "- if: github.ref_type == 'tag'"  # a PR's ref isn't a tag
+    assert "github.event_name == 'push'" in workflow[workflow.index("  publish:"):]
