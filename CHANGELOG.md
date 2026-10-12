@@ -19,6 +19,14 @@ still needs real hardware. Numbers in parentheses are pull requests.
   built on first use (`python -m gpubridge.ucx build`). Design and open
   questions: docs/RDMA_TRANSPORT.md (#35).
 
+### Fixed
+
+- The two-node job tests (Explorer steps 05 and 07) no longer hang on machines
+  whose own name doesn't resolve, such as macOS, where `socket.getfqdn()` can
+  return the reverse name of `::1`. The test harness's fake `srun` gives each
+  pretend node torchrun's `--local-addr=127.0.0.1`; the job scripts are
+  unchanged (#36).
+
 ## [0.3.0-alpha] - 2026-10-12
 
 CPU-validated, with the GPU validation kit ready for a first GPU run. Not on

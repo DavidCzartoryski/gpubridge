@@ -6,6 +6,9 @@
 # the NAME=VALUE pairs in $FAKE_SLURM_HET_ENV_G (e.g. its simulated vendor).
 # With --kill-on-bad-exit the first failure stops the rest. Exits with the
 # first failure's code. Appends "srun ARGS" to $FAKE_SLURM_LOG.
+# Every pretend node is this machine, so each copy gets PET_LOCAL_ADDR=127.0.0.1
+# (torchrun's --local-addr): a c10d rendezvous then never looks up this host's
+# name, which on some machines (macOS) gives an address that doesn't resolve.
 set -uo pipefail
 echo "srun $*" >>"${FAKE_SLURM_LOG:-/dev/null}"
 
@@ -19,7 +22,7 @@ launch() {
     var="FAKE_SLURM_HET_ENV_$group"
     read -ra extra <<<"${!var:-}"
     for ((i = 0; i < count; i++)); do
-        env SLURM_PROCID=$copies SLURM_NODEID=$copies SLURM_LOCALID=0 \
+        env SLURM_PROCID=$copies SLURM_NODEID=$copies SLURM_LOCALID=0 PET_LOCAL_ADDR=127.0.0.1 \
             GPUBRIDGE_SIM_HOSTNAME="fake-node-$copies" "${extra[@]+"${extra[@]}"}" "$@" &
         pids+=($!)
         copies=$((copies + 1))
