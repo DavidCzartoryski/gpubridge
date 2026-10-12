@@ -243,7 +243,9 @@ class ReduceBridgeBroadcast(CollectivePolicy):
     reduce_scatter_tensor: island reduce onto the leader, bridge all_reduce of
     the whole input, then each leader scatters its island members' slices.
 
-    Leaders copy to host memory with ``.cpu()`` (pageable) by default. With
+    With a bridge transport that takes GPU tensors (``device_tensors``, e.g.
+    ``bridge="ucx"``), GPU leaders hand the tensor straight to it. Otherwise
+    leaders copy to host memory with ``.cpu()`` (pageable) by default. With
     ``GPUBRIDGE_PINNED_STAGING=1`` the bridge steps of all_reduce, broadcast and
     reduce_scatter_tensor go through one pinned buffer per leader instead
     (:class:`gpubridge.staging.PinnedBridgeStaging`), so one allocation can
@@ -256,8 +258,16 @@ class ReduceBridgeBroadcast(CollectivePolicy):
     #: leader; None otherwise, and always None in subclasses that set up their own.
     staging_buffer: _staging.BridgeStaging | None = None
 
+    #: True on a GPU leader whose bridge transport takes GPU tensors itself
+    #: (``device_tensors``): the bridge step then makes no host copy at all.
+    direct_bridge: bool = False
+
     def setup(self, topology: Topology) -> None:
-        if topology.pinned_staging and topology.layout.needs_bridge and topology.is_leader:
+        if not (topology.layout.needs_bridge and topology.is_leader):
+            return
+        self.direct_bridge = (topology.device.type == "cuda"
+                              and getattr(topology.bridge, "device_tensors", False))
+        if topology.pinned_staging and not self.direct_bridge:
             self.staging_buffer = _staging.make_bridge_staging(topology.device)
 
     def close(self) -> None:
@@ -266,14 +276,18 @@ class ReduceBridgeBroadcast(CollectivePolicy):
             self.staging_buffer = None
 
     def _to_host(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.direct_bridge:
+            return tensor
         if self.staging_buffer is not None:
             return self.staging_buffer.to_host(tensor)
         return _stage_to_host(tensor)
 
     def _to_device(self, tensor: torch.Tensor, host: torch.Tensor) -> None:
+        if host is tensor:
+            return
         if self.staging_buffer is not None:
             self.staging_buffer.to_device(tensor, host)
-        elif host is not tensor:
+        else:
             tensor.copy_(host)
 
     @classmethod

@@ -35,3 +35,27 @@ jobs:
       - run: shellcheck scripts/*.sh scripts/gpu/*.sh scripts/gpu/*/*.sh scripts/gpu/explorer/*.sbatch tests/fake_cluster/*
       - run: pytest ${{ matrix.pytest-args }}
       - run: python examples/simulate_two_islands.py
+
+  ucx:
+    # The UCX bridge transport (docs/RDMA_TRANSPORT.md): built against Ubuntu's
+    # UCX and tested between processes over UCX's TCP transport. Not a required
+    # check; the pytest jobs above skip these tests (no UCX there).
+    name: ucx bridge (3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # The runners expose an RDMA device UCX finds but can't use (ibv_create_srq
+      # fails), so its default transport choice can't initialize there.
+      UCX_TLS: tcp,self
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.12"
+          activate-environment: true
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libucx-dev ucx-utils
+      - run: ucx_info -v
+      - run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: uv pip install -e ".[test]"
+      - run: python -m gpubridge.ucx build && python -m gpubridge.ucx info
+      - run: pytest tests/test_ucx.py -rs

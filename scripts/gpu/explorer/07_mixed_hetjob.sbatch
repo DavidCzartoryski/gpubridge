@@ -108,6 +108,17 @@ step summarize_pinned python "$KIT_DIR/summarize.py" "$RESULTS/check_pinned"
 step bench_pinned mixed_torchrun bench-pinned "$KIT_DIR/bench_all_reduce.py" \
     --out "$RESULTS/bench_pinned" --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES"
 unset GPUBRIDGE_PINNED_STAGING
+# The UCX bridge between real NVIDIA and AMD leaders (items 26 and 27), opt-in
+# with UCX_BRIDGE=1. Each side builds it against its own UCX (CUDA- or ROCm-built).
+if [ "$UCX_BRIDGE" = 1 ]; then
+    step ucx_build both @VENV@/bin/python -m gpubridge.ucx build
+    step check_ucx mixed_torchrun check-ucx "$KIT_DIR/check.py" --out "$RESULTS/check_ucx" \
+        --bridge ucx
+    step summarize_ucx python "$KIT_DIR/summarize.py" "$RESULTS/check_ucx"
+    step bench_ucx mixed_torchrun bench-ucx "$KIT_DIR/bench_all_reduce.py" \
+        --out "$RESULTS/bench_ucx" --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES" \
+        --bridge ucx
+fi
 # Opt-in policies on the real mixed job (items 17 to 21).
 for policy in $OPT_IN_POLICIES; do
     step "check_$policy" mixed_torchrun "check-$policy" "$KIT_DIR/check.py" \

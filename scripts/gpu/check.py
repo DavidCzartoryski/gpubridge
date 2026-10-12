@@ -27,7 +27,8 @@ Writes OUT/rank<N>.json. Run scripts/gpu/summarize.py OUT afterwards.
 
     torchrun --nproc-per-node=4 scripts/gpu/check.py --out results/explorer/04_split_4gpu
 
---policy picks the collective policy (default auto), so runs can compare them.
+--policy picks the collective policy (default auto), so runs can compare them;
+--bridge picks the bridge transport (default gloo; ucx for the UCX bridge).
 
 --expect-init-error REGEX turns the run into a negative test: every rank must
 fail gpubridge.init() with a matching message, and nothing else runs (item 12).
@@ -104,6 +105,8 @@ def main() -> int:
                         help="group timeout (s); default KIT_TIMEOUT, else 600")
     parser.add_argument("--dtypes", default=",".join(DTYPES), help="comma-separated")
     parser.add_argument("--policy", default="auto", help="collective policy for gpubridge.init")
+    parser.add_argument("--bridge", default="gloo",
+                        help="bridge transport for gpubridge.init: gloo, or ucx")
     parser.add_argument("--large-numel", type=int, default=None,
                         help="elements in the busy-GPU tensor (default: 64M on GPU, 1M on CPU)")
     parser.add_argument("--busy-iters", type=int, default=20,
@@ -124,7 +127,7 @@ def main() -> int:
     try:
         with rec.stage("init"):
             topology = gpubridge.init(timeout=timedelta(seconds=args.timeout),
-                                      policy=args.policy)
+                                      policy=args.policy, bridge=args.bridge)
         rec.data["run"] = run_info(topology)
         rec.write()
         if topology.split_test and rank == 0:
@@ -251,6 +254,8 @@ def main() -> int:
             entry.update(in_flight_while_late(rank, world, device, args.in_flight_settle,
                                               args.timeout))
 
+        rec.data["run"]["bridge_path"] = getattr(topology.bridge, "last_path", None)
+        rec.data["run"]["bridge_flush"] = getattr(topology.bridge, "flush_method", None)
         with rec.stage("barrier"):
             gpubridge.barrier()
 

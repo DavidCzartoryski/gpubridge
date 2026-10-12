@@ -234,8 +234,13 @@ def summary_table(rows: list[dict], info: dict[str, Any]) -> str:
     timers = sorted({r.get("timer", "host") for r in rows})
     timing = ("CUDA events on the current stream" if timers == ["cuda-events"]
               else "the host timer" if timers == ["host"] else ", ".join(timers))
-    staging = "pinned (`GPUBRIDGE_PINNED_STAGING`)" if info.get("pinned_staging") else "pageable"
+    if info.get("bridge") == "ucx" and info.get("bridge_path"):
+        staging = f"by UCX ({info['bridge_path']})"
+    else:
+        staging = ("pinned (`GPUBRIDGE_PINNED_STAGING`)" if info.get("pinned_staging")
+                   else "pageable")
     lines += [f"Run kind `{info['kind']}`, gpubridge policy `{info['policy']}`, "
+              f"bridge `{info.get('bridge', 'gloo')}`, "
               f"bridge staging {staging}, {info['world_size']} ranks, "
               f"{len(info['islands'])} island(s). Latency is the median of the slowest rank, "
               f"timed with {timing}.",
@@ -354,6 +359,9 @@ def main() -> int:
                              "falls back to island where one native group is impossible")
     parser.add_argument("--policy", default="auto",
                         help="collective policy for the gpubridge op, e.g. flat-gloo")
+    parser.add_argument("--bridge", default="gloo",
+                        help="bridge transport for the gpubridge op: gloo, or ucx "
+                             "(docs/RDMA_TRANSPORT.md)")
     parser.add_argument("--timeout", type=float, default=default_timeout(1800),
                         help="group timeout (s); default KIT_TIMEOUT, else 1800")
     parser.add_argument("--phases", action="store_true",
@@ -366,7 +374,8 @@ def main() -> int:
     if args.write_thresholds and not args.candidates:
         args.candidates = DEFAULT_CANDIDATES
 
-    topology = gpubridge.init(timeout=timedelta(seconds=args.timeout), policy=args.policy)
+    topology = gpubridge.init(timeout=timedelta(seconds=args.timeout), policy=args.policy,
+                              bridge=args.bridge)
     info = run_info(topology)
     device, dtype = topology.device, DTYPES[args.dtype]
     if topology.split_test and topology.rank == 0:
@@ -436,6 +445,13 @@ def main() -> int:
                           f"busbw {r['busbw_GBps']} GB/s  ({r['trials']} trials)", flush=True)
         del tensor
 
+    # Every leader's own path and GPUDirect RDMA flush (a mixed job's two sides may
+    # differ), not just rank 0's.
+    paths: list[tuple[str | None, str | None]] = [(None, None)] * topology.world_size
+    dist.all_gather_object(paths, (getattr(topology.bridge, "last_path", None),
+                                   getattr(topology.bridge, "flush_method", None)))
+    info["bridge_path"] = "+".join(sorted({p for p, _ in paths if p})) or None
+    info["bridge_flush"] = "; ".join(sorted({f for _, f in paths if f})) or None
     if topology.rank == 0:
         args.out.mkdir(parents=True, exist_ok=True)
         with open(args.out / "bench.csv", "w", newline="") as fh:

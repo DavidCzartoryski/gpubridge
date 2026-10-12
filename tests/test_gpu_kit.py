@@ -392,13 +392,17 @@ def test_submit_free_and_multi_submit_every_step():
                                  "--kill-on-bad-exit=1 bash KIT/node_ifname.sh torchrun"]),
         ("05_multinode.sbatch", ["preflight.py --role auto", "--bandwidth-seconds 2"]),
         ("05_multinode.sbatch", ["[check_pinned]", "[bench_pinned]", "check-pinned"]),
+        ("05_multinode.sbatch", ["UCX_BRIDGE=1", "[ucx_build]", "python -m gpubridge.ucx build",
+                                 "--bridge ucx", "[bench_ucx]"]),
         ("07_mixed_hetjob.sbatch", ["[check_pinned]", "[bench_pinned]"]),
         ("06_scaling.sbatch", ["--nproc-per-node=4", "train_synthetic.py", "summarize.py"]),
         ("07_mixed_hetjob.sbatch", ["--het-group=1", "--rdzv-backend=c10d", "summarize.py"]),
     ],
 )
 def test_explorer_jobs_dry_run(job, expected):
-    result = dry_run(KIT / "explorer" / job)
+    env = {"UCX_BRIDGE": "1"} if "UCX_BRIDGE=1" in expected else {}
+    expected = [text for text in expected if text != "UCX_BRIDGE=1"]
+    result = dry_run(KIT / "explorer" / job, **env)
     assert result.returncode == 0, result.stderr
     for text in expected:
         text = text.replace("KIT/", f"{KIT}/")
@@ -849,7 +853,7 @@ def test_tables_cover_every_hardware_validation_item():
 
 
 def test_every_step_the_tables_look_for_is_one_a_job_runs():
-    runs = [dry_run(KIT / "explorer" / job) for job in sorted(
+    runs = [dry_run(KIT / "explorer" / job, UCX_BRIDGE="1") for job in sorted(
         p.name for p in (KIT / "explorer").glob("0*.sbatch"))]
     runs += [dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="4"),
              dry_run(KIT / "mixed" / "node.sh", ROLE="master", MASTER_ADDR="10.0.0.1",
@@ -934,7 +938,7 @@ def test_tables_from_a_results_tree(tmp_path):
     assert [r["bytes"] for r in bench] == [2**20, 64 * 2**20, 256 * 2**20]
     assert {(r["baseline"], r["gpubridge_over_baseline"], r["flat-gloo_over_baseline"])
             for r in bench} == {("native", 15.0, 30.0)}
-    assert {r["staging"] for r in tables["benchmarks"]} == {"pageable"}
+    assert {(r["bridge"], r["staging"]) for r in tables["benchmarks"]} == {("gloo", "pageable")}
 
     predicted = next(r for r in tables["predicted"]
                      if r["bytes"] == 64 * 2**20 and not r["simulated"])
@@ -1169,3 +1173,18 @@ def test_check_and_bench_take_a_policy(tmp_path):
     assert bench.returncode == 0, bench.stderr[-3000:]
     rows = json.loads((tmp_path / "bench" / "bench.json").read_text())["rows"]
     assert {r["policy"] for r in rows if r["op"] == "gpubridge"} == {"flat-gloo"}
+
+
+def test_ucx_steps_are_off_unless_asked_for():
+    out = dry_run(KIT / "explorer" / "05_multinode.sbatch").stdout
+    assert "--bridge ucx" not in out and "ucx_build" not in out
+
+
+def test_tables_name_the_bridge_and_its_path(tmp_path):
+    job = _job(tmp_path, "explorer/05_multinode", [("bench_ucx", 0)], GPU_ENV, "cuda:0")
+    bench = json.loads((job / "bench_phases_x" / "bench.json").read_text())
+    bench["run"].update({"bridge": "ucx", "bridge_path": "direct"})
+    (job / "bench_phases_x" / "bench.json").write_text(json.dumps(bench))
+    tables = validation_tables.build([tmp_path])
+    assert {(r["bridge"], r["staging"]) for r in tables["benchmarks"]} == {("ucx", "ucx direct")}
+    assert {(r["bridge"], r["staging"]) for r in tables["predicted"]} == {("ucx", "ucx direct")}

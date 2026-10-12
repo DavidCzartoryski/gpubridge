@@ -1,6 +1,7 @@
 # Roadmap: designs waiting on GPU results
 
-These are designs, not commitments, and none of them is implemented. Each one
+These are designs, not commitments. Section 2 now has an experimental
+implementation, tested on CPU only; the others are not implemented. Each one
 waits for specific results from the GPU validation kit
 ([GPU_VALIDATION_RUNBOOK.md](GPU_VALIDATION_RUNBOOK.md)). Without those
 results there is no way to tell whether the problem it solves is the one that
@@ -142,7 +143,11 @@ None of them publishes code today.
   13 (how much of a bridged all_reduce the bridge takes): RDMA only pays off
   where the bridge dominates.
 
-**Status: design only, not implemented.**
+**Status: implemented as an experimental UCX transport, `bridge="ucx"`,
+tested on CPU over TCP only.** UCX instead of raw verbs, and a ctypes-loaded
+library instead of a torch extension; the design and why are in
+[RDMA_TRANSPORT.md](RDMA_TRANSPORT.md). Nothing has run on RDMA hardware or a
+GPU (HARDWARE_VALIDATION.md items 26 and 27).
 
 ## 3. A torch.distributed backend for FSDP2 and DeviceMesh
 

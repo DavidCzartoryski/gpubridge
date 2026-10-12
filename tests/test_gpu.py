@@ -44,6 +44,7 @@ import torch
 import torch.multiprocessing as mp
 
 import gpubridge
+from gpubridge import ucx
 from gpubridge.policies import implements
 
 requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA or ROCm GPU")
@@ -69,9 +70,26 @@ OWN_ENV = ("GPUBRIDGE_VENDOR", "GPUBRIDGE_CPU_ONLY", "GPUBRIDGE_SPLIT_TEST",
            "GPUBRIDGE_PINNED_STAGING")
 #: The default bridge with opt-in pinned staging.
 PINNED = {"GPUBRIDGE_PINNED_STAGING": "1"}
-#: Every bridge policy, plus reduce-bridge-broadcast with pinned staging: (tag, policy, env).
+#: An ``env`` key that init() passes as the bridge transport instead of setting it.
+BRIDGE = "bridge"
+
+
+def _ucx_available() -> bool:
+    try:
+        ucx.build()
+    except ucx.Unavailable:
+        return False
+    return True
+
+
+UCX = _ucx_available()
+#: Every bridge policy, reduce-bridge-broadcast with pinned staging, and, where
+#: the UCX bridge builds, the default and pipelined policies over it: (tag, policy, env).
 VARIANTS = (*((policy, policy, {}) for policy in BRIDGE_POLICIES),
-            ("reduce-bridge-broadcast-pinned", "reduce-bridge-broadcast", PINNED))
+            ("reduce-bridge-broadcast-pinned", "reduce-bridge-broadcast", PINNED),
+            *((("ucx", "reduce-bridge-broadcast", {BRIDGE: "ucx"}),
+               ("ucx-pipelined", "pipelined-reduce-bridge-broadcast", {BRIDGE: "ucx"}))
+              if UCX else ()))
 
 
 # ---- data and expected results ---------------------------------------------------
@@ -166,13 +184,16 @@ def _rank_main(rank: int, world: int, fn: Callable[[int, int, Path], None], tmp_
 
 def init(tmp_path: Path, tag: str, rank: int, world: int, policy: str,
          env: dict[str, str] | None = None) -> gpubridge.Topology:
-    """gpubridge.init, with ``env`` set while it reads its settings."""
-    os.environ.update(env or {})
+    """gpubridge.init, with ``env`` set while it reads its settings (and ``env[BRIDGE]``,
+    if given, as the bridge transport)."""
+    settings = {k: v for k, v in (env or {}).items() if k != BRIDGE}
+    os.environ.update(settings)
     try:
         return gpubridge.init(init_method=f"file://{tmp_path}/rendezvous-{tag}", rank=rank,
-                              world_size=world, timeout=TIMEOUT, policy=policy)
+                              world_size=world, timeout=TIMEOUT, policy=policy,
+                              bridge=(env or {}).get(BRIDGE, "gloo"))
     finally:
-        for name in env or {}:
+        for name in settings:
             os.environ.pop(name)
 
 
@@ -275,8 +296,7 @@ def compare_policies(rank: int, world: int, tmp_path: Path, *, numels: tuple[int
     runs.append(("pipelined-odd-chunk", "pipelined-reduce-bridge-broadcast",
                  {"GPUBRIDGE_CHUNK_BYTES": ODD_CHUNK_BYTES}))
     for tag, policy, env in runs:
-        os.environ.update(env)
-        topology = init(tmp_path, tag, rank, world, policy)
+        topology = init(tmp_path, tag, rank, world, policy, env)
         try:
             assert topology.split_test == "half" and len(topology.layout.islands) == 2
             digests[tag] = {}
@@ -286,8 +306,6 @@ def compare_policies(rank: int, world: int, tmp_path: Path, *, numels: tuple[int
                 check_refuses_non_contiguous(topology, bad)
         finally:
             gpubridge.destroy()
-            for name in env:
-                os.environ.pop(name)
     reference = digests.pop(REFERENCE)
     for tag, cases in digests.items():
         bad.check(f"{tag} ran every case", set(cases) == set(reference),
@@ -474,6 +492,86 @@ def completion(rank: int, world: int, tmp_path: Path, *, numel: int) -> None:
     bad.raise_if_any()
 
 
+def ucx_device_path(rank: int, world: int, tmp_path: Path, *, numel: int) -> None:
+    """bridge="ucx" says which path a GPU tensor took, and the result is right either way.
+
+    ``direct`` where this rank's UCX supports the GPU's memory type (CUDA or
+    ROCm), ``staged`` through pinned host memory where it doesn't. On CPU (the
+    simulation self-test) tensors are on the host.
+    """
+    bad = Mismatches(rank)
+    topology = init(tmp_path, "ucx-path", rank, world, "reduce-bridge-broadcast",
+                    {BRIDGE: "ucx"})
+    try:
+        device = topology.device
+        tensor = rank_data(rank, numel, torch.float32, device)
+        gpubridge.all_reduce(tensor)
+        sync(device)
+        bad.equal("ucx all_reduce", tensor,
+                  expected_reduce("sum", world, numel, torch.float32).to(device))
+        bridge = topology.bridge
+        if bridge is not None:
+            kind = "rocm" if torch.version.hip else "cuda"
+            want = ("host" if device.type == "cpu"
+                    else "direct" if kind in bridge.memory_types else "staged")
+            bad.check("ucx path", bridge.last_path == want,
+                      f"{bridge.last_path}, expected {want} (UCX memory types "
+                      f"{sorted(bridge.memory_types)})")
+    finally:
+        gpubridge.destroy()
+    bad.raise_if_any()
+
+
+def ucx_fresh_data(rank: int, world: int, tmp_path: Path, *, numel: int, iters: int) -> None:
+    """What UCX writes into GPU memory is what the next kernel reads.
+
+    On the direct path the NIC writes received data into GPU memory, and the
+    CPU can see a receive complete before kernels can see that data; the
+    transport flushes after every receive (docs/RDMA_TRANSPORT.md, section 4).
+    Each iteration sends new values, so a reduction or copy that read a
+    buffer's earlier contents would give an earlier iteration's numbers.
+    Kernels check every result right after its collective returns, with no
+    host synchronization in between; the counts are read back at the end. The
+    NIC writes GPU memory only when UCX uses a network transport for it: across
+    nodes, or on one node with ``GPUBRIDGE_TEST_UCX_TLS`` naming one (e.g.
+    ``rc,cuda_copy``). Otherwise UCX copies with CUDA or ROCm IPC, and this
+    checks the ordering only.
+    """
+    bad = Mismatches(rank)
+    topology = init(tmp_path, "ucx-fresh", rank, world, "reduce-bridge-broadcast",
+                    {BRIDGE: "ucx"})
+    try:
+        device = topology.device
+        total = expected_reduce("sum", world, numel, torch.float32).to(device)
+        root = rank_values(0, numel).float().to(device)
+        wrong = torch.zeros(2, iters, dtype=torch.int64, device=device)
+        for it in range(iters):  # every value stays below 2**24: exact in float32
+            tensor = rank_data(rank, numel, torch.float32, device) + it
+            gpubridge.all_reduce(tensor)
+            wrong[0, it] = (tensor != total + world * it).sum()
+            tensor = rank_data(rank, numel, torch.float32, device) + it
+            gpubridge.broadcast(tensor, 0)
+            wrong[1, it] = (tensor != root + it).sum()
+        sync(device)
+        for row, op in enumerate(("all_reduce", "broadcast")):
+            stale = [(it, n) for it, n in enumerate(wrong[row].tolist()) if n]
+            bad.check(f"ucx {op}, read right after it returned", not stale,
+                      f"(iteration, wrong elements): {stale[:10]}")
+        bridge = topology.bridge
+        if bridge is not None:
+            print(f"rank {rank}: UCX path {bridge.last_path}, flush {bridge.flush_method}",
+                  flush=True)
+            # Direct: how it flushes. Host: nothing to flush. Staged: why, if UCX had
+            # the memory type but no flush was possible.
+            if bridge.last_path in ("direct", "host"):
+                bad.check("ucx flush recorded",
+                          (bridge.flush_method is None) == (bridge.last_path == "host"),
+                          f"path {bridge.last_path}, flush {bridge.flush_method}")
+    finally:
+        gpubridge.destroy()
+    bad.raise_if_any()
+
+
 def pinned_reuse(rank: int, world: int, tmp_path: Path, *, numel: int) -> None:
     """The default bridge's pinned buffer (``GPUBRIDGE_PINNED_STAGING``), reused at once.
 
@@ -540,6 +638,22 @@ def test_pinned_slots_are_not_reused_before_their_copies_back(tmp_path):
 
 @pytest.mark.gpu
 @requires_gpu
+@pytest.mark.skipif(not UCX, reason="the UCX bridge can't be built here")
+def test_the_ucx_bridge_takes_gpu_tensors_directly_or_says_it_staged_them(tmp_path):
+    spawn(partial(ucx_device_path, numel=LARGE_NUMEL // 4), gpu_ranks(), tmp_path, SPLIT)
+
+
+@pytest.mark.gpu
+@requires_gpu
+@pytest.mark.skipif(not UCX, reason="the UCX bridge can't be built here")
+def test_data_ucx_writes_into_gpu_memory_is_what_the_next_kernel_reads(tmp_path):
+    tls = os.environ.get("GPUBRIDGE_TEST_UCX_TLS")
+    spawn(partial(ucx_fresh_data, numel=LARGE_NUMEL // 4, iters=30), gpu_ranks(), tmp_path,
+          {**SPLIT, **({"UCX_TLS": tls} if tls else {})})
+
+
+@pytest.mark.gpu
+@requires_gpu
 def test_the_pinned_bridge_buffer_is_not_reused_before_its_copy_back(tmp_path):
     spawn(partial(pinned_reuse, numel=LARGE_NUMEL // 4), gpu_ranks(), tmp_path, SPLIT)
 
@@ -594,3 +708,6 @@ def test_gpu_test_logic_in_simulation(tmp_path):
     each(partial(slot_reuse, iters=0), 4, "slots")
     each(partial(completion, numel=100_003), 2, "completion")
     each(partial(pinned_reuse, numel=10_007), 4, "pinned")
+    if UCX:
+        each(partial(ucx_device_path, numel=10_007), 4, "ucx-path")
+        each(partial(ucx_fresh_data, numel=10_007, iters=3), 4, "ucx-fresh")

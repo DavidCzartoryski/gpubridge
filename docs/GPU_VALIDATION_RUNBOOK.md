@@ -116,6 +116,11 @@ The same steps then rerun the check and the gpubridge benchmark with
 allocation compares the default bridge's pageable copies with pinned staging:
 read `bench_pinned/summary.md` next to the pageable benchmark's gpubridge rows
 and `bridge` phase. `validation_tables.py` shows each benchmark's staging.
+With `UCX_BRIDGE=1`, steps 05 and 07 also run the check and the gpubridge
+benchmark over the UCX bridge (`check_ucx`, `bench_ucx`; items 26 and 27); the
+run records say whether GPU tensors went to UCX directly or through pinned host
+memory (`run.bridge_path`), and how received data was flushed into the GPU
+(`run.bridge_flush`).
 Steps 04, 06, 07 and the AMD script train with DDP and `gpubridge.ddp_comm_hook`
 (`examples/train_synthetic.py`, item 22).
 Steps 02, 04 and the AMD script also run the GPU-only tests, `pytest -m gpu
@@ -169,6 +174,7 @@ as of 2026-10-06; **verify each one**:
 | `GLOO_SOCKET_IFNAME` | empty: the preflight chooses | in steps 05 and 07, the interface Gloo uses on every node; the preflight then measures only it. Unset, each node uses the interface the preflight chose for it, even when the two nodes' names differ |
 | `USE_PREFLIGHT_IFNAME` | `1` | `0` leaves `GLOO_SOCKET_IFNAME` unset after the preflight, so Gloo picks by hostname |
 | `SHARED_GPU_CHECK_SECONDS` | `60` | step 02's limit for its deliberate failing run, which fails within seconds when the check works |
+| `UCX_BRIDGE` | `0` | `1`: steps 05 and 07 also build the UCX bridge on each node (`python -m gpubridge.ucx build`) and run `check_ucx` and `bench_ucx` over `bridge="ucx"` (items 26 and 27; [RDMA_TRANSPORT.md](RDMA_TRANSPORT.md)). Needs UCX and a C++ compiler on the nodes, e.g. `MODULES=ucx` |
 | `PREFLIGHT_SECONDS` | `2` | seconds of raw TCP data each way per pair of interfaces in the preflight |
 
 Also check:
@@ -611,7 +617,9 @@ to read the ratio:
 - **Well above 1 at small sizes only**: per-call overhead, not bandwidth; the
   round trip dominates the prediction there.
 - **Below 1**: the preflight understated the link. It measures one TCP stream
-  driven from Python, which may not fill 100 Gb/s Ethernet or IPoIB. Policies
+  driven from Python, which may not fill 100 Gb/s Ethernet or IPoIB. For the
+  UCX bridge over RDMA (`bench_ucx`) that is the expected outcome: the
+  prediction is the TCP baseline it should beat. Policies
   that split or overlap the transfer (`sharded-bridge`,
   `pipelined-reduce-bridge-broadcast`) can also beat it, so for them the
   prediction is closer to an upper bound.

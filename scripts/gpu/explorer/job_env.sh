@@ -17,6 +17,10 @@ MODULES="${MODULES:-}"                               # `module load` names, if a
 # Opt-in collective policies each check-and-bench step also runs (off by default
 # in gpubridge itself; selected here with --policy).
 OPT_IN_POLICIES="${OPT_IN_POLICIES:-pipelined-reduce-bridge-broadcast sharded-bridge}"
+# 1: steps 05 and 07 also build the UCX bridge on each node and run the check and
+# the gpubridge benchmark over bridge="ucx" (docs/RDMA_TRANSPORT.md). Needs UCX
+# there (e.g. MODULES="ucx") and a C++ compiler. Off by default.
+UCX_BRIDGE="${UCX_BRIDGE:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
 # load_modules "NAMES": `module load` each space-separated name. Finds Lmod if
