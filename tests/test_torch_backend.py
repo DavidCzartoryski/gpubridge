@@ -163,17 +163,22 @@ def _fsdp2_float32(rank, world, out):
         torch.save(full, out)
 
 
-def test_fsdp2_in_float32_takes_the_avg_path_and_matches_gloo_closely(tmp_path):
-    results = {}
-    for backend in ("gloo", "gpubridge"):
-        out = tmp_path / f"{backend}.pt"
-        (tmp_path / backend).mkdir()
-        run_backend(TWO_TWO, partial(_fsdp2_float32, out=str(out)), tmp_path / backend,
-                    backend=backend)
-        results[backend] = torch.load(out)
+def test_fsdp2_in_float32_takes_the_avg_path_and_matches_a_single_process(tmp_path):
+    out = tmp_path / "gpubridge.pt"
+    run_backend(TWO_TWO, partial(_fsdp2_float32, out=str(out)), tmp_path)
+    # One process on the whole batch, not Gloo: torch 2.8.0's Gloo reduce_scatter
+    # returns the sum for AVG (measured), so FSDP2 on Gloo doesn't average there.
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 4))
+    opt = torch.optim.SGD(model.parameters(), lr=0.05)
+    for step in range(STEPS):
+        loss = sum(model(_batch(r, step).float()).sum() for r in range(4)) / 4
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
     # Not bit for bit: float32 sums in a different order round differently.
-    for a, b in zip(results["gloo"], results["gpubridge"], strict=True):
-        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+    for a, b in zip(torch.load(out), model.parameters(), strict=True):
+        torch.testing.assert_close(a, b.detach(), rtol=1e-5, atol=1e-6)
 
 
 def test_fsdp2_trains_bit_for_bit_like_gloo_and_a_single_process(tmp_path):
@@ -355,9 +360,9 @@ def _refused(rank, world):
     if rank < 2:
         expect(lambda: dist.new_group([0, 1], use_local_synchronization=True),
                "runs on the world group only")
-    else:
-        assert dist.new_group([0, 1], use_local_synchronization=True) is (
-            dist.GroupMember.NON_GROUP_MEMBER)
+    else:  # torch 2.8 returns None there, newer ones NON_GROUP_MEMBER
+        assert dist.new_group([0, 1], use_local_synchronization=True) in (
+            None, dist.GroupMember.NON_GROUP_MEMBER)
     # The world again is fine: it shares gpubridge's topology.
     again = dist.new_group(list(range(world)))
     t = rank_tensor((4,), torch.float32, rank)

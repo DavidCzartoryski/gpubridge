@@ -117,9 +117,9 @@ Other measured facts:
 `gpubridge.torch_backend.GpubridgeProcessGroup` for the world group.
 gpubridge's collectives run on the world group only, so a subgroup
 (`new_group`, or a multi-dimensional `DeviceMesh`) fails where it is created:
-on each of its members, saying so. Ranks outside it get torch's
-`NON_GROUP_MEMBER`, as with any backend. A group of every rank is allowed; it
-shares gpubridge's topology.
+on each of its members, saying so. Ranks outside it get what torch gives
+any non-member. A group of every rank is allowed; it shares gpubridge's
+topology.
 
 **Setup at the first collective.** gpubridge needs its own groups: a Gloo group
 of every rank (discovery, `barrier()`, `flat-gloo`), one per island on its
@@ -226,7 +226,10 @@ bridge):
   integer-valued data. Also with BatchNorm buffers, unused parameters and a
   comm hook, within float64 rounding of Gloo.
 - **FSDP2** (`fully_shard`) matches Gloo and a single-process reference bit for
-  bit in float64, and Gloo within float32 rounding on the float32 (AVG) path.
+  bit in float64. On the float32 (AVG) path it matches a single process within
+  float32 rounding. Gloo isn't the reference there: torch 2.8.0's Gloo
+  `reduce_scatter` returns the sum for AVG (measured), so FSDP2 on Gloo doesn't
+  average.
 - **Collectives:** the coalesced and bucketed paths, and the object
   collectives. The CPU-tensor path, which simulated jobs don't take on their
   own, forced: the same collectives on the backend's Gloo group.
