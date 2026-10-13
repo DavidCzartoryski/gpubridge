@@ -339,10 +339,10 @@ class Topology:
     timeout: timedelta | None = None
     """The timeout ``init()`` gave its groups, for groups a policy creates in ``setup()``."""
     world_group: ProcessGroup | None = None
-    """A Gloo group of every rank for discovery, :func:`gpubridge.barrier` and ``flat-gloo``,
-    under the torch.distributed backend, where the default group is the backend
-    itself. None after :func:`gpubridge.init`: the default group, a Gloo one, looked
-    up when used rather than held here."""
+    """Under the torch.distributed backend, where the default group is the backend itself:
+    a Gloo group of every rank for discovery, :func:`gpubridge.barrier` and ``flat-gloo``.
+    None after :func:`gpubridge.init`, whose default group is a Gloo one: they look it
+    up when used rather than hold it, so it goes when the job destroys it."""
 
     @property
     def policy_name(self) -> str:
