@@ -396,7 +396,7 @@ class ReduceBridgeBroadcast(CollectivePolicy):
                     staged = mine if other == island else torch.empty(
                         (len(other.ranks), n), dtype=input.dtype)
                     topology.bridge.broadcast(staged, src=other.leader)
-                    assembled[list(other.ranks)] = staged
+                    assembled[[topology.layout.index(r) for r in other.ranks]] = staged
                 if assembled.data_ptr() != output.data_ptr():
                     output.view(world, n).copy_(assembled)
         with phase("island-broadcast"):
@@ -420,7 +420,8 @@ class ReduceBridgeBroadcast(CollectivePolicy):
         with phase("island-scatter"):
             slices = work.view(world, -1)
             dist.scatter(output.view(-1),
-                         [slices[r] for r in island.ranks] if topology.is_leader else None,
+                         [slices[topology.layout.index(r)] for r in island.ranks]
+                         if topology.is_leader else None,
                          src=island.leader, group=topology.island_group)
 
 
@@ -441,15 +442,16 @@ class NativeOnly(CollectivePolicy):
     def broadcast(self, tensor: torch.Tensor, src: int, topology: Topology) -> None:
         dist.broadcast(tensor, src=src, group=topology.island_group)
 
-    # The only island holds every rank in ascending order, so group ranks are
-    # global ranks and native output order is global order.
+    # The only island holds every member in ascending order, so its group ranks
+    # are member positions and native output order is member order.
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor,  # noqa: A002
                                topology: Topology) -> None:
         _all_gather(output, input, topology.island_group, _native(topology))
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor,  # noqa: A002
                               topology: Topology) -> None:
-        _reduce_scatter(output, input, topology.island_group, topology.rank, _native(topology))
+        _reduce_scatter(output, input, topology.island_group,
+                        topology.layout.index(topology.rank), _native(topology))
 
 
 class FlatGloo(CollectivePolicy):
@@ -489,8 +491,8 @@ class FlatGloo(CollectivePolicy):
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor,  # noqa: A002
                               topology: Topology) -> None:
         received = _host_like(output)
-        _reduce_scatter(received, _stage_to_host(input), _world(topology), topology.rank,
-                        native=False)
+        _reduce_scatter(received, _stage_to_host(input), _world(topology),
+                        topology.layout.index(topology.rank), native=False)
         if received.data_ptr() != output.data_ptr():
             output.copy_(received)
 

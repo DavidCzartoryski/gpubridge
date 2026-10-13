@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import warnings
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from typing import Any, cast
@@ -15,6 +16,7 @@ from torch.distributed import ProcessGroup
 
 from gpubridge.config import (
     BRIDGE_COMPRESSION_ENV,
+    CPU_BACKEND,
     CPU_ONLY_ENV,
     GPU_BACKEND,
     PINNED_STAGING_ENV,
@@ -53,13 +55,25 @@ class Layout:
     """How the cluster splits into islands. Depends only on each rank's vendor."""
 
     vendors: tuple[str, ...]
-    """Vendor of each global rank."""
+    """Vendor of each member, in member order (of each global rank, for the world)."""
     islands: tuple[Island, ...]
     """Ordered by leader rank."""
+    ranks: tuple[int, ...] = ()
+    """The members' global ranks, ascending: a subgroup's (torch orders a group's ranks so).
+    Empty for the world, whose members are ``range(len(vendors))``."""
 
     @property
     def world_size(self) -> int:
+        """How many members: the rows of an all_gather, the slices of a reduce_scatter."""
         return len(self.vendors)
+
+    @property
+    def members(self) -> tuple[int, ...]:
+        return self.ranks or tuple(range(len(self.vendors)))
+
+    def index(self, rank: int) -> int:
+        """A member's position (its group rank): its row in an all_gather."""
+        return self.ranks.index(rank) if self.ranks else rank
 
     @property
     def bridge_ranks(self) -> tuple[int, ...]:
@@ -73,32 +87,37 @@ class Layout:
 
     def island_of(self, rank: int) -> Island:
         """Return the island containing global rank ``rank``."""
-        vendor = self.vendors[rank]
+        vendor = self.vendors[self.index(rank)]
         return next(island for island in self.islands if island.vendor == vendor)
 
 
-def plan_topology(vendors: Sequence[str]) -> Layout:
+def plan_topology(vendors: Sequence[str], ranks: Sequence[int] = ()) -> Layout:
     """Group ranks into islands by vendor and elect each island's leader.
 
     This is a pure function of the vendor map, so every rank that sees the
     same map computes the same islands, leaders and bridge.
 
     Args:
-        vendors: The vendor of each global rank, indexed by rank.
+        vendors: The vendor of each global rank, indexed by rank; for a subgroup,
+            of each member in ``ranks``' order.
+        ranks: A subgroup's members (global ranks, ascending). Empty: the world.
 
     Raises:
         ValueError: if ``vendors`` is empty.
     """
     if not vendors:
         raise ValueError("cannot plan a topology for zero ranks")
+    if ranks and (len(ranks) != len(vendors) or list(ranks) != sorted(set(ranks))):
+        raise ValueError(f"a subgroup's ranks must be distinct and ascending, got {list(ranks)}")
+    members = tuple(ranks) or tuple(range(len(vendors)))
     ranks_by_vendor: dict[str, list[int]] = {}
-    for rank, vendor in enumerate(vendors):
+    for rank, vendor in zip(members, vendors, strict=True):
         ranks_by_vendor.setdefault(vendor, []).append(rank)
     islands = sorted(
-        (Island(vendor, tuple(ranks)) for vendor, ranks in ranks_by_vendor.items()),
+        (Island(vendor, tuple(rs)) for vendor, rs in ranks_by_vendor.items()),
         key=lambda island: island.leader,
     )
-    return Layout(vendors=tuple(vendors), islands=tuple(islands))
+    return Layout(vendors=tuple(vendors), islands=tuple(islands), ranks=tuple(ranks))
 
 
 @dataclass(frozen=True)
@@ -377,7 +396,7 @@ class Topology:
     @property
     def vendor(self) -> str:
         """This rank's island label. Differs from :attr:`detected_vendor` only in a split test."""
-        return self.layout.vendors[self.rank]
+        return self.layout.vendors[self.layout.index(self.rank)]
 
     @property
     def detected_vendor(self) -> str:
@@ -564,6 +583,68 @@ def build_topology(
     )
     topology.policy.setup(topology)
     return topology
+
+
+@contextlib.contextmanager
+def _members_only() -> Iterator[None]:
+    """Every ``dist.new_group`` inside synchronizes only the new group's ranks
+    (``use_local_synchronization=True``): a subgroup's members build its groups
+    without the rest of the job. Transports and policies call ``dist.new_group``."""
+    plain = dist.new_group
+
+    def local(*args: Any, **kwargs: Any) -> Any:
+        kwargs["use_local_synchronization"] = True
+        return plain(*args, **kwargs)
+
+    dist.new_group = local  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        dist.new_group = plain  # type: ignore[assignment]
+
+
+def build_subtopology(world: Topology, ranks: Sequence[int],
+                      timeout: timedelta | None = None) -> tuple[Topology, ProcessGroup]:
+    """A subgroup's own topology, over its members only; and a Gloo group of them.
+
+    Collective over the members (``ranks``, global, ascending), which must all
+    call it, in the same order relative to other subgroups' setups; the rest of
+    the job doesn't take part. Islands come from the world's labels (no new
+    discovery). Single-vendor members get ``native-only``; mixed members get
+    the policy the job asked for, resolved for their layout, and the world's
+    bridge transport over their own leaders. Groups are created in the same
+    order on every member: a Gloo group of the members (the subgroup's
+    ``world_group``), a second one for CPU tensors, the islands in leader
+    order, the bridge, then whatever the policy's ``setup()`` creates.
+    """
+    ranks = tuple(ranks)
+    layout = plan_topology([world.layout.vendors[world.layout.index(r)] for r in ranks], ranks)
+    asked = world.peers[world.rank].policy
+    if not layout.needs_bridge:
+        policy_cls: type[CollectivePolicy] = choose_policy(AUTO, layout)
+    else:
+        policy_cls = choose_policy(AUTO if asked == AUTO else type(world.policy), layout)
+    rank = world.rank
+    with _members_only():
+        group = dist.new_group(list(ranks), timeout=timeout, backend=CPU_BACKEND)
+        cpu = dist.new_group(list(ranks), timeout=timeout, backend=CPU_BACKEND)
+        island_group: ProcessGroup | None = None
+        for island in layout.islands:
+            created = dist.new_group(list(island.ranks), timeout=timeout,
+                                     backend=world.config.island_backend)
+            if rank in island.ranks:
+                island_group = created
+        bridge: BridgeTransport | None = None
+        if layout.needs_bridge:
+            assert world.transport is not None
+            bridge = world.transport.create(layout.bridge_ranks, timeout=timeout)
+        assert island_group is not None
+        topology = Topology(
+            rank=rank, layout=layout, peers=world.peers, config=world.config,
+            island_group=island_group, bridge=bridge, policy=policy_cls(),
+            transport=world.transport, timeout=timeout, world_group=group)
+        topology.policy.setup(topology)
+    return topology, cpu
 
 
 _current: Topology | None = None
