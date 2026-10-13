@@ -199,9 +199,9 @@ anything else, so no rank is left waiting in `new_group`.
   with an error, pointing at `topology.world_group`.
 
 **gpubridge internals.** Two changes, invisible to the existing API:
-- `Topology` gains `world_group`: the Gloo group of every rank. It is the
-  default group after `gpubridge.init()`, and a new Gloo group under the
-  backend.
+- `Topology` gains `world_group`: a new Gloo group of every rank under the
+  backend. After `gpubridge.init()` it is None, meaning the default group,
+  which is looked up when used rather than held.
 - Discovery, `barrier()` and `flat-gloo` use `world_group` instead of the
   default group, which under the backend is the backend itself.
 
@@ -228,7 +228,8 @@ bridge):
 - **FSDP2** (`fully_shard`) matches Gloo and a single-process reference bit for
   bit in float64, and Gloo within float32 rounding on the float32 (AVG) path.
 - **Collectives:** the coalesced and bucketed paths, and the object
-  collectives.
+  collectives. The CPU-tensor path, which simulated jobs don't take on their
+  own, forced: the same collectives on the backend's Gloo group.
 - **Refusals:** unsupported operations fail on every rank, and subgroups on
   their members. A setting one rank can't read fails every rank, and so does
   a collective during setup.

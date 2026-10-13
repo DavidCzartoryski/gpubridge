@@ -199,7 +199,7 @@ def test_fsdp2_trains_bit_for_bit_like_gloo_and_a_single_process(tmp_path):
 
 # ---- every collective the backend carries -----------------------------------------------------
 
-def _collectives(rank, world):
+def _carried(rank, world):
     expected = sum(rank_tensor((5, 7), torch.float32, r) for r in range(world))
     for op, want in [(dist.ReduceOp.SUM, expected), (dist.ReduceOp.AVG, expected / world),
                      (dist.ReduceOp.MAX, rank_tensor((5, 7), torch.float32, world - 1)),
@@ -262,6 +262,10 @@ def _collectives(rank, world):
         cm.wait()
         whole = sum(rank_tensor((world * 3,), torch.float32, r) for r in range(world))
         assert torch.equal(got[1], whole.view(world, 3)[rank])
+
+
+def _collectives(rank, world):
+    _carried(rank, world)
     # gpubridge's own API works on the same topology, and its observers see the calls.
     seen = []
 
@@ -280,6 +284,35 @@ def _collectives(rank, world):
 @pytest.mark.parametrize("vendors", [TWO_TWO, ["amd", "nvidia", "nvidia"]], ids=["2+2", "1+2"])
 def test_every_collective_the_backend_carries(vendors, tmp_path):
     run_backend(vendors, _collectives, tmp_path)
+
+
+def _cpu_tensor_path(rank, world):
+    """Simulated jobs run on CPU, where nothing takes the CPU-tensor path: force it."""
+    torch_backend._cpu_path = lambda topology, tensors: True
+    seen = []
+
+    class Seen(gpubridge.CollectiveObserver):
+        def on_collective(self, record):
+            seen.append(record.op)
+
+    dist.barrier()  # sets gpubridge up, so the observer can be added
+    gpubridge.add_observer(Seen())
+    _carried(rank, world)
+    for refused in (lambda: dist.all_reduce(torch.ones(2), op=dist.ReduceOp.PRODUCT),
+                    lambda: dist.reduce_scatter_tensor(torch.empty(1), torch.ones(world),
+                                                       op=dist.ReduceOp.MAX)):
+        with pytest.raises((ValueError, NotImplementedError), match="(?i)product|max"):
+            refused()
+    rows = rank_tensor((world, 3), torch.float32, rank)
+    got = torch.empty(3)
+    dist.reduce_scatter_tensor(got, rows, op=dist.ReduceOp.AVG)
+    assert torch.equal(got, sum(rank_tensor((world, 3), torch.float32, r)
+                                for r in range(world))[rank] / world)
+    assert seen == ["barrier"], seen  # the rest on the backend's Gloo group, not gpubridge
+
+
+def test_the_cpu_tensor_path_carries_every_collective_on_gloo(tmp_path):
+    run_backend(TWO_TWO, _cpu_tensor_path, tmp_path)
 
 
 def _policy_and_bridge(rank, world, policy):

@@ -210,8 +210,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         topology = self._topology()
         if _cpu_path(topology, [*outputs, *inputs]):
             return self._on_cpu_group("all_gather_into_tensor", list(outputs), [
-                lambda o=o, i=i: dist.all_gather_into_tensor(o, i, group=self._cpu(),
-                                                             async_op=True)
+                lambda o=o, i=i: _gloo_all_gather(o, i, self._cpu())
                 for o, i in zip(outputs, inputs, strict=True)])
         return self._run("all_gather_into_tensor", outputs, list(outputs), [
             lambda o=o, i=i: _collectives.all_gather_into_tensor(o, i, async_op=True)
@@ -229,16 +228,18 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
                                    "every rank must contribute a tensor of the same shape")
         on_cpu = _cpu_path(topology, inputs)
         for outputs, tensor in zip(output_lists, inputs, strict=True):
-            buffer = torch.empty((self.size(), *tensor.shape), dtype=tensor.dtype,
+            # Flat: Gloo wants the output a concatenation along dim 0 of the inputs' shape.
+            buffer = torch.empty(self.size() * tensor.numel(), dtype=tensor.dtype,
                                  device=tensor.device)
-            source = tensor.contiguous()
+            source = tensor.contiguous().reshape(-1)
             if on_cpu:
                 dist.all_gather_into_tensor(buffer, source, group=self._cpu())
             else:
                 self._run("allgather", [buffer], None, [
                     lambda b=buffer, s=source: _collectives.all_gather_into_tensor(
                         b, s, async_op=True)]).wait()
-            for out, row in zip(outputs, buffer.unbind(0), strict=True):
+            rows = buffer.view(self.size(), *tensor.shape).unbind(0)
+            for out, row in zip(outputs, rows, strict=True):
                 out.copy_(row)
         return _completed(output_lists)
 
@@ -302,7 +303,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
     def _end_coalescing(self, device: torch.device) -> dist.Work:
         works, self._coalesced = self._coalesced or [], None
         torch_works, self._coalesced_torch = self._coalesced_torch, []
-        futures = [w.get_future() for w in torch_works]
+        futures = [_future_of(w) for w in torch_works]
         if works:  # the worker runs gpubridge's in order: the last one ends after the others
             futures.append(works[-1].get_future())
         if not futures:
@@ -365,19 +366,54 @@ def _gloo_reduce(fn, tensor: torch.Tensor, name: str, size: int, group) -> dist.
     return _completed([tensor])
 
 
-def _gloo_reduce_scatter(output, input, name: str, size: int, group) -> dist.Work:  # noqa: A002
-    work = dist.reduce_scatter_tensor(output, input, op=dist.ReduceOp.SUM, group=group,
-                                      async_op=True)
-    if name != "avg":
+def _flat_output(output: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """Gloo wants a tensor collective's input and output to be concatenations along dim 0;
+    flat ones are. Whether the flat output is ``output`` itself (a view)."""
+    if output.is_contiguous():
+        return output.view(-1), True
+    return output.new_empty(output.numel()), False
+
+
+def _gloo_all_gather(output, input, group) -> dist.Work:  # noqa: A002
+    flat, in_place = _flat_output(output)
+    work = dist.all_gather_into_tensor(flat, input.reshape(-1), group=group, async_op=True)
+    if in_place:
         return work
     work.wait()
-    output.div_(size)
+    output.copy_(flat.view(output.shape))
     return _completed([output])
+
+
+def _gloo_reduce_scatter(output, input, name: str, size: int, group) -> dist.Work:  # noqa: A002
+    flat, in_place = _flat_output(output)
+    work = dist.reduce_scatter_tensor(flat, input.reshape(-1), op=dist.ReduceOp.SUM,
+                                      group=group, async_op=True)
+    if name != "avg" and in_place:
+        return work
+    work.wait()
+    if name == "avg":
+        flat.div_(size)
+    if not in_place:
+        output.copy_(flat.view(output.shape))
+    return _completed([output])
+
+
+def _future_of(work: dist.Work) -> torch.futures.Future:
+    """A torch Work's future. Some Gloo Works have none (reduce_scatter): wait for those."""
+    try:
+        return work.get_future()
+    except RuntimeError as exc:
+        if "not implemented" not in str(exc):
+            raise
+    work.wait()
+    future: torch.futures.Future = torch.futures.Future()
+    future.set_result(None)
+    return future
 
 
 def _all_of(works: Sequence[dist.Work], result: Any) -> dist.Work:
     """A Work that completes with ``result`` once every one of ``works`` has."""
-    futures = [w.get_future() for w in works]
+    futures = [_future_of(w) for w in works]
     if not futures:
         return _completed(result)
     return _create_work_from_future(
