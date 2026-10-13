@@ -44,20 +44,29 @@ follows. Source references are to PyTorch 2.8.0 (gpubridge's floor) and 2.14.1
   in 2.14.1 but not in 2.8.0, where constructing one fails with "No
   constructor defined" (measured). gpubridge supports 2.8, so it returns a
   `ProcessGroup` subclass.
-- **Names.** `DeviceMesh` reads the group's `group_name`. A Python group can't
-  set it with `_set_group_name` (it raises "ProcessGroup name not set" when
-  no C++ backend is registered, measured on both versions), so the subclass
-  defines `group_name` as a property, as `ProcessLocalGroup` does, with the
-  `group_id` from the extended API.
-- **Teardown.** `destroy_process_group()` calls `shutdown()` on every group, in
-  order of group name, so the world group ("0") goes first (2.8.0 line 2186,
-  2.14.1 line 3020), then clears its maps.
-- **Autoloading.** At the end of `import torch`, `_import_device_backends()`
-  calls every entry point in the `torch.backends` group, unless
-  `TORCH_DEVICE_BACKEND_AUTOLOAD=0` (`torch/__init__.py`: lines 2805 and 2866 in
-  2.8.0, 3469 and 3529 in 2.14.1). An
-  exception there makes `import torch` itself fail, so an entry point must
-  never raise.
+- **Names.** `DeviceMesh` reads the group's `group_name`. torch sets the name on
+  the new group, but for a Python group with no C++ backend the C++ getter
+  raises "ProcessGroup name not set" (measured on both versions). So the
+  subclass defines `group_name` as a property, as `ProcessLocalGroup` does, with
+  the `group_id` from the extended API.
+- **`device_id`.** With `init_process_group(device_id=...)`, torch asks the group
+  for that device's C++ backend and whether it can split eagerly (2.8.0 line
+  2123, 2.14.1 line 2944). A Python group has no per-device backend, so the
+  subclass's `_get_backend()` returns a stand-in that says it can't.
+- **Teardown.** `destroy_process_group()` calls `shutdown()` on every group in
+  *reverse* order of group name, so the world group ("0") goes **last**, after
+  every group created later (2.8.0 line 2186, 2.14.1 line 3020), then clears
+  its maps.
+- **Autoloading.**
+  - At the end of `import torch`, `_import_device_backends()` calls every entry
+    point in the `torch.backends` group, unless `TORCH_DEVICE_BACKEND_AUTOLOAD=0`
+    (`torch/__init__.py`: lines 2805 and 2866 in 2.8.0, 3469 and 3529 in 2.14.1).
+    An exception there, including failing to import the entry point's module,
+    makes `import torch` itself fail.
+  - 2.14.1 also has a lazy group, `torch.distributed.backends`, loaded only when
+    an unknown backend name is first asked for
+    (`Backend._ensure_backend_registered`, `distributed_c10d.py` line 543). It
+    doesn't exist in 2.8.0.
 
 ## What DDP and FSDP2 call
 
@@ -91,17 +100,26 @@ Other measured facts:
 **Registration.**
 - `import gpubridge` registers the backend name `"gpubridge"`, with
   `extended_api=True` and devices `cpu` and `cuda` (ROCm builds use `cuda`).
-- gpubridge also ships a `torch.backends` entry point, so `import torch`
-  registers the name without importing gpubridge. Then a script's only gpubridge
-  line can be the backend name. The entry point catches every exception (it
-  must never break `import torch`). `TORCH_DEVICE_BACKEND_AUTOLOAD=0` turns it
-  off; `import gpubridge` still registers.
+- gpubridge also ships entry points, so a script's only gpubridge line can be
+  the backend name:
+  - **`torch.distributed.backends`** (newer torch): loaded only when
+    `backend="gpubridge"` is first asked for, so it costs nothing otherwise.
+  - **`torch.backends`** (older torch, 2.8 included): called on every
+    `import torch`. It registers the name without importing gpubridge, and
+    catches every exception.
+- **The `torch.backends` hook's one risk:** an install whose metadata outlives
+  its files (an editable install of a deleted worktree, or a checkout of a
+  commit older than the hook) makes `import torch` fail, because torch can't
+  import the hook's module. `TORCH_DEVICE_BACKEND_AUTOLOAD=0` turns it off;
+  reinstalling fixes it. `import gpubridge` always registers the name too.
 
 **One process group, the world.** The creator returns a
 `gpubridge.torch_backend.GpubridgeProcessGroup` for the world group.
 gpubridge's collectives run on the world group only, so a subgroup
-(`new_group`, or a multi-dimensional `DeviceMesh`) fails at creation, on every
-rank that creates it, saying so.
+(`new_group`, or a multi-dimensional `DeviceMesh`) fails where it is created:
+on each of its members, saying so. Ranks outside it get torch's
+`NON_GROUP_MEMBER`, as with any backend. A group of every rank is allowed; it
+shares gpubridge's topology.
 
 **Setup at the first collective.** gpubridge needs its own groups: a Gloo group
 of every rank (discovery, `barrier()`, `flat-gloo`), one per island on its
@@ -114,15 +132,22 @@ GPU and settings are exchanged, and any problem fails that first collective on
 every rank with gpubridge's usual message. The policy and bridge transport,
 which `gpubridge.init()` takes as arguments, come from `GPUBRIDGE_POLICY` and
 `GPUBRIDGE_BRIDGE` (default `auto` and `gloo`), checked across ranks like the
-other settings.
+other settings. A setting one rank can't read at all (an unknown policy name,
+a malformed `GPUBRIDGE_*` value) also fails every rank. The Gloo groups are
+created first, and every rank's error is exchanged over them before
+anything else, so no rank is left waiting in `new_group`.
 
 **Collectives.**
 - Each torch collective maps onto gpubridge's public collective of the same
   meaning, called with `async_op=True`. The returned torch `Work` wraps the
   gpubridge `Work`'s future.
-- Stream semantics are therefore gpubridge's async ones: the collective waits
-  for the caller's stream at submission. `wait()` and the future make the
-  waiting stream wait for the result, as NCCL's do (`src/gpubridge/work.py`).
+- Stream semantics are therefore gpubridge's async ones
+  (`src/gpubridge/work.py`):
+  - The collective waits for the caller's stream at submission.
+  - `wait()` and the future make the waiting stream wait for the result.
+  - Unlike NCCL, `wait()` also blocks the host until gpubridge's worker thread
+    has run the collective. So FSDP2's prefetching gets less overlap of
+    compute and communication than it would with NCCL.
 
 | torch call | gpubridge |
 | --- | --- |
@@ -133,31 +158,45 @@ other settings.
 | `_reduce_scatter_base`, `reduce_scatter_single`, `reduce_scatter_tensor_coalesced` (SUM, AVG) | `reduce_scatter_tensor` |
 | `reduce_scatter` (list form) | the inputs concatenated, then `reduce_scatter_tensor` |
 | `barrier` | `barrier` |
+| `gather`, `scatter` | CPU tensors only, on the backend's Gloo group (below) |
 | `_start_coalescing` / `_end_coalescing` | calls run as they come; `_end_coalescing` returns a `Work` for all of them |
 
-- **CPU tensors on a GPU job.** gpubridge collectives take tensors on the rank's
-  device, so CPU tensors in a GPU job (some libraries all_reduce CPU flags or
-  counts) go to the Gloo world group directly. So `backend="gpubridge"`
-  behaves like `"cpu:gloo,cuda:gpubridge"` on every supported torch release.
-  That string also works: torch then creates a Gloo backend for CPU and calls
-  gpubridge's creator for CUDA, whose process group replaces the whole group.
+- **CPU tensors.** gpubridge collectives take tensors on the rank's device.
+  So in a GPU job, CPU tensors (some libraries all_reduce CPU flags or counts)
+  go to a Gloo group of every rank that belongs to the backend. It is kept
+  apart from the one gpubridge's worker thread uses, so the two threads never
+  interleave collectives on one group. AVG there is a SUM and a division, as
+  in gpubridge. `backend="gpubridge"` therefore behaves like
+  `"cpu:gloo,cuda:gpubridge"` on every supported torch release.
+- **Gather and scatter** of CPU tensors take the same group, in any job.
+  That's what `gather_object` and `scatter_object_list` use, and
+  `torch.distributed.checkpoint` plans its saves with them. The object
+  collectives are tested; a full checkpoint save isn't.
 - **Refused before any communication**, with an error naming the operation and
   the backend:
-  - reductions other than SUM, AVG, MAX and MIN (PRODUCT, PREMUL_SUM,
-    bitwise);
-  - point-to-point `send` and `recv`, `alltoall`, `gather`, `scatter`,
-    `reduce`;
+  - reductions other than SUM, AVG, MAX and MIN (PRODUCT, PREMUL_SUM, bitwise),
+    on the CPU path too;
+  - point-to-point `send` and `recv`, `alltoall` and `reduce`;
+  - gather and scatter of GPU tensors;
   - list-form collectives with tensors of different sizes.
 
   The arguments are the same on every rank of a matching collective, so every
   rank refuses alike.
 
-**Teardown.** `shutdown()`, which `destroy_process_group()` calls before it
-shuts down gpubridge's own groups, finishes queued async collectives and
-releases gpubridge's state, as `gpubridge.destroy()` does. In one process,
-use either `gpubridge.init()` or the backend, not both; with the backend,
-`gpubridge.all_reduce` and the other gpubridge functions also work on the
-groups it built.
+**Teardown.**
+- `destroy_process_group()` calls the backend's `shutdown()` last, after it has
+  shut down gpubridge's own groups. So `shutdown()` releases gpubridge's state
+  without running anything still queued: those collectives fail.
+- It waits at most 10 s for gpubridge's worker thread, and never raises, so
+  `destroy_process_group()` always finishes and `init_process_group()` can run
+  again in the same process.
+- `abort()` does the same.
+- In one process, use either `gpubridge.init()` or the backend, not both. With
+  the backend, `gpubridge.all_reduce` and the other gpubridge functions also
+  work on the groups it built.
+- A custom bridge transport or policy that ran a collective on the default
+  group during setup would wait on the backend's own setup. That is refused
+  with an error, pointing at `topology.world_group`.
 
 **gpubridge internals.** Two changes, invisible to the existing API:
 - `Topology` gains `world_group`: the Gloo group of every rank. It is the
@@ -171,12 +210,11 @@ groups it built.
 - **Subgroups:** HSDP, 2-D meshes, tensor parallelism and any `new_group`. gpubridge
   composes collectives over its islands of the whole job; a subgroup would
   need its own islands and bridge. Possible later; not planned yet.
-- **`torch.compile` and functional collectives** (`torch.ops._c10d_functional`).
-  They dispatch to a process group's C++ backend for the tensor's device, and
-  a Python process group has none. Eager DDP and FSDP2 use `torch.distributed`
-  calls, which reach Python.
-- **Point-to-point, all-to-all, gather and scatter:** gpubridge has no
-  cross-vendor implementation of them yet.
+- **`torch.compile`:** not tested. Functional collectives
+  (`torch.ops._c10d_functional`) do reach the Python group: FSDP2's
+  `full_tensor()` uses them, and it is tested.
+- **Point-to-point, all-to-all, and gather and scatter of GPU tensors:**
+  gpubridge has no cross-vendor implementation of them yet.
 - **Overhead:** each collective goes through Python and gpubridge's worker
   thread, as `gpubridge.all_reduce(async_op=True)` does today.
 
@@ -184,11 +222,22 @@ groups it built.
 
 In simulation mode (CPU processes with faked vendors, two islands and a Gloo
 bridge):
-- DDP with `backend="gpubridge"` trains bit for bit like a Gloo-only run on
-  integer-valued data.
-- An FSDP2 (`fully_shard`) loop matches a single-process reference.
-- The coalesced and bucketed paths are exercised.
-- Unsupported operations and subgroups fail on every rank.
-- GPU tests are written and skipped without a GPU.
+- **DDP** with `backend="gpubridge"` trains bit for bit like a Gloo-only run on
+  integer-valued data. Also with BatchNorm buffers, unused parameters and a
+  comm hook, within float64 rounding of Gloo.
+- **FSDP2** (`fully_shard`) matches Gloo and a single-process reference bit for
+  bit in float64, and Gloo within float32 rounding on the float32 (AVG) path.
+- **Collectives:** the coalesced and bucketed paths, and the object
+  collectives.
+- **Refusals:** unsupported operations fail on every rank, and subgroups on
+  their members. A setting one rank can't read fails every rank, and so does
+  a collective during setup.
+- **Lifecycle:** init twice in one process, and destroy with collectives still
+  queued.
+- **GPU tests** (DDP on two GPUs, `device_id`) are written and skipped without
+  GPUs.
+- **Examples:** the FSDP2 example's `--verify` mode compares against a
+  single-process replay bit for bit. The GPU kit runs it, so a stream race on
+  GPUs would show even when every rank agrees.
 
 HARDWARE_VALIDATION.md lists what a GPU run must show.

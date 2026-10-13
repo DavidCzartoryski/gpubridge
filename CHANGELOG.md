@@ -16,8 +16,8 @@ still needs real hardware. Numbers in parentheses are pull requests.
   registers the name when torch is imported. gpubridge's groups are built at
   the first collective, with the usual discovery checks.
   `GPUBRIDGE_POLICY` and `GPUBRIDGE_BRIDGE` pick the policy and transport.
-  World group only; point-to-point, all-to-all, gather, scatter, reduce and
-  other reductions are refused before any communication. New examples
+  World group only; point-to-point, all-to-all, reduce, GPU-tensor gather
+  and scatter, and other reductions are refused before any communication. New examples
   `ddp_torch_backend.py` and `fsdp2_torch_backend.py`; the GPU kit's
   `train_fsdp2_backend` step. Design: docs/TORCH_BACKEND.md.
 

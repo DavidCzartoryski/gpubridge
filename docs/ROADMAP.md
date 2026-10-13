@@ -173,11 +173,11 @@ before:
   which the backend refuses. Both 2.8's `_allgather_base` /
   `_reduce_scatter_base` and 2.14's `all_gather_single` /
   `reduce_scatter_single` (and their coalesced forms) are implemented.
-- **Still true from the prototype:** `TORCH_DISTRIBUTED_DEBUG=DETAIL` wraps
-  process groups in a way Python backends don't support; a collective that
-  fails at run time reaches DDP as an exception in a future, which crashed
-  DDP's backward in the prototype, so argument errors are raised before any
-  communication instead.
+- **Errors.** Argument errors are raised before any communication, on every
+  rank alike. A collective that fails at run time reaches DDP as an exception
+  in its future, which in the prototype crashed DDP's backward. With a Python
+  process group it surfaces as a RuntimeError instead (found in review, not
+  yet a test).
 
 **What's left, and depends on GPU results:** HARDWARE_VALIDATION.md item 30
 (DDP and FSDP2 through the backend on GPUs: the `train_fsdp2_backend` step in
