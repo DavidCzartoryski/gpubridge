@@ -53,6 +53,8 @@ _cpu_group: dist.ProcessGroup | None = None
 """A Gloo group of every rank for CPU-tensor collectives, apart from the one
 gpubridge's worker thread uses, so the two threads never interleave on one group."""
 _setting_up = False
+_subgroups: list[GpubridgeProcessGroup] = []
+"""Subgroups whose topology is built; the world's teardown closes what they hold."""
 
 
 def _completed(result: Any) -> dist.Work:
@@ -85,6 +87,8 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         self._timeout = timeout
         self._members = tuple(members)
         self._sub: tuple[_topology.Topology, dist.ProcessGroup] | None = None
+        self._sub_lock = threading.Lock()
+        self._building = False
         self._coalesced: list[_work.Work] | None = None
         self._coalesced_torch: list[dist.Work] = []
 
@@ -116,14 +120,28 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
 
     def _topology(self) -> _topology.Topology:
         """This group's topology: the world's, or for a subgroup its own, built at its first
-        collective by its members (after the world's, if no collective has built that yet)."""
-        world = self._world_topology()
+        collective by its members (after the world's, if no collective has built that yet).
+
+        The world's is always built and owned by the default group, with its timeout,
+        whichever group's collective comes first: destroying a subgroup must not
+        release gpubridge for the whole job."""
+        world = _default_group(self)._world_topology()
         if not self._members:
             return world
-        with _setup_lock:
+        with self._sub_lock:
             if self._sub is None:
-                self._sub = _topology.build_subtopology(world, self._members, self._name,
-                                                        self._timeout)
+                if self._building:
+                    raise RuntimeError(
+                        f"a collective on a {NAME} subgroup ran while that subgroup was setting "
+                        "itself up (from a custom bridge transport or policy?)")
+                self._building = True
+                try:
+                    self._sub = _topology.build_subtopology(world, self._members, self._name,
+                                                            self._timeout)
+                finally:
+                    self._building = False
+                with _setup_lock:
+                    _subgroups.append(self)
             return self._sub[0]
 
     def _world_topology(self) -> _topology.Topology:
@@ -159,9 +177,11 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
     def shutdown(self) -> None:
         """Called by ``destroy_process_group()``, after it has shut down gpubridge's own groups
         (it goes in reverse order of group name, the world group last): release gpubridge's
-        state without running anything still queued, and never raise. A subgroup only
-        forgets its topology, whose groups torch destroys."""
-        self._sub = None
+        state without running anything still queued, and never raise. A subgroup closes
+        its own topology's policy and bridge; torch destroys its groups."""
+        if self._members:
+            _close_subgroup(self)
+            return
         _teardown(self)
 
     def abort(self) -> None:
@@ -458,12 +478,42 @@ def _all_of(works: Sequence[dist.Work], result: Any) -> dist.Work:
             lambda f: ([g.value() for g in f.value()], result)[1]))
 
 
+def _default_group(group: GpubridgeProcessGroup) -> GpubridgeProcessGroup:
+    """The job's default group if it is gpubridge's (it is under ``init_process_group(
+    backend="gpubridge")``), else ``group``: the group that builds and owns the world's
+    topology."""
+    try:
+        default = dist.distributed_c10d._get_default_group()
+    except (RuntimeError, ValueError):
+        return group
+    return default if isinstance(default, GpubridgeProcessGroup) else group
+
+
+def _close_subgroup(group: GpubridgeProcessGroup) -> None:
+    """Close a subgroup's policy and bridge; never raise (destroy_process_group must finish)."""
+    with _setup_lock:
+        if group in _subgroups:
+            _subgroups.remove(group)
+        sub, group._sub = group._sub, None
+    if sub is None:
+        return
+    topology = sub[0]
+    try:
+        topology.policy.close()
+        if topology.bridge is not None:
+            topology.bridge.close()
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(f"{NAME} backend: closing a subgroup's policy or bridge failed: {exc}",
+                      RuntimeWarning, stacklevel=3)
+
+
 def _teardown(group: GpubridgeProcessGroup) -> None:
     global _owner, _cpu_group
     with _setup_lock:
         if _owner is not group:
             return
         _owner, _cpu_group = None, None
+        subgroups = list(_subgroups)
         if not _topology.is_initialized():
             return
         try:
@@ -473,6 +523,8 @@ def _teardown(group: GpubridgeProcessGroup) -> None:
         except Exception as exc:  # noqa: BLE001 - destroy_process_group must finish
             warnings.warn(f"{NAME} backend: releasing gpubridge's state failed: {exc}",
                           RuntimeWarning, stacklevel=3)
+    for sub in subgroups:  # after the worker is abandoned, as for the world's own
+        _close_subgroup(sub)
 
 
 def setup(timeout: timedelta | None) -> dist.ProcessGroup:
@@ -515,7 +567,12 @@ def setup(timeout: timedelta | None) -> dist.ProcessGroup:
 def create(options, backend_options=None) -> GpubridgeProcessGroup:
     """The creator ``init_process_group`` and ``new_group`` call (``extended_api=True``).
     torch calls it on the group's members only."""
-    ranks = sorted(options.global_ranks_in_group)  # empty for the world group
+    ranks = list(options.global_ranks_in_group)  # empty for the world group
+    if ranks != sorted(ranks):
+        raise RuntimeError(
+            f"the {NAME} torch.distributed backend takes a subgroup's ranks in ascending order "
+            f"(its group ranks), but got {ranks}: new_group(..., sort_ranks=False) isn't "
+            "supported (docs/TORCH_BACKEND.md)")
     world = dist.get_world_size() if dist.is_initialized() else options.group_size
     members = ranks if ranks and ranks != list(range(world)) else []
     return GpubridgeProcessGroup(options.group_rank, options.group_size, options.group_id,

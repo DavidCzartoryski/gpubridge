@@ -232,7 +232,9 @@ leaders. A subgroup gets the same structure over its members only:
   how many groups of the same ranks it created before: the same on every
   member, and the job's later group names stay in step.
 - **Ranks.** Collectives keep global ranks wherever torch wants them (the
-  source of a broadcast, the destination of a reduce). Rows of an all_gather
+  source of a broadcast; inside gpubridge, the destination of an island's
+  reduce onto its leader). A subgroup's ranks must be ascending, as
+  `new_group` sorts them by default; `sort_ranks=False` is refused. Rows of an all_gather
   and slices of a reduce_scatter follow the subgroup's own rank order, its
   members in ascending global rank, as torch orders a group.
 

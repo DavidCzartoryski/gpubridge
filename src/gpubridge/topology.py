@@ -34,6 +34,7 @@ from gpubridge.detect import Probe, detect_vendor, probe
 from gpubridge.policies import AUTO, CollectivePolicy, choose_policy, policy_name
 from gpubridge.split_test import SplitTestWarning, banner, split_labels
 from gpubridge.transport import BridgeTransport
+from gpubridge.transport import _scope as _transport_scope
 
 
 @dataclass(frozen=True)
@@ -598,7 +599,12 @@ def _members_only(prefix: str) -> Iterator[None]:
     members could compute different names and wait on different store keys, and
     later groups of the whole job too. Only a group's ranks name it (torch
     returns early on the others), and they create the same groups in the same
-    order. ``prefix`` is the subgroup's own name, the same on every member."""
+    order. ``prefix`` is the subgroup's own name, the same on every member.
+    Transports name their links the same way (:func:`gpubridge.transport.scoped_name`).
+
+    The patch is process-wide: no other thread may create groups meanwhile
+    (the backend holds the subgroup's setup lock; the training thread is in
+    the subgroup's first collective)."""
     c10d = dist.distributed_c10d
     plain_new, plain_name = dist.new_group, c10d._process_group_name
     seen: dict[tuple[int, ...], int] = {}
@@ -613,9 +619,11 @@ def _members_only(prefix: str) -> Iterator[None]:
         return f"{prefix}.{'_'.join(map(str, key))}.{seen[key]}"
 
     dist.new_group, c10d._process_group_name = local, name  # type: ignore[assignment]
+    token = _transport_scope.set(name)
     try:
         yield
     finally:
+        _transport_scope.reset(token)
         dist.new_group, c10d._process_group_name = plain_new, plain_name  # type: ignore[assignment]
 
 

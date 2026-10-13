@@ -12,7 +12,8 @@ reduce-bridge-broadcast logic in ``collectives.py``.
 from __future__ import annotations
 
 import abc
-from collections.abc import Sequence
+import contextvars
+from collections.abc import Callable, Sequence
 from datetime import timedelta
 from typing import ClassVar
 
@@ -21,6 +22,21 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
 from gpubridge.config import CPU_BACKEND
+
+_scope: contextvars.ContextVar[Callable[[Sequence[int]], str] | None] = contextvars.ContextVar(
+    "gpubridge_subgroup_scope", default=None)
+"""Set while a subgroup's members build its topology (topology._members_only)."""
+
+
+def scoped_name(ranks: Sequence[int]) -> str | None:
+    """Inside a subgroup's setup, a name for a new group or link over ``ranks``: the same
+    on every member, unique in the job. None otherwise.
+
+    A transport whose setup keys anything by a per-process count (store keys, say)
+    must use this when it isn't None: a subgroup's setup runs on its members only,
+    so such counts would differ between ranks."""
+    namer = _scope.get()
+    return namer(ranks) if namer is not None else None
 
 
 class BridgeTransport(abc.ABC):
@@ -50,8 +66,11 @@ class BridgeTransport(abc.ABC):
     ) -> BridgeTransport | None:
         """Set up the bridge between ``ranks`` (the island leaders).
 
-        Collective over the whole world: every rank calls it, in the same order
-        relative to other group creation, including ranks not in ``ranks``.
+        Collective over every rank that builds the topology, in the same order
+        relative to other group creation, including ranks not in ``ranks``: the
+        whole job for the world's topology; for a subgroup's (torch.distributed
+        backend), its members only, with :func:`scoped_name` set and
+        ``dist.new_group`` synchronizing only each new group's ranks.
 
         Returns:
             A transport on members of ``ranks``, None everywhere else.
@@ -63,8 +82,8 @@ class BridgeTransport(abc.ABC):
     ) -> list[BridgeTransport | None]:
         """Set up one bridge per entry of ``groups``, for policies that use several links.
 
-        Collective over the whole world, like :meth:`create`: every rank calls
-        it with the same ``groups`` in the same order. The default calls
+        Collective like :meth:`create`: every rank that builds the topology
+        calls it with the same ``groups`` in the same order. The default calls
         :meth:`create` once per group, in order, so every transport supports
         it; one that can set up several links more cheaply at once may
         override it. The leader bridge ``init()`` creates is unaffected.

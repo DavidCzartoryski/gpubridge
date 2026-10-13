@@ -49,7 +49,7 @@ from torch.distributed import ReduceOp
 from gpubridge import ucx
 from gpubridge.config import parse_size
 from gpubridge.staging import PinnedBridgeStaging
-from gpubridge.transport import BridgeTransport, register_transport
+from gpubridge.transport import BridgeTransport, register_transport, scoped_name
 from gpubridge.ucx import gdr
 
 #: Chunk size of every UCX message, e.g. ``4M`` or ``65536``.
@@ -122,6 +122,7 @@ class UcxTransport(BridgeTransport):
 
     #: Links created in this process, the same count on every rank (creation is
     #: collective and in the same order everywhere), so store keys never collide.
+    #: A subgroup's links, built by its members only, take scoped_name() instead.
     _links: ClassVar[itertools.count] = itertools.count()
 
     def __init__(self, worker: ucx.Worker, members: Sequence[int], rank: int,
@@ -150,7 +151,7 @@ class UcxTransport(BridgeTransport):
     def create(cls, ranks: Sequence[int], *, timeout: timedelta | None = None
                ) -> UcxTransport | None:
         timeout = timeout or DEFAULT_TIMEOUT
-        link = next(cls._links)
+        link = scoped_name(ranks) or next(cls._links)
         store = dist.distributed_c10d._get_default_store()
         key = f"gpubridge/ucx/{link}"
         members, rank = list(ranks), dist.get_rank()

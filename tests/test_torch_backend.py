@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import gc
 import importlib.metadata
+import inspect
 import os
 import subprocess
 import sys
@@ -553,6 +554,8 @@ def _subgroups(rank, world):
     dist.all_reduce(t, group=island)
     mates = [0, 1] if rank < 2 else [2, 3]
     assert torch.equal(t, sum(rank_tensor((5,), torch.float32, r) for r in mates))
+    # The world's topology belongs to the default group even so, with its timeout.
+    assert torch_backend._owner is dist.distributed_c10d._get_default_group()
     topology = _sub(island)._topology()
     assert topology.policy.name == "native-only" and topology.bridge is None
     assert topology.layout.members == tuple(mates) and len(topology.layout.islands) == 1
@@ -593,14 +596,75 @@ def _subgroups(rank, world):
         objects = [None] * 3
         dist.all_gather_object(objects, f"r{rank}", group=triple)  # CPU tensors: Gloo
         assert objects == ["r0", "r1", "r3"]
+    # Destroying a subgroup closes its own topology only: gpubridge stays up for the job.
+    if rank in (0, 2):
+        dist.destroy_process_group(pair)
+        assert all(g is not pair for g in torch_backend._subgroups)
+    assert gpubridge.is_initialized()
     # The world still works after its subgroups.
     t = rank_tensor((4,), torch.float32, rank)
     dist.all_reduce(t)
     assert torch.equal(t, sum(rank_tensor((4,), torch.float32, r) for r in range(world)))
+    # Ranks out of order (new_group(..., sort_ranks=False)) are refused on the members.
+    if "sort_ranks" in inspect.signature(dist.new_group).parameters:  # torch 2.14; not 2.8
+        if rank in (1, 2):
+            with pytest.raises(RuntimeError, match="ascending order"):
+                dist.new_group([2, 1], sort_ranks=False, use_local_synchronization=True)
 
 
 def test_subgroups_of_one_vendor_are_native_and_mixed_ones_bridged(tmp_path):
     run_backend(TWO_TWO, _subgroups, tmp_path)
+
+
+def _interleaved(rank, world):
+    # Vendors alternate, so a subgroup's islands laid end to end ({0, 2} then {1}) are
+    # not its member order (0, 1, 2): rows and slices must follow the member order.
+    dist.barrier()
+    group = dist.new_group([0, 1, 2])
+    if rank == 3:
+        return
+    topology = _sub(group)._topology()
+    assert [i.ranks for i in topology.layout.islands] == [(0, 2), (1,)]
+    out = torch.empty(3, 2, dtype=torch.float32)
+    dist.all_gather_into_tensor(out, torch.full((2,), float(rank)), group=group)
+    assert out[:, 0].tolist() == [0.0, 1.0, 2.0]
+    got = torch.empty(2, dtype=torch.float32)
+    dist.reduce_scatter_tensor(got, torch.arange(6, dtype=torch.float32), group=group)
+    assert got.tolist() == [3.0 * (2 * rank), 3.0 * (2 * rank + 1)]
+
+
+def test_a_subgroup_whose_member_order_is_not_its_islands_end_to_end(tmp_path):
+    run_backend(["nvidia", "amd", "nvidia", "amd"], _interleaved, tmp_path)
+
+
+def _subgroup_cpu_path(rank, world):
+    """The CPU-tensor path, forced as in _cpu_tensor_path, on subgroups: their own Gloo
+    group, and roots given as global ranks."""
+    torch_backend._cpu_path = lambda topology, tensors: True
+    dist.barrier()
+    pair = dist.new_group([0, 2])
+    if rank not in (0, 2):
+        return
+    t = torch.full((3,), float(rank + 1))
+    dist.all_reduce(t, group=pair)
+    assert t.tolist() == [4.0] * 3
+    b = torch.full((2,), float(rank))
+    dist.broadcast(b, src=2, group=pair)
+    assert b.tolist() == [2.0, 2.0]
+    objects = [None, None]
+    dist.all_gather_object(objects, rank, group=pair)
+    assert objects == [0, 2]
+    gathered = [None, None] if rank == 2 else None
+    dist.gather_object(f"r{rank}", gathered, dst=2, group=pair)
+    assert gathered == (["r0", "r2"] if rank == 2 else None)
+    received = [None]
+    dist.scatter_object_list(received, ["to0", "to2"] if rank == 2 else None, src=2, group=pair)
+    assert received == [f"to{rank}"]
+    assert _sub(pair)._cpu() is _sub(pair)._sub[1]  # the subgroup's own Gloo group
+
+
+def test_the_cpu_tensor_path_on_a_subgroup(tmp_path):
+    run_backend(TWO_TWO, _subgroup_cpu_path, tmp_path)
 
 
 class _Records(gpubridge.CollectiveObserver):
