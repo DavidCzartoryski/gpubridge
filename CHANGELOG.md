@@ -23,7 +23,7 @@ still needs real hardware. Numbers in parentheses are pull requests.
   `compress` and `decompress` keep kernel time out of `bridge`. The GPU kit's
   `bench_compression.py` times the kernels against memory bandwidth, and
   `bench_all_reduce.py --compression` compares bridge time with and without
-  compression. Design and error bounds: docs/COMPRESSION.md (#PR).
+  compression. Design and error bounds: docs/COMPRESSION.md (#37).
 
 - An opt-in UCX bridge transport, `init(bridge="ucx")`, **not validated on
   GPUs or RDMA hardware** (tested on CPU over UCX's TCP transport only); the
