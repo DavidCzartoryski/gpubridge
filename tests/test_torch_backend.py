@@ -9,6 +9,7 @@ call refused on every rank. docs/TORCH_BACKEND.md has the design.
 
 from __future__ import annotations
 
+import gc
 import importlib.metadata
 import os
 import subprocess
@@ -51,7 +52,12 @@ def _main(rank, vendors, fn, init_file, backend, env):
     try:
         fn(rank, len(vendors))
     finally:
+        # FSDP2 modules keep process groups alive in reference cycles. Destroyed later,
+        # at interpreter exit, a Gloo group can abort the process ("terminate called
+        # without an active exception"), with either backend. Collect them first.
+        gc.collect()
         dist.destroy_process_group()
+        gc.collect()
     assert not gpubridge.is_initialized()  # shutdown() released it
 
 

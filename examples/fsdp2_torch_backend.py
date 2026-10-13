@@ -17,6 +17,7 @@ parameters.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 from pathlib import Path
@@ -83,6 +84,8 @@ def main() -> int:
             args.json.parent.mkdir(parents=True, exist_ok=True)
             args.json.write_text(json.dumps({"world": world, "losses": losses,
                                              "identical": same, "ok": ok}, indent=2))
+    del model, opt  # FSDP2 holds process groups in reference cycles: free them before
+    gc.collect()    # the groups are destroyed, not at interpreter exit
     dist.destroy_process_group()
     return 0 if ok else 1
 
