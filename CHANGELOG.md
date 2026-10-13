@@ -7,6 +7,15 @@ still needs real hardware. Numbers in parentheses are pull requests.
 
 ## [Unreleased]
 
+### Added
+
+- A Kaggle runner for the GPU validation kit, for a free notebook with two
+  T4s (`scripts/gpu/kaggle/`): a notebook and the same steps as one script,
+  each step under a hard time limit. It checks what compute capability 7.5
+  can run (CUDA events, bfloat16, Triton) and skips or adapts the rest with
+  the reason. The results are the kit's usual records and validation tables,
+  in one tarball (#43).
+
 ### Changed
 
 - The README opens with a pitch, badges, a one-line status, an architecture
