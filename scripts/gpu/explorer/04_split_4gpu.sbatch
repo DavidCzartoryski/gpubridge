@@ -27,7 +27,8 @@ done
 # GPU-only correctness tests (tests/test_gpu.py): every policy against flat-gloo,
 # fp32/fp16/bf16, odd and large sizes, async on non-default streams.
 step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" \
-    "$REPO_DIR/tests/test_compression_kernels.py" -q -p no:cacheprovider \
+    "$REPO_DIR/tests/test_compression_kernels.py" \
+    "$REPO_DIR/tests/test_torch_backend.py" -q -p no:cacheprovider \
     --junitxml="$RESULTS/gpu_tests.xml"
 export GPUBRIDGE_SPLIT_TEST=half
 # --ops island and --phases put the island step (a reduce onto the leader) next
@@ -67,4 +68,11 @@ step check_auto_tuned env_local_torchrun GPUBRIDGE_THRESHOLDS="$RESULTS/threshol
 # if the ranks' parameters diverge.
 step train_ddp local_torchrun --nproc-per-node="$GPUS" "$REPO_DIR/examples/train_synthetic.py" \
     --json "$RESULTS/train_ddp.json"
+# gpubridge as the torch.distributed backend (item 30): a plain FSDP2 script apart from
+# backend="gpubridge" and `import gpubridge`. Exits non-zero if ranks disagree.
+step train_fsdp2_backend local_torchrun --nproc-per-node="$GPUS" \
+    "$REPO_DIR/examples/fsdp2_torch_backend.py" --json "$RESULTS/train_fsdp2_backend.json"
+# The same through the backend on exact data, against a single-process replay, bit for bit.
+step verify_fsdp2_backend local_torchrun --nproc-per-node="$GPUS" \
+    "$REPO_DIR/examples/fsdp2_torch_backend.py" --verify
 finish

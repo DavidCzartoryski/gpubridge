@@ -61,6 +61,9 @@ from gpubridge.transport import (
 from gpubridge.work import Work
 
 from gpubridge.ucx import transport as _ucx_transport  # noqa: E402,F401 - registers bridge="ucx"
+from gpubridge import torch_backend as _torch_backend  # noqa: E402
+
+_torch_backend.register()  # backend="gpubridge" for torch.distributed
 
 __version__ = "0.3.0a0"
 
@@ -186,16 +189,8 @@ def destroy() -> None:
     """
     if not is_initialized():
         return
-    topology = get_topology()
     try:
-        _work.shutdown()  # queued async collectives run first
-    finally:
-        _topology._set_topology(None)
-        _observe._reset()
-    try:
-        topology.policy.close()
-        if topology.bridge is not None:
-            topology.bridge.close()
+        _release()
     finally:
         # Why torch 2.8 is the floor: before it, this could deadlock. A Gloo
         # worker dropping the last reference to a Python tensor waits for the
@@ -203,3 +198,21 @@ def destroy() -> None:
         # ran with the GIL held, waiting for that lock. torch 2.8 releases the
         # GIL first (https://github.com/pytorch/pytorch/pull/154976).
         dist.destroy_process_group()
+
+
+def _release(drain: bool = True) -> None:
+    """Release gpubridge's state, but not the process groups: :func:`destroy` destroys
+    them after, and under the torch.distributed backend ``destroy_process_group()``
+    does (before, so there queued collectives fail instead: ``drain=False``)."""
+    topology = get_topology()
+    try:
+        if drain:
+            _work.shutdown()  # queued async collectives run first
+        else:
+            _work.abandon()
+    finally:
+        _topology._set_topology(None)
+        _observe._reset()
+    topology.policy.close()
+    if topology.bridge is not None:
+        topology.bridge.close()

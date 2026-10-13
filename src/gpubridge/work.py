@@ -125,6 +125,19 @@ class _Worker:
         self.queue.put(None)
         self.thread.join()
 
+    def abandon(self, timeout: float) -> None:
+        while True:
+            try:
+                item = self.queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not None:
+                item[0]._finish(RuntimeError(
+                    f"gpubridge async {item[0].op} not run: its process groups were destroyed"))
+            self.queue.task_done()
+        self.queue.put(None)
+        self.thread.join(timeout)
+
     def _run(self) -> None:
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)  # the current device is per thread
@@ -188,7 +201,8 @@ def check_healthy() -> None:
         raise RuntimeError(
             "an earlier async gpubridge collective failed on this rank "
             f"({type(_worker.failed).__name__}: {_worker.failed}); the process groups may "
-            "be inconsistent. Call gpubridge.destroy() and init() again."
+            "be inconsistent. Call gpubridge.destroy() and init() again (under the "
+            "torch.distributed backend: destroy_process_group() and init_process_group())."
         )
 
 
@@ -205,3 +219,13 @@ def shutdown() -> None:
     worker, _worker = _worker, None
     if worker is not None:
         worker.close()
+
+
+def abandon(timeout: float = 10.0) -> None:
+    """Stop the worker thread without running what is queued: each queued collective
+    fails. For teardown once the process groups are gone (the torch.distributed
+    backend's ``shutdown()``); waits at most ``timeout`` seconds for the thread."""
+    global _worker
+    worker, _worker = _worker, None
+    if worker is not None:
+        worker.abandon(timeout)

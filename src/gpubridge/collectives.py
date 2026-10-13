@@ -229,7 +229,7 @@ def barrier(*, async_op: bool = False) -> Work | None:
         with observe.collective(topology, "barrier"):
             if not topology.simulated:
                 torch.cuda.synchronize(topology.device)
-            dist.barrier()
+            dist.barrier(group=topology.world_group)
 
     return _start(topology, "barrier", run, [], None, async_op)
 

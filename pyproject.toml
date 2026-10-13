@@ -43,6 +43,13 @@ Issues = "https://github.com/DavidCzartoryski/gpubridge/issues"
 [project.optional-dependencies]
 test = ["pytest>=8"]
 
+# init_process_group(backend="gpubridge") without import gpubridge, on torch 2.14 and
+# later: torch loads this group only when the backend name is first asked for. Never
+# the eager "torch.backends" group, which runs at every import of torch: a library must
+# never be able to break `import torch`. Before 2.14, scripts import gpubridge.
+[project.entry-points."torch.distributed.backends"]
+gpubridge = "gpubridge.torch_backend:register"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/gpubridge"]
 

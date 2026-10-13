@@ -91,5 +91,11 @@ step bench_compression_kernels limited python "$KIT_DIR/bench_compression.py" \
 step bench_compressed mixed_torchrun bench-compressed "$KIT_DIR/bench_all_reduce.py" \
     --out "$RESULTS/bench_compressed" --max-bytes "$BENCH_MAX_BYTES" --phases \
     --compression none,bf16,fp8
+# gpubridge as the torch.distributed backend (item 30): a plain FSDP2 script apart from
+# backend="gpubridge" and `import gpubridge`.
+step train_fsdp2_backend mixed_torchrun fsdp2 "$REPO_DIR/examples/fsdp2_torch_backend.py" \
+    --json "$RESULTS/train_fsdp2_backend.json"
+step verify_fsdp2_backend mixed_torchrun fsdp2-verify "$REPO_DIR/examples/fsdp2_torch_backend.py" \
+    --verify
 package_results "$RESULTS"
 finish

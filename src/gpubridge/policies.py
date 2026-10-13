@@ -108,6 +108,11 @@ def _bridge_all_reduce(bridge: BridgeTransport, tensor: torch.Tensor, op: Reduce
         bridge.all_reduce(tensor, op=op)
 
 
+def _world(topology: Topology):
+    """The Gloo group of every rank (the default group unless the torch backend runs)."""
+    return topology.world_group if topology.world_group is not None else dist.group.WORLD
+
+
 def _native(topology: Topology) -> bool:
     """Whether islands run NCCL/RCCL (GPUs), which have the tensor collectives built in."""
     return topology.config.island_backend == GPU_BACKEND
@@ -464,27 +469,27 @@ class FlatGloo(CollectivePolicy):
     def all_reduce(self, tensor: torch.Tensor, topology: Topology,
                    op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
         staged = _stage_to_host(tensor)
-        dist.all_reduce(staged, op=op, group=dist.group.WORLD)
+        dist.all_reduce(staged, op=op, group=_world(topology))
         if staged is not tensor:
             tensor.copy_(staged)
 
     def broadcast(self, tensor: torch.Tensor, src: int, topology: Topology) -> None:
         staged = _stage_to_host(tensor)
-        dist.broadcast(staged, src=src, group=dist.group.WORLD)
+        dist.broadcast(staged, src=src, group=_world(topology))
         if staged is not tensor:
             tensor.copy_(staged)
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor,  # noqa: A002
                                topology: Topology) -> None:
         received = _host_like(output)
-        _all_gather(received, _stage_to_host(input), dist.group.WORLD, native=False)
+        _all_gather(received, _stage_to_host(input), _world(topology), native=False)
         if received.data_ptr() != output.data_ptr():
             output.copy_(received)
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor,  # noqa: A002
                               topology: Topology) -> None:
         received = _host_like(output)
-        _reduce_scatter(received, _stage_to_host(input), dist.group.WORLD, topology.rank,
+        _reduce_scatter(received, _stage_to_host(input), _world(topology), topology.rank,
                         native=False)
         if received.data_ptr() != output.data_ptr():
             output.copy_(received)

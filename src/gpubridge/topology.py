@@ -338,6 +338,11 @@ class Topology:
     """The bridge transport class every rank chose, on every rank (leaders or not)."""
     timeout: timedelta | None = None
     """The timeout ``init()`` gave its groups, for groups a policy creates in ``setup()``."""
+    world_group: ProcessGroup | None = None
+    """Under the torch.distributed backend, where the default group is the backend itself:
+    a Gloo group of every rank for discovery, :func:`gpubridge.barrier` and ``flat-gloo``.
+    None after :func:`gpubridge.init`, whose default group is a Gloo one: they look it
+    up when used rather than hold it, so it goes when the job destroys it."""
 
     @property
     def policy_name(self) -> str:
@@ -479,6 +484,7 @@ def build_topology(
     transport: type[BridgeTransport],
     policy: str | type[CollectivePolicy] = AUTO,
     timeout: timedelta | None = None,
+    world_group: ProcessGroup | None = None,
 ) -> Topology:
     """Exchange every rank's :class:`PeerInfo`, then create the island groups and the bridge.
 
@@ -491,6 +497,10 @@ def build_topology(
         policy: ``"auto"`` or the collective policy class; its name must match
             ``local.policy``.
         timeout: Timeout for the new groups' collectives. None keeps PyTorch's default.
+        world_group: A Gloo group of every rank, for discovery, ``barrier()`` and
+            ``flat-gloo``. None means the default group, which ``init()`` makes a
+            Gloo one; the torch.distributed backend passes its own, since there
+            the default group is the backend itself.
 
     Raises:
         RuntimeError: from :func:`validate_peers`, or if the policy doesn't apply
@@ -498,7 +508,7 @@ def build_topology(
     """
     rank = dist.get_rank()
     gathered: list[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, local.to_wire())
+    dist.all_gather_object(gathered, local.to_wire(), group=world_group)  # None: the default
     peers = tuple(PeerInfo.from_wire(info) for info in gathered)
     validate_peers(peers, warn=rank == 0)
     if not config.simulated:
@@ -550,6 +560,7 @@ def build_topology(
         policy=policy_cls(),
         transport=transport,
         timeout=timeout,
+        world_group=world_group,
     )
     topology.policy.setup(topology)
     return topology

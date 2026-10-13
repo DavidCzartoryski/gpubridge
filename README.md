@@ -404,9 +404,53 @@ model.register_comm_hook(None, gpubridge.ddp_comm_hook)
   collective on that rank refuses to start.
 - Tested on CPU; not validated on GPUs (HARDWARE_VALIDATION.md item 22).
 
-This is a comm hook, not a `torch.distributed` backend: FSDP2 and DeviceMesh
-can't use gpubridge yet. [docs/ROADMAP.md](docs/ROADMAP.md) sketches that
-backend.
+The hook covers DDP only. For FSDP2, or to change a training script only by
+its backend name and `import gpubridge`, use gpubridge as the backend instead
+(below).
+
+### As a torch.distributed backend (experimental, not validated on GPUs)
+
+An existing DDP or FSDP2 script runs on a mixed NVIDIA + AMD cluster by
+changing the backend name and importing gpubridge:
+
+```python
+import gpubridge                                # registers the backend name
+dist.init_process_group(backend="gpubridge")   # instead of "nccl"
+```
+
+- **Registration.** `import gpubridge` registers the name. Before torch 2.14
+  (2.8 included) the script needs it before `init_process_group`. On torch
+  2.14 and later, installed gpubridge also registers the name when it is
+  first asked for (torch's lazy `torch.distributed.backends` entry point), so
+  there the import is optional. gpubridge never hooks `import torch`.
+- **Setup.** gpubridge builds its own groups (a Gloo group of every rank, the
+  islands, the bridge) at the first collective, and runs the same discovery
+  checks as `gpubridge.init()`. `GPUBRIDGE_POLICY` and `GPUBRIDGE_BRIDGE` pick
+  the policy and the bridge transport (default `auto` and `gloo`), and the
+  other `GPUBRIDGE_*` settings apply as usual.
+- **Collectives.** DDP's `allreduce`, `broadcast` and `allgather`, FSDP2's
+  all-gathers and reduce-scatters (both torch 2.8's names and 2.14's), their
+  coalesced forms and `barrier()` run as gpubridge async collectives, with the
+  same stream semantics. Waiting on one also blocks the host, which costs
+  FSDP2 some overlap.
+- **CPU tensors.** On GPUs, CPU tensors go to a Gloo group of the backend's
+  own, so it behaves like `"cpu:gloo,cuda:gpubridge"`. Gather and scatter of
+  CPU tensors (`gather_object`, `scatter_object_list`) take that group too.
+- **Not supported**, refused with an error before any communication:
+  - subgroups (HSDP, 2-D meshes, `new_group` other than the world), refused on
+    the group's members;
+  - point-to-point, all-to-all, reduce, and gather and scatter of GPU tensors;
+  - reductions other than SUM, AVG, MAX and MIN.
+
+  `torch.compile` isn't tested.
+- **One or the other.** Use `gpubridge.init()` or the backend in one process,
+  not both. With the backend, gpubridge's own functions (`gpubridge.all_reduce`,
+  observers, `in_flight()`) work too.
+- **Status.** Tested on CPU in simulation mode: DDP and FSDP2 train bit for bit
+  like Gloo on integer-valued data, on torch 2.8.0 and 2.14.1. Not validated on
+  GPUs (HARDWARE_VALIDATION.md item 30).
+- **More:** `examples/ddp_torch_backend.py`, `examples/fsdp2_torch_backend.py`
+  and [docs/TORCH_BACKEND.md](docs/TORCH_BACKEND.md).
 
 ### Bridge transports
 

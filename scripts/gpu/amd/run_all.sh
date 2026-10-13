@@ -67,7 +67,8 @@ step rccl_version rccl_version
 # GPU-only correctness tests (tests/test_gpu.py): every policy against flat-gloo,
 # fp32/fp16/bf16, odd and large sizes, async on non-default streams.
 step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" \
-    "$REPO_DIR/tests/test_compression_kernels.py" -q -p no:cacheprovider \
+    "$REPO_DIR/tests/test_compression_kernels.py" \
+    "$REPO_DIR/tests/test_torch_backend.py" -q -p no:cacheprovider \
     --junitxml="$RESULTS/gpu_tests.xml"
 # Bridge compression kernels (item 28): the same bits as the CPU reference, and their
 # throughput against the GPU's memory bandwidth. One GPU is enough.
@@ -110,6 +111,12 @@ if [ "$GPUS" -ge 2 ]; then
     # DDP with gpubridge.ddp_comm_hook across two islands (item 22).
     step train_ddp_split env_local_torchrun GPUBRIDGE_SPLIT_TEST=half --nproc-per-node="$GPUS" \
         "$REPO_DIR/examples/train_synthetic.py" --json "$RESULTS/train_ddp_split.json"
+    # gpubridge as the torch.distributed backend (item 30), FSDP2, across two islands.
+    step train_fsdp2_backend env_local_torchrun GPUBRIDGE_SPLIT_TEST=half \
+        --nproc-per-node="$GPUS" "$REPO_DIR/examples/fsdp2_torch_backend.py" \
+        --json "$RESULTS/train_fsdp2_backend.json"
+    step verify_fsdp2_backend env_local_torchrun GPUBRIDGE_SPLIT_TEST=half \
+        --nproc-per-node="$GPUS" "$REPO_DIR/examples/fsdp2_torch_backend.py" --verify
     max=$((GPUS < SCALING_MAX_GPUS ? GPUS : SCALING_MAX_GPUS))
     for n in $(seq 1 "$max"); do
         step "train_n$n" local_torchrun --nproc-per-node="$n" \

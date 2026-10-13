@@ -389,6 +389,23 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     none,bf16,fp8 --phases`) in Explorer steps 04 and 07, `amd/run_all.sh`
     and `mixed/node.sh`; its summary.md says from which size each mode is
     faster.
+30. **DDP and FSDP2 through `backend="gpubridge"` on GPUs.** The
+    torch.distributed backend (docs/TORCH_BACKEND.md) carries a script's
+    collectives as gpubridge async collectives. Check that
+    `examples/fsdp2_torch_backend.py --verify` passes across a split test and
+    across real NVIDIA + AMD ranks: on exact data, its parameters must equal a
+    single-process replay bit for bit, which a collective reading or writing a
+    tensor at the wrong moment would break even when every rank agrees. Also
+    that its plain training run ends with every rank's parameters identical,
+    and that the GPU tests pass (DDP on two GPUs split into two islands, with a
+    CPU tensor carried by Gloo; `init_process_group(device_id=...)`). Step time
+    against FSDP2 on one vendor's NCCL/RCCL isn't measured by the kit yet.
+    *Status: works on CPU in simulation mode on torch 2.8.0 and 2.14.1: DDP and
+    FSDP2 bit for bit like Gloo on integer-valued data, every collective the
+    backend carries, every refusal (`tests/test_torch_backend.py`), and the
+    example's `--verify`; the GPU tests are written.* *Step:*
+    `verify_fsdp2_backend` and `train_fsdp2_backend` in Explorer steps 04 and
+    07, `amd/run_all.sh` and `mixed/node.sh`; `gpu_tests`.
 
 ## Mixed build results
 
