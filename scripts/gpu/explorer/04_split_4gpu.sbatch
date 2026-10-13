@@ -75,4 +75,11 @@ step train_fsdp2_backend local_torchrun --nproc-per-node="$GPUS" \
 # The same through the backend on exact data, against a single-process replay, bit for bit.
 step verify_fsdp2_backend local_torchrun --nproc-per-node="$GPUS" \
     "$REPO_DIR/examples/fsdp2_torch_backend.py" --verify
+# HSDP through the backend (item 31): shard within each half (the split test's two
+# islands, contiguous ranks), replicate across them over the bridge. Its JSON has the
+# median step time, to set against train_fsdp2_backend's; then bit for bit on exact data.
+step train_hsdp_backend local_torchrun --nproc-per-node="$GPUS" \
+    "$REPO_DIR/examples/fsdp2_torch_backend.py" --hsdp 2 --json "$RESULTS/train_hsdp_backend.json"
+step verify_hsdp_backend local_torchrun --nproc-per-node="$GPUS" \
+    "$REPO_DIR/examples/fsdp2_torch_backend.py" --verify --hsdp 2
 finish

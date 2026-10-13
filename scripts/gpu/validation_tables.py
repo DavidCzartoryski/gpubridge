@@ -116,6 +116,8 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
     29: ("Where bridge compression pays off", [Step("bench_compressed")]),
     30: ("gpubridge as a torch.distributed backend: DDP and FSDP2 on GPUs",
          [Step("verify_fsdp2_backend"), Step("train_fsdp2_backend"), Step("gpu_tests")]),
+    31: ("HSDP through the backend: shard within islands, replicate across vendors",
+         [Step("verify_hsdp_backend"), Step("train_hsdp_backend")]),
 }
 
 

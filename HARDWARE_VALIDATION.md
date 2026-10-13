@@ -406,6 +406,23 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     example's `--verify`; the GPU tests are written.* *Step:*
     `verify_fsdp2_backend` and `train_fsdp2_backend` in Explorer steps 04 and
     07, `amd/run_all.sh` and `mixed/node.sh`; `gpu_tests`.
+31. **HSDP through the backend: shard within islands, replicate across
+    vendors.** Subgroups give each vendor island a native-only shard group
+    and each replicate group a bridged topology (docs/TORCH_BACKEND.md,
+    "Subgroups and HSDP"). Check that `examples/fsdp2_torch_backend.py
+    --verify --hsdp 2` passes on the split test and on real NVIDIA + AMD
+    ranks, bit for bit against a single-process replay, and that the plain
+    `--hsdp 2` run ends with every rank's parameters identical. Its JSON has
+    the median step time; set it against `train_fsdp2_backend`'s from the same
+    job (plain FSDP2 over every rank, whose all-gathers and reduce-scatters
+    cross the bridge). On the mixed job this needs as many NVIDIA GPUs as AMD;
+    with one of each, the shard groups are single ranks and only the replicate
+    all_reduce is exercised. *Status: works on CPU in simulation mode on torch
+    2.14.1 and in CI on torch 2.8.0 and 2.14.1: bit for bit like one process,
+    every all-gather and reduce-scatter native-only with no bridge phase
+    (`tests/test_torch_backend.py`), and the example's `--hsdp 2` and
+    `--verify --hsdp 2` on 4 simulated ranks.* *Step:* `train_hsdp_backend`
+    and `verify_hsdp_backend` in Explorer steps 04 and 07.
 
 ## Mixed build results
 

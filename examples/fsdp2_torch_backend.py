@@ -27,6 +27,8 @@ import argparse
 import gc
 import json
 import os
+import statistics
+import time
 from pathlib import Path
 
 import torch
@@ -74,14 +76,18 @@ def main() -> int:
     opt = torch.optim.SGD(model.parameters(), lr=0.05)
     teacher = torch.randn(32, 8, generator=torch.Generator().manual_seed(1)).to(device)
     data = torch.Generator().manual_seed(100 + rank)
-    losses = []
+    losses, step_ms = [], []
     for _ in range(args.steps):
+        start = time.perf_counter()
         x = torch.randn(64, 32, generator=data).to(device)
         loss = nn.functional.cross_entropy(model(x), (x @ teacher).argmax(dim=1))
         loss.backward()
         opt.step()
         opt.zero_grad()
-        losses.append(loss.item())
+        losses.append(loss.item())  # waits for the step's GPU work
+        step_ms.append((time.perf_counter() - start) * 1e3)
+    # The first steps set up gpubridge's groups and warm up; the median of the rest.
+    median_ms = statistics.median(step_ms[3:] or step_ms)
 
     # Each rank assembles the full parameters from every rank's shard (an
     # all-gather); they must agree everywhere.
@@ -94,11 +100,15 @@ def main() -> int:
         same &= bool(torch.equal(hi, lo))
     ok = same and losses[-1] < losses[0]
     if rank == 0:
-        print(f"{world} ranks, loss {losses[0]:.3f} -> {losses[-1]:.3f}, "
-              f"parameters {'identical' if same else 'DIFFER'} on every rank")
+        mode = f"HSDP over {args.hsdp} islands" if args.hsdp else "FSDP2"
+        print(f"{world} ranks, {mode}, loss {losses[0]:.3f} -> {losses[-1]:.3f}, "
+              f"median step {median_ms:.2f} ms, parameters "
+              f"{'identical' if same else 'DIFFER'} on every rank")
         if args.json:
             args.json.parent.mkdir(parents=True, exist_ok=True)
-            args.json.write_text(json.dumps({"world": world, "losses": losses,
+            args.json.write_text(json.dumps({"world": world, "hsdp_islands": args.hsdp,
+                                             "losses": losses, "step_ms": step_ms,
+                                             "median_step_ms": median_ms,
                                              "identical": same, "ok": ok}, indent=2))
     del model, opt  # FSDP2 holds process groups in reference cycles: free them before
     gc.collect()    # the groups are destroyed, not at interpreter exit

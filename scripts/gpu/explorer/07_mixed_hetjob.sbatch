@@ -145,4 +145,16 @@ step train_fsdp2_backend mixed_torchrun fsdp2 "$REPO_DIR/examples/fsdp2_torch_ba
 # The same on exact data, against a single-process replay, bit for bit.
 step verify_fsdp2_backend mixed_torchrun fsdp2-verify "$REPO_DIR/examples/fsdp2_torch_backend.py" \
     --verify
+# HSDP through the backend (item 31): shard within each vendor (NVIDIA ranks first, as
+# the hetjob orders them), replicate across vendors over the bridge. Needs the same GPU
+# count on both sides. Its JSON has the median step time, to set against
+# train_fsdp2_backend's; then bit for bit on exact data.
+if [ "$GPUS_NVIDIA" = "$GPUS_AMD" ]; then
+    step train_hsdp_backend mixed_torchrun hsdp "$REPO_DIR/examples/fsdp2_torch_backend.py" \
+        --hsdp 2 --json "$RESULTS/train_hsdp_backend.json"
+    step verify_hsdp_backend mixed_torchrun hsdp-verify \
+        "$REPO_DIR/examples/fsdp2_torch_backend.py" --verify --hsdp 2
+else
+    log "skipping the HSDP steps: they need as many NVIDIA GPUs as AMD ($GPUS_NVIDIA vs $GPUS_AMD)"
+fi
 finish

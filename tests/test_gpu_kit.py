@@ -321,6 +321,14 @@ def test_submit_07_can_put_the_nvidia_side_on_multigpu():
     assert "--partition=sharing " in amd and ":2 " in amd
 
 
+def test_mixed_hetjob_skips_hsdp_unless_both_sides_have_as_many_gpus():
+    result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w",
+                     GPUS_MIXED_NVIDIA="2", GPUS_MIXED_AMD="1")
+    assert result.returncode == 0, result.stderr
+    assert "--hsdp" not in result.stdout
+    assert "skipping the HSDP steps: they need as many NVIDIA GPUs as AMD (2 vs 1)" in result.stderr
+
+
 def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w")
     assert result.returncode == 0, result.stderr
@@ -330,13 +338,15 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     assert all(line.startswith("+ timeout --kill-after=30 1200 srun ") for line in launches)
     sruns = [line[line.index("srun "):] for line in launches]
     # probe, preflight, check, bench, a check per opt-in policy, the candidates bench,
-    # DDP training, then FSDP2 on the torch.distributed backend (trained, then verified)
-    assert len(sruns) >= 9
+    # DDP training, then FSDP2 on the torch.distributed backend (trained, then verified),
+    # then HSDP the same way (one GPU per side by default: as many on each side)
+    assert len(sruns) >= 11
     assert any("--policy pipelined-reduce-bridge-broadcast" in line for line in sruns[4:])
     assert any("--policy sharded-bridge" in line for line in sruns[4:])
-    assert "--write-thresholds" in sruns[-4]
-    assert "examples/train_synthetic.py" in sruns[-3] and "train_ddp.json" in sruns[-3]
-    assert "examples/fsdp2_torch_backend.py" in sruns[-2] and "--verify" in sruns[-1]
+    assert "--write-thresholds" in sruns[-6]
+    assert "examples/train_synthetic.py" in sruns[-5] and "train_ddp.json" in sruns[-5]
+    assert "examples/fsdp2_torch_backend.py" in sruns[-4] and "--verify" in sruns[-3]
+    assert "--hsdp 2 --json" in sruns[-2] and "--verify --hsdp 2" in sruns[-1]
     for line in sruns:
         nvidia, amd = line.split(" : ")
         assert "/w/venv/bin/" in nvidia and "/w/venv-rocm/" not in nvidia
