@@ -4,7 +4,7 @@
 native NCCL or RCCL, and a bridge joins them.**
 
 [![tests](https://github.com/DavidCzartoryski/gpubridge/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/DavidCzartoryski/gpubridge/actions/workflows/tests.yml)
-[![license](https://img.shields.io/github/license/DavidCzartoryski/gpubridge)](LICENSE)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![release](https://img.shields.io/github/v/release/DavidCzartoryski/gpubridge?include_prereleases&sort=semver)](https://github.com/DavidCzartoryski/gpubridge/releases)
 
 **Status:** alpha. Validated on CPU, in simulation and with CUDA and ROCm
