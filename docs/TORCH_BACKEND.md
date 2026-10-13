@@ -231,6 +231,22 @@ leaders. A subgroup gets the same structure over its members only:
   subgroup's own groups are named from the subgroup's name, their ranks, and
   how many groups of the same ranks it created before: the same on every
   member, and the job's later group names stay in step.
+- **That naming uses a private torch function.** While a subgroup sets up,
+  gpubridge replaces `torch.distributed.distributed_c10d._process_group_name(ranks,
+  use_hashed_name)` and passes `use_local_synchronization=True` to
+  `dist.new_group`. A torch release can change private functions without
+  notice. If the patch then missed or broke group naming, members could wait
+  on different store keys until the group's timeout: a hang, not an error.
+  So creating a subgroup first checks three things: the function exists with
+  exactly that signature, `dist.new_group` still names groups with it
+  (directly or through a `distributed_c10d` function it calls), and
+  `new_group` still takes `use_local_synchronization`. If one fails,
+  `new_group(..., backend="gpubridge")` raises on the subgroup's members,
+  naming the torch version and what changed, and nothing is patched. Groups of
+  every rank don't need the patch and keep working. Checked on torch 2.8.0
+  and 2.14.1. `tests/test_torch_backend.py` simulates each change: a
+  parameter added, renamed or made keyword-only, the function gone, and
+  `new_group` naming groups another way or without local synchronization.
 - **Ranks.** Collectives keep global ranks wherever torch wants them (the
   source of a broadcast; inside gpubridge, the destination of an island's
   reduce onto its leader). A subgroup's ranks must be ascending, as
