@@ -111,6 +111,9 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
     25: ("Pinned staging for the default bridge", [Step("check_pinned"), Step("bench_pinned")]),
     26: ("The UCX bridge is correct on GPUs", [Step("ucx_build"), Step("check_ucx")]),
     27: ("The UCX bridge against the Gloo bridge", [Step("bench_ucx")]),
+    28: ("Bridge compression kernels give the reference's bits on GPUs",
+         [Step("gpu_tests"), Step("bench_compression_kernels")]),
+    29: ("Where bridge compression pays off", [Step("bench_compressed")]),
 }
 
 

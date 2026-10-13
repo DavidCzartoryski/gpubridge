@@ -9,6 +9,22 @@ still needs real hardware. Numbers in parentheses are pull requests.
 
 ### Added
 
+- Opt-in bridge compression, `GPUBRIDGE_BRIDGE_COMPRESSION=bf16|fp8`, **off by
+  default, changes results (no longer bit-exact against the uncompressed sum)
+  and not validated on GPUs.** The bridged policies (default, pipelined,
+  sharded) compress the bridge step of floating-point SUM and AVG, over Gloo
+  or UCX. Island steps and every other op and dtype stay exact. Leaders
+  quantize on the GPU with Triton kernels (one source for CUDA and ROCm;
+  PyTorch fallback without Triton), exchange the payloads, then dequantize and
+  add them in float32. `fp8` is OCP E4M3 with a power-of-two scale per 256
+  values, travelling as uint8 bytes plus a float32 scale tensor. Every rank
+  still ends with the same bits, whichever GPU ran the kernels. Error feedback
+  per buffer carries each step's rounding error into the next. New phases
+  `compress` and `decompress` keep kernel time out of `bridge`. The GPU kit's
+  `bench_compression.py` times the kernels against memory bandwidth, and
+  `bench_all_reduce.py --compression` compares bridge time with and without
+  compression. Design and error bounds: docs/COMPRESSION.md (#PR).
+
 - An opt-in UCX bridge transport, `init(bridge="ucx")`, **not validated on
   GPUs or RDMA hardware** (tested on CPU over UCX's TCP transport only); the
   Gloo bridge stays the default. It carries the leaders' bridge over

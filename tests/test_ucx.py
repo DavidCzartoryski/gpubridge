@@ -24,7 +24,8 @@ from torch.distributed import ReduceOp
 import gpubridge
 from gpubridge import ucx
 from gpubridge.collectives import SUPPORTED_DTYPES
-from gpubridge.config import VENDOR_ENV
+from gpubridge.config import BRIDGE_COMPRESSION_ENV, VENDOR_ENV
+from gpubridge.config import CHUNK_BYTES_ENV as PIPELINE_CHUNK_ENV
 from gpubridge.policies import FlatGloo
 from gpubridge.ucx import transport as ucx_transport
 from gpubridge.ucx.transport import CHUNK_BYTES_ENV, UcxTransport
@@ -168,6 +169,26 @@ def test_every_policy_on_the_ucx_bridge_matches_flat_gloo(vendors, labels, polic
     run_ranks(vendors, partial(_check_matches_flat_gloo, policy=policy), tmp_path,
               before_init=partial(_label_islands, labels, env),
               init_kwargs={"bridge": "ucx", "policy": policy})
+
+
+def _check_compressed_on_ucx(topology, mode):
+    from test_compression import _check_compressed
+
+    if topology.is_leader:
+        assert isinstance(topology.bridge, UcxTransport)
+    _check_compressed(topology, mode)  # bit for bit the model's result, on every rank
+
+
+@needs_ucx
+@pytest.mark.parametrize("policy", POLICIES)
+@pytest.mark.parametrize("mode", ["bf16", "fp8"])
+@pytest.mark.parametrize(("vendors", "labels"), [LAYOUTS["2+2"], LAYOUTS["three-islands-2+2+1"]],
+                         ids=["2+2", "three-islands"])
+def test_bridge_compression_on_the_ucx_bridge(vendors, labels, mode, policy, tmp_path):
+    env = {**TCP, BRIDGE_COMPRESSION_ENV: mode, PIPELINE_CHUNK_ENV: "64"}
+    run_ranks(vendors, partial(_check_compressed_on_ucx, mode=mode), tmp_path,
+              init_kwargs={"policy": policy, "bridge": "ucx"},
+              before_init=partial(_label_islands, labels, env))
 
 
 @needs_ucx

@@ -360,6 +360,35 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     the preflight's TCP prediction, which RDMA should beat.
     *Status: not run.* *Step:* `bench_ucx` in steps 05 and 07 with
     `UCX_BRIDGE=1`; compare with the Gloo benchmark of the same job.
+28. **Bridge compression's Triton kernels give the reference's bits on NVIDIA
+    and AMD GPUs.** `GPUBRIDGE_BRIDGE_COMPRESSION=bf16|fp8` (opt-in) promises
+    that every rank still ends with the same bits, which needs the compiled
+    kernels on both vendors to match the plain-PyTorch reference exactly
+    (integer arithmetic on bit patterns, power-of-two scales, explicit
+    flushing below 2^-100; docs/COMPRESSION.md). Check that the GPU tests pass,
+    that `bench_compression.py` reports "same bits as CPU" for every mode and
+    dtype, that its payload and result digests are identical on the NVIDIA
+    and the AMD node, and that `bench_compressed` reports every rank the same.
+    Also how close each kernel gets to the GPU's memory bandwidth.
+    *Status: works on CPU, where Triton's interpreter runs the kernels and
+    they match the reference bit for bit (`tests/test_compression_kernels.py`);
+    in simulated jobs one leader on Triton and the other on PyTorch agree
+    (`tests/test_compression.py`). The GPU tests are written
+    (`test_compression_kernels.py`, marked `gpu`).* *Step:* `gpu_tests` and
+    `bench_compression_kernels` in Explorer steps 04 and 07, `amd/run_all.sh`
+    and `mixed/node.sh`; in step 07 compare `bench_compression_gpu` with
+    `bench_compression_amd`.
+29. **Where bridge compression pays off.** Compression adds two kernels and
+    saves bridge bytes (2x for `bf16`, 3.9x for `fp8` on float32). From which
+    size, if any, is a compressed all_reduce faster, per policy, and how much
+    shorter does the `bridge` phase get? The `compress` and `decompress`
+    phases show the kernels' share. And the cost in accuracy, from the error
+    `bench_compressed` reports, and from loss curves with and without it.
+    *Status: not run; on CPU the PyTorch reference kernels are slower than the
+    bridge they save.* *Step:* `bench_compressed` (`--compression
+    none,bf16,fp8 --phases`) in Explorer steps 04 and 07, `amd/run_all.sh`
+    and `mixed/node.sh`; its summary.md says from which size each mode is
+    faster.
 
 ## Mixed build results
 

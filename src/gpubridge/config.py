@@ -36,6 +36,11 @@ THRESHOLDS_ENV = "GPUBRIDGE_THRESHOLDS"
 #: through one pinned host buffer per leader instead of pageable ``.cpu()``
 #: copies. Off by default; must match on every rank. Not validated on GPUs.
 PINNED_STAGING_ENV = "GPUBRIDGE_PINNED_STAGING"
+#: ``bf16`` or ``fp8`` to compress the bridge step of floating-point SUM and AVG
+#: reductions (:mod:`gpubridge.compression`). Off by default; must match on every
+#: rank. Changes results: not bit-exact. Not validated on GPUs.
+BRIDGE_COMPRESSION_ENV = "GPUBRIDGE_BRIDGE_COMPRESSION"
+BRIDGE_COMPRESSION_MODES = ("bf16", "fp8")
 
 #: Backend of the global discovery group and the cross-vendor bridge. Both run on CPU.
 CPU_BACKEND = "gloo"
@@ -73,6 +78,23 @@ def pinned_staging_setting() -> bool:
         ValueError: if the variable holds something other than a boolean word.
     """
     return _flag(PINNED_STAGING_ENV)
+
+
+def bridge_compression_setting() -> str:
+    """``GPUBRIDGE_BRIDGE_COMPRESSION``: ``bf16``, ``fp8``, or empty when off.
+
+    Raises:
+        ValueError: for any other value.
+    """
+    value = os.environ.get(BRIDGE_COMPRESSION_ENV, "").strip().lower()
+    if value in ("", "0", "false", "no", "off", "none"):
+        return ""
+    if value in BRIDGE_COMPRESSION_MODES:
+        return value
+    raise ValueError(
+        f"{BRIDGE_COMPRESSION_ENV}={os.environ[BRIDGE_COMPRESSION_ENV]!r} is not valid; use "
+        f"{' or '.join(BRIDGE_COMPRESSION_MODES)}, or leave it unset (off)"
+    )
 
 
 def split_test_mode() -> str | None:

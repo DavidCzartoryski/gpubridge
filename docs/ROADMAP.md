@@ -1,7 +1,7 @@
 # Roadmap: designs waiting on GPU results
 
-These are designs, not commitments. Section 2 now has an experimental
-implementation, tested on CPU only; the others are not implemented. Each one
+These are designs, not commitments. Sections 1 and 2 now have experimental
+implementations, tested on CPU only; section 3 is not implemented. Each one
 waits for specific results from the GPU validation kit
 ([GPU_VALIDATION_RUNBOOK.md](GPU_VALIDATION_RUNBOOK.md)). Without those
 results there is no way to tell whether the problem it solves is the one that
@@ -29,41 +29,36 @@ Gloo over TCP. If GPU runs show the bridge step dominates large all_reduces,
 sending fewer bytes over the bridge alone would help without touching the
 fast island links.
 
-**Design.**
-- **Cast on the bridge only.** Island leaders cast their island sum to
-  bfloat16 (or float16) before the bridge all_reduce and cast back
-  afterwards. Island reductions stay in full precision. PyTorch's own
-  `bf16_compress_hook` compresses the whole DDP all_reduce; this would
-  compress only the slow hop.
-- **Lossy, so explicit.** gpubridge policies promise not to change what a
-  collective computes, and this does. So it would be an opt-in policy with
-  "lossy" in its name, and it would refuse integer dtypes, MAX and MIN on
-  every rank before any communication. The target dtype would be a setting
-  (`GPUBRIDGE_BRIDGE_DTYPE`), checked across ranks in discovery like the
-  chunk size.
-- **Error feedback, later and only for DDP.** Carrying each bucket's rounding
-  error into the next step needs state per bucket. That fits a DDP comm hook
-  (the `state` argument of `ddp_comm_hook`), not a stateless all_reduce.
-- **Not planned.** Lossless compression of float gradients saves little, and
+**Status: implemented, opt-in, tested on CPU only.** `GPUBRIDGE_BRIDGE_COMPRESSION=bf16|fp8`;
+design, numerics and error bounds in [COMPRESSION.md](COMPRESSION.md). It
+differs from the design first sketched here in three ways:
+
+- **A setting, not a policy.** It applies to the bridge step of the three
+  bridged policies (default, pipelined, sharded) and both bridge transports,
+  instead of being a separate "lossy" policy. It is still off by default,
+  checked across ranks in discovery, and limited to floating-point SUM and
+  AVG.
+- **fp8 as well as bf16.** OCP E4M3 with per-block power-of-two scales,
+  quantized and dequantized by Triton kernels on the leaders' GPUs, so the
+  copy to host memory carries fewer bytes too. Codes are computed with
+  integer arithmetic, so every vendor's GPU gives the same bits and every
+  rank still ends with the same result.
+- **Error feedback for every buffer, not only DDP.** Each bridge member keeps
+  a residual per buffer (found by address, size and dtype), which carries a
+  step's rounding error into the next. That needs no comm-hook state, so
+  plain all_reduce gets it too.
+
+**What's left, and depends on GPU results:**
+- Whether it pays off, and from which size (HARDWARE_VALIDATION.md item 29,
+  the kit's `bench_compressed` step). If items 13, 18 and 21 show the bridge
+  isn't the bottleneck, it isn't worth its loss of precision.
+- That the compiled kernels match the reference bit for bit on NVIDIA and AMD
+  GPUs (item 28).
+- Training accuracy: loss curves from `examples/train_synthetic.py` with and
+  without it, over enough steps to see drift.
+- **Not planned:** lossless compression of float gradients saves little, and
   it costs CPU time on the leaders, which already do the host copies and run
   Gloo.
-
-**How we'd measure it.**
-- `bench_all_reduce.py --candidates` with the lossy policy next to
-  reduce-bridge-broadcast, and `--phases` to see the bridge step alone.
-- The cost in accuracy: loss curves from `examples/train_synthetic.py` with
-  and without it, over enough steps to see drift.
-- Tests on CPU: bit for bit against a local model of the cast (island sums
-  cast, summed in bridge order, cast back), since FlatGloo no longer gives the
-  same answer.
-
-**Depends on GPU results.**
-- HARDWARE_VALIDATION.md item 13 (the share of the bridge phase in a bridged
-  all_reduce) and items 18 and 21 (whether pipelining or sharding already
-  close the gap). If the bridge isn't the bottleneck, this isn't worth its
-  loss of precision.
-
-**Status: design only, not implemented.**
 
 ## 2. An RDMA bridge transport
 

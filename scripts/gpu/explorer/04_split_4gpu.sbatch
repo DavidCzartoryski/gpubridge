@@ -26,8 +26,9 @@ for mode in half alternate; do
 done
 # GPU-only correctness tests (tests/test_gpu.py): every policy against flat-gloo,
 # fp32/fp16/bf16, odd and large sizes, async on non-default streams.
-step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" -q \
-    -p no:cacheprovider --junitxml="$RESULTS/gpu_tests.xml"
+step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" \
+    "$REPO_DIR/tests/test_compression_kernels.py" -q -p no:cacheprovider \
+    --junitxml="$RESULTS/gpu_tests.xml"
 export GPUBRIDGE_SPLIT_TEST=half
 # --ops island and --phases put the island step (a reduce onto the leader) next
 # to a native island all_reduce of the same size (item 13).
@@ -41,6 +42,13 @@ step summarize_pinned python "$KIT_DIR/summarize.py" "$RESULTS/check_pinned"
 step bench_pinned env_local_torchrun GPUBRIDGE_PINNED_STAGING=1 --nproc-per-node="$GPUS" \
     "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench_pinned" --max-bytes "$BENCH_MAX_BYTES" \
     --ops gpubridge --phases
+# Bridge compression (items 28 and 29): the kernels against the CPU reference and the
+# GPU's memory bandwidth, then the bridge step with and without compression.
+step bench_compression_kernels limited python "$KIT_DIR/bench_compression.py" \
+    --out "$RESULTS/bench_compression" --max-bytes "$BENCH_MAX_BYTES"
+step bench_compressed local_torchrun --nproc-per-node="$GPUS" "$KIT_DIR/bench_all_reduce.py" \
+    --out "$RESULTS/bench_compressed" --max-bytes "$BENCH_MAX_BYTES" --ops gpubridge \
+    --compression none,bf16,fp8 --phases
 # Opt-in policies (items 17 to 21): the same check under each, then one benchmark
 # that times every candidate side by side and writes a thresholds file, then the
 # check again under auto-tuned with that file.

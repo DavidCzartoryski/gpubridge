@@ -5,7 +5,8 @@ An observer sees each collective this rank runs (``all_reduce``, ``broadcast``,
 :class:`CollectiveRecord`: a sequence number that matches across ranks, the
 call's op, size and policy, and timing marks for the whole call and for each
 phase the policy marked (reduce-bridge-broadcast marks island-reduce, bridge
-and island-broadcast).
+and island-broadcast; with bridge compression, the ranks that compress also
+mark compress and decompress around bridge, so kernel time stays out of it).
 
 Rules that keep observers from ever changing what any rank communicates:
 
@@ -153,7 +154,7 @@ class InFlight:
     """The policy carrying it; None for a barrier."""
     phase: str | None
     """The phase its policy marked that the thread is in now (``island-reduce``,
-    ``bridge``...), or None: between phases, or for a policy that marks none."""
+    ``compress``, ``bridge``...), or None: between phases, or for a policy that marks none."""
     phases_done: tuple[str, ...]
     """Phases this thread finished in this collective, in order."""
     thread: str

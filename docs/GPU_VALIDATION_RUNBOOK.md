@@ -121,10 +121,19 @@ benchmark over the UCX bridge (`check_ucx`, `bench_ucx`; items 26 and 27); the
 run records say whether GPU tensors went to UCX directly or through pinned host
 memory (`run.bridge_path`), and how received data was flushed into the GPU
 (`run.bridge_flush`).
+Steps 04 and 07, the AMD script and `mixed/node.sh` also measure opt-in bridge
+compression (items 28 and 29). `bench_compression_kernels` times the Triton
+kernels against the GPU's memory bandwidth and checks they give the CPU
+reference's bits; in step 07 it runs on both sides, and the digests in
+`bench_compression_gpu` and `bench_compression_amd` must match.
+`bench_compressed` times the bridge with and without compression
+(`--compression none,bf16,fp8 --phases`), and its summary.md says from which
+size each mode is faster.
 Steps 04, 06, 07 and the AMD script train with DDP and `gpubridge.ddp_comm_hook`
 (`examples/train_synthetic.py`, item 22).
 Steps 02, 04 and the AMD script also run the GPU-only tests, `pytest -m gpu
-tests/test_gpu.py` (step `gpu_tests`, results in `gpu_tests.xml`): every
+tests/test_gpu.py tests/test_compression_kernels.py` (step `gpu_tests`, results
+in `gpu_tests.xml`): the compression kernels against the CPU reference, and every
 bridge policy against `flat-gloo` bit for bit for every op, fp32/fp16/bf16, odd
 and large sizes; non-contiguous tensors refused; sync and async
 collectives called from non-default streams behind queued GPU work; the

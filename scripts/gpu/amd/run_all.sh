@@ -66,8 +66,13 @@ rccl_version() {
 step rccl_version rccl_version
 # GPU-only correctness tests (tests/test_gpu.py): every policy against flat-gloo,
 # fp32/fp16/bf16, odd and large sizes, async on non-default streams.
-step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" -q \
-    -p no:cacheprovider --junitxml="$RESULTS/gpu_tests.xml"
+step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" \
+    "$REPO_DIR/tests/test_compression_kernels.py" -q -p no:cacheprovider \
+    --junitxml="$RESULTS/gpu_tests.xml"
+# Bridge compression kernels (item 28): the same bits as the CPU reference, and their
+# throughput against the GPU's memory bandwidth. One GPU is enough.
+step bench_compression_kernels limited python "$KIT_DIR/bench_compression.py" \
+    --out "$RESULTS/bench_compression" --max-bytes "$BENCH_MAX_BYTES"
 
 checks=("$RESULTS/check_1gpu")
 if [ "$GPUS" -ge 2 ]; then
@@ -86,6 +91,10 @@ if [ "$GPUS" -ge 2 ]; then
     step bench_pinned env_local_torchrun GPUBRIDGE_SPLIT_TEST=half GPUBRIDGE_PINNED_STAGING=1 \
         --nproc-per-node="$GPUS" "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench_pinned" \
         --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES" --trials "$BENCH_TRIALS"
+    # The bridge step with and without compression (item 29): where it starts paying off.
+    step bench_compressed env_local_torchrun GPUBRIDGE_SPLIT_TEST=half --nproc-per-node="$GPUS" \
+        "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench_compressed" --ops gpubridge \
+        --compression none,bf16,fp8 --phases --max-bytes "$BENCH_MAX_BYTES" --trials "$BENCH_TRIALS"
     # Opt-in policies (items 17 to 21), each under the same split-test check, then
     # every candidate timed side by side, writing a thresholds file for auto-tuned.
     for policy in $OPT_IN_POLICIES; do

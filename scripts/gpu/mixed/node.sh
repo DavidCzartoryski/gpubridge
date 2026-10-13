@@ -84,5 +84,12 @@ step check mixed_torchrun check "$KIT_DIR/check.py" --out "$RESULTS/check"
 step summarize python "$KIT_DIR/summarize.py" --partial "$RESULTS/check"
 step bench mixed_torchrun bench "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" \
     --max-bytes "$BENCH_MAX_BYTES" --phases
+# Bridge compression: this machine's kernels (compare the digests with the other
+# machine's summary), then the bridge step with and without compression.
+step bench_compression_kernels limited python "$KIT_DIR/bench_compression.py" \
+    --out "$RESULTS/bench_compression" --max-bytes "$BENCH_MAX_BYTES"
+step bench_compressed mixed_torchrun bench-compressed "$KIT_DIR/bench_all_reduce.py" \
+    --out "$RESULTS/bench_compressed" --max-bytes "$BENCH_MAX_BYTES" --phases \
+    --compression none,bf16,fp8
 package_results "$RESULTS"
 finish

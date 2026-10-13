@@ -108,6 +108,13 @@ step summarize_pinned python "$KIT_DIR/summarize.py" "$RESULTS/check_pinned"
 step bench_pinned mixed_torchrun bench-pinned "$KIT_DIR/bench_all_reduce.py" \
     --out "$RESULTS/bench_pinned" --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES"
 unset GPUBRIDGE_PINNED_STAGING
+# Bridge compression between real NVIDIA and AMD leaders (items 28 and 29). The kernel
+# benchmark runs on each side's GPU; the digests in the two summaries must match.
+step bench_compression_kernels both @VENV@/bin/python "$KIT_DIR/bench_compression.py" \
+    --out "$RESULTS/bench_compression_@SIDE@" --max-bytes "$BENCH_MAX_BYTES"
+step bench_compressed mixed_torchrun bench-compressed "$KIT_DIR/bench_all_reduce.py" \
+    --out "$RESULTS/bench_compressed" --ops gpubridge --compression none,bf16,fp8 --phases \
+    --max-bytes "$BENCH_MAX_BYTES"
 # The UCX bridge between real NVIDIA and AMD leaders (items 26 and 27), opt-in
 # with UCX_BRIDGE=1. Each side builds it against its own UCX (CUDA- or ROCm-built).
 if [ "$UCX_BRIDGE" = 1 ]; then

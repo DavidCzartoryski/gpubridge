@@ -123,6 +123,9 @@ alone. With an older one, pip would replace it with a default build, so
 upgrade it first. Older releases can deadlock while tearing down Gloo groups,
 which [pytorch/pytorch#154976](https://github.com/pytorch/pytorch/pull/154976)
 fixed in 2.8. CI tests 2.8.0 on Python 3.10 and the newest release on 3.12.
+Opt-in bridge compression runs Triton kernels on GPUs; PyTorch's CUDA and
+ROCm builds for Linux bring Triton with them. Without it, compression falls
+back to slower PyTorch code with the same results.
 
 ## Usage
 
@@ -262,7 +265,8 @@ process group when the transport has one, as the default Gloo transport does.
 ### Collective policies
 
 A policy decides how a collective travels: which process groups carry the
-data, and in which order. It never changes what the collective computes.
+data, and in which order. It never changes what the collective computes,
+unless you turn on bridge compression (below).
 Every rank must use the same policy; `init()` fails on every rank otherwise,
 or if the policy doesn't fit the cluster.
 
@@ -303,6 +307,24 @@ buffers, the pipelined policy always uses pinned memory, and the other
 policies ignore the setting. Every rank must set the same value; `init()`
 fails on every rank otherwise. It exists so one GPU allocation can compare
 the two (the GPU kit's `check_pinned` and `bench_pinned` steps).
+
+**Bridge compression (opt-in, changes results, not validated on GPUs).**
+`GPUBRIDGE_BRIDGE_COMPRESSION=bf16` or `fp8` makes the bridged policies
+(`reduce-bridge-broadcast`, pipelined, sharded) send fewer bytes over the
+bridge for floating-point SUM and AVG. Leaders quantize their island's sum on
+the GPU with Triton kernels before the bridge step, exchange the payloads,
+and dequantize and add them in float32 after it. Island steps, MAX/MIN,
+integer dtypes, broadcast and all_gather stay exact. `fp8` is OCP E4M3 with a
+power-of-two scale per 256 values, 3.9x fewer bytes for float32, keeping
+about one significant digit per value relative to its block's largest
+value. `bf16` halves float32 and keeps about three digits.
+
+The result is no longer bit-exact against the uncompressed sum, but every
+rank still ends with the same bits, whichever vendor's GPU ran the kernels.
+Each bridge member keeps an error-feedback residual per buffer, so rounding
+error carries into the next step instead of accumulating. Off by default, and
+every rank must set the same value. Design, error bounds and limits:
+[docs/COMPRESSION.md](docs/COMPRESSION.md).
 
 ```python
 gpubridge.init(policy="flat-gloo")     # e.g. to rule out NCCL/RCCL while debugging
@@ -463,6 +485,8 @@ collective, an observer gets a `CollectiveRecord`:
   `island-reduce`, `bridge` (leaders only) and `island-broadcast`.
   `sharded-bridge` marks `island-reduce-scatter` and `island-all-gather`
   instead on islands of exactly k ranks, and `bridge` on every rank with a link.
+  With bridge compression, the ranks that compress also mark `compress` before
+  `bridge` and `decompress` after it, so kernel time never counts as bridge time.
 
 ```python
 import gpubridge
@@ -572,12 +596,14 @@ mixed hardware, such as monitoring or profiling tools:
   GPUs and may not be faster there (HARDWARE_VALIDATION.md items 17 to 21 and
   25). None of them changes the limit above: all still go through host
   memory and Gloo.
-- No custom kernels. The experimental UCX bridge (`bridge="ucx"`) is meant to
-  move GPU memory over RDMA, but it has run only on CPU over TCP so far
-  (HARDWARE_VALIDATION.md items 26 and 27).
-- Designed but not implemented, each waiting on GPU results: bridge-only
-  compression and a `torch.distributed` backend for FSDP2 and DeviceMesh. See
-  [docs/ROADMAP.md](docs/ROADMAP.md).
+- The experimental UCX bridge (`bridge="ucx"`) is meant to move GPU memory
+  over RDMA, but it has run only on CPU over TCP so far (HARDWARE_VALIDATION.md
+  items 26 and 27).
+- Bridge compression's Triton kernels have run only in Triton's CPU
+  interpreter, and whole compressed jobs only in simulation mode
+  (HARDWARE_VALIDATION.md items 28 and 29).
+- Designed but not implemented, waiting on GPU results: a `torch.distributed`
+  backend for FSDP2 and DeviceMesh. See [docs/ROADMAP.md](docs/ROADMAP.md).
 - No GPU numbers yet: everything above is tested on CPU (see
   [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)).
 
