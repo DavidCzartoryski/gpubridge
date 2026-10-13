@@ -575,6 +575,8 @@ def create(options, backend_options=None) -> GpubridgeProcessGroup:
             "supported (docs/TORCH_BACKEND.md)")
     world = dist.get_world_size() if dist.is_initialized() else options.group_size
     members = ranks if ranks and ranks != list(range(world)) else []
+    if members:
+        _topology.check_subgroup_naming()  # here, not at its first collective mid-training
     return GpubridgeProcessGroup(options.group_rank, options.group_size, options.group_id,
                                  options.timeout, members)
 
