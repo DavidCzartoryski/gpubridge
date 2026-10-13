@@ -29,6 +29,13 @@ jobs:
         run: python scripts/check_release_tag.py "$GITHUB_REF_NAME"
       - run: uv build
       - run: uvx twine check --strict dist/*
+      # The wheel, installed on its own: its torch entry points register
+      # backend="gpubridge" (editable installs in the test jobs never use the wheel).
+      - run: |
+          uv venv /tmp/wheelcheck
+          uv pip install --python /tmp/wheelcheck torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --python /tmp/wheelcheck dist/*.whl
+          /tmp/wheelcheck/bin/python -c "import sys, torch, torch.distributed as dist; assert 'gpubridge' in dist.Backend.backend_list; assert 'gpubridge.topology' not in sys.modules; import gpubridge_backend, gpubridge; print('wheel ok')"
       - uses: actions/upload-artifact@v7
         with:
           name: dist

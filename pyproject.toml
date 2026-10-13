@@ -43,8 +43,13 @@ Issues = "https://github.com/DavidCzartoryski/gpubridge/issues"
 [project.optional-dependencies]
 test = ["pytest>=8"]
 
-# torch calls this at import, so init_process_group(backend="gpubridge") needs no
-# import gpubridge (src/gpubridge_backend.py; it never raises).
+# init_process_group(backend="gpubridge") without import gpubridge. Newer torch
+# loads this group only when the backend name is first asked for:
+[project.entry-points."torch.distributed.backends"]
+gpubridge = "gpubridge.torch_backend:register"
+# Older torch (2.8 included) has only this one, which it calls on every import of
+# torch: src/gpubridge_backend.py catches every exception (TORCH_DEVICE_BACKEND_AUTOLOAD=0
+# turns it off).
 [project.entry-points."torch.backends"]
 gpubridge = "gpubridge_backend:register"
 

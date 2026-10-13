@@ -11,7 +11,11 @@ reduce-scatters cross the bridge. On CPU, in simulation mode, with two islands:
 
 On a mixed NVIDIA + AMD cluster, the same command without the two variables.
 It exits non-zero unless the loss went down and every rank assembled the same
-parameters.
+parameters. With ``--verify`` it trains a float64 model on integer-valued data
+(learning rate 4, so every update is a whole-number sum, exact in any order)
+and rank 0 replays the same steps in one process: the parameters must match
+bit for bit. A collective that read or wrote a tensor at the wrong moment on a
+GPU would show there, even when every rank agrees.
 """
 
 from __future__ import annotations
@@ -37,7 +41,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--json", type=Path, help="rank 0 writes the losses here")
+    parser.add_argument("--verify", action="store_true",
+                        help="exact data; compare with a single-process replay on rank 0")
     args = parser.parse_args()
+    if args.verify:
+        return verify()
 
     dist.init_process_group(backend="gpubridge")
     rank, world = dist.get_rank(), dist.get_world_size()
@@ -88,6 +96,61 @@ def main() -> int:
     gc.collect()    # the groups are destroyed, not at interpreter exit
     dist.destroy_process_group()
     return 0 if ok else 1
+
+
+def verify() -> int:
+    """float64, integer-valued data and lr=4: every rank's averaged update is a whole-number
+    sum, so FSDP2 through the backend must equal one process on the whole batch exactly."""
+    dist.init_process_group(backend="gpubridge")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    if torch.cuda.is_available() and not os.environ.get("GPUBRIDGE_VENDOR"):
+        device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
+    mesh = init_device_mesh(device.type, (world,))
+
+    def make() -> nn.Module:
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 4)).double()
+        with torch.no_grad():
+            for p in model.parameters():
+                p.copy_(torch.randint(-3, 4, p.shape).double())
+        return model
+
+    def batch(r: int, step: int) -> torch.Tensor:
+        g = torch.Generator().manual_seed(100 * step + r)
+        return torch.randint(-2, 3, (4, 8), generator=g).double()
+
+    model = make().to(device)
+    for layer in model:
+        if isinstance(layer, nn.Linear):
+            fully_shard(layer, mesh=mesh)
+    fully_shard(model, mesh=mesh)
+    opt = torch.optim.SGD(model.parameters(), lr=4.0)
+    for step in range(3):
+        model(batch(rank, step).to(device)).sum().backward()
+        opt.step()
+        opt.zero_grad()
+    full = [p.full_tensor().detach().cpu() for p in model.parameters()]
+    ok = True
+    if rank == 0:
+        reference = make()
+        ref_opt = torch.optim.SGD(reference.parameters(), lr=4.0)
+        for step in range(3):
+            (sum(reference(batch(r, step)).sum() for r in range(world)) / world).backward()
+            ref_opt.step()
+            ref_opt.zero_grad()
+        ok = all(torch.equal(a, b.detach()) for a, b in zip(full, reference.parameters(),
+                                                            strict=True))
+        print(f"verify: {world} ranks, parameters {'equal' if ok else 'DIFFER from'} "
+              "a single-process replay, bit for bit")
+    flag = torch.tensor([1.0 if ok else 0.0], device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)  # every rank exits with rank 0's verdict
+    del model, opt
+    gc.collect()
+    dist.destroy_process_group()
+    return 0 if flag.item() == 1.0 else 1
 
 
 if __name__ == "__main__":

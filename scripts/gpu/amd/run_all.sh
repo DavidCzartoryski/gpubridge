@@ -115,6 +115,8 @@ if [ "$GPUS" -ge 2 ]; then
     step train_fsdp2_backend env_local_torchrun GPUBRIDGE_SPLIT_TEST=half \
         --nproc-per-node="$GPUS" "$REPO_DIR/examples/fsdp2_torch_backend.py" \
         --json "$RESULTS/train_fsdp2_backend.json"
+    step verify_fsdp2_backend env_local_torchrun GPUBRIDGE_SPLIT_TEST=half \
+        --nproc-per-node="$GPUS" "$REPO_DIR/examples/fsdp2_torch_backend.py" --verify
     max=$((GPUS < SCALING_MAX_GPUS ? GPUS : SCALING_MAX_GPUS))
     for n in $(seq 1 "$max"); do
         step "train_n$n" local_torchrun --nproc-per-node="$n" \

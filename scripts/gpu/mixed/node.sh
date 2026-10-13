@@ -94,5 +94,7 @@ step bench_compressed mixed_torchrun bench-compressed "$KIT_DIR/bench_all_reduce
 # gpubridge as the torch.distributed backend (item 30): an unmodified FSDP2 script.
 step train_fsdp2_backend mixed_torchrun fsdp2 "$REPO_DIR/examples/fsdp2_torch_backend.py" \
     --json "$RESULTS/train_fsdp2_backend.json"
+step verify_fsdp2_backend mixed_torchrun fsdp2-verify "$REPO_DIR/examples/fsdp2_torch_backend.py" \
+    --verify
 package_results "$RESULTS"
 finish

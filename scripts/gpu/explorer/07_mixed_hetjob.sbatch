@@ -142,4 +142,7 @@ step train_ddp mixed_torchrun train "$REPO_DIR/examples/train_synthetic.py" \
 # backend="gpubridge" its only gpubridge line. Exits non-zero if ranks disagree.
 step train_fsdp2_backend mixed_torchrun fsdp2 "$REPO_DIR/examples/fsdp2_torch_backend.py" \
     --json "$RESULTS/train_fsdp2_backend.json"
+# The same on exact data, against a single-process replay, bit for bit.
+step verify_fsdp2_backend mixed_torchrun fsdp2-verify "$REPO_DIR/examples/fsdp2_torch_backend.py" \
+    --verify
 finish

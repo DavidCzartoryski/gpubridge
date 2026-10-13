@@ -201,7 +201,8 @@ def check_healthy() -> None:
         raise RuntimeError(
             "an earlier async gpubridge collective failed on this rank "
             f"({type(_worker.failed).__name__}: {_worker.failed}); the process groups may "
-            "be inconsistent. Call gpubridge.destroy() and init() again."
+            "be inconsistent. Call gpubridge.destroy() and init() again (under the "
+            "torch.distributed backend: destroy_process_group() and init_process_group())."
         )
 
 
