@@ -412,3 +412,14 @@ def test_a_message_shorter_than_its_receive_is_an_error_not_garbage(tmp_path):
     import torch.multiprocessing as mp
 
     mp.spawn(_short_message, args=(str(tmp_path / "addr"),), nprocs=2)
+
+
+@needs_ucx
+def test_subgroups_on_the_ucx_bridge(tmp_path):
+    # A subgroup's members build its UCX links on their own: their store keys must
+    # not depend on how many links each process made before (three mixed groups here).
+    from test_torch_backend import TWO_TWO, _subgroups, run_backend
+
+    from gpubridge.config import BRIDGE_ENV
+
+    run_backend(TWO_TWO, _subgroups, tmp_path, env={-1: {BRIDGE_ENV: "ucx", **TCP}})

@@ -84,7 +84,7 @@ calls were identical on 2.8.0 and 2.14.1 apart from the renames below):
 | DDP | after the first step | `broadcast` (x2) | rebuilding buckets: rank 0's bucket order |
 | FSDP2 | every step | `_allgather_base` (2.8) / `all_gather_single` (2.14) | `dist.all_gather_into_tensor` / `dist.all_gather_single` in `torch/distributed/fsdp/_fully_shard/_fsdp_collectives.py` |
 | FSDP2 | every step | `_reduce_scatter_base` (2.8) / `reduce_scatter_single` (2.14) | `dist.reduce_scatter_tensor` / `dist.reduce_scatter_single`, same file |
-| FSDP2 (HSDP) | every step | `allreduce` | same file; needs a 2-D mesh, which gpubridge doesn't support (below) |
+| FSDP2 (HSDP) | every step | `allreduce` on the replicate group | same file; needs a 2-D mesh ("Subgroups and HSDP", below) |
 | any | `dist.barrier()` | `barrier` | |
 | any | `dist._coalescing_manager` | `allreduce_coalesced`, `allgather_into_tensor_coalesced`, `reduce_scatter_tensor_coalesced`; with a device, `_start_coalescing` / `_end_coalescing` around individual calls | `distributed_c10d.py` |
 
@@ -115,13 +115,12 @@ Other measured facts:
   enough, whatever the hook catches. A library must never be able to break
   `import torch`, so gpubridge doesn't use it.
 
-**One process group, the world.** The creator returns a
-`gpubridge.torch_backend.GpubridgeProcessGroup` for the world group.
-gpubridge's collectives run on the world group only, so a subgroup
-(`new_group`, or a multi-dimensional `DeviceMesh`) fails where it is created:
-on each of its members, saying so. Ranks outside it get what torch gives
-any non-member. A group of every rank is allowed; it shares gpubridge's
-topology.
+**Process groups: the world and subgroups.** The creator returns a
+`gpubridge.torch_backend.GpubridgeProcessGroup` for the world group and for
+every subgroup (`new_group`, the groups of a multi-dimensional `DeviceMesh`).
+A group of every rank shares the world's topology. A subgroup gets a topology
+of its own, over its members only ("Subgroups and HSDP", below). Ranks
+outside a group get what torch gives any non-member.
 
 **Setup at the first collective.** gpubridge needs its own groups: a Gloo group
 of every rank (discovery, `barrier()`, `flat-gloo`), one per island on its
@@ -207,11 +206,115 @@ anything else, so no rank is left waiting in `new_group`.
 - Discovery, `barrier()` and `flat-gloo` use `world_group` instead of the
   default group, which under the backend is the backend itself.
 
+## Subgroups and HSDP
+
+**A subgroup is a smaller gpubridge job.** gpubridge's collectives compose
+over islands: one native group per vendor, joined by a bridge between island
+leaders. A subgroup gets the same structure over its members only:
+- **Its islands** are its members grouped by vendor, from the labels the
+  world's discovery already settled (a split test's labels included), so a
+  subgroup runs no discovery of its own.
+- **Single-vendor members** make one island and no bridge: the `auto` policy
+  resolves to `native-only`, one NCCL/RCCL collective (Gloo in simulation),
+  with no host staging and no bridge.
+- **Mixed members** make a bridged topology like the world's: islands
+  reduce onto their leaders, the leaders' bridge carries the cross-vendor
+  step, and leaders broadcast back. The leaders are the subgroup's own, its
+  lowest member of each vendor.
+- **Policy and transport.** Single-vendor members always run `native-only`.
+  Mixed members run the policy the job asked for (`GPUBRIDGE_POLICY`; `auto`
+  resolves to `reduce-bridge-broadcast`), over the job's bridge transport
+  (`GPUBRIDGE_BRIDGE`).
+- **Group names.** torch names groups created with local synchronization from
+  state that differs between ranks of asymmetric groups (2.8: how many groups
+  the rank has; 2.14: a counter only creating ranks advance). So a
+  subgroup's own groups are named from the subgroup's name, their ranks, and
+  how many groups of the same ranks it created before: the same on every
+  member, and the job's later group names stay in step.
+- **Ranks.** Collectives keep global ranks wherever torch wants them (the
+  source of a broadcast; inside gpubridge, the destination of an island's
+  reduce onto its leader). A subgroup's ranks must be ascending, as
+  `new_group` sorts them by default; `sort_ranks=False` is refused. Rows of an all_gather
+  and slices of a reduce_scatter follow the subgroup's own rank order, its
+  members in ascending global rank, as torch orders a group.
+
+**When its groups are created.** At the subgroup's first collective, like the
+world's, and only by its members, with `new_group(...,
+use_local_synchronization=True)`. torch calls the creator on members only, so
+non-members can't take part in a group creation that every rank would have
+to join.
+- **Same order on every member:** a Gloo group of the members (barrier,
+  `flat-gloo`, CPU tensors), the islands in leader order, then the bridge.
+  The layout is a pure function of the members and the world's labels, so
+  every member creates the same groups in the same order.
+- **The world comes first.** A subgroup's first collective also sets up the
+  world's topology if no collective has yet, and that setup takes every rank
+  (limit 2 below).
+- **One worker per rank.** Every group's async collectives run on the same
+  worker thread, in the order the training thread issued them, as NCCL runs
+  them on a stream. Two groups whose members issue collectives in opposite
+  orders would deadlock there, as they would with NCCL.
+
+**HSDP on a mixed cluster: shard within islands, replicate across vendors.**
+FSDP2's HSDP takes a 2-D mesh `(replicate, shard)`. It shards parameters and
+gradients over the shard dimension, all-gathering parameters before forward
+and backward and reduce-scattering gradients after backward. It all-reduces
+the reduce-scattered gradient shard over the replicate dimension once per
+step. With the shard groups set to the vendor islands:
+
+```python
+# 2 islands of 4 GPUs, island ranks contiguous: rows are islands
+mesh = init_device_mesh(device, (2, 4), mesh_dim_names=("replicate", "shard"))
+fully_shard(model, mesh=mesh)
+```
+
+- **The shard groups are single-vendor.** Each is a `native-only` topology,
+  so every all-gather and reduce-scatter is one NCCL or RCCL call inside a
+  vendor's fabric (NVLink, xGMI, the vendor's network). None of it touches the
+  bridge or the host.
+- **The replicate groups are mixed.** Each joins rank i of every island, so
+  its topology is bridged. Once per step, its all_reduce of a gradient shard
+  crosses vendors: a reduce within each island (one rank per island in this
+  layout, so nothing to do), then the bridge between the leaders, then a
+  broadcast back.
+- **What crosses the bridge:** one all_reduce per step per replicate group,
+  of that rank's gradient shard: the model's gradients divided by the shard
+  size. Summed over the replicate groups, the gradients cross the bridge once
+  per step, in as many parallel streams as there are ranks per island. The
+  frequent, latency-bound traffic, every parameter all-gather in forward and
+  backward and every gradient reduce-scatter, stays inside each vendor's
+  fabric.
+- **Why this layout.** The bridge is the slow link: host staging, Gloo or UCX
+  between leaders. Plain FSDP2 over the whole mixed job puts every
+  all-gather and reduce-scatter on it, several per layer per step. Shard
+  groups that span vendors would do the same. With shards inside islands, the
+  bridge sees only the replicate all_reduce, once per step, overlapped with
+  the next step's compute as FSDP2 schedules it. The cost is memory: each
+  island holds a full copy of the model state, sharded over its own ranks
+  only, so an island must be big enough to hold one.
+
+**Two limits.**
+1. **Islands must be contiguous blocks of ranks, all the same size.** That
+   means the same number of GPUs from each vendor, with the ranks ordered by
+   vendor: all of one vendor's ranks, then all of the next's. A Slurm
+   heterogeneous job with one component per vendor gives exactly that, since
+   its ranks follow the components in order. `init_device_mesh` lays out ranks
+   row by row, and each row is a shard group, so only then is every shard
+   group one island. With unequal islands there is no 2-D mesh to build. With
+   ranks interleaved, the shard groups span vendors: HSDP still runs, but every
+   all-gather and reduce-scatter crosses the bridge, which is what this layout
+   is meant to avoid.
+2. **The job's first collective must include every rank.** gpubridge sets
+   itself up at the first collective on any of its groups, and that setup
+   takes every rank. DDP, FSDP2 and HSDP meet this: their first collectives
+   run on every rank. A job whose first collective is on a subgroup of some
+   ranks would hang there until the group's timeout. Call `dist.barrier()`
+   on the world group first.
+
 ## What isn't supported, and why
 
-- **Subgroups:** HSDP, 2-D meshes, tensor parallelism and any `new_group`. gpubridge
-  composes collectives over its islands of the whole job; a subgroup would
-  need its own islands and bridge. Possible later; not planned yet.
+- **Subgroups:** see "Subgroups and HSDP" above for what works. Tensor
+  parallelism hasn't been tested.
 - **`torch.compile`:** not tested. Functional collectives
   (`torch.ops._c10d_functional`) do reach the Python group: FSDP2's
   `full_tensor()` uses them, and it is tested.
@@ -235,8 +338,15 @@ bridge):
 - **Collectives:** the coalesced and bucketed paths, and the object
   collectives. The CPU-tensor path, which simulated jobs don't take on their
   own, forced: the same collectives on the backend's Gloo group.
-- **Refusals:** unsupported operations fail on every rank, and subgroups on
-  their members. A setting one rank can't read fails every rank, and so does
+- **Refusals:** unsupported operations fail on every rank.
+- **Subgroups** (simulation, 2+2 ranks): single-vendor ones (native-only, no
+  bridge), a mixed pair and a mixed group of three with an island of one
+  (all_reduce, all_gather and reduce_scatter rows in group-rank order,
+  broadcast from a global rank, barrier, object collectives), the world after
+  them. HSDP on a `(2, 2)` mesh whose rows are the islands: bit for bit like
+  one process; every all-gather and reduce-scatter native-only with no bridge
+  phase; one bridged all_reduce per reduce-scatter; bridge transport calls
+  only for those. A setting one rank can't read fails every rank, and so does
   a collective during setup.
 - **Lifecycle:** init twice in one process, and destroy with collectives still
   queued.

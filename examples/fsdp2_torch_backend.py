@@ -12,7 +12,9 @@ mode, with two islands:
 
 On a mixed NVIDIA + AMD cluster, the same command without the two variables.
 It exits non-zero unless the loss went down and every rank assembled the same
-parameters. With ``--verify`` it trains a float64 model on integer-valued data
+parameters. With ``--hsdp 2`` it runs HSDP instead: parameters sharded within
+each vendor island, replicated across the two (docs/TORCH_BACKEND.md,
+"Subgroups and HSDP"). With ``--verify`` it trains a float64 model on integer-valued data
 (learning rate 4, so every update is a whole-number sum, exact in any order)
 and rank 0 replays the same steps in one process: the parameters must match
 bit for bit. A collective that read or wrote a tensor at the wrong moment on a
@@ -25,6 +27,8 @@ import argparse
 import gc
 import json
 import os
+import statistics
+import time
 from pathlib import Path
 
 import torch
@@ -46,9 +50,12 @@ def main() -> int:
     parser.add_argument("--json", type=Path, help="rank 0 writes the losses here")
     parser.add_argument("--verify", action="store_true",
                         help="exact data; compare with a single-process replay on rank 0")
+    parser.add_argument("--hsdp", type=int, metavar="ISLANDS",
+                        help="HSDP on a 2-D mesh: shard within each of ISLANDS vendor islands "
+                             "(contiguous, equal blocks of ranks), replicate across them")
     args = parser.parse_args()
     if args.verify:
-        return verify()
+        return verify(args.hsdp)
 
     dist.init_process_group(backend="gpubridge")
     rank, world = dist.get_rank(), dist.get_world_size()
@@ -57,7 +64,7 @@ def main() -> int:
         torch.cuda.set_device(device)
     else:
         device = torch.device("cpu")
-    mesh = init_device_mesh(device.type, (world,))
+    mesh = make_mesh(device, world, args.hsdp)
 
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU(),
@@ -69,14 +76,18 @@ def main() -> int:
     opt = torch.optim.SGD(model.parameters(), lr=0.05)
     teacher = torch.randn(32, 8, generator=torch.Generator().manual_seed(1)).to(device)
     data = torch.Generator().manual_seed(100 + rank)
-    losses = []
+    losses, step_ms = [], []
     for _ in range(args.steps):
+        start = time.perf_counter()
         x = torch.randn(64, 32, generator=data).to(device)
         loss = nn.functional.cross_entropy(model(x), (x @ teacher).argmax(dim=1))
         loss.backward()
         opt.step()
         opt.zero_grad()
-        losses.append(loss.item())
+        losses.append(loss.item())  # waits for the step's GPU work
+        step_ms.append((time.perf_counter() - start) * 1e3)
+    # The first steps set up gpubridge's groups and warm up; the median of the rest.
+    median_ms = statistics.median(step_ms[3:] or step_ms)
 
     # Each rank assembles the full parameters from every rank's shard (an
     # all-gather); they must agree everywhere.
@@ -89,11 +100,15 @@ def main() -> int:
         same &= bool(torch.equal(hi, lo))
     ok = same and losses[-1] < losses[0]
     if rank == 0:
-        print(f"{world} ranks, loss {losses[0]:.3f} -> {losses[-1]:.3f}, "
-              f"parameters {'identical' if same else 'DIFFER'} on every rank")
+        mode = f"HSDP over {args.hsdp} islands" if args.hsdp else "FSDP2"
+        print(f"{world} ranks, {mode}, loss {losses[0]:.3f} -> {losses[-1]:.3f}, "
+              f"median step {median_ms:.2f} ms, parameters "
+              f"{'identical' if same else 'DIFFER'} on every rank")
         if args.json:
             args.json.parent.mkdir(parents=True, exist_ok=True)
-            args.json.write_text(json.dumps({"world": world, "losses": losses,
+            args.json.write_text(json.dumps({"world": world, "hsdp_islands": args.hsdp,
+                                             "losses": losses, "step_ms": step_ms,
+                                             "median_step_ms": median_ms,
                                              "identical": same, "ok": ok}, indent=2))
     del model, opt  # FSDP2 holds process groups in reference cycles: free them before
     gc.collect()    # the groups are destroyed, not at interpreter exit
@@ -101,7 +116,20 @@ def main() -> int:
     return 0 if ok else 1
 
 
-def verify() -> int:
+def make_mesh(device: torch.device, world: int, islands: int | None):
+    """1-D over every rank (FSDP2), or with ``islands`` 2-D (HSDP): row i is island i's
+    ranks, the shard group; each column, one rank per island, is a replicate group.
+    Shard groups are single-vendor, so all-gathers and reduce-scatters stay on
+    NCCL/RCCL; only the replicate all_reduce, once per step, crosses the bridge."""
+    if not islands:
+        return init_device_mesh(device.type, (world,))
+    if world % islands:
+        raise SystemExit(f"--hsdp {islands}: {world} ranks don't split into {islands} islands")
+    return init_device_mesh(device.type, (islands, world // islands),
+                            mesh_dim_names=("replicate", "shard"))
+
+
+def verify(islands: int | None = None) -> int:
     """float64, integer-valued data and lr=4: every rank's averaged update is a whole-number
     sum, so FSDP2 through the backend must equal one process on the whole batch exactly."""
     dist.init_process_group(backend="gpubridge")
@@ -111,7 +139,7 @@ def verify() -> int:
         torch.cuda.set_device(device)
     else:
         device = torch.device("cpu")
-    mesh = init_device_mesh(device.type, (world,))
+    mesh = make_mesh(device, world, islands)
 
     def make() -> nn.Module:
         torch.manual_seed(0)

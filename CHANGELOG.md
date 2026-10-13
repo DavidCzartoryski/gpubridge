@@ -9,6 +9,15 @@ still needs real hardware. Numbers in parentheses are pull requests.
 
 ### Added
 
+- Subgroups on the `torch.distributed` backend, **experimental, tested in
+  simulation only**: `new_group` and multi-dimensional `DeviceMesh` groups get a
+  topology of their own over their members, built at their first collective
+  (native-only for one vendor, bridged for mixed members). HSDP with shard
+  groups set to the vendor islands keeps all-gathers and reduce-scatters inside
+  each vendor and sends one replicate all_reduce per step over the bridge.
+  `examples/fsdp2_torch_backend.py --hsdp ISLANDS`. Design:
+  docs/TORCH_BACKEND.md, "Subgroups and HSDP".
+
 - gpubridge as a `torch.distributed` backend,
   `dist.init_process_group(backend="gpubridge")`, **experimental and not
   validated on GPUs.** DDP and FSDP2 scripts run their collectives through
@@ -18,7 +27,7 @@ still needs real hardware. Numbers in parentheses are pull requests.
   nothing hooks `import torch`. gpubridge's groups are built at the first
   collective, with the usual discovery checks. `GPUBRIDGE_POLICY` and
   `GPUBRIDGE_BRIDGE` pick the policy and transport. CPU tensors in GPU jobs go
-  to a Gloo group. World group only; point-to-point, all-to-all, reduce,
+  to a Gloo group. Point-to-point, all-to-all, reduce,
   GPU-tensor gather and scatter, and other reductions are refused before any
   communication. New examples `ddp_torch_backend.py` and
   `fsdp2_torch_backend.py` (with a `--verify` mode); the GPU kit's

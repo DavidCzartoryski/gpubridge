@@ -53,7 +53,7 @@ _FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 
 
 def all_reduce(tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM, *,
-               async_op: bool = False) -> Work | None:
+               async_op: bool = False, _topology: Topology | None = None) -> Work | None:
     """Reduce ``tensor`` across every rank in the cluster, in place.
 
     Mirrors ``torch.distributed.all_reduce`` on the world group. Every rank must
@@ -84,7 +84,7 @@ def all_reduce(tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM, *,
         NotImplementedError: if the active policy or bridge transport can't
             carry this op.
     """
-    topology = get_topology()
+    topology = _topology or get_topology()
     name = _reduce_op_name(op, "all_reduce")
     _check_tensor(tensor, topology)
     _check_avg(name, tensor.dtype, "all_reduce")
@@ -105,7 +105,8 @@ def all_reduce(tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM, *,
     return _start(topology, "all_reduce", run, [tensor], tensor, async_op)
 
 
-def broadcast(tensor: torch.Tensor, src: int, *, async_op: bool = False) -> Work | None:
+def broadcast(tensor: torch.Tensor, src: int, *, async_op: bool = False,
+              _topology: Topology | None = None) -> Work | None:
     """Copy ``tensor`` from global rank ``src`` to every rank, in place.
 
     Mirrors ``torch.distributed.broadcast`` on the world group. The active
@@ -128,9 +129,12 @@ def broadcast(tensor: torch.Tensor, src: int, *, async_op: bool = False) -> Work
         ValueError: if ``src`` is not a rank, or for an unsupported dtype, or a
             tensor on the wrong device or not contiguous.
     """
-    topology = get_topology()
-    if not 0 <= src < topology.world_size:
-        raise ValueError(f"src must be a rank in [0, {topology.world_size}), got {src}")
+    topology = _topology or get_topology()
+    if src not in topology.layout.members:
+        if not topology.layout.ranks:
+            raise ValueError(f"src must be a rank in [0, {topology.world_size}), got {src}")
+        raise ValueError(f"src must be one of the group's ranks "
+                         f"{list(topology.layout.members)}, got {src}")
     _check_tensor(tensor, topology)
     policy = topology.policy.select_policy(tensor.nbytes)
 
@@ -142,7 +146,8 @@ def broadcast(tensor: torch.Tensor, src: int, *, async_op: bool = False) -> Work
 
 
 def all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor, *,  # noqa: A002
-                           async_op: bool = False) -> Work | None:
+                           async_op: bool = False,
+                           _topology: Topology | None = None) -> Work | None:
     """Gather every rank's ``input`` into ``output``, ordered by global rank.
 
     Mirrors ``torch.distributed.all_gather_into_tensor`` on the world group:
@@ -161,7 +166,7 @@ def all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor, *,  # noqa
             usual dtype, device and contiguity checks.
         NotImplementedError: if the active policy doesn't implement it.
     """
-    topology = get_topology()
+    topology = _topology or get_topology()
     _check_pair(output, input, topology, "all_gather_into_tensor", big=output, small=input)
     policy = topology.policy.select_policy(output.nbytes)
     _check_implements(policy, "all_gather_into_tensor", topology)
@@ -176,7 +181,8 @@ def all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor, *,  # noqa
 
 def reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor,  # noqa: A002
                           op: ReduceOp.RedOpType = ReduceOp.SUM, *,
-                          async_op: bool = False) -> Work | None:
+                          async_op: bool = False,
+                          _topology: Topology | None = None) -> Work | None:
     """Reduce every rank's ``input`` and give rank ``r`` the ``r``-th slice of the result.
 
     Mirrors ``torch.distributed.reduce_scatter_tensor`` on the world group:
@@ -195,7 +201,7 @@ def reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor,  # noqa: A0
             mismatched sizes or dtypes, or tensors that fail the usual checks.
         NotImplementedError: if the active policy doesn't implement it.
     """
-    topology = get_topology()
+    topology = _topology or get_topology()
     name = _reduce_op_name(op, "reduce_scatter_tensor")
     if name not in ("sum", "avg"):
         raise ValueError(f"gpubridge.reduce_scatter_tensor supports SUM and AVG, got {op}")
@@ -214,7 +220,7 @@ def reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor,  # noqa: A0
     return _start(topology, "reduce_scatter_tensor", run, [output, input], output, async_op)
 
 
-def barrier(*, async_op: bool = False) -> Work | None:
+def barrier(*, async_op: bool = False, _topology: Topology | None = None) -> Work | None:
     """Block until every rank in the cluster reaches this call.
 
     On GPUs this first waits for the rank's queued device work, so collectives
@@ -223,7 +229,7 @@ def barrier(*, async_op: bool = False) -> Work | None:
     Raises:
         RuntimeError: if gpubridge is not initialized.
     """
-    topology = get_topology()
+    topology = _topology or get_topology()
 
     def run() -> None:
         with observe.collective(topology, "barrier"):
