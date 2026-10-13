@@ -1,7 +1,7 @@
 # Roadmap: designs waiting on GPU results
 
-These are designs, not commitments. Sections 1 and 2 now have experimental
-implementations, tested on CPU only; section 3 is not implemented. Each one
+These are designs, not commitments. All three now have experimental
+implementations, tested on CPU only. Each one
 waits for specific results from the GPU validation kit
 ([GPU_VALIDATION_RUNBOOK.md](GPU_VALIDATION_RUNBOOK.md)). Without those
 results there is no way to tell whether the problem it solves is the one that
@@ -150,60 +150,38 @@ GPU (HARDWARE_VALIDATION.md items 26 and 27).
 FSDP2, DeviceMesh and DTensor have no hook point: they call a process group's
 collectives directly. That takes a `torch.distributed` backend.
 
-**Design.** A CPU prototype on torch 2.14.1 (not in this repository) settled
-these points:
+**Status: implemented, experimental, tested on CPU only.**
+`dist.init_process_group(backend="gpubridge")`; design, measurements and limits in
+[TORCH_BACKEND.md](TORCH_BACKEND.md). Unmodified DDP and FSDP2 scripts train
+through it, bit for bit like Gloo on integer-valued data in simulation mode,
+on torch 2.8.0 and 2.14.1. What changed from the CPU prototype recorded here
+before:
 
-- **A Python `c10d.Backend` subclass.** Subclassing
-  `torch._C._distributed_c10d.Backend` works; subclassing
-  `dist.ProcessGroup` does not (DeviceMesh fails with "ProcessGroup name not
-  set"). Register with `dist.Backend.register_backend("gpubridge", creator,
-  extended_api=True, devices=["cpu", "cuda"])`. The creator receives the
-  store, group rank and size, timeout and global ranks.
-- **Required overrides.** `supports_splitting`, `supports_coalescing`,
-  `supports_time_estimate`, `supports_shrinking` and `options` must all be
-  overridden, or PyTorch recurses until it raises `RecursionError`.
-- **Methods FSDP2 calls.** `all_gather_single` (forward and backward) and
-  `reduce_scatter_single` (gradients), with AVG for float32 and bfloat16, SUM
-  for float16, and PREMUL_SUM when a gradient divide factor is set. HSDP adds
-  `allreduce` AVG on the replicate group. DTensor state dicts use
-  `all_gather_single_coalesced`, and `distribute_tensor` uses `scatter`.
-  The old `_allgather_base` names fail on 2.14.1. These names change between
-  releases, so the backend would pin a supported range.
-- **PREMUL_SUM.** Gloo lacks it, so the backend would scale, then SUM.
-- **Subgroups.** `new_group(backend="gpubridge")` calls the creator on member
-  ranks only. Each group needs its own islands and bridge, built from the
-  store under a distinct `PrefixStore`; Gloo groups built that way worked in
-  the prototype.
-- **Fail together.** If the creator raises on one rank, the others hang until
-  the store times out. So each rank would publish its checks to the store and
-  read everyone's before building any group, the way discovery works today.
-- **Work objects.** Return a `dist.Work` subclass with `wait()` and
-  `get_future()` (DDP requires the future). A future that carries an
-  exception crashed DDP's backward in the prototype (SIGSEGV), so failures
-  would raise synchronously instead. `is_completed()` always reported False
-  through the Python binding.
-- **Known limits.** `TORCH_DISTRIBUTED_DEBUG=DETAIL` breaks Python backends.
-  Overhead was about 120 to 129 us per tiny all_reduce, against 110 us for
-  Gloo on its own, on CPU.
-- **GPU risk.** FSDP2 records CUDA events right after a synchronous
-  collective returns, so outputs must be ready relative to the caller's
-  current stream when each method returns.
-- **The alternative.** Registering as a torchcomms backend
-  (PRIOR_ART.md, torchcomms idea 2) would reach the same users once its API
-  and ROCm wheels settle.
+- **A Python `dist.ProcessGroup` subclass, not a `c10d.Backend` one.** A
+  `Backend` subclass can't be constructed in Python on torch 2.8.0, the floor.
+  DeviceMesh's "ProcessGroup name not set" goes away once the subclass defines
+  `group_name` as a property, as PyTorch's own threaded test backend does.
+- **gpubridge's groups are built at the first collective**, with
+  `dist.new_group`, once the default group exists; discovery checks every rank
+  then, so a bad setting fails that collective on every rank instead of hanging
+  the others.
+- **The world group only.** Subgroups (HSDP, 2-D meshes) fail where they are
+  created; each would need its own islands and bridge (the prototype's
+  per-group `PrefixStore` idea), which is left for later.
+- **Reductions.** FSDP2 picks AVG for float32 and bfloat16 and SUM for float16
+  and float64; PREMUL_SUM appears only with a custom gradient divide factor,
+  which the backend refuses. Both 2.8's `_allgather_base` /
+  `_reduce_scatter_base` and 2.14's `all_gather_single` /
+  `reduce_scatter_single` (and their coalesced forms) are implemented.
+- **Still true from the prototype:** `TORCH_DISTRIBUTED_DEBUG=DETAIL` wraps
+  process groups in a way Python backends don't support; a collective that
+  fails at run time reaches DDP as an exception in a future, which crashed
+  DDP's backward in the prototype, so argument errors are raised before any
+  communication instead.
 
-**How we'd measure it.**
-- Correctness on CPU first: every method through the backend, bit for bit
-  against `flat-gloo` on integer-valued data, in the layouts the tests already
-  use; then FSDP2 on a small transformer with the loss curve against a
-  single-island run.
-- On GPUs: the same FSDP2 model in a split test (step 04) and on real mixed
-  ranks (step 07), with step time against FSDP2 on the Gloo backend and on
-  one vendor's NCCL/RCCL.
-
-**Depends on GPU results.**
-- HARDWARE_VALIDATION.md items 15 and 16 (native collectives and async
-  stream semantics on GPUs), and item 22 (DDP through the comm hook), since
-  the backend would build on all three.
-
-**Status: design only, not implemented.**
+**What's left, and depends on GPU results:** HARDWARE_VALIDATION.md item 30
+(DDP and FSDP2 through the backend on GPUs: the `train_fsdp2_backend` step in
+steps 04 and 07, `amd/run_all.sh` and `mixed/node.sh`), step time against
+FSDP2 on one vendor's NCCL/RCCL, and subgroups if HSDP is wanted. The
+torchcomms route (PRIOR_ART.md, torchcomms idea 2) remains an alternative once
+its API and ROCm wheels settle.
