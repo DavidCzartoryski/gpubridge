@@ -221,9 +221,16 @@ leaders. A subgroup gets the same structure over its members only:
   reduce onto their leaders, the leaders' bridge carries the cross-vendor
   step, and leaders broadcast back. The leaders are the subgroup's own, its
   lowest member of each vendor.
-- **Policy and transport** are the world's: the policy the job asked for
-  (`GPUBRIDGE_POLICY`), resolved again for the subgroup's layout, and the
-  bridge transport (`GPUBRIDGE_BRIDGE`).
+- **Policy and transport.** Single-vendor members always run `native-only`.
+  Mixed members run the policy the job asked for (`GPUBRIDGE_POLICY`; `auto`
+  resolves to `reduce-bridge-broadcast`), over the job's bridge transport
+  (`GPUBRIDGE_BRIDGE`).
+- **Group names.** torch names groups created with local synchronization from
+  state that differs between ranks of asymmetric groups (2.8: how many groups
+  the rank has; 2.14: a counter only creating ranks advance). So a
+  subgroup's own groups are named from the subgroup's name, their ranks, and
+  how many groups of the same ranks it created before: the same on every
+  member, and the job's later group names stay in step.
 - **Ranks.** Collectives keep global ranks wherever torch wants them (the
   source of a broadcast, the destination of a reduce). Rows of an all_gather
   and slices of a reduce_scatter follow the subgroup's own rank order, its
@@ -318,8 +325,15 @@ bridge):
 - **Collectives:** the coalesced and bucketed paths, and the object
   collectives. The CPU-tensor path, which simulated jobs don't take on their
   own, forced: the same collectives on the backend's Gloo group.
-- **Refusals:** unsupported operations fail on every rank, and subgroups on
-  their members. A setting one rank can't read fails every rank, and so does
+- **Refusals:** unsupported operations fail on every rank.
+- **Subgroups** (simulation, 2+2 ranks): single-vendor ones (native-only, no
+  bridge), a mixed pair and a mixed group of three with an island of one
+  (all_reduce, all_gather and reduce_scatter rows in group-rank order,
+  broadcast from a global rank, barrier, object collectives), the world after
+  them. HSDP on a `(2, 2)` mesh whose rows are the islands: bit for bit like
+  one process; every all-gather and reduce-scatter native-only with no bridge
+  phase; one bridged all_reduce per reduce-scatter; bridge transport calls
+  only for those. A setting one rank can't read fails every rank, and so does
   a collective during setup.
 - **Lifecycle:** init twice in one process, and destroy with collectives still
   queued.

@@ -436,9 +436,15 @@ dist.init_process_group(backend="gpubridge")   # instead of "nccl"
 - **CPU tensors.** On GPUs, CPU tensors go to a Gloo group of the backend's
   own, so it behaves like `"cpu:gloo,cuda:gpubridge"`. Gather and scatter of
   CPU tensors (`gather_object`, `scatter_object_list`) take that group too.
+- **Subgroups and HSDP.** A subgroup (`new_group`, a dimension of a 2-D
+  `DeviceMesh`) gets its own topology over its members at its first
+  collective. Single-vendor members run native-only (one NCCL/RCCL call);
+  mixed members are bridged. For FSDP2 on a mixed cluster, HSDP with the shard
+  groups set to the vendor islands keeps every all-gather and reduce-scatter
+  inside a vendor; only the replicate all_reduce crosses the bridge, once per
+  step (`examples/fsdp2_torch_backend.py --hsdp 2`; docs/TORCH_BACKEND.md,
+  "Subgroups and HSDP"). Tested in simulation only.
 - **Not supported**, refused with an error before any communication:
-  - subgroups (HSDP, 2-D meshes, `new_group` other than the world), refused on
-    the group's members;
   - point-to-point, all-to-all, reduce, and gather and scatter of GPU tensors;
   - reductions other than SUM, AVG, MAX and MIN.
 
