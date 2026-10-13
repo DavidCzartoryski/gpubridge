@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 560" width="880" height="560" role="img" aria-labelledby="t d">
+<title id="t">gpubridge all_reduce across an NVIDIA and an AMD island</title>
+<desc id="d">Each vendor's ranks form an island on their native library, NCCL or RCCL, whose lowest rank is its leader. all_reduce: 1, every island reduces onto its leader; 2, the leaders all_reduce over the bridge, Gloo over TCP through host memory by default or UCX with RDMA where available (opt-in); 3, each leader broadcasts the result to its island.</desc>
+<defs>
+  <marker id="tip" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#59636e"/></marker>
+  <marker id="btip" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#0969da"/></marker>
+</defs>
+<g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" fill="#1f2328">
+<rect x="10" y="70" width="390" height="370" rx="18" fill="#76b900" fill-opacity="0.14" stroke="#4d7a00" stroke-width="2"/>
+<rect x="120" y="96" width="170" height="72" rx="10" fill="#ffffff" stroke="#4d7a00" stroke-width="4"/><text x="205.0" y="128" font-size="27" font-weight="700" text-anchor="middle">rank 0</text><text x="205.0" y="154" font-size="21" text-anchor="middle" fill="#59636e">leader</text>
+<rect x="18" y="306" width="124" height="60" rx="10" fill="#ffffff" stroke="#4d7a00" stroke-width="2"/><text x="80.0" y="345.0" font-size="26" text-anchor="middle">rank 1</text>
+<line x1="143" y1="174" x2="80" y2="300" stroke="#59636e" stroke-width="3" marker-start="url(#tip)" marker-end="url(#tip)"/>
+<rect x="268" y="306" width="124" height="60" rx="10" fill="#ffffff" stroke="#4d7a00" stroke-width="2"/><text x="330.0" y="345.0" font-size="26" text-anchor="middle">rank 2</text>
+<line x1="267" y1="174" x2="330" y2="300" stroke="#59636e" stroke-width="3" marker-start="url(#tip)" marker-end="url(#tip)"/>
+<circle cx="161" cy="232" r="16" fill="#1f2328"/><text x="161" y="239" font-size="21" font-weight="700" text-anchor="middle" fill="#ffffff">1</text><text x="185" y="241" font-size="25">reduce</text>
+<circle cx="143" cy="278" r="16" fill="#1f2328"/><text x="143" y="285" font-size="21" font-weight="700" text-anchor="middle" fill="#ffffff">3</text><text x="167" y="287" font-size="25">broadcast</text>
+<text x="205" y="418" font-size="29" font-weight="700" text-anchor="middle">NVIDIA island · NCCL</text>
+<rect x="480" y="70" width="390" height="370" rx="18" fill="#ed1c24" fill-opacity="0.10" stroke="#b3141a" stroke-width="2"/>
+<rect x="590" y="96" width="170" height="72" rx="10" fill="#ffffff" stroke="#b3141a" stroke-width="4"/><text x="675.0" y="128" font-size="27" font-weight="700" text-anchor="middle">rank 3</text><text x="675.0" y="154" font-size="21" text-anchor="middle" fill="#59636e">leader</text>
+<rect x="488" y="306" width="124" height="60" rx="10" fill="#ffffff" stroke="#b3141a" stroke-width="2"/><text x="550.0" y="345.0" font-size="26" text-anchor="middle">rank 4</text>
+<line x1="613" y1="174" x2="550" y2="300" stroke="#59636e" stroke-width="3" marker-start="url(#tip)" marker-end="url(#tip)"/>
+<rect x="738" y="306" width="124" height="60" rx="10" fill="#ffffff" stroke="#b3141a" stroke-width="2"/><text x="800.0" y="345.0" font-size="26" text-anchor="middle">rank 5</text>
+<line x1="737" y1="174" x2="800" y2="300" stroke="#59636e" stroke-width="3" marker-start="url(#tip)" marker-end="url(#tip)"/>
+<circle cx="631" cy="232" r="16" fill="#1f2328"/><text x="631" y="239" font-size="21" font-weight="700" text-anchor="middle" fill="#ffffff">1</text><text x="655" y="241" font-size="25">reduce</text>
+<circle cx="613" cy="278" r="16" fill="#1f2328"/><text x="613" y="285" font-size="21" font-weight="700" text-anchor="middle" fill="#ffffff">3</text><text x="637" y="287" font-size="25">broadcast</text>
+<text x="675" y="418" font-size="29" font-weight="700" text-anchor="middle">AMD island · RCCL</text>
+<line x1="301" y1="132" x2="579" y2="132" stroke="#0969da" stroke-width="7" marker-start="url(#btip)" marker-end="url(#btip)"/>
+<circle cx="268" cy="36" r="16" fill="#0969da"/><text x="268" y="43" font-size="21" font-weight="700" text-anchor="middle" fill="#ffffff">2</text><text x="294" y="45" font-size="25" fill="#0969da" font-weight="700">all_reduce between leaders</text>
+<text x="440" y="492" font-size="25" text-anchor="middle">Bridge: Gloo over TCP, through host memory (default)</text>
+<text x="440" y="530" font-size="25" text-anchor="middle">or UCX, with RDMA where available (opt-in)</text>
+</g>
+</svg>

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 600" width="880" height="600" role="img" aria-labelledby="t d">
+<title id="t">HSDP on a mixed cluster with gpubridge</title>
+<desc id="d">A 2 by 4 device mesh. Each shard group is a vendor island: NVIDIA ranks 0 to 3 on NCCL and AMD ranks 4 to 7 on RCCL, so every all-gather and reduce-scatter stays on the native library. Each replicate group joins rank i of both islands, and its all_reduce of the gradient shards crosses the bridge once per step.</desc>
+<defs>
+  <marker id="tip" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#9198a1"/></marker>
+  <marker id="btip" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#4493f8"/></marker>
+</defs>
+<g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" fill="#e6edf3">
+<rect x="10" y="10" width="860" height="230" rx="18" fill="#76b900" fill-opacity="0.18" stroke="#8fd14f" stroke-width="2"/>
+<text x="440" y="60" font-size="29" font-weight="700" text-anchor="middle">shard group = NVIDIA island · NCCL</text>
+<text x="440" y="108" font-size="25" text-anchor="middle" fill="#9198a1">all-gather and reduce-scatter stay native</text>
+<rect x="40" y="140" width="180" height="64" rx="10" fill="#151b23" stroke="#8fd14f" stroke-width="2"/><text x="130.0" y="181.0" font-size="26" text-anchor="middle">rank 0</text>
+<rect x="245" y="140" width="180" height="64" rx="10" fill="#151b23" stroke="#8fd14f" stroke-width="2"/><text x="335.0" y="181.0" font-size="26" text-anchor="middle">rank 1</text>
+<rect x="450" y="140" width="180" height="64" rx="10" fill="#151b23" stroke="#8fd14f" stroke-width="2"/><text x="540.0" y="181.0" font-size="26" text-anchor="middle">rank 2</text>
+<rect x="655" y="140" width="180" height="64" rx="10" fill="#151b23" stroke="#8fd14f" stroke-width="2"/><text x="745.0" y="181.0" font-size="26" text-anchor="middle">rank 3</text>
+<rect x="10" y="360" width="860" height="230" rx="18" fill="#ff5c63" fill-opacity="0.15" stroke="#ff7b81" stroke-width="2"/>
+<text x="440" y="548" font-size="29" font-weight="700" text-anchor="middle">shard group = AMD island · RCCL</text>
+<text x="440" y="500" font-size="25" text-anchor="middle" fill="#9198a1">all-gather and reduce-scatter stay native</text>
+<rect x="40" y="380" width="180" height="64" rx="10" fill="#151b23" stroke="#ff7b81" stroke-width="2"/><text x="130.0" y="421.0" font-size="26" text-anchor="middle">rank 4</text>
+<rect x="245" y="380" width="180" height="64" rx="10" fill="#151b23" stroke="#ff7b81" stroke-width="2"/><text x="335.0" y="421.0" font-size="26" text-anchor="middle">rank 5</text>
+<rect x="450" y="380" width="180" height="64" rx="10" fill="#151b23" stroke="#ff7b81" stroke-width="2"/><text x="540.0" y="421.0" font-size="26" text-anchor="middle">rank 6</text>
+<rect x="655" y="380" width="180" height="64" rx="10" fill="#151b23" stroke="#ff7b81" stroke-width="2"/><text x="745.0" y="421.0" font-size="26" text-anchor="middle">rank 7</text>
+<line x1="130" y1="210" x2="130" y2="374" stroke="#4493f8" stroke-width="5" marker-start="url(#btip)" marker-end="url(#btip)"/>
+<line x1="335" y1="210" x2="335" y2="374" stroke="#4493f8" stroke-width="5" marker-start="url(#btip)" marker-end="url(#btip)"/>
+<line x1="540" y1="210" x2="540" y2="374" stroke="#4493f8" stroke-width="5" marker-start="url(#btip)" marker-end="url(#btip)"/>
+<line x1="745" y1="210" x2="745" y2="374" stroke="#4493f8" stroke-width="5" marker-start="url(#btip)" marker-end="url(#btip)"/>
+<rect x="120" y="262" width="640" height="60" rx="12" fill="#0d1117" stroke="#4493f8" stroke-width="2"/><text x="440" y="301" font-size="25" text-anchor="middle" fill="#4493f8" font-weight="700">replicate: all_reduce over the bridge, once per step</text>
+</g>
+</svg>

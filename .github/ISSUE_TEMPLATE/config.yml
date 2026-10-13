@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security issue privately
+    url: https://github.com/DavidCzartoryski/gpubridge/security/advisories/new
+    about: Please don't open a public issue for security problems.
