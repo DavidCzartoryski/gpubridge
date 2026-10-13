@@ -180,6 +180,8 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
             lambda o=o, i=i: _collectives.all_gather_into_tensor(o, i, async_op=True)
             for o, i in zip(outputs, inputs, strict=True)])
 
+    all_gather_single_coalesced = allgather_into_tensor_coalesced  # torch 2.13 on; also DTensor
+
     def allgather(self, output_lists, inputs, opts=None):  # noqa: D102
         """The list form (DDP checks parameter shapes with it): gathered into one buffer per
         input, then copied out. Every rank's tensor must be the same size."""
@@ -225,6 +227,8 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         return self._run("reduce_scatter_tensor", outputs, list(outputs), [
             lambda o=o, i=i: _collectives.reduce_scatter_tensor(o, i, op=op, async_op=True)
             for o, i in zip(outputs, inputs, strict=True)])
+
+    reduce_scatter_single_coalesced = reduce_scatter_tensor_coalesced  # torch 2.13 on
 
     def reduce_scatter(self, outputs, input_lists, opts=None):  # noqa: D102
         """The list form: each rank's slices concatenated, then one reduce_scatter_tensor."""

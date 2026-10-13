@@ -136,6 +136,40 @@ def _fsdp2(rank, world, out):
         torch.save(full, out)
 
 
+def _fsdp2_float32(rank, world, out):
+    """float32 gradients take FSDP2's AVG reduce-scatter (float64 takes SUM)."""
+    from torch.distributed.device_mesh import init_device_mesh
+
+    fully_shard = _fully_shard()
+    mesh = init_device_mesh("cpu", (world,))
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 4))
+    fully_shard(model[0], mesh=mesh)
+    fully_shard(model[2], mesh=mesh)
+    fully_shard(model, mesh=mesh)
+    opt = torch.optim.SGD(model.parameters(), lr=0.05)
+    for step in range(STEPS):
+        model(_batch(rank, step).float()).sum().backward()
+        opt.step()
+        opt.zero_grad()
+    full = [p.full_tensor().detach().clone() for p in model.parameters()]
+    if rank == 0:
+        torch.save(full, out)
+
+
+def test_fsdp2_in_float32_takes_the_avg_path_and_matches_gloo_closely(tmp_path):
+    results = {}
+    for backend in ("gloo", "gpubridge"):
+        out = tmp_path / f"{backend}.pt"
+        (tmp_path / backend).mkdir()
+        run_backend(TWO_TWO, partial(_fsdp2_float32, out=str(out)), tmp_path / backend,
+                    backend=backend)
+        results[backend] = torch.load(out)
+    # Not bit for bit: float32 sums in a different order round differently.
+    for a, b in zip(results["gloo"], results["gpubridge"], strict=True):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+
+
 def test_fsdp2_trains_bit_for_bit_like_gloo_and_a_single_process(tmp_path):
     results = {}
     for backend in ("gloo", "gpubridge"):
