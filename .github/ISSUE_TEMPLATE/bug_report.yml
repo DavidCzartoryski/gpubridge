@@ -1,0 +1,57 @@
+name: Bug report
+description: Something doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. gpubridge is an alpha tested on CPU only, so reports from real GPUs are especially useful.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: gpubridge
+    attributes:
+      label: gpubridge version or commit
+      placeholder: "v0.4.0-alpha, or a commit hash"
+    validations:
+      required: true
+  - type: input
+    id: torch
+    attributes:
+      label: PyTorch version on each vendor's nodes
+      description: "Output of python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.version.hip)'"
+      placeholder: "NVIDIA nodes: 2.14.1+cu128 12.8 None; AMD nodes: 2.14.1+rocm6.4 None 6.4"
+    validations:
+      required: true
+  - type: dropdown
+    id: build
+    attributes:
+      label: Builds in the job
+      options:
+        - CUDA and ROCm (a mixed job)
+        - CUDA only
+        - ROCm only
+        - CPU only (simulation, GPUBRIDGE_VENDOR, or GPUBRIDGE_CPU_ONLY)
+    validations:
+      required: true
+  - type: textarea
+    id: layout
+    attributes:
+      label: Layout
+      description: Nodes, GPUs per node and vendor, how ranks are ordered, the policy and bridge transport, and any GPUBRIDGE_* settings.
+      placeholder: "2 nodes: 4x A100 (ranks 0-3), 4x MI250X (ranks 4-7); policy auto; bridge gloo; GPUBRIDGE_PINNED_STAGING=1"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The error from every rank that printed one, and the full traceback. For hangs, gpubridge.in_flight() output from each rank helps. Remove hostnames, paths or anything else private first.
+      render: text
+    validations:
+      required: true

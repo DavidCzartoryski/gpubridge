@@ -1,40 +1,62 @@
 # gpubridge
 
-gpubridge lets one distributed PyTorch job span NVIDIA and AMD GPUs at the
-same time. Choosing between NCCL and RCCL on a single-vendor machine is already
-solved: PyTorch's `"nccl"` backend runs NCCL on CUDA builds and RCCL on ROCm
-builds, and Modular's MAX loads NCCL or RCCL to match the GPU it was built for.
-Neither connects the two, because an NCCL communicator and an RCCL
-communicator cannot exchange data, and Modular states that mixed-vendor hosts
-are not supported. Meta's torchcomms lists mixed-vendor jobs as a design goal,
-but each of its communicators still runs one vendor's library. Research
-systems published in 2026 (two called HetCCL, and Zettabyte's joint AMD and
-NVIDIA training) do join the vendors, moving data GPU to GPU over RDMA, and
-report much higher cross-vendor bandwidth than a Gloo-based bridge like
-gpubridge's. Their code isn't available (October 2026), and they rely on
-RDMA-capable NICs for that speed and on custom builds or plugins. gpubridge is
-the open-source option that runs on stock PyTorch builds over any network. It
-keeps each vendor on its native library inside an island and joins the islands
-with a CPU bridge. One `all_reduce`, `broadcast`, `all_gather_into_tensor`,
-`reduce_scatter_tensor` or `barrier` call then covers every GPU in the job,
-from the same code on every node, and DistributedDataParallel can sync
-gradients through it with a comm hook. CUDA and ROCm builds of PyTorch, from
-2.9.1 to 2.14.1, have been shown to join one job and complete the bridge on
-CPU; validation on real GPUs is next.
+**One PyTorch training job across NVIDIA and AMD GPUs: each vendor runs on its
+native NCCL or RCCL, and a bridge joins them.**
 
-gpubridge writes no CUDA or HIP code. It composes collectives that PyTorch
-already provides. For how it relates to Modular MAX, RAJA, Triton,
-Triton-distributed, Meta's torchcomms and the 2026 papers, see
-[docs/PRIOR_ART.md](docs/PRIOR_ART.md).
+[![tests](https://github.com/DavidCzartoryski/gpubridge/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/DavidCzartoryski/gpubridge/actions/workflows/tests.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![release](https://img.shields.io/github/v/release/DavidCzartoryski/gpubridge?include_prereleases&sort=semver)](https://github.com/DavidCzartoryski/gpubridge/releases)
 
-> **Status: v0.2 alpha, correctness first.** All orchestration logic is tested
-> in CPU simulation mode, and the CPU side of a mixed job has been checked with
-> real CUDA and ROCm builds. It has not yet run on a real mixed cluster; see
-> [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the results and what
-> still needs checking. The default path is reduce-bridge-broadcast. The
-> opt-in policies (pipelined, sharded, auto-tuned) and the DDP comm hook are
-> tested on CPU only and are **not validated on GPUs**.
-> [docs/ROADMAP.md](docs/ROADMAP.md) holds designs that wait on GPU results.
+**Status:** alpha. Validated on CPU, in simulation and with CUDA and ROCm
+builds of PyTorch joined in one job. Not yet run on GPUs.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/architecture-dark.svg">
+  <img alt="An NVIDIA island on NCCL and an AMD island on RCCL, each led by its lowest rank. all_reduce: 1, each island reduces onto its leader; 2, the leaders all_reduce over the bridge (Gloo over TCP through host memory by default, or UCX with RDMA where available, opt-in); 3, each leader broadcasts the result to its island." src="docs/img/architecture-light.svg" width="700">
+</picture>
+
+## Quickstart
+
+```bash
+# not on PyPI: install the release tag from GitHub
+pip install "gpubridge @ git+https://github.com/DavidCzartoryski/gpubridge@v0.4.0-alpha"
+```
+
+As a `torch.distributed` backend, with plain DDP (FSDP2 and HSDP work too):
+
+```python
+import gpubridge  # registers the backend; on torch < 2.14, import it first
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+
+dist.init_process_group(backend="gpubridge")  # instead of "nccl"
+model = DistributedDataParallel(model)
+```
+
+Or with gpubridge's own API (one or the other in a process, not both):
+
+```python
+topology = gpubridge.init()
+gpubridge.all_reduce(grad)  # summed across NVIDIA and AMD ranks
+```
+
+Launch the same script on every node with `torchrun`; each process detects
+its own vendor. No GPUs? See [Simulation mode](#simulation-mode-no-gpus-needed).
+
+## Features
+
+| Feature | Status |
+| --- | --- |
+| Collectives: `all_reduce`, `broadcast`, `all_gather_into_tensor`, `reduce_scatter_tensor`, `barrier` | tested on CPU · not yet on GPU |
+| Async collectives (`async_op=True`) and a DDP comm hook | tested on CPU · not yet on GPU |
+| `torch.distributed` backend: DDP, FSDP2, HSDP through subgroups | experimental · tested on CPU · not yet on GPU |
+| Pipelined and sharded bridge policies | opt-in · tested on CPU · not yet on GPU |
+| UCX bridge transport (RDMA where available) | opt-in · tested on CPU over TCP · not yet on GPU or RDMA |
+| bf16 / fp8 bridge compression with Triton kernels | opt-in · kernels tested in Triton's CPU interpreter · not yet on GPU |
+| GPU validation kit: Slurm job scripts, checks, benchmarks | every script runs end to end on CPU against a fake Slurm · not yet run on GPUs |
+
+[HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what each one still
+needs from real GPUs.
 
 ## How it works
 
@@ -48,16 +70,7 @@ belongs to exactly one vendor. gpubridge groups processes by vendor:
   is the island's lowest global rank. By default it is a Gloo process group;
   the transport can be swapped (see [Bridge transports](#bridge-transports)).
 
-```
-        NVIDIA island (NCCL)                   AMD island (RCCL)
-   ┌──────────────────────────────┐      ┌──────────────────────────────┐
-   │  rank 0*   rank 1   rank 2   │      │  rank 3*   rank 4   rank 5   │
-   └────┬─────────────────────────┘      └────┬─────────────────────────┘
-        │                                     │
-        └──────── Gloo bridge (on CPU) ───────┘          * island leader
-```
-
-**`all_reduce`** uses reduce-bridge-broadcast:
+**`all_reduce`** uses reduce-bridge-broadcast (the diagram above):
 
 1. `reduce` within each island onto its leader, on the native backend. Only
    the leader needs the island sum, and a reduce moves about half the bytes of
@@ -104,18 +117,9 @@ links at once), never what a collective computes, and `auto` never picks them.
 
 ## Install
 
-gpubridge isn't on PyPI. Install it with pip from the repository:
-
-```bash
-pip install git+https://github.com/DavidCzartoryski/gpubridge
-```
-
-or, for development:
-
-```bash
-uv venv
-uv pip install -e ".[test]"
-```
+The [quickstart](#quickstart) installs a tagged release; `pip install
+git+https://github.com/DavidCzartoryski/gpubridge` installs `main`. For
+development, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 On GPU nodes, install the CUDA or ROCm build of PyTorch first. gpubridge only
 needs `torch>=2.8` (and numpy), so it leaves an existing 2.8 or newer install
@@ -127,33 +131,22 @@ Opt-in bridge compression runs Triton kernels on GPUs; PyTorch's CUDA and
 ROCm builds for Linux bring Triton with them. Without it, compression falls
 back to slower PyTorch code with the same results.
 
-## Usage
+## Examples
 
-```python
-import torch
-import gpubridge
-
-topology = gpubridge.init()  # env:// rendezvous, e.g. from torchrun
-
-grad = torch.randn(1024, device=topology.device)
-gpubridge.all_reduce(grad)              # summed across NVIDIA and AMD ranks
-gpubridge.broadcast(grad, src=0)
-gpubridge.barrier()
-
-gpubridge.destroy()
-```
-
-Launch the same script on every node with `torchrun`; each node detects its
-own vendor. See [`examples/all_reduce_torchrun.py`](examples/all_reduce_torchrun.py).
-
-For a fuller demo, [`examples/train_synthetic.py`](examples/train_synthetic.py)
-trains a small model with DistributedDataParallel and syncs its gradients
-through gpubridge with `gpubridge.ddp_comm_hook`. It reports samples/sec and
-checks that every rank ends with identical parameters:
-
-```bash
-GPUBRIDGE_VENDOR=nvidia torchrun --nproc-per-node=2 examples/train_synthetic.py  # on CPU
-```
+- [`examples/all_reduce_torchrun.py`](examples/all_reduce_torchrun.py): the
+  native API under `torchrun`, one script for every node.
+- [`examples/train_synthetic.py`](examples/train_synthetic.py): a small model
+  trained with DistributedDataParallel, its gradients synced through
+  `gpubridge.ddp_comm_hook`. It reports samples/sec and checks that every
+  rank ends with identical parameters
+  (`GPUBRIDGE_VENDOR=nvidia torchrun --nproc-per-node=2 examples/train_synthetic.py`
+  on CPU).
+- [`examples/ddp_torch_backend.py`](examples/ddp_torch_backend.py) and
+  [`examples/fsdp2_torch_backend.py`](examples/fsdp2_torch_backend.py): plain
+  DDP and FSDP2 scripts on `backend="gpubridge"` (`--hsdp` for HSDP,
+  `--verify` to check against a single process).
+- [`examples/simulate_two_islands.py`](examples/simulate_two_islands.py): two
+  NVIDIA and two AMD ranks on one CPU (below).
 
 ## Simulation mode (no GPUs needed)
 
@@ -439,19 +432,8 @@ dist.init_process_group(backend="gpubridge")   # instead of "nccl"
 - **Subgroups and HSDP.** A subgroup (`new_group`, a dimension of a 2-D
   `DeviceMesh`) gets its own topology over its members at its first
   collective. Single-vendor members run native-only (one NCCL/RCCL call);
-  mixed members are bridged. For FSDP2 on a mixed cluster, HSDP with the shard
-  groups set to the vendor islands keeps every all-gather and reduce-scatter
-  inside a vendor; only the replicate all_reduce crosses the bridge, once per
-  step (`examples/fsdp2_torch_backend.py --hsdp 2`; docs/TORCH_BACKEND.md,
-  "Subgroups and HSDP"). Tested in simulation only. Two limits:
-  - **Islands must be contiguous, equal-size blocks of ranks:** the same
-    number of GPUs per vendor, with ranks ordered by vendor, as a Slurm
-    heterogeneous job with one component per vendor gives. Otherwise the
-    shard groups span vendors and HSDP's all-gathers and reduce-scatters cross
-    the bridge.
-  - **The job's first collective must include every rank,** since gpubridge
-    sets itself up there. DDP, FSDP2 and HSDP do this. Otherwise call
-    `dist.barrier()` first.
+  mixed members are bridged. See [HSDP on a mixed cluster](#hsdp-on-a-mixed-cluster)
+  below. Tested in simulation only.
 - **Not supported**, refused with an error before any communication:
   - point-to-point, all-to-all, reduce, and gather and scatter of GPU tensors;
   - reductions other than SUM, AVG, MAX and MIN.
@@ -465,6 +447,34 @@ dist.init_process_group(backend="gpubridge")   # instead of "nccl"
   GPUs (HARDWARE_VALIDATION.md item 30).
 - **More:** `examples/ddp_torch_backend.py`, `examples/fsdp2_torch_backend.py`
   and [docs/TORCH_BACKEND.md](docs/TORCH_BACKEND.md).
+
+#### HSDP on a mixed cluster
+
+FSDP2's HSDP takes a 2-D mesh `(replicate, shard)`. With the shard groups set
+to the vendor islands, every all-gather and reduce-scatter is one NCCL or RCCL
+call inside a vendor, and only the replicate all_reduce of the gradient shards
+crosses the bridge, once per step:
+
+```python
+# 2 islands of 4 GPUs, ranks ordered by vendor: each row of the mesh is an island
+mesh = init_device_mesh(device, (2, 4), mesh_dim_names=("replicate", "shard"))
+fully_shard(model, mesh=mesh)
+```
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/hsdp-dark.svg">
+  <img alt="A 2 by 4 device mesh. The shard groups are the vendor islands, NVIDIA ranks 0 to 3 on NCCL and AMD ranks 4 to 7 on RCCL, so all-gathers and reduce-scatters stay native. Each replicate group joins rank i of both islands; its all_reduce crosses the bridge once per step." src="docs/img/hsdp-light.svg" width="700">
+</picture>
+
+Two limits (`examples/fsdp2_torch_backend.py --hsdp 2`; docs/TORCH_BACKEND.md,
+"Subgroups and HSDP"):
+- **Islands must be contiguous, equal-size blocks of ranks:** the same number
+  of GPUs per vendor, with ranks ordered by vendor, as a Slurm heterogeneous
+  job with one component per vendor gives. Otherwise the shard groups span
+  vendors and HSDP's all-gathers and reduce-scatters cross the bridge.
+- **The job's first collective must include every rank,** since gpubridge
+  sets itself up there. DDP, FSDP2 and HSDP do this. Otherwise call
+  `dist.barrier()` first.
 
 ### Bridge transports
 
@@ -636,8 +646,9 @@ mixed hardware, such as monitoring or profiling tools:
 ## Limitations
 
 - Reductions are `SUM`, `AVG`, `MAX` and `MIN` (no `PRODUCT` yet), and
-  `reduce_scatter_tensor` takes `SUM` and `AVG` only. Collectives run on the
-  world group (no custom groups). `async_op` runs collectives on one worker
+  `reduce_scatter_tensor` takes `SUM` and `AVG` only. gpubridge's own
+  functions run on the world group; for subgroups, use the `torch.distributed`
+  backend. `async_op` runs collectives on one worker
   thread per rank, one at a time, so two async collectives never overlap each
   other.
 - With NaN in the data, `MAX` and `MIN` follow whatever NCCL/RCCL and Gloo do,
@@ -660,28 +671,31 @@ mixed hardware, such as monitoring or profiling tools:
 - Bridge compression's Triton kernels have run only in Triton's CPU
   interpreter, and whole compressed jobs only in simulation mode
   (HARDWARE_VALIDATION.md items 28 and 29).
-- Designed but not implemented, waiting on GPU results: a `torch.distributed`
-  backend for FSDP2 and DeviceMesh. See [docs/ROADMAP.md](docs/ROADMAP.md).
 - No GPU numbers yet: everything above is tested on CPU (see
   [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)).
+  [docs/ROADMAP.md](docs/ROADMAP.md) lists what each experimental design
+  still waits for from GPU runs.
 
-## Development
+## How it compares
 
-```bash
-uv venv
-uv pip install -e ".[test]"
-pytest
-```
+Choosing between NCCL and RCCL on a single-vendor machine is already solved:
+PyTorch's `"nccl"` backend runs NCCL on CUDA builds and RCCL on ROCm builds,
+and Modular's MAX loads whichever matches its build. Neither connects the two,
+because an NCCL communicator and an RCCL communicator cannot exchange data.
+Meta's torchcomms lists mixed-vendor jobs as a design goal, but each of its
+communicators still runs one vendor's library. Research systems published in
+2026 do join the vendors over RDMA, with much higher cross-vendor bandwidth
+than a Gloo bridge, but their code isn't available (October 2026) and they
+need RDMA-capable NICs and custom builds or plugins. gpubridge runs on stock
+PyTorch builds over any network, and writes no CUDA or HIP code: it composes
+collectives PyTorch already provides. Details, including RAJA, Triton and
+Triton-distributed: [docs/PRIOR_ART.md](docs/PRIOR_ART.md).
 
-The tests start real multi-process clusters on CPU with
-`torch.multiprocessing`, using simulation mode. They cover mixed, uneven and
-single-vendor clusters, leader election, several shapes and dtypes, and
-`broadcast` from every rank.
+## Contributing
 
-To validate on real GPUs (a Slurm cluster, a rented AMD machine, and a real
-mixed NVIDIA + AMD job), follow
-[docs/GPU_VALIDATION_RUNBOOK.md](docs/GPU_VALIDATION_RUNBOOK.md). Every step is
-a script under [`scripts/gpu/`](scripts/gpu) with a `--dry-run` flag.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers running the CPU test suite, branches
+and pull requests, and how GPU validation works. To report a security issue,
+see [SECURITY.md](SECURITY.md).
 
 ## License
 
