@@ -330,12 +330,13 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     assert all(line.startswith("+ timeout --kill-after=30 1200 srun ") for line in launches)
     sruns = [line[line.index("srun "):] for line in launches]
     # probe, preflight, check, bench, a check per opt-in policy, the candidates bench,
-    # then DDP training
-    assert len(sruns) >= 7
+    # DDP training, then FSDP2 on the torch.distributed backend
+    assert len(sruns) >= 8
     assert any("--policy pipelined-reduce-bridge-broadcast" in line for line in sruns[4:])
     assert any("--policy sharded-bridge" in line for line in sruns[4:])
-    assert "--write-thresholds" in sruns[-2]
-    assert "examples/train_synthetic.py" in sruns[-1] and "train_ddp.json" in sruns[-1]
+    assert "--write-thresholds" in sruns[-3]
+    assert "examples/train_synthetic.py" in sruns[-2] and "train_ddp.json" in sruns[-2]
+    assert "examples/fsdp2_torch_backend.py" in sruns[-1]
     for line in sruns:
         nvidia, amd = line.split(" : ")
         assert "/w/venv/bin/" in nvidia and "/w/venv-rocm/" not in nvidia
