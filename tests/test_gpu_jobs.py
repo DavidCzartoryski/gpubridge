@@ -54,6 +54,9 @@ END_TO_END = {
     "explorer/amd_node.sbatch": "test_amd_node_job",
     "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines",
     "amd/run_all.sh": "test_gpu_kit.py: test_amd_script_keeps_going_*",
+    "kaggle/kaggle_gpubridge.py": "test_kaggle_runner.py: the plan, hard timeouts, feature decisions, "
+                                  "the feature check and packaging (the GPU steps need GPUs)",
+    "kaggle/make_notebook.py": "test_kaggle_runner.py: the notebook matches the script",
 }
 
 
