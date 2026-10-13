@@ -18,13 +18,14 @@ builds of PyTorch joined in one job. Not yet run on GPUs.
 ## Quickstart
 
 ```bash
-pip install "gpubridge @ git+https://github.com/DavidCzartoryski/gpubridge@v0.4.0-alpha"  # not on PyPI
+# not on PyPI: install the release tag from GitHub
+pip install "gpubridge @ git+https://github.com/DavidCzartoryski/gpubridge@v0.4.0-alpha"
 ```
 
 As a `torch.distributed` backend, with plain DDP (FSDP2 and HSDP work too):
 
 ```python
-import gpubridge                              # registers "gpubridge"; on torch < 2.14, import it first
+import gpubridge  # registers the backend; on torch < 2.14, import it first
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
@@ -36,7 +37,7 @@ Or with gpubridge's own API (one or the other in a process, not both):
 
 ```python
 topology = gpubridge.init()
-gpubridge.all_reduce(grad)                    # summed across NVIDIA and AMD ranks
+gpubridge.all_reduce(grad)  # summed across NVIDIA and AMD ranks
 ```
 
 Launch the same script on every node with `torchrun`; each process detects
