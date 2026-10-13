@@ -246,10 +246,8 @@ to join.
   The layout is a pure function of the members and the world's labels, so
   every member creates the same groups in the same order.
 - **The world comes first.** A subgroup's first collective also sets up the
-  world's topology if no collective has yet. That setup takes every rank. It
-  is so in DDP, FSDP2 and HSDP, whose first collectives run on every rank.
-  Otherwise, call a collective on the world group (`dist.barrier()`) before
-  a subgroup's first one.
+  world's topology if no collective has yet, and that setup takes every rank
+  (limit 2 below).
 - **One worker per rank.** Every group's async collectives run on the same
   worker thread, in the order the training thread issued them, as NCCL runs
   them on a stream. Two groups whose members issue collectives in opposite
@@ -292,11 +290,24 @@ fully_shard(model, mesh=mesh)
   the next step's compute as FSDP2 schedules it. The cost is memory: each
   island holds a full copy of the model state, sharded over its own ranks
   only, so an island must be big enough to hold one.
-- **The mesh must match the islands.** `init_device_mesh` lays out ranks row
-  by row. Each row is a shard group, so islands must be contiguous blocks of
-  ranks of equal size. Otherwise build the mesh from an explicit rank tensor
-  (`DeviceMesh(device, ranks)`). A shard group that spans vendors still works,
-  but bridged, and so slowly.
+
+**Two limits.**
+1. **Islands must be contiguous blocks of ranks, all the same size.** That
+   means the same number of GPUs from each vendor, with the ranks ordered by
+   vendor: all of one vendor's ranks, then all of the next's. A Slurm
+   heterogeneous job with one component per vendor gives exactly that, since
+   its ranks follow the components in order. `init_device_mesh` lays out ranks
+   row by row, and each row is a shard group, so only then is every shard
+   group one island. With unequal islands there is no 2-D mesh to build. With
+   ranks interleaved, the shard groups span vendors: HSDP still runs, but every
+   all-gather and reduce-scatter crosses the bridge, which is what this layout
+   is meant to avoid.
+2. **The job's first collective must include every rank.** gpubridge sets
+   itself up at the first collective on any of its groups, and that setup
+   takes every rank. DDP, FSDP2 and HSDP meet this: their first collectives
+   run on every rank. A job whose first collective is on a subgroup of some
+   ranks would hang there until the group's timeout. Call `dist.barrier()`
+   on the world group first.
 
 ## What isn't supported, and why
 

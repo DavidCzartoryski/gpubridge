@@ -443,7 +443,15 @@ dist.init_process_group(backend="gpubridge")   # instead of "nccl"
   groups set to the vendor islands keeps every all-gather and reduce-scatter
   inside a vendor; only the replicate all_reduce crosses the bridge, once per
   step (`examples/fsdp2_torch_backend.py --hsdp 2`; docs/TORCH_BACKEND.md,
-  "Subgroups and HSDP"). Tested in simulation only.
+  "Subgroups and HSDP"). Tested in simulation only. Two limits:
+  - **Islands must be contiguous, equal-size blocks of ranks:** the same
+    number of GPUs per vendor, with ranks ordered by vendor, as a Slurm
+    heterogeneous job with one component per vendor gives. Otherwise the
+    shard groups span vendors and HSDP's all-gathers and reduce-scatters cross
+    the bridge.
+  - **The job's first collective must include every rank,** since gpubridge
+    sets itself up there. DDP, FSDP2 and HSDP do this. Otherwise call
+    `dist.barrier()` first.
 - **Not supported**, refused with an error before any communication:
   - point-to-point, all-to-all, reduce, and gather and scatter of GPU tensors;
   - reductions other than SUM, AVG, MAX and MIN.
