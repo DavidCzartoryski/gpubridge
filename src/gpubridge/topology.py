@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import itertools
 import json
 import warnings
 from collections.abc import Iterator, Sequence
@@ -592,22 +591,26 @@ def _members_only(prefix: str) -> Iterator[None]:
     (``use_local_synchronization=True``), so a subgroup's members build its groups
     without the rest of the job (transports and policies call ``dist.new_group``).
 
-    And each group is named ``{prefix}.{i}``, the i-th created here. torch names
-    such groups from state that differs between ranks of asymmetric groups (2.8:
-    how many groups this rank has; 2.14: a counter that only creating ranks
-    advance), so members could compute different names and wait on different
-    store keys, and later groups of the whole job too. ``prefix`` is the
-    subgroup's own name, the same on every member."""
+    And each group is named ``{prefix}.{ranks}.{k}``: its ranks, and how many
+    groups of the same ranks were named here before it. torch names such groups
+    from state that differs between ranks of asymmetric groups (2.8: how many
+    groups this rank has; 2.14: a counter that only creating ranks advance), so
+    members could compute different names and wait on different store keys, and
+    later groups of the whole job too. Only a group's ranks name it (torch
+    returns early on the others), and they create the same groups in the same
+    order. ``prefix`` is the subgroup's own name, the same on every member."""
     c10d = dist.distributed_c10d
     plain_new, plain_name = dist.new_group, c10d._process_group_name
-    count = itertools.count()
+    seen: dict[tuple[int, ...], int] = {}
 
     def local(*args: Any, **kwargs: Any) -> Any:
         kwargs["use_local_synchronization"] = True
         return plain_new(*args, **kwargs)
 
     def name(ranks: Any, use_hashed_name: bool = False) -> str:
-        return f"{prefix}.{next(count)}"
+        key = tuple(ranks)
+        seen[key] = seen.get(key, -1) + 1
+        return f"{prefix}.{'_'.join(map(str, key))}.{seen[key]}"
 
     dist.new_group, c10d._process_group_name = local, name  # type: ignore[assignment]
     try:
