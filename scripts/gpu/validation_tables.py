@@ -114,6 +114,8 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
     28: ("Bridge compression kernels give the reference's bits on GPUs",
          [Step("gpu_tests"), Step("bench_compression_kernels")]),
     29: ("Where bridge compression pays off", [Step("bench_compressed")]),
+    30: ("gpubridge as a torch.distributed backend: DDP and FSDP2 on GPUs",
+         [Step("train_fsdp2_backend"), Step("gpu_tests")]),
 }
 
 
