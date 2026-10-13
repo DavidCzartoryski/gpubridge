@@ -5,7 +5,12 @@ release so far is an alpha that is **validated on CPU only**. Nothing has run
 on a GPU yet: [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what
 still needs real hardware. Numbers in parentheses are pull requests.
 
-## [Unreleased]
+## [0.4.0-alpha] - 2026-10-13
+
+CPU-validated. New in this alpha: gpubridge as an experimental
+`torch.distributed` backend (DDP, FSDP2 and HSDP through subgroups), opt-in
+bridge compression and an opt-in UCX bridge transport. None of it has run on a
+GPU or on RDMA hardware. Not on PyPI.
 
 ### Added
 
@@ -20,7 +25,7 @@ still needs real hardware. Numbers in parentheses are pull requests.
   private `distributed_c10d._process_group_name`. On a torch where that
   function or `dist.new_group`'s use of it has changed, creating a subgroup
   fails with an error naming the torch version, so the job doesn't risk a
-  hang.
+  hang (#39, #40).
 
 - gpubridge as a `torch.distributed` backend,
   `dist.init_process_group(backend="gpubridge")`, **experimental and not
@@ -36,7 +41,7 @@ still needs real hardware. Numbers in parentheses are pull requests.
   communication. New examples `ddp_torch_backend.py` and
   `fsdp2_torch_backend.py` (with a `--verify` mode); the GPU kit's
   `train_fsdp2_backend` and `verify_fsdp2_backend` steps. Design:
-  docs/TORCH_BACKEND.md.
+  docs/TORCH_BACKEND.md (#38).
 
 - Opt-in bridge compression, `GPUBRIDGE_BRIDGE_COMPRESSION=bf16|fp8`, **off by
   default, changes results (no longer bit-exact against the uncompressed sum)
@@ -190,7 +195,7 @@ CPU-validated, GPU validation pending.
 - A CPU-only matrix showing CUDA and ROCm builds of PyTorch can share one job
   (#1, #4), and prior-art notes (#2, #6).
 
-[Unreleased]: https://github.com/DavidCzartoryski/gpubridge/compare/v0.3.0-alpha...main
+[0.4.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.4.0-alpha
 [0.3.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.3.0-alpha
 [0.2.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.2.0-alpha
 [0.1.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.1.0-alpha

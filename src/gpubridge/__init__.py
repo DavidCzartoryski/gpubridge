@@ -65,7 +65,7 @@ from gpubridge import torch_backend as _torch_backend  # noqa: E402
 
 _torch_backend.register()  # backend="gpubridge" for torch.distributed
 
-__version__ = "0.3.0a0"
+__version__ = "0.4.0a0"
 
 __all__ = [
     "BridgeTransport",
