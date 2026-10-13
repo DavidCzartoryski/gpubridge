@@ -12,14 +12,16 @@ still needs real hardware. Numbers in parentheses are pull requests.
 - gpubridge as a `torch.distributed` backend,
   `dist.init_process_group(backend="gpubridge")`, **experimental and not
   validated on GPUs.** Unmodified DDP and FSDP2 scripts run their collectives
-  through gpubridge across vendor islands. A `torch.backends` entry point
-  registers the name when torch is imported. gpubridge's groups are built at
-  the first collective, with the usual discovery checks.
-  `GPUBRIDGE_POLICY` and `GPUBRIDGE_BRIDGE` pick the policy and transport.
-  World group only; point-to-point, all-to-all, reduce, GPU-tensor gather
-  and scatter, and other reductions are refused before any communication. New examples
-  `ddp_torch_backend.py` and `fsdp2_torch_backend.py`; the GPU kit's
-  `train_fsdp2_backend` step. Design: docs/TORCH_BACKEND.md.
+  through gpubridge across vendor islands. Entry points register the name
+  without `import gpubridge`. gpubridge's groups are built at the first
+  collective, with the usual discovery checks. `GPUBRIDGE_POLICY` and
+  `GPUBRIDGE_BRIDGE` pick the policy and transport. CPU tensors in GPU jobs go
+  to a Gloo group. World group only; point-to-point, all-to-all, reduce,
+  GPU-tensor gather and scatter, and other reductions are refused before any
+  communication. New examples `ddp_torch_backend.py` and
+  `fsdp2_torch_backend.py` (with a `--verify` mode); the GPU kit's
+  `train_fsdp2_backend` and `verify_fsdp2_backend` steps. Design:
+  docs/TORCH_BACKEND.md.
 
 - Opt-in bridge compression, `GPUBRIDGE_BRIDGE_COMPRESSION=bf16|fp8`, **off by
   default, changes results (no longer bit-exact against the uncompressed sum)
