@@ -5,6 +5,15 @@ release so far is an alpha that is **validated on CPU only**. Nothing has run
 on a GPU yet: [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what
 still needs real hardware. Numbers in parentheses are pull requests.
 
+## [Unreleased]
+
+### Changed
+
+- The README opens with a pitch, badges, a one-line status, an architecture
+  diagram, a quickstart and a feature table with each feature's status. New
+  diagrams for all_reduce and HSDP (docs/img, light and dark). New
+  CONTRIBUTING.md, SECURITY.md and issue templates (#42).
+
 ## [0.4.0-alpha] - 2026-10-13
 
 CPU-validated. New in this alpha: gpubridge as an experimental
@@ -195,6 +204,7 @@ CPU-validated, GPU validation pending.
 - A CPU-only matrix showing CUDA and ROCm builds of PyTorch can share one job
   (#1, #4), and prior-art notes (#2, #6).
 
+[Unreleased]: https://github.com/DavidCzartoryski/gpubridge/compare/v0.4.0-alpha...main
 [0.4.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.4.0-alpha
 [0.3.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.3.0-alpha
 [0.2.0-alpha]: https://github.com/DavidCzartoryski/gpubridge/releases/tag/v0.2.0-alpha
