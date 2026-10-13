@@ -321,6 +321,18 @@ def test_gpubridge_init_and_the_backend_exclude_each_other(tmp_path):
     run_backend(TWO_TWO, _two_jobs_in_a_row, tmp_path)
 
 
+def _backend_group_after_init(topology):
+    group = dist.new_group(list(range(topology.world_size)), backend="gpubridge")
+    with pytest.raises(RuntimeError, match="use either gpubridge.init\\(\\) or the gpubridge"):
+        dist.all_reduce(torch.ones(2), group=group)
+
+
+def test_a_backend_group_after_gpubridge_init_is_refused(tmp_path):
+    from _harness import run_ranks
+
+    run_ranks(TWO_TWO, _backend_group_after_init, tmp_path)
+
+
 def test_bridge_from_gpubridge_bridge_is_checked(tmp_path):
     run_backend(["nvidia", "amd"], _first_collective_unknown_bridge, tmp_path,
                 env={-1: {BRIDGE_ENV: "no-such-bridge"}})
@@ -362,11 +374,11 @@ def test_the_autoload_hook_never_raises(monkeypatch):
 
 
 def test_cpu_tensors_go_to_gloo_only_on_gpu_jobs():
-    pg = torch_backend.GpubridgeProcessGroup.__new__(torch_backend.GpubridgeProcessGroup)
     gpu = SimpleNamespace(device=torch.device("cuda", 0))
     cpu = SimpleNamespace(device=torch.device("cpu"))
-    assert pg._on_gloo(gpu, [torch.ones(1)])
-    assert not pg._on_gloo(cpu, [torch.ones(1)])  # simulation: CPU is gpubridge's device
+    assert torch_backend._on_gloo(gpu, [torch.ones(1)])
+    assert not torch_backend._on_gloo(cpu, [torch.ones(1)])  # simulation: CPU is gpubridge's
+    assert not torch_backend._on_gloo(gpu, [torch.ones(1), torch.ones(1, device="meta")])
 
 
 # ---- on GPUs (written; skipped without one) ------------------------------------------------

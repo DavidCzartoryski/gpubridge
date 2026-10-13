@@ -110,10 +110,6 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
 
     # ---- running gpubridge collectives ---------------------------------------------------
 
-    def _on_gloo(self, topology: _topology.Topology, tensors: Sequence[torch.Tensor]) -> bool:
-        """Whether these are CPU tensors on a GPU job: Gloo carries them directly."""
-        return topology.device.type != "cpu" and all(t.device.type == "cpu" for t in tensors)
-
     def _run(self, what: str, tensors: Sequence[torch.Tensor], result: Any,
              calls: Sequence[Callable[[], _work.Work | None]]) -> dist.Work:
         """Start ``calls`` (gpubridge async collectives), and return a torch Work that completes
@@ -146,7 +142,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
     def allreduce(self, tensors, opts=None):  # noqa: D102 - torch's API
         op = opts.reduceOp if opts is not None else dist.ReduceOp.SUM
         topology = self._topology()
-        if self._on_gloo(topology, tensors):
+        if _on_gloo(topology, tensors):
             return self._gloo("allreduce", tensors, lambda t: dist.all_reduce(
                 t, op=op, group=topology.world_group, async_op=True))
         return self._run("allreduce", tensors, list(tensors), [
@@ -158,7 +154,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
     def broadcast(self, tensors, opts=None):  # noqa: D102
         root = opts.rootRank if opts is not None else 0
         topology = self._topology()
-        if self._on_gloo(topology, tensors):
+        if _on_gloo(topology, tensors):
             return self._gloo("broadcast", tensors, lambda t: dist.broadcast(
                 t, src=root, group=topology.world_group, async_op=True))
         return self._run("broadcast", tensors, list(tensors), [
@@ -166,7 +162,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
 
     def _allgather_base(self, output, input, opts=None):  # noqa: A002, D102 - torch 2.8's name
         topology = self._topology()
-        if self._on_gloo(topology, [output, input]):
+        if _on_gloo(topology, [output, input]):
             return dist.all_gather_into_tensor(output, input, group=topology.world_group,
                                                async_op=True)
         return self._run("all_gather_into_tensor", [output], [output], [
@@ -176,7 +172,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
 
     def allgather_into_tensor_coalesced(self, outputs, inputs, opts=None):  # noqa: D102
         topology = self._topology()
-        if self._on_gloo(topology, [*outputs, *inputs]):
+        if _on_gloo(topology, [*outputs, *inputs]):
             works = [dist.all_gather_into_tensor(o, i, group=topology.world_group, async_op=True)
                      for o, i in zip(outputs, inputs, strict=True)]
             return _all_of(works, list(outputs))
@@ -192,7 +188,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
             if len(outputs) != self.size() or any(o.shape != tensor.shape for o in outputs):
                 raise _unsupported("allgather with tensors of different sizes",
                                    "every rank must contribute a tensor of the same shape")
-        on_gloo = self._on_gloo(topology, inputs)
+        on_gloo = _on_gloo(topology, inputs)
         for outputs, tensor in zip(output_lists, inputs, strict=True):
             buffer = torch.empty((self.size(), *tensor.shape), dtype=tensor.dtype,
                                  device=tensor.device)
@@ -210,7 +206,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
     def _reduce_scatter_base(self, output, input, opts=None):  # noqa: A002, D102
         op = opts.reduceOp if opts is not None else dist.ReduceOp.SUM
         topology = self._topology()
-        if self._on_gloo(topology, [output, input]):
+        if _on_gloo(topology, [output, input]):
             return dist.reduce_scatter_tensor(output, input, op=op, group=topology.world_group,
                                               async_op=True)
         return self._run("reduce_scatter_tensor", [output], [output], [
@@ -221,7 +217,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
     def reduce_scatter_tensor_coalesced(self, outputs, inputs, opts=None):  # noqa: D102
         op = opts.reduceOp if opts is not None else dist.ReduceOp.SUM
         topology = self._topology()
-        if self._on_gloo(topology, [*outputs, *inputs]):
+        if _on_gloo(topology, [*outputs, *inputs]):
             works = [dist.reduce_scatter_tensor(o, i, op=op, group=topology.world_group,
                                                 async_op=True)
                      for o, i in zip(outputs, inputs, strict=True)]
@@ -289,6 +285,11 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
 
     def reduce(self, *args, **kwargs):  # noqa: D102
         raise _unsupported("reduce", "use all_reduce")
+
+
+def _on_gloo(topology: _topology.Topology, tensors: Sequence[torch.Tensor]) -> bool:
+    """Whether these are CPU tensors on a GPU job: Gloo carries them directly."""
+    return topology.device.type != "cpu" and all(t.device.type == "cpu" for t in tensors)
 
 
 def _all_of(works: Sequence[dist.Work], result: Any) -> dist.Work:
