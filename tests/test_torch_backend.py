@@ -309,10 +309,6 @@ def _refused(rank, world):
            "gpubridge backend, allreduce: .*supports ReduceOp.SUM, AVG, MAX and MIN")
     expect(lambda: dist.all_to_all_single(torch.empty(world), torch.ones(world)),
            "the gpubridge torch.distributed backend doesn't support all_to_all")
-    expect(lambda: dist.gather(torch.ones(2), [torch.empty(2)] * world if rank == 0 else None),
-           "doesn't support gather")
-    expect(lambda: dist.scatter(torch.empty(2), [torch.ones(2)] * world if rank == 0 else None),
-           "doesn't support scatter")
     expect(lambda: dist.reduce(torch.ones(2), dst=0), "doesn't support reduce")
     peer = rank ^ 1
     expect(lambda: dist.send(torch.ones(2), dst=peer) if rank % 2 == 0
@@ -321,10 +317,14 @@ def _refused(rank, world):
            "allgather with tensors of different sizes")
     expect(lambda: dist.reduce_scatter_tensor(torch.empty(2), torch.ones(5)),
            "gpubridge backend, reduce_scatter_tensor: .*times as many elements")
-    # A subgroup can't be gpubridge's: refused where it is created.
-    expect(lambda: dist.new_group([0, 1], use_local_synchronization=True) if rank < 2
-           else (_ for _ in ()).throw(RuntimeError("runs on the world group only")),
-           "runs on the world group only")
+    # A subgroup can't be gpubridge's: refused on its members, where it is created;
+    # the other ranks aren't members and get NON_GROUP_MEMBER, as with any backend.
+    if rank < 2:
+        expect(lambda: dist.new_group([0, 1], use_local_synchronization=True),
+               "runs on the world group only")
+    else:
+        assert dist.new_group([0, 1], use_local_synchronization=True) is (
+            dist.GroupMember.NON_GROUP_MEMBER)
     # The world again is fine: it shares gpubridge's topology.
     again = dist.new_group(list(range(world)))
     t = rank_tensor((4,), torch.float32, rank)
@@ -338,6 +338,115 @@ def _refused(rank, world):
 
 def test_unsupported_calls_fail_clearly_on_every_rank(tmp_path):
     run_backend(TWO_TWO, _refused, tmp_path)
+
+
+def _objects_and_checkpoint_helpers(rank, world):
+    # gather_object and scatter_object_list (torch.distributed.checkpoint plans with them)
+    # use gather and scatter of CPU tensors: the backend's Gloo group carries them.
+    got = [None] * world if rank == 0 else None
+    dist.gather_object({"rank": rank}, got, dst=0)
+    if rank == 0:
+        assert got == [{"rank": r} for r in range(world)]
+    out = [None]
+    dist.scatter_object_list(out, [f"to {r}" for r in range(world)] if rank == 2 else None,
+                             src=2)
+    assert out == [f"to {rank}"]
+    objs = [None] * world
+    dist.all_gather_object(objs, rank * 10)
+    assert objs == [r * 10 for r in range(world)]
+    box = [rank] if rank == 1 else [None]
+    dist.broadcast_object_list(box, src=1)
+    assert box == [1]
+
+
+def test_object_collectives_and_what_checkpointing_needs(tmp_path):
+    run_backend(TWO_TWO, _objects_and_checkpoint_helpers, tmp_path)
+
+
+def _ddp_buffers_unused_and_hook(rank, world, out):
+    torch.manual_seed(0)
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a, self.b = nn.Linear(8, 8).double(), nn.Linear(8, 4).double()
+            self.unused = nn.Linear(4, 4).double()
+            self.norm = nn.BatchNorm1d(8).double()  # buffers, broadcast every step
+
+        def forward(self, x):
+            return self.b(self.norm(self.a(x)).relu())
+
+    net = Net()
+    ddp = nn.parallel.DistributedDataParallel(net, find_unused_parameters=True,
+                                              broadcast_buffers=True)
+    ddp.register_comm_hook(None, lambda state, bucket: dist.all_reduce(
+        bucket.buffer().div_(world), async_op=True).get_future().then(lambda f: f.value()[0]))
+    opt = torch.optim.SGD(ddp.parameters(), lr=0.01)
+    for step in range(3):
+        ddp(_batch(rank, step)).sum().backward()
+        opt.step()
+        opt.zero_grad()
+    if rank == 0:
+        torch.save([t.detach().clone() for t in net.state_dict().values()], out)
+
+
+def test_ddp_with_buffers_unused_parameters_and_a_comm_hook(tmp_path):
+    results = {}
+    for backend in ("gloo", "gpubridge"):
+        out = tmp_path / f"{backend}.pt"
+        (tmp_path / backend).mkdir()
+        run_backend(TWO_TWO, partial(_ddp_buffers_unused_and_hook, out=str(out)),
+                    tmp_path / backend, backend=backend)
+        results[backend] = torch.load(out)
+    for a, b in zip(results["gloo"], results["gpubridge"], strict=True):
+        torch.testing.assert_close(a, b, rtol=1e-12, atol=1e-12)
+
+
+def _reinit_and_teardown_with_work_queued(rank, init_file, world):
+    os.environ[VENDOR_ENV] = TWO_TWO[rank]
+    torch.set_num_threads(1)
+    for attempt in range(2):  # the same process, twice
+        dist.init_process_group(backend="gpubridge", init_method=f"file://{init_file}{attempt}",
+                                rank=rank, world_size=world, timeout=TIMEOUT)
+        t = rank_tensor((5,), torch.float32, rank)
+        dist.all_reduce(t)
+        assert torch.equal(t, sum(rank_tensor((5,), torch.float32, r) for r in range(world)))
+        assert gpubridge.is_initialized()
+        if attempt == 1:  # destroy with collectives still queued: never hangs
+            for _ in range(3):
+                dist.all_reduce(torch.ones(1000), async_op=True)
+        dist.destroy_process_group()
+        assert not gpubridge.is_initialized() and not dist.is_initialized()
+
+
+def test_init_again_in_the_same_process_and_destroy_with_work_queued(tmp_path):
+    mp.spawn(_reinit_and_teardown_with_work_queued,
+             args=(str(tmp_path / "rendezvous"), 4), nprocs=4)
+
+
+def test_init_process_group_with_a_device_id_finds_no_backend_to_split():
+    # With device_id, torch asks the group for that device's C++ backend and whether
+    # it can split eagerly; a Python group has none. (device_id must be an
+    # accelerator, so the real call is in the GPU tests.)
+    pg = torch_backend.GpubridgeProcessGroup(0, 1, "test", None)
+    assert pg._get_backend(torch.device("cuda", 0)).supports_splitting is False
+    assert pg.group_name == "test" and pg.getBackendName() == "gpubridge"
+
+
+def _collective_during_setup(rank, world):
+    original = gpubridge.topology.build_topology
+
+    def calls_back(*args, **kwargs):  # as a custom transport or policy might
+        dist.all_reduce(torch.ones(1))
+        return original(*args, **kwargs)
+
+    gpubridge.topology.build_topology = calls_back
+    with pytest.raises(RuntimeError, match="while gpubridge was setting itself up"):
+        dist.barrier()
+
+
+def test_a_collective_on_the_backend_during_its_own_setup_is_refused(tmp_path):
+    run_backend(TWO_TWO, _collective_during_setup, tmp_path)
 
 
 def _first_collective_fails(rank, world):
@@ -379,8 +488,19 @@ def test_bridge_from_gpubridge_bridge_is_checked(tmp_path):
 
 
 def _first_collective_unknown_bridge(rank, world):
-    with pytest.raises(ValueError, match="unknown bridge transport 'no-such-bridge'"):
+    # A setting one rank can't use fails every rank (here all of them), not just that one.
+    with pytest.raises(RuntimeError, match="unknown bridge transport 'no-such-bridge'"):
         dist.barrier()
+
+
+def _one_rank_with_a_bad_setting(rank, world):
+    with pytest.raises(RuntimeError, match=r"rank 1: unknown collective policy 'no-such'"):
+        dist.barrier()
+
+
+def test_a_bad_setting_on_one_rank_fails_every_rank_instead_of_hanging(tmp_path):
+    run_backend(TWO_TWO, _one_rank_with_a_bad_setting, tmp_path,
+                env={1: {POLICY_ENV: "no-such"}, -1: {}})
 
 
 # ---- registration and pure logic -----------------------------------------------------------
@@ -416,12 +536,33 @@ def test_the_autoload_hook_never_raises(monkeypatch):
 def test_cpu_tensors_go_to_gloo_only_on_gpu_jobs():
     gpu = SimpleNamespace(device=torch.device("cuda", 0))
     cpu = SimpleNamespace(device=torch.device("cpu"))
-    assert torch_backend._on_gloo(gpu, [torch.ones(1)])
-    assert not torch_backend._on_gloo(cpu, [torch.ones(1)])  # simulation: CPU is gpubridge's
-    assert not torch_backend._on_gloo(gpu, [torch.ones(1), torch.ones(1, device="meta")])
+    assert torch_backend._cpu_path(gpu, [torch.ones(1)])
+    assert not torch_backend._cpu_path(cpu, [torch.ones(1)])  # simulation: CPU is gpubridge's
+    assert not torch_backend._cpu_path(gpu, [torch.ones(1), torch.ones(1, device="meta")])
+    with pytest.raises(NotImplementedError, match="gather of GPU tensors"):
+        torch_backend._cpu_only("gather", [torch.ones(1, device="meta")])
 
 
 # ---- on GPUs (written; skipped without one) ------------------------------------------------
+
+def _gpu_device_id(rank, init_file, world):
+    torch.cuda.set_device(rank)
+    os.environ["GPUBRIDGE_SPLIT_TEST"] = "half"
+    dist.init_process_group(backend="gpubridge", init_method=f"file://{init_file}", rank=rank,
+                            world_size=world, timeout=TIMEOUT,
+                            device_id=torch.device("cuda", rank))
+    t = torch.full((4,), float(rank + 1), device="cuda")
+    dist.all_reduce(t)
+    assert t.cpu().tolist() == [float(sum(range(1, world + 1)))] * 4
+    gc.collect()
+    dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_gpu_init_process_group_with_a_device_id(tmp_path):
+    mp.spawn(_gpu_device_id, args=(str(tmp_path / "rendezvous"), 2), nprocs=2)
+
 
 @pytest.mark.gpu
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")

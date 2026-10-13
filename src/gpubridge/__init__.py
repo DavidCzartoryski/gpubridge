@@ -200,13 +200,16 @@ def destroy() -> None:
         dist.destroy_process_group()
 
 
-def _release() -> None:
-    """Finish queued async collectives and release gpubridge's state, but not the
-    process groups: :func:`destroy` destroys them after, and under the
-    torch.distributed backend ``destroy_process_group()`` does."""
+def _release(drain: bool = True) -> None:
+    """Release gpubridge's state, but not the process groups: :func:`destroy` destroys
+    them after, and under the torch.distributed backend ``destroy_process_group()``
+    does (before, so there queued collectives fail instead: ``drain=False``)."""
     topology = get_topology()
     try:
-        _work.shutdown()  # queued async collectives run first
+        if drain:
+            _work.shutdown()  # queued async collectives run first
+        else:
+            _work.abandon()
     finally:
         _topology._set_topology(None)
         _observe._reset()

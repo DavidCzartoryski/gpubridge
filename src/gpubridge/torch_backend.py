@@ -4,24 +4,26 @@ Unmodified DDP and FSDP2 scripts then run their collectives through gpubridge,
 across vendor islands. Design and limits: docs/TORCH_BACKEND.md.
 
 - ``import gpubridge`` registers the name (and so does ``import torch``, through
-  gpubridge's ``torch.backends`` entry point; see :mod:`gpubridge_backend`).
+  gpubridge's entry points; see :mod:`gpubridge_backend`).
 - The process group is the world group. gpubridge's own groups (a Gloo group of
   every rank, the islands, the bridge) are created at its first collective,
   when ``dist.new_group`` can run; discovery then checks every rank as
   ``gpubridge.init()`` does. ``GPUBRIDGE_POLICY`` and ``GPUBRIDGE_BRIDGE`` pick the
   policy and bridge transport (``auto`` and ``gloo`` by default).
 - Each collective runs as gpubridge's async collective, so stream semantics are
-  those of ``async_op=True`` (:mod:`gpubridge.work`). On GPUs, CPU tensors go to
-  the Gloo group directly.
-- Unsupported calls (other reductions, point-to-point, all-to-all, gather,
-  scatter, reduce, subgroups) fail before any communication, saying what isn't
-  supported.
+  those of ``async_op=True`` (:mod:`gpubridge.work`). CPU tensors on a GPU job,
+  and gather and scatter of CPU tensors on any job (object collectives,
+  checkpointing), go to a Gloo group of the backend's own.
+- Unsupported calls (other reductions, point-to-point, all-to-all, reduce,
+  GPU-tensor gather and scatter, subgroups) fail before any communication,
+  saying what isn't supported.
 """
 
 from __future__ import annotations
 
 import os
 import threading
+import warnings
 from collections.abc import Callable, Sequence
 from datetime import timedelta
 from typing import Any
@@ -40,9 +42,13 @@ from gpubridge.transport import DEFAULT_TRANSPORT, resolve_transport
 
 NAME = "gpubridge"
 
-_setup_lock = threading.Lock()
+_setup_lock = threading.RLock()
 _owner: GpubridgeProcessGroup | None = None
 """The process group that built gpubridge's topology; it releases it at shutdown."""
+_cpu_group: dist.ProcessGroup | None = None
+"""A Gloo group of every rank for CPU-tensor collectives, apart from the one
+gpubridge's worker thread uses, so the two threads never interleave on one group."""
+_setting_up = False
 
 
 def _completed(result: Any) -> dist.Work:
@@ -57,6 +63,13 @@ def _unsupported(what: str, why: str = "") -> NotImplementedError:
         + (f": {why}" if why else "") + " (docs/TORCH_BACKEND.md)")
 
 
+class _NoBackend:
+    """What ``_get_backend()`` returns: a Python group has no C++ backend per device.
+    ``init_process_group(device_id=...)`` only asks whether it can split eagerly."""
+
+    supports_splitting = False
+
+
 class GpubridgeProcessGroup(dist.ProcessGroup):
     """The world group, carried by gpubridge. Created by ``init_process_group``."""
 
@@ -65,11 +78,12 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         self._name = name
         self._timeout = timeout
         self._coalesced: list[_work.Work] | None = None
+        self._coalesced_torch: list[dist.Work] = []
 
     # ---- identity -------------------------------------------------------------------------
 
     @property
-    def group_name(self) -> str:  # DeviceMesh reads it; a Python group can't set the C++ one
+    def group_name(self) -> str:  # DeviceMesh reads it; the C++ getter raises for this group
         return self._name
 
     @property
@@ -79,6 +93,9 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
     def getBackendName(self) -> str:  # noqa: N802 - torch's name
         return NAME
 
+    def _get_backend(self, device: torch.device) -> _NoBackend:
+        return _NoBackend()
+
     def __repr__(self) -> str:
         return f"GpubridgeProcessGroup(rank={self.rank()}, size={self.size()})"
 
@@ -86,27 +103,40 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
 
     def _topology(self) -> _topology.Topology:
         """gpubridge's topology, built at the first collective (every rank's first is the same)."""
-        global _owner
+        global _owner, _cpu_group, _setting_up
         with _setup_lock:
             if _owner is None:
+                if _setting_up:
+                    raise RuntimeError(
+                        f"a collective on the {NAME} backend's group ran while gpubridge was setting "
+                        "itself up (from a custom bridge transport or policy?): during setup, "
+                        "communicate on topology.world_group instead")
                 if _topology.is_initialized():
                     raise RuntimeError(
                         "gpubridge is already initialized in this process (gpubridge.init()); use "
                         f"either gpubridge.init() or the {NAME} torch.distributed backend")
-                setup(self._timeout)
+                _setting_up = True
+                try:
+                    _cpu_group = setup(self._timeout)
+                finally:
+                    _setting_up = False
                 _owner = self
             return _topology.get_topology()
 
-    def shutdown(self) -> None:
-        """Called by ``destroy_process_group()`` before it shuts down gpubridge's groups."""
-        global _owner
-        with _setup_lock:
-            if _owner is self:
-                _owner = None
-                if _topology.is_initialized():
-                    from gpubridge import _release
+    def _cpu(self) -> dist.ProcessGroup:
+        self._topology()
+        assert _cpu_group is not None
+        return _cpu_group
 
-                    _release()
+    def shutdown(self) -> None:
+        """Called by ``destroy_process_group()``, after it has shut down gpubridge's own groups
+        (it goes in reverse order of group name, the world group last): release gpubridge's
+        state without running anything still queued, and never raise."""
+        _teardown(self)
+
+    def abort(self) -> None:
+        """Called by ``torch.distributed`` to abort the job's groups: as :meth:`shutdown`."""
+        _teardown(self)
 
     # ---- running gpubridge collectives ---------------------------------------------------
 
@@ -137,14 +167,24 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
 
         return _create_work_from_future(last.get_future().then(done))
 
+    def _on_cpu_group(self, what: str, result: Any, starts: Sequence[Callable[[], dist.Work]]
+                      ) -> dist.Work:
+        """Start Gloo collectives on the backend's CPU group; a Work for all of them."""
+        works = [start() for start in starts]
+        if self._coalesced is not None:
+            self._coalesced_torch.extend(works)
+        return _all_of(works, result)
+
     # ---- collectives ----------------------------------------------------------------------
 
     def allreduce(self, tensors, opts=None):  # noqa: D102 - torch's API
         op = opts.reduceOp if opts is not None else dist.ReduceOp.SUM
         topology = self._topology()
-        if _on_gloo(topology, tensors):
-            return self._gloo("allreduce", tensors, lambda t: dist.all_reduce(
-                t, op=op, group=topology.world_group, async_op=True))
+        if _cpu_path(topology, tensors):
+            name = _check_op(op, "allreduce")
+            return self._on_cpu_group("allreduce", list(tensors), [
+                lambda t=t: _gloo_reduce(dist.all_reduce, t, name, self.size(), self._cpu())
+                for t in tensors])
         return self._run("allreduce", tensors, list(tensors), [
             lambda t=t: _collectives.all_reduce(t, op=op, async_op=True) for t in tensors])
 
@@ -154,28 +194,25 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
     def broadcast(self, tensors, opts=None):  # noqa: D102
         root = opts.rootRank if opts is not None else 0
         topology = self._topology()
-        if _on_gloo(topology, tensors):
-            return self._gloo("broadcast", tensors, lambda t: dist.broadcast(
-                t, src=root, group=topology.world_group, async_op=True))
+        if _cpu_path(topology, tensors):
+            return self._on_cpu_group("broadcast", list(tensors), [
+                lambda t=t: dist.broadcast(t, src=root, group=self._cpu(), async_op=True)
+                for t in tensors])
         return self._run("broadcast", tensors, list(tensors), [
             lambda t=t: _collectives.broadcast(t, root, async_op=True) for t in tensors])
 
     def _allgather_base(self, output, input, opts=None):  # noqa: A002, D102 - torch 2.8's name
-        topology = self._topology()
-        if _on_gloo(topology, [output, input]):
-            return dist.all_gather_into_tensor(output, input, group=topology.world_group,
-                                               async_op=True)
-        return self._run("all_gather_into_tensor", [output], [output], [
-            lambda: _collectives.all_gather_into_tensor(output, input, async_op=True)])
+        return self.allgather_into_tensor_coalesced([output], [input], opts)
 
     all_gather_single = _allgather_base  # its name from torch 2.13 on
 
     def allgather_into_tensor_coalesced(self, outputs, inputs, opts=None):  # noqa: D102
         topology = self._topology()
-        if _on_gloo(topology, [*outputs, *inputs]):
-            works = [dist.all_gather_into_tensor(o, i, group=topology.world_group, async_op=True)
-                     for o, i in zip(outputs, inputs, strict=True)]
-            return _all_of(works, list(outputs))
+        if _cpu_path(topology, [*outputs, *inputs]):
+            return self._on_cpu_group("all_gather_into_tensor", list(outputs), [
+                lambda o=o, i=i: dist.all_gather_into_tensor(o, i, group=self._cpu(),
+                                                             async_op=True)
+                for o, i in zip(outputs, inputs, strict=True)])
         return self._run("all_gather_into_tensor", outputs, list(outputs), [
             lambda o=o, i=i: _collectives.all_gather_into_tensor(o, i, async_op=True)
             for o, i in zip(outputs, inputs, strict=True)])
@@ -190,13 +227,13 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
             if len(outputs) != self.size() or any(o.shape != tensor.shape for o in outputs):
                 raise _unsupported("allgather with tensors of different sizes",
                                    "every rank must contribute a tensor of the same shape")
-        on_gloo = _on_gloo(topology, inputs)
+        on_cpu = _cpu_path(topology, inputs)
         for outputs, tensor in zip(output_lists, inputs, strict=True):
             buffer = torch.empty((self.size(), *tensor.shape), dtype=tensor.dtype,
                                  device=tensor.device)
             source = tensor.contiguous()
-            if on_gloo:
-                dist.all_gather_into_tensor(buffer, source, group=topology.world_group)
+            if on_cpu:
+                dist.all_gather_into_tensor(buffer, source, group=self._cpu())
             else:
                 self._run("allgather", [buffer], None, [
                     lambda b=buffer, s=source: _collectives.all_gather_into_tensor(
@@ -206,24 +243,20 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         return _completed(output_lists)
 
     def _reduce_scatter_base(self, output, input, opts=None):  # noqa: A002, D102
-        op = opts.reduceOp if opts is not None else dist.ReduceOp.SUM
-        topology = self._topology()
-        if _on_gloo(topology, [output, input]):
-            return dist.reduce_scatter_tensor(output, input, op=op, group=topology.world_group,
-                                              async_op=True)
-        return self._run("reduce_scatter_tensor", [output], [output], [
-            lambda: _collectives.reduce_scatter_tensor(output, input, op=op, async_op=True)])
+        return self.reduce_scatter_tensor_coalesced([output], [input], opts)
 
     reduce_scatter_single = _reduce_scatter_base  # its name from torch 2.13 on
 
     def reduce_scatter_tensor_coalesced(self, outputs, inputs, opts=None):  # noqa: D102
         op = opts.reduceOp if opts is not None else dist.ReduceOp.SUM
         topology = self._topology()
-        if _on_gloo(topology, [*outputs, *inputs]):
-            works = [dist.reduce_scatter_tensor(o, i, op=op, group=topology.world_group,
-                                                async_op=True)
-                     for o, i in zip(outputs, inputs, strict=True)]
-            return _all_of(works, list(outputs))
+        if _cpu_path(topology, [*outputs, *inputs]):
+            name = _check_op(op, "reduce_scatter_tensor")
+            if name not in ("sum", "avg"):
+                raise _unsupported(f"reduce_scatter with {name.upper()}", "SUM and AVG only")
+            return self._on_cpu_group("reduce_scatter_tensor", list(outputs), [
+                lambda o=o, i=i: _gloo_reduce_scatter(o, i, name, self.size(), self._cpu())
+                for o, i in zip(outputs, inputs, strict=True)])
         return self._run("reduce_scatter_tensor", outputs, list(outputs), [
             lambda o=o, i=i: _collectives.reduce_scatter_tensor(o, i, op=op, async_op=True)
             for o, i in zip(outputs, inputs, strict=True)])
@@ -232,36 +265,52 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
 
     def reduce_scatter(self, outputs, input_lists, opts=None):  # noqa: D102
         """The list form: each rank's slices concatenated, then one reduce_scatter_tensor."""
-        works = []
+        joined = []
         for output, slices in zip(outputs, input_lists, strict=True):
             if len(slices) != self.size() or any(s.shape != output.shape for s in slices):
                 raise _unsupported("reduce_scatter with slices of different sizes",
                                    "every slice must have the output's shape")
-            joined = torch.cat([s.reshape(-1) for s in slices])
-            works.append(self._reduce_scatter_base(output, joined, opts))
-        return _all_of(works, list(outputs))
+            joined.append(torch.cat([s.reshape(-1) for s in slices]))
+        return self.reduce_scatter_tensor_coalesced(list(outputs), joined, opts)
 
     def barrier(self, opts=None):  # noqa: D102
         self._topology()
         return self._run("barrier", [], [], [lambda: _collectives.barrier(async_op=True)])
 
+    def gather(self, outputs, inputs, opts=None):  # noqa: D102
+        """CPU tensors only, on Gloo: what ``gather_object`` and checkpointing need."""
+        root = opts.rootRank if opts is not None else 0
+        _cpu_only("gather", [*inputs, *(t for lst in outputs for t in lst)])
+        gather_list = outputs[0] if self.rank() == root else None
+        return self._on_cpu_group("gather", outputs, [lambda: dist.gather(
+            inputs[0], gather_list=gather_list, dst=root, group=self._cpu(), async_op=True)])
+
+    def scatter(self, outputs, inputs, opts=None):  # noqa: D102
+        """CPU tensors only, on Gloo: what ``scatter_object_list`` and checkpointing need."""
+        root = opts.rootRank if opts is not None else 0
+        _cpu_only("scatter", [*outputs, *(t for lst in inputs for t in lst)])
+        scatter_list = inputs[0] if self.rank() == root else None
+        return self._on_cpu_group("scatter", outputs, [lambda: dist.scatter(
+            outputs[0], scatter_list=scatter_list, src=root, group=self._cpu(), async_op=True)])
+
     # ---- coalescing (dist._coalescing_manager with a device) ------------------------------
 
     def _start_coalescing(self, device: torch.device) -> None:
         """Calls until :meth:`_end_coalescing` run as they come, each queued in order."""
-        self._coalesced = []
+        self._coalesced, self._coalesced_torch = [], []
 
     def _end_coalescing(self, device: torch.device) -> dist.Work:
         works, self._coalesced = self._coalesced or [], None
-        if not works:
+        torch_works, self._coalesced_torch = self._coalesced_torch, []
+        futures = [w.get_future() for w in torch_works]
+        if works:  # the worker runs gpubridge's in order: the last one ends after the others
+            futures.append(works[-1].get_future())
+        if not futures:
             return _completed([])
-        last = works[-1]
-        return _create_work_from_future(last.get_future().then(lambda f: (f.value(), [])[1]))
+        return _create_work_from_future(torch.futures.collect_all(futures).then(
+            lambda f: ([g.value() for g in f.value()], [])[1]))
 
     # ---- refused --------------------------------------------------------------------------
-
-    def _gloo(self, what: str, tensors, start) -> dist.Work:
-        return _all_of([start(t) for t in tensors], list(tensors))
 
     def send(self, *args, **kwargs):  # noqa: D102
         raise _unsupported("send", "gpubridge has no point-to-point operations yet")
@@ -281,19 +330,49 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
     def all_to_all_single(self, *args, **kwargs):  # noqa: D102
         raise _unsupported("all_to_all_single")
 
-    def gather(self, *args, **kwargs):  # noqa: D102
-        raise _unsupported("gather")
-
-    def scatter(self, *args, **kwargs):  # noqa: D102
-        raise _unsupported("scatter")
-
     def reduce(self, *args, **kwargs):  # noqa: D102
         raise _unsupported("reduce", "use all_reduce")
 
 
-def _on_gloo(topology: _topology.Topology, tensors: Sequence[torch.Tensor]) -> bool:
-    """Whether these are CPU tensors on a GPU job: Gloo carries them directly."""
+def _cpu_path(topology: _topology.Topology, tensors: Sequence[torch.Tensor]) -> bool:
+    """Whether these are CPU tensors on a GPU job: the backend's Gloo group carries them."""
     return topology.device.type != "cpu" and all(t.device.type == "cpu" for t in tensors)
+
+
+def _cpu_only(what: str, tensors: Sequence[torch.Tensor]) -> None:
+    if not all(t.device.type == "cpu" for t in tensors):
+        raise _unsupported(f"{what} of GPU tensors",
+                           f"{what} runs on Gloo, for CPU tensors (e.g. {what}_object)")
+
+
+def _check_op(op, what: str) -> str:
+    """The reduction's name, refusing the ones gpubridge refuses, on the CPU path too."""
+    try:
+        return _collectives._reduce_op_name(op, what)
+    except ValueError as exc:
+        raise ValueError(f"{NAME} backend, {what}: {exc}") from exc
+
+
+def _gloo_reduce(fn, tensor: torch.Tensor, name: str, size: int, group) -> dist.Work:
+    """A Gloo all_reduce of ``name``; AVG as SUM and a division, as gpubridge does."""
+    op = {"sum": dist.ReduceOp.SUM, "avg": dist.ReduceOp.SUM, "max": dist.ReduceOp.MAX,
+          "min": dist.ReduceOp.MIN}[name]
+    if name != "avg":
+        return fn(tensor, op=op, group=group, async_op=True)
+    work = fn(tensor, op=op, group=group, async_op=True)
+    work.wait()
+    tensor.div_(size)
+    return _completed([tensor])
+
+
+def _gloo_reduce_scatter(output, input, name: str, size: int, group) -> dist.Work:  # noqa: A002
+    work = dist.reduce_scatter_tensor(output, input, op=dist.ReduceOp.SUM, group=group,
+                                      async_op=True)
+    if name != "avg":
+        return work
+    work.wait()
+    output.div_(size)
+    return _completed([output])
 
 
 def _all_of(works: Sequence[dist.Work], result: Any) -> dist.Work:
@@ -306,28 +385,62 @@ def _all_of(works: Sequence[dist.Work], result: Any) -> dist.Work:
             lambda f: ([g.value() for g in f.value()], result)[1]))
 
 
-def setup(timeout: timedelta | None) -> _topology.Topology:
-    """Build gpubridge's topology inside an existing ``torch.distributed`` job.
+def _teardown(group: GpubridgeProcessGroup) -> None:
+    global _owner, _cpu_group
+    with _setup_lock:
+        if _owner is not group:
+            return
+        _owner, _cpu_group = None, None
+        if not _topology.is_initialized():
+            return
+        try:
+            from gpubridge import _release
 
-    Collective over every rank. Creates a Gloo group of every rank for
-    discovery, then the islands and the bridge, exactly as ``gpubridge.init()``
-    does after it creates its own default group.
+            _release(drain=False)  # gpubridge's groups are already shut down
+        except Exception as exc:  # noqa: BLE001 - destroy_process_group must finish
+            warnings.warn(f"{NAME} backend: releasing gpubridge's state failed: {exc}",
+                          RuntimeWarning, stacklevel=3)
+
+
+def setup(timeout: timedelta | None) -> dist.ProcessGroup:
+    """Build gpubridge's topology inside an existing ``torch.distributed`` job; return the
+    backend's Gloo group for CPU tensors.
+
+    Collective over every rank. Creates two Gloo groups of every rank (one for
+    gpubridge's discovery, ``barrier()`` and ``flat-gloo``, one for the
+    backend's CPU tensors), then the islands and the bridge, as
+    ``gpubridge.init()`` does after it creates its own default group. A setting
+    one rank can't read fails every rank, after the groups exist, instead of
+    leaving the others waiting in ``new_group``.
     """
-    transport = resolve_transport(os.environ.get(BRIDGE_ENV, "").strip() or DEFAULT_TRANSPORT)
-    chosen = resolve_policy(os.environ.get(POLICY_ENV, "").strip() or DEFAULT_POLICY)
-    local, config = _topology.describe_local(transport.name, chosen)
-    world = dist.new_group(list(range(dist.get_world_size())), backend=CPU_BACKEND,
-                           timeout=timeout)
+    ranks = list(range(dist.get_world_size()))
+    world = dist.new_group(ranks, backend=CPU_BACKEND, timeout=timeout)
+    cpu = dist.new_group(ranks, backend=CPU_BACKEND, timeout=timeout)
+    problem = None
+    try:
+        transport = resolve_transport(os.environ.get(BRIDGE_ENV, "").strip()
+                                      or DEFAULT_TRANSPORT)
+        chosen = resolve_policy(os.environ.get(POLICY_ENV, "").strip() or DEFAULT_POLICY)
+        local, config = _topology.describe_local(transport.name, chosen)
+    except (ValueError, TypeError) as exc:
+        problem = str(exc)
+    problems: list[Any] = [None] * len(ranks)
+    dist.all_gather_object(problems, problem, group=world)
+    failing = [(rank, p) for rank, p in enumerate(problems) if p]
+    if failing:
+        raise RuntimeError(
+            f"gpubridge cannot start: {len(failing)} of {len(ranks)} ranks reported problems.\n"
+            + "\n".join(f"  rank {rank}: {p}" for rank, p in failing))
     topology = _topology.build_topology(local, config, transport=transport, policy=chosen,
                                         timeout=timeout, world_group=world)
     _work.shutdown()
     _observe._reset()
     _topology._set_topology(topology)
-    return topology
+    return cpu
 
 
 def create(options, backend_options=None) -> GpubridgeProcessGroup:
-    """The creator ``init_process_group`` calls (``extended_api=True``)."""
+    """The creator ``init_process_group`` and ``new_group`` call (``extended_api=True``)."""
     ranks = list(options.global_ranks_in_group)
     world = dist.get_world_size() if dist.is_initialized() else options.group_size
     if ranks and sorted(ranks) != list(range(world)):
@@ -342,6 +455,6 @@ def create(options, backend_options=None) -> GpubridgeProcessGroup:
 
 def register() -> None:
     """Make ``backend="gpubridge"`` known to ``torch.distributed``. Does nothing if it is
-    already (from an earlier call, or gpubridge's ``torch.backends`` entry point)."""
+    already (from an earlier call, or one of gpubridge's entry points)."""
     if dist.is_available() and NAME not in dist.Backend.backend_list:
         dist.Backend.register_backend(NAME, create, extended_api=True, devices=["cpu", "cuda"])
