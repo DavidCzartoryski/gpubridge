@@ -138,8 +138,8 @@ step bench_candidates mixed_torchrun candidates "$KIT_DIR/bench_all_reduce.py" \
 # DDP with gpubridge.ddp_comm_hook on real NVIDIA + AMD ranks (item 22).
 step train_ddp mixed_torchrun train "$REPO_DIR/examples/train_synthetic.py" \
     --json "$RESULTS/train_ddp.json"
-# gpubridge as the torch.distributed backend (item 30): an unmodified FSDP2 script,
-# backend="gpubridge" its only gpubridge line. Exits non-zero if ranks disagree.
+# gpubridge as the torch.distributed backend (item 30): a plain FSDP2 script apart from
+# backend="gpubridge" and `import gpubridge`. Exits non-zero if ranks disagree.
 step train_fsdp2_backend mixed_torchrun fsdp2 "$REPO_DIR/examples/fsdp2_torch_backend.py" \
     --json "$RESULTS/train_fsdp2_backend.json"
 # The same on exact data, against a single-process replay, bit for bit.

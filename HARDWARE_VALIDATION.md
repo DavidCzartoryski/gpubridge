@@ -390,8 +390,8 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     and `mixed/node.sh`; its summary.md says from which size each mode is
     faster.
 30. **DDP and FSDP2 through `backend="gpubridge"` on GPUs.** The
-    torch.distributed backend (docs/TORCH_BACKEND.md) carries an unmodified
-    script's collectives as gpubridge async collectives. Check that
+    torch.distributed backend (docs/TORCH_BACKEND.md) carries a script's
+    collectives as gpubridge async collectives. Check that
     `examples/fsdp2_torch_backend.py --verify` passes across a split test and
     across real NVIDIA + AMD ranks: on exact data, its parameters must equal a
     single-process replay bit for bit, which a collective reading or writing a

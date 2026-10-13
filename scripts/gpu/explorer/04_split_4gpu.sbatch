@@ -68,8 +68,8 @@ step check_auto_tuned env_local_torchrun GPUBRIDGE_THRESHOLDS="$RESULTS/threshol
 # if the ranks' parameters diverge.
 step train_ddp local_torchrun --nproc-per-node="$GPUS" "$REPO_DIR/examples/train_synthetic.py" \
     --json "$RESULTS/train_ddp.json"
-# gpubridge as the torch.distributed backend (item 30): an unmodified FSDP2 script,
-# backend="gpubridge" its only gpubridge line. Exits non-zero if ranks disagree.
+# gpubridge as the torch.distributed backend (item 30): a plain FSDP2 script apart from
+# backend="gpubridge" and `import gpubridge`. Exits non-zero if ranks disagree.
 step train_fsdp2_backend local_torchrun --nproc-per-node="$GPUS" \
     "$REPO_DIR/examples/fsdp2_torch_backend.py" --json "$RESULTS/train_fsdp2_backend.json"
 # The same through the backend on exact data, against a single-process replay, bit for bit.

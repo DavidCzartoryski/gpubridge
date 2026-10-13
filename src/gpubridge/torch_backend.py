@@ -1,10 +1,12 @@
 """gpubridge as a ``torch.distributed`` backend: ``dist.init_process_group(backend="gpubridge")``.
 
-Unmodified DDP and FSDP2 scripts then run their collectives through gpubridge,
-across vendor islands. Design and limits: docs/TORCH_BACKEND.md.
+DDP and FSDP2 scripts then run their collectives through gpubridge, across
+vendor islands, with no other change. Design and limits: docs/TORCH_BACKEND.md.
 
-- ``import gpubridge`` registers the name (and so does ``import torch``, through
-  gpubridge's entry points; see :mod:`gpubridge_backend`).
+- ``import gpubridge`` registers the name. On torch 2.14 and later, so does
+  asking for it (``init_process_group``, ``is_backend_available``), through
+  gpubridge's lazy ``torch.distributed.backends`` entry point. ``import torch``
+  never runs gpubridge code.
 - The process group is the world group. gpubridge's own groups (a Gloo group of
   every rank, the islands, the bridge) are created at its first collective,
   when ``dist.new_group`` can run; discovery then checks every rank as
@@ -491,6 +493,6 @@ def create(options, backend_options=None) -> GpubridgeProcessGroup:
 
 def register() -> None:
     """Make ``backend="gpubridge"`` known to ``torch.distributed``. Does nothing if it is
-    already (from an earlier call, or one of gpubridge's entry points)."""
+    already (from an earlier call, or gpubridge's entry point)."""
     if dist.is_available() and NAME not in dist.Backend.backend_list:
         dist.Backend.register_backend(NAME, create, extended_api=True, devices=["cpu", "cuda"])

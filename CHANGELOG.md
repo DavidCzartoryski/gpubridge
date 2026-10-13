@@ -11,9 +11,11 @@ still needs real hardware. Numbers in parentheses are pull requests.
 
 - gpubridge as a `torch.distributed` backend,
   `dist.init_process_group(backend="gpubridge")`, **experimental and not
-  validated on GPUs.** Unmodified DDP and FSDP2 scripts run their collectives
-  through gpubridge across vendor islands. Entry points register the name
-  without `import gpubridge`. gpubridge's groups are built at the first
+  validated on GPUs.** DDP and FSDP2 scripts run their collectives through
+  gpubridge across vendor islands with the backend name and `import
+  gpubridge`, which registers it. On torch 2.14 and later, a lazy
+  `torch.distributed.backends` entry point registers it without the import;
+  nothing hooks `import torch`. gpubridge's groups are built at the first
   collective, with the usual discovery checks. `GPUBRIDGE_POLICY` and
   `GPUBRIDGE_BRIDGE` pick the policy and transport. CPU tensors in GPU jobs go
   to a Gloo group. World group only; point-to-point, all-to-all, reduce,

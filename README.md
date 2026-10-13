@@ -410,19 +410,18 @@ untouched, use gpubridge as the backend instead (below).
 ### As a torch.distributed backend (experimental, not validated on GPUs)
 
 An existing DDP or FSDP2 script runs on a mixed NVIDIA + AMD cluster by
-changing only the backend name:
+changing the backend name and importing gpubridge:
 
 ```python
+import gpubridge                                # registers the backend name
 dist.init_process_group(backend="gpubridge")   # instead of "nccl"
 ```
 
-- **Registration.** Installed gpubridge registers the name through torch's
-  entry points, so the script needs no `import gpubridge`. On newer torch this
-  happens when the name is first asked for; on older torch (2.8), at every
-  `import torch`. From a source checkout that isn't installed, add `import
-  gpubridge`. If a stale install ever makes `import torch` fail,
-  `TORCH_DEVICE_BACKEND_AUTOLOAD=0` turns the older hook off; `import gpubridge`
-  still registers.
+- **Registration.** `import gpubridge` registers the name. Before torch 2.14
+  (2.8 included) the script needs it before `init_process_group`. On torch
+  2.14 and later, installed gpubridge also registers the name when it is
+  first asked for (torch's lazy `torch.distributed.backends` entry point), so
+  there the import is optional. gpubridge never hooks `import torch`.
 - **Setup.** gpubridge builds its own groups (a Gloo group of every rank, the
   islands, the bridge) at the first collective, and runs the same discovery
   checks as `gpubridge.init()`. `GPUBRIDGE_POLICY` and `GPUBRIDGE_BRIDGE` pick

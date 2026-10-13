@@ -1,10 +1,10 @@
 # gpubridge as a torch.distributed backend
 
-**Status: experimental, tested on CPU only.** The goal is for an unmodified
-DDP or FSDP2 training script to run on a mixed NVIDIA + AMD cluster by naming
-the backend:
+**Status: experimental, tested on CPU only.** The goal is for a DDP or FSDP2
+training script to run on a mixed NVIDIA + AMD cluster by naming the backend:
 
 ```python
+import gpubridge  # registers the name; optional on torch 2.14 and later
 dist.init_process_group(backend="gpubridge")
 ```
 
@@ -63,10 +63,12 @@ follows. Source references are to PyTorch 2.8.0 (gpubridge's floor) and 2.14.1
     (`torch/__init__.py`: lines 2805 and 2866 in 2.8.0, 3469 and 3529 in 2.14.1).
     An exception there, including failing to import the entry point's module,
     makes `import torch` itself fail.
-  - 2.14.1 also has a lazy group, `torch.distributed.backends`, loaded only when
-    an unknown backend name is first asked for
-    (`Backend._ensure_backend_registered`, `distributed_c10d.py` line 543). It
-    doesn't exist in 2.8.0.
+  - 2.14.0 added a lazy group, `torch.distributed.backends`, loaded only when
+    an unknown backend name is first asked for: by `init_process_group`,
+    `new_group`, `dist.Backend(name)` or `is_backend_available`
+    (`Backend._ensure_backend_registered`, `distributed_c10d.py` line 543 in
+    2.14.1). A failure there fails only that call. It doesn't exist in 2.13.0
+    or 2.8.0.
 
 ## What DDP and FSDP2 call
 
@@ -100,18 +102,18 @@ Other measured facts:
 **Registration.**
 - `import gpubridge` registers the backend name `"gpubridge"`, with
   `extended_api=True` and devices `cpu` and `cuda` (ROCm builds use `cuda`).
-- gpubridge also ships entry points, so a script's only gpubridge line can be
-  the backend name:
-  - **`torch.distributed.backends`** (newer torch): loaded only when
-    `backend="gpubridge"` is first asked for, so it costs nothing otherwise.
-  - **`torch.backends`** (older torch, 2.8 included): called on every
-    `import torch`. It registers the name without importing gpubridge, and
-    catches every exception.
-- **The `torch.backends` hook's one risk:** an install whose metadata outlives
-  its files (an editable install of a deleted worktree, or a checkout of a
-  commit older than the hook) makes `import torch` fail, because torch can't
-  import the hook's module. `TORCH_DEVICE_BACKEND_AUTOLOAD=0` turns it off;
-  reinstalling fixes it. `import gpubridge` always registers the name too.
+- On torch 2.14 and later, installed gpubridge also registers it through the
+  lazy `torch.distributed.backends` entry point, when `backend="gpubridge"` is
+  first asked for. There a script's only gpubridge line can be the backend
+  name, and nothing of gpubridge runs otherwise.
+- Before 2.14 (2.8 included), scripts need `import gpubridge` before
+  `init_process_group`.
+- **No `torch.backends` entry point.** It would register the name on older
+  torch too, but torch runs that group at every `import torch`, and anything
+  that goes wrong there makes `import torch` fail: an install whose metadata
+  outlives its files (an editable install of a deleted worktree, say) is
+  enough, whatever the hook catches. A library must never be able to break
+  `import torch`, so gpubridge doesn't use it.
 
 **One process group, the world.** The creator returns a
 `gpubridge.torch_backend.GpubridgeProcessGroup` for the world group.

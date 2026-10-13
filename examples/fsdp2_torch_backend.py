@@ -1,10 +1,11 @@
 """FSDP2 (``fully_shard``) with gpubridge as the torch.distributed backend.
 
-A plain FSDP2 training script: the only gpubridge in it is the backend name.
-Installed gpubridge registers that name when torch is imported (from a source
-checkout that isn't installed, add ``import gpubridge``). Parameters are
-sharded across every rank of every island; FSDP2's all-gathers and
-reduce-scatters cross the bridge. On CPU, in simulation mode, with two islands:
+A plain FSDP2 training script apart from the backend name and ``import
+gpubridge``, which registers that name. (On torch 2.14 and later, installed
+gpubridge also registers it when the name is first asked for, so the import is
+optional there.) Parameters are sharded across every rank of every island;
+FSDP2's all-gathers and reduce-scatters cross the bridge. On CPU, in simulation
+mode, with two islands:
 
     GPUBRIDGE_VENDOR=nvidia GPUBRIDGE_SPLIT_TEST=half torchrun --nproc-per-node=4 \\
         examples/fsdp2_torch_backend.py
@@ -30,6 +31,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+
+import gpubridge  # noqa: F401  registers backend="gpubridge"
 
 try:
     from torch.distributed.fsdp import fully_shard

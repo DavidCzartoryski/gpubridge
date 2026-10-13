@@ -152,10 +152,10 @@ collectives directly. That takes a `torch.distributed` backend.
 
 **Status: implemented, experimental, tested on CPU only.**
 `dist.init_process_group(backend="gpubridge")`; design, measurements and limits in
-[TORCH_BACKEND.md](TORCH_BACKEND.md). Unmodified DDP and FSDP2 scripts train
-through it, bit for bit like Gloo on integer-valued data in simulation mode,
-on torch 2.8.0 and 2.14.1. What changed from the CPU prototype recorded here
-before:
+[TORCH_BACKEND.md](TORCH_BACKEND.md). DDP and FSDP2 scripts train through it
+with the backend name and `import gpubridge`, bit for bit like Gloo on
+integer-valued data in simulation mode, on torch 2.8.0 and 2.14.1. What
+changed from the CPU prototype recorded here before:
 
 - **A Python `dist.ProcessGroup` subclass, not a `c10d.Backend` one.** A
   `Backend` subclass can't be constructed in Python on torch 2.8.0, the floor.

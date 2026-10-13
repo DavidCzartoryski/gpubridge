@@ -1,9 +1,9 @@
 """DistributedDataParallel with gpubridge as the torch.distributed backend.
 
-A plain DDP training script: the only gpubridge in it is the backend name.
-Installed gpubridge registers that name when torch is imported (from a source
-checkout that isn't installed, add ``import gpubridge``). On CPU, in simulation
-mode, with two islands:
+A plain DDP training script apart from the backend name and ``import gpubridge``,
+which registers that name. (On torch 2.14 and later, installed gpubridge also
+registers it when the name is first asked for, so the import is optional
+there.) On CPU, in simulation mode, with two islands:
 
     GPUBRIDGE_VENDOR=nvidia GPUBRIDGE_SPLIT_TEST=half torchrun --nproc-per-node=4 \\
         examples/ddp_torch_backend.py
@@ -23,6 +23,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
+
+import gpubridge  # noqa: F401  registers backend="gpubridge"
 
 
 def main() -> int:

@@ -549,26 +549,36 @@ def test_the_backend_is_registered_by_import_gpubridge():
     assert dist.Backend.backend_list.count("gpubridge") == 1
 
 
-def _entry_point_installed() -> bool:
-    return any(ep.name == "gpubridge" for ep in importlib.metadata.entry_points(
-        group="torch.backends"))
-
-
-@pytest.mark.skipif(not _entry_point_installed(), reason="gpubridge isn't installed with its "
-                    "entry points (e.g. run from a source tree)")
-def test_import_torch_registers_it_without_import_gpubridge():
+def test_import_torch_never_runs_gpubridge():
+    # No eager torch.backends entry point: anything that goes wrong in one breaks
+    # `import torch` itself. Only the lazy torch.distributed.backends group, if any.
     code = ("import sys, torch, torch.distributed as dist; "
-            "print('gpubridge' in dist.Backend.backend_list, 'gpubridge.topology' in sys.modules)")
+            "print('gpubridge' in dist.Backend.backend_list, "
+            "any(m.split('.')[0] == 'gpubridge' for m in sys.modules))")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          check=True).stdout.split()
-    assert out == ["True", "False"]  # registered, and gpubridge not yet imported
+    assert out == ["False", "False"]
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    assert '[project.entry-points."torch.backends"]' not in pyproject
+    assert '[project.entry-points."torch.distributed.backends"]' in pyproject
 
 
-def test_the_autoload_hook_never_raises(monkeypatch):
-    import gpubridge_backend
+def _lazy_entry_point() -> bool:
+    """Installed gpubridge, on a torch with the lazy group (2.14 and later)."""
+    return hasattr(dist.Backend, "_ensure_backend_registered") and any(
+        ep.name == "gpubridge"
+        for ep in importlib.metadata.entry_points(group="torch.distributed.backends"))
 
-    monkeypatch.setitem(sys.modules, "torch.distributed", None)  # importing it now fails
-    gpubridge_backend.register()  # must not raise: it would break `import torch`
+
+@pytest.mark.skipif(not _lazy_entry_point(), reason="needs torch 2.14+ and gpubridge installed "
+                    "with its entry point (not a source tree)")
+def test_newer_torch_registers_it_when_the_name_is_first_asked_for():
+    code = ("import sys, torch.distributed as dist; "
+            "print('gpubridge' in dist.Backend.backend_list, dist.is_backend_available('gpubridge'), "
+            "'gpubridge' in dist.Backend.backend_list)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         check=True).stdout.split()
+    assert out == ["False", "True", "True"]
 
 
 def test_cpu_tensors_go_to_gloo_only_on_gpu_jobs():
