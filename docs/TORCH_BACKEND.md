@@ -65,10 +65,10 @@ follows. Source references are to PyTorch 2.8.0 (gpubridge's floor) and 2.14.1
     makes `import torch` itself fail.
   - 2.14.0 added a lazy group, `torch.distributed.backends`, loaded only when
     an unknown backend name is first asked for: by `init_process_group`,
-    `new_group`, `dist.Backend(name)` or `is_backend_available`
+    `new_group` or `is_backend_available`, not by `dist.Backend(name)`
     (`Backend._ensure_backend_registered`, `distributed_c10d.py` line 543 in
-    2.14.1). A failure there fails only that call. It doesn't exist in 2.13.0
-    or 2.8.0.
+    2.14.1). A failure there fails only that call. It isn't in 2.13.0's
+    source, nor in 2.8.0.
 
 ## What DDP and FSDP2 call
 

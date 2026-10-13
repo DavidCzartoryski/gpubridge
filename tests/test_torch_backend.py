@@ -558,7 +558,7 @@ def test_import_torch_never_runs_gpubridge():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          check=True).stdout.split()
     assert out == ["False", "False"]
-    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    pyproject = (REPO / "pyproject.toml").read_text()
     assert '[project.entry-points."torch.backends"]' not in pyproject
     assert '[project.entry-points."torch.distributed.backends"]' in pyproject
 
@@ -572,13 +572,20 @@ def _lazy_entry_point() -> bool:
 
 @pytest.mark.skipif(not _lazy_entry_point(), reason="needs torch 2.14+ and gpubridge installed "
                     "with its entry point (not a source tree)")
-def test_newer_torch_registers_it_when_the_name_is_first_asked_for():
-    code = ("import sys, torch.distributed as dist; "
-            "print('gpubridge' in dist.Backend.backend_list, dist.is_backend_available('gpubridge'), "
-            "'gpubridge' in dist.Backend.backend_list)")
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+def test_newer_torch_registers_it_when_the_name_is_first_asked_for(tmp_path):
+    asked = ("import torch.distributed as dist; "
+             "print('gpubridge' in dist.Backend.backend_list, dist.is_backend_available('gpubridge'), "
+             "'gpubridge' in dist.Backend.backend_list)")
+    out = subprocess.run([sys.executable, "-c", asked], capture_output=True, text=True,
                          check=True).stdout.split()
     assert out == ["False", "True", "True"]
+    # A script whose only gpubridge line is the backend name.
+    script = ("import torch.distributed as dist; "
+              f"dist.init_process_group('gpubridge', init_method='file://{tmp_path / 'init'}', "
+              "rank=0, world_size=1); print(dist.get_backend()); dist.destroy_process_group()")
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         check=True).stdout.split()
+    assert out == ["gpubridge"]
 
 
 def test_cpu_tensors_go_to_gloo_only_on_gpu_jobs():

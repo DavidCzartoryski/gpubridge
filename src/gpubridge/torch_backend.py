@@ -1,7 +1,7 @@
 """gpubridge as a ``torch.distributed`` backend: ``dist.init_process_group(backend="gpubridge")``.
 
 DDP and FSDP2 scripts then run their collectives through gpubridge, across
-vendor islands, with no other change. Design and limits: docs/TORCH_BACKEND.md.
+vendor islands. Design and limits: docs/TORCH_BACKEND.md.
 
 - ``import gpubridge`` registers the name. On torch 2.14 and later, so does
   asking for it (``init_process_group``, ``is_backend_available``), through

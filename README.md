@@ -404,8 +404,9 @@ model.register_comm_hook(None, gpubridge.ddp_comm_hook)
   collective on that rank refuses to start.
 - Tested on CPU; not validated on GPUs (HARDWARE_VALIDATION.md item 22).
 
-The hook covers DDP only. For FSDP2, or to leave a training script
-untouched, use gpubridge as the backend instead (below).
+The hook covers DDP only. For FSDP2, or to change a training script only by
+its backend name and `import gpubridge`, use gpubridge as the backend instead
+(below).
 
 ### As a torch.distributed backend (experimental, not validated on GPUs)
 
