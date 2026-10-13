@@ -42,6 +42,12 @@ PINNED_STAGING_ENV = "GPUBRIDGE_PINNED_STAGING"
 BRIDGE_COMPRESSION_ENV = "GPUBRIDGE_BRIDGE_COMPRESSION"
 BRIDGE_COMPRESSION_MODES = ("bf16", "fp8")
 
+#: Under the torch.distributed backend (``init_process_group(backend="gpubridge")``)
+#: only: the collective policy and the bridge transport, which ``gpubridge.init()``
+#: takes as arguments. Default ``auto`` and ``gloo``; must match on every rank.
+POLICY_ENV = "GPUBRIDGE_POLICY"
+BRIDGE_ENV = "GPUBRIDGE_BRIDGE"
+
 #: Backend of the global discovery group and the cross-vendor bridge. Both run on CPU.
 CPU_BACKEND = "gloo"
 #: Backend of islands on real GPUs. On ROCm builds of PyTorch, "nccl" runs RCCL.

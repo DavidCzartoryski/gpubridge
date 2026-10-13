@@ -61,6 +61,9 @@ from gpubridge.transport import (
 from gpubridge.work import Work
 
 from gpubridge.ucx import transport as _ucx_transport  # noqa: E402,F401 - registers bridge="ucx"
+from gpubridge import torch_backend as _torch_backend  # noqa: E402
+
+_torch_backend.register()  # backend="gpubridge" for torch.distributed
 
 __version__ = "0.3.0a0"
 

@@ -43,8 +43,16 @@ Issues = "https://github.com/DavidCzartoryski/gpubridge/issues"
 [project.optional-dependencies]
 test = ["pytest>=8"]
 
+# torch calls this at import, so init_process_group(backend="gpubridge") needs no
+# import gpubridge (src/gpubridge_backend.py; it never raises).
+[project.entry-points."torch.backends"]
+gpubridge = "gpubridge_backend:register"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/gpubridge"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/gpubridge_backend.py" = "gpubridge_backend.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
