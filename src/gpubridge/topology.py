@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import warnings
 from collections.abc import Iterator, Sequence
@@ -586,30 +587,43 @@ def build_topology(
 
 
 @contextlib.contextmanager
-def _members_only() -> Iterator[None]:
+def _members_only(prefix: str) -> Iterator[None]:
     """Every ``dist.new_group`` inside synchronizes only the new group's ranks
-    (``use_local_synchronization=True``): a subgroup's members build its groups
-    without the rest of the job. Transports and policies call ``dist.new_group``."""
-    plain = dist.new_group
+    (``use_local_synchronization=True``), so a subgroup's members build its groups
+    without the rest of the job (transports and policies call ``dist.new_group``).
+
+    And each group is named ``{prefix}.{i}``, the i-th created here. torch names
+    such groups from state that differs between ranks of asymmetric groups (2.8:
+    how many groups this rank has; 2.14: a counter that only creating ranks
+    advance), so members could compute different names and wait on different
+    store keys, and later groups of the whole job too. ``prefix`` is the
+    subgroup's own name, the same on every member."""
+    c10d = dist.distributed_c10d
+    plain_new, plain_name = dist.new_group, c10d._process_group_name
+    count = itertools.count()
 
     def local(*args: Any, **kwargs: Any) -> Any:
         kwargs["use_local_synchronization"] = True
-        return plain(*args, **kwargs)
+        return plain_new(*args, **kwargs)
 
-    dist.new_group = local  # type: ignore[assignment]
+    def name(ranks: Any, use_hashed_name: bool = False) -> str:
+        return f"{prefix}.{next(count)}"
+
+    dist.new_group, c10d._process_group_name = local, name  # type: ignore[assignment]
     try:
         yield
     finally:
-        dist.new_group = plain  # type: ignore[assignment]
+        dist.new_group, c10d._process_group_name = plain_new, plain_name  # type: ignore[assignment]
 
 
-def build_subtopology(world: Topology, ranks: Sequence[int],
+def build_subtopology(world: Topology, ranks: Sequence[int], name: str,
                       timeout: timedelta | None = None) -> tuple[Topology, ProcessGroup]:
     """A subgroup's own topology, over its members only; and a Gloo group of them.
 
     Collective over the members (``ranks``, global, ascending), which must all
     call it, in the same order relative to other subgroups' setups; the rest of
-    the job doesn't take part. Islands come from the world's labels (no new
+    the job doesn't take part. ``name`` is the subgroup's (torch's group name),
+    from which its own groups are named alike on every member. Islands come from the world's labels (no new
     discovery). Single-vendor members get ``native-only``; mixed members get
     the policy the job asked for, resolved for their layout, and the world's
     bridge transport over their own leaders. Groups are created in the same
@@ -625,7 +639,7 @@ def build_subtopology(world: Topology, ranks: Sequence[int],
     else:
         policy_cls = choose_policy(AUTO if asked == AUTO else type(world.policy), layout)
     rank = world.rank
-    with _members_only():
+    with _members_only(f"gpubridge:{name}"):
         group = dist.new_group(list(ranks), timeout=timeout, backend=CPU_BACKEND)
         cpu = dist.new_group(list(ranks), timeout=timeout, backend=CPU_BACKEND)
         island_group: ProcessGroup | None = None

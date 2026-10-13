@@ -122,7 +122,8 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
             return world
         with _setup_lock:
             if self._sub is None:
-                self._sub = _topology.build_subtopology(world, self._members, self._timeout)
+                self._sub = _topology.build_subtopology(world, self._members, self._name,
+                                                        self._timeout)
             return self._sub[0]
 
     def _world_topology(self) -> _topology.Topology:

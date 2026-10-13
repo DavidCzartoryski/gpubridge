@@ -355,15 +355,7 @@ def _refused(rank, world):
            "allgather with tensors of different sizes")
     expect(lambda: dist.reduce_scatter_tensor(torch.empty(2), torch.ones(5)),
            "gpubridge backend, reduce_scatter_tensor: .*times as many elements")
-    # A subgroup can't be gpubridge's: refused on its members, where it is created;
-    # the other ranks aren't members and get NON_GROUP_MEMBER, as with any backend.
-    if rank < 2:
-        expect(lambda: dist.new_group([0, 1], use_local_synchronization=True),
-               "runs on the world group only")
-    else:  # torch 2.8 returns None there, newer ones NON_GROUP_MEMBER
-        assert dist.new_group([0, 1], use_local_synchronization=True) in (
-            None, dist.GroupMember.NON_GROUP_MEMBER)
-    # The world again is fine: it shares gpubridge's topology.
+    # A group of every rank shares gpubridge's topology.
     again = dist.new_group(list(range(world)))
     t = rank_tensor((4,), torch.float32, rank)
     dist.all_reduce(t, group=again)
@@ -539,6 +531,154 @@ def _one_rank_with_a_bad_setting(rank, world):
 def test_a_bad_setting_on_one_rank_fails_every_rank_instead_of_hanging(tmp_path):
     run_backend(TWO_TWO, _one_rank_with_a_bad_setting, tmp_path,
                 env={1: {POLICY_ENV: "no-such"}, -1: {}})
+
+
+# ---- subgroups and HSDP --------------------------------------------------------------------
+
+def _sub(group) -> torch_backend.GpubridgeProcessGroup:
+    assert isinstance(group, torch_backend.GpubridgeProcessGroup), group
+    return group
+
+
+def _subgroups(rank, world):
+    # Every rank creates every group, in the same order; torch calls the creator on
+    # members only, and the others get NON_GROUP_MEMBER (None on torch 2.8).
+    nvidia, amd = dist.new_group([0, 1]), dist.new_group([2, 3])
+    pair, triple = dist.new_group([0, 2]), dist.new_group([0, 1, 3])
+    outside = (None, dist.GroupMember.NON_GROUP_MEMBER)
+    # The first collective runs on every rank, each on its own island's subgroup: it
+    # sets up the world's topology too (every rank takes part), then the subgroup's.
+    island = nvidia if rank < 2 else amd
+    t = rank_tensor((5,), torch.float32, rank)
+    dist.all_reduce(t, group=island)
+    mates = [0, 1] if rank < 2 else [2, 3]
+    assert torch.equal(t, sum(rank_tensor((5,), torch.float32, r) for r in mates))
+    topology = _sub(island)._topology()
+    assert topology.policy.name == "native-only" and topology.bridge is None
+    assert topology.layout.members == tuple(mates) and len(topology.layout.islands) == 1
+    assert (nvidia in outside) == (rank >= 2) and (amd in outside) == (rank < 2)
+
+    # Mixed members: bridged, between the subgroup's own leaders.
+    if rank in (0, 2):
+        topology = _sub(pair)._topology()
+        assert topology.policy.name == "reduce-bridge-broadcast"
+        assert topology.layout.bridge_ranks == (0, 2) and topology.bridge is not None
+        t = rank_tensor((6,), torch.float64, rank)
+        dist.all_reduce(t, group=pair)
+        assert torch.equal(t, rank_tensor((6,), torch.float64, 0)
+                           + rank_tensor((6,), torch.float64, 2))
+        out = torch.empty(2, 3, dtype=torch.int64)
+        dist.all_gather_into_tensor(out, torch.full((3,), rank), group=pair)
+        assert out.tolist() == [[0, 0, 0], [2, 2, 2]]  # rows in group-rank order
+        got = torch.empty(2, dtype=torch.int64)
+        dist.reduce_scatter_tensor(got, torch.arange(4) + 10 * rank, group=pair)
+        assert got.tolist() == ([20, 22] if rank == 0 else [24, 26])  # slice = group rank
+        b = torch.full((4,), float(rank))
+        dist.broadcast(b, src=2, group=pair)  # src is a global rank, as torch takes it
+        assert torch.equal(b, torch.full((4,), 2.0))
+        dist.barrier(group=pair)
+    else:
+        assert pair in outside
+    # Members not contiguous, and an island of one: rows follow ascending global rank.
+    if rank in (0, 1, 3):
+        topology = _sub(triple)._topology()
+        assert [i.ranks for i in topology.layout.islands] == [(0, 1), (3,)]
+        out = torch.empty(3, 2, dtype=torch.float32)
+        dist.all_gather_into_tensor(out, torch.full((2,), float(rank)), group=triple)
+        assert out[:, 0].tolist() == [0.0, 1.0, 3.0]
+        got = torch.empty(2, dtype=torch.float32)
+        dist.reduce_scatter_tensor(got, torch.arange(6, dtype=torch.float32), group=triple)
+        position = [0, 1, 3].index(rank)
+        assert got.tolist() == [3.0 * (2 * position), 3.0 * (2 * position + 1)]
+        objects = [None] * 3
+        dist.all_gather_object(objects, f"r{rank}", group=triple)  # CPU tensors: Gloo
+        assert objects == ["r0", "r1", "r3"]
+    # The world still works after its subgroups.
+    t = rank_tensor((4,), torch.float32, rank)
+    dist.all_reduce(t)
+    assert torch.equal(t, sum(rank_tensor((4,), torch.float32, r) for r in range(world)))
+
+
+def test_subgroups_of_one_vendor_are_native_and_mixed_ones_bridged(tmp_path):
+    run_backend(TWO_TWO, _subgroups, tmp_path)
+
+
+class _Records(gpubridge.CollectiveObserver):
+    def __init__(self):
+        self.records = []
+
+    def on_collective(self, record):
+        self.records.append(record)
+
+
+def _hsdp(rank, world, out):
+    """HSDP on a 2-D mesh whose rows are the vendor islands: shard within an island,
+    replicate across vendors. Records every gpubridge collective and bridge call."""
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from gpubridge import transport
+
+    fully_shard = _fully_shard()
+    dist.barrier()  # sets gpubridge up, so an observer can attach before training
+    records = _Records()
+    gpubridge.add_observer(records)
+    bridge_calls = []
+    for name in ("all_reduce", "broadcast"):
+        plain = getattr(transport.GlooTransport, name)
+
+        def counted(self, *args, _plain=plain, _name=name, **kwargs):
+            bridge_calls.append(_name)
+            return _plain(self, *args, **kwargs)
+
+        setattr(transport.GlooTransport, name, counted)
+    mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("replicate", "shard"))
+    shard, replicate = mesh.get_group("shard"), mesh.get_group("replicate")
+    assert _sub(shard)._topology().layout.members == ((0, 1) if rank < 2 else (2, 3))
+    assert _sub(replicate)._topology().layout.members == ((0, 2) if rank % 2 == 0 else (1, 3))
+    model = _integer_model()
+    for layer in model:
+        if isinstance(layer, nn.Linear):
+            fully_shard(layer, mesh=mesh)
+    fully_shard(model, mesh=mesh)
+    opt = torch.optim.SGD(model.parameters(), lr=LR)
+    for step in range(STEPS):
+        model(_batch(rank, step)).sum().backward()
+        opt.step()
+        opt.zero_grad()
+    full = [p.full_tensor().detach().clone() for p in model.parameters()]
+    gpubridge.remove_observer(records)
+    calls = [(r.op, r.policy, tuple(p.name for p in r.phases)) for r in records.records]
+    torch.save({"params": full, "calls": calls, "bridge_calls": bridge_calls},
+               f"{out}.{rank}")
+
+
+def test_hsdp_shards_within_islands_and_replicates_across_the_bridge(tmp_path):
+    out = tmp_path / "hsdp"
+    run_backend(TWO_TWO, partial(_hsdp, out=str(out)), tmp_path)
+    # One process on the whole batch: the mean gradient over the 4 ranks' batches.
+    model = _integer_model()
+    opt = torch.optim.SGD(model.parameters(), lr=LR)
+    for step in range(STEPS):
+        loss = sum(model(_batch(r, step)).sum() for r in range(4)) / 4
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+    for rank in range(4):
+        got = torch.load(f"{out}.{rank}")
+        assert all(torch.equal(a, b.detach()) for a, b in zip(got["params"], model.parameters(),
+                                                              strict=True)), rank
+        calls = got["calls"]
+        gathers = [c for c in calls if c[0] in ("all_gather_into_tensor", "reduce_scatter_tensor")]
+        scatters = [c for c in gathers if c[0] == "reduce_scatter_tensor"]
+        reduces = [c for c in calls if c[0] == "all_reduce"]
+        # Every all-gather and reduce-scatter ran native-only, inside an island: no bridge.
+        assert gathers and all(c[1] == "native-only" and "bridge" not in c[2] for c in gathers)
+        # Each reduce-scattered gradient shard crossed vendors once, on the replicate group.
+        assert scatters and len(reduces) == len(scatters) and len(reduces) % STEPS == 0
+        assert all(c[1] == "reduce-bridge-broadcast" and "bridge" in c[2] for c in reduces)
+        # Bridge calls: only on the leaders of the replicate groups (every rank is one
+        # here: one rank per island), one per all_reduce, none for the rest.
+        assert got["bridge_calls"] == ["all_reduce"] * len(reduces), rank
 
 
 # ---- registration and pure logic -----------------------------------------------------------
