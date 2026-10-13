@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import warnings
 from collections.abc import Iterator, Sequence
@@ -586,6 +587,58 @@ def build_topology(
     return topology
 
 
+def _subgroup_naming_problem() -> str | None:
+    """What, if anything, differs from the torch :func:`_members_only` patches:
+    ``distributed_c10d._process_group_name(ranks, use_hashed_name)``, which
+    ``dist.new_group`` (or a ``distributed_c10d`` function it calls) names its
+    groups with, and ``dist.new_group``'s ``use_local_synchronization``."""
+    c10d = dist.distributed_c10d
+    name = getattr(c10d, "_process_group_name", None)
+    if not callable(name):
+        return "torch.distributed.distributed_c10d has no _process_group_name"
+    try:
+        signature = inspect.signature(name)
+    except (TypeError, ValueError):
+        return "its _process_group_name has no signature to check"
+    params = list(signature.parameters.values())
+    if ([p.name for p in params] != ["ranks", "use_hashed_name"]
+            or any(p.kind is not p.POSITIONAL_OR_KEYWORD for p in params)):
+        return f"its _process_group_name takes {signature}, not (ranks, use_hashed_name)"
+    if "use_local_synchronization" not in inspect.signature(dist.new_group).parameters:
+        return "its dist.new_group has no use_local_synchronization argument"
+
+    def names(fn: Any) -> tuple[str, ...]:  # the globals a function's code looks up
+        return getattr(getattr(inspect.unwrap(fn), "__code__", None), "co_names", ())
+
+    called = names(dist.new_group)
+    inner = [getattr(c10d, n) for n in called
+             if callable(getattr(c10d, n, None))
+             and getattr(getattr(c10d, n), "__module__", None) == c10d.__name__]
+    if "_process_group_name" not in called + tuple(n for fn in inner for n in names(fn)):
+        return "its dist.new_group doesn't name groups with _process_group_name"
+    return None
+
+
+def check_subgroup_naming() -> None:
+    """Refuse subgroups, clearly, on a torch whose private group naming isn't what
+    :func:`_members_only` patches: the patch would miss or break it, and members
+    could wait on different store keys until the timeout instead.
+
+    Raises:
+        RuntimeError: naming the torch version and what differs.
+    """
+    problem = _subgroup_naming_problem()
+    if problem is not None:
+        raise RuntimeError(
+            f"gpubridge can't create subgroups on torch {torch.__version__}: {problem}. While a "
+            "subgroup sets up, gpubridge replaces torch's private "
+            "distributed_c10d._process_group_name(ranks, use_hashed_name) so that every member "
+            "names the subgroup's groups alike; on this torch that could leave members waiting "
+            "on each other until the timeout, so subgroups are refused instead. Groups of every "
+            "rank (DDP, FSDP2 on a 1-D mesh) are unaffected. Checked on torch 2.8.0 and 2.14.1 "
+            "(docs/TORCH_BACKEND.md, \"Subgroups and HSDP\").")
+
+
 @contextlib.contextmanager
 def _members_only(prefix: str) -> Iterator[None]:
     """Every ``dist.new_group`` inside synchronizes only the new group's ranks
@@ -605,6 +658,7 @@ def _members_only(prefix: str) -> Iterator[None]:
     The patch is process-wide: no other thread may create groups meanwhile
     (the backend holds the subgroup's setup lock; the training thread is in
     the subgroup's first collective)."""
+    check_subgroup_naming()
     c10d = dist.distributed_c10d
     plain_new, plain_name = dist.new_group, c10d._process_group_name
     seen: dict[tuple[int, ...], int] = {}

@@ -16,7 +16,11 @@ still needs real hardware. Numbers in parentheses are pull requests.
   groups set to the vendor islands keeps all-gathers and reduce-scatters inside
   each vendor and sends one replicate all_reduce per step over the bridge.
   `examples/fsdp2_torch_backend.py --hsdp ISLANDS`. Design:
-  docs/TORCH_BACKEND.md, "Subgroups and HSDP".
+  docs/TORCH_BACKEND.md, "Subgroups and HSDP". Subgroup setup patches torch's
+  private `distributed_c10d._process_group_name`. On a torch where that
+  function or `dist.new_group`'s use of it has changed, creating a subgroup
+  fails with an error naming the torch version, so the job doesn't risk a
+  hang.
 
 - gpubridge as a `torch.distributed` backend,
   `dist.init_process_group(backend="gpubridge")`, **experimental and not

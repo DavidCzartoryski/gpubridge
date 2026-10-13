@@ -13,6 +13,7 @@ import gc
 import importlib.metadata
 import inspect
 import os
+import re
 import subprocess
 import sys
 from datetime import timedelta
@@ -25,10 +26,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
-from _harness import rank_tensor
+from _harness import expected_sum, rank_tensor
 
 import gpubridge
-from gpubridge import torch_backend
+from gpubridge import topology, torch_backend
 from gpubridge.config import BRIDGE_ENV, POLICY_ENV, VENDOR_ENV
 
 TWO_TWO = ["nvidia", "nvidia", "amd", "amd"]
@@ -743,6 +744,85 @@ def test_hsdp_shards_within_islands_and_replicates_across_the_bridge(tmp_path):
         # Bridge calls: only on the leaders of the replicate groups (every rank is one
         # here: one rank per island), one per all_reduce, none for the rest.
         assert got["bridge_calls"] == ["all_reduce"] * len(reduces), rank
+
+
+# A torch whose private group naming isn't what subgroup setup patches
+# (topology._members_only): subgroups are refused where they are created, on
+# their members, naming the torch version; groups of every rank still work.
+
+def _changed_naming(plain):
+    return lambda ranks, use_hashed_name, group_desc=None: plain(ranks, use_hashed_name)
+
+
+NAMING_CHANGES = {
+    "a parameter added": (lambda c10d: ("_process_group_name", _changed_naming(
+        c10d._process_group_name)), r"takes \(ranks, use_hashed_name, group_desc=None\)"),
+    "a parameter renamed": (lambda c10d: ("_process_group_name", lambda ranks, hashed: "0"),
+                            r"takes \(ranks, hashed\), not \(ranks, use_hashed_name\)"),
+    "keyword-only": (lambda c10d: ("_process_group_name", lambda ranks, *, use_hashed_name: "0"),
+                     r"takes \(ranks, \*, use_hashed_name\)"),
+    "gone": (lambda c10d: ("_process_group_name", None), "has no _process_group_name"),
+    "new_group names groups otherwise": (
+        lambda c10d: ("new_group", lambda ranks=None, use_local_synchronization=False: None),
+        "doesn't name groups with _process_group_name"),
+    "new_group without local synchronization": (
+        lambda c10d: ("new_group", lambda ranks=None, timeout=None, backend=None: None),
+        "has no use_local_synchronization argument"),
+}
+
+
+def test_this_torch_has_the_private_group_naming_subgroups_patch():
+    assert topology._subgroup_naming_problem() is None, torch.__version__
+
+
+@pytest.mark.parametrize("change", list(NAMING_CHANGES))
+def test_subgroups_are_refused_if_torch_changed_its_private_group_naming(change, monkeypatch):
+    patch, why = NAMING_CHANGES[change]
+    c10d = dist.distributed_c10d
+    name, replacement = patch(c10d)
+    owner = dist if name == "new_group" else c10d
+    if replacement is None:
+        monkeypatch.delattr(owner, name)
+    else:
+        monkeypatch.setattr(owner, name, replacement)
+    refused = rf"can't create subgroups on torch {re.escape(str(torch.__version__))}: .*{why}"
+
+    def options(ranks, size):
+        return SimpleNamespace(global_ranks_in_group=ranks, group_size=size, group_rank=0,
+                               group_id="1", timeout=TIMEOUT)
+
+    world = dist.get_world_size() if dist.is_initialized() else 4
+    with pytest.raises(RuntimeError, match=refused):
+        torch_backend.create(options([0, 2], 2))
+    with pytest.raises(RuntimeError, match=refused):  # and nothing is patched
+        with topology._members_only("gpubridge:1"):
+            pass
+    assert getattr(owner, name, None) is replacement
+    assert torch_backend.create(options([], world)).size() == world  # the world group
+    assert torch_backend.create(options(list(range(world)), world))._members == ()
+
+
+def _naming_changed_mid_job(rank, world):
+    t = rank_tensor((3,), torch.float32, rank)
+    dist.all_reduce(t)  # gpubridge is set up
+    c10d = dist.distributed_c10d
+    plain = c10d._process_group_name
+    c10d._process_group_name = _changed_naming(plain)
+    try:
+        if rank in (0, 2):
+            with pytest.raises(RuntimeError, match="can't create subgroups on torch "
+                               + re.escape(str(torch.__version__))):
+                dist.new_group([0, 2], backend="gpubridge")
+        else:
+            assert dist.new_group([0, 2], backend="gpubridge") == dist.GroupMember.NON_GROUP_MEMBER
+    finally:
+        c10d._process_group_name = plain
+    dist.all_reduce(t)  # the job goes on, on every rank
+    assert torch.equal(t, expected_sum((3,), torch.float32, world) * world)
+
+
+def test_a_refused_subgroup_fails_its_members_where_created_and_the_job_goes_on(tmp_path):
+    run_backend(TWO_TWO, _naming_changed_mid_job, tmp_path)
 
 
 # ---- registration and pure logic -----------------------------------------------------------
