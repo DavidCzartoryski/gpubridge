@@ -339,9 +339,10 @@ class Topology:
     timeout: timedelta | None = None
     """The timeout ``init()`` gave its groups, for groups a policy creates in ``setup()``."""
     world_group: ProcessGroup | None = None
-    """A Gloo group of every rank: discovery, :func:`gpubridge.barrier` and ``flat-gloo``.
-    The default group after :func:`gpubridge.init`; a group of its own under the
-    torch.distributed backend, where the default group is the backend itself."""
+    """A Gloo group of every rank for discovery, :func:`gpubridge.barrier` and ``flat-gloo``,
+    under the torch.distributed backend, where the default group is the backend
+    itself. None after :func:`gpubridge.init`: the default group, a Gloo one, looked
+    up when used rather than held here."""
 
     @property
     def policy_name(self) -> str:
@@ -506,9 +507,8 @@ def build_topology(
             to the layout, on every rank alike.
     """
     rank = dist.get_rank()
-    world = world_group if world_group is not None else dist.group.WORLD
     gathered: list[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, local.to_wire(), group=world)
+    dist.all_gather_object(gathered, local.to_wire(), group=world_group)  # None: the default
     peers = tuple(PeerInfo.from_wire(info) for info in gathered)
     validate_peers(peers, warn=rank == 0)
     if not config.simulated:
@@ -560,7 +560,7 @@ def build_topology(
         policy=policy_cls(),
         transport=transport,
         timeout=timeout,
-        world_group=world,
+        world_group=world_group,
     )
     topology.policy.setup(topology)
     return topology
