@@ -435,8 +435,10 @@ dist.init_process_group(backend="gpubridge")   # instead of "nccl"
   communication:
   - subgroups (HSDP, 2-D meshes, `new_group` other than the world);
   - point-to-point, all-to-all, gather, scatter and reduce;
-  - reductions other than SUM, AVG, MAX and MIN;
-  - `torch.compile`'s functional collectives.
+  - reductions other than SUM, AVG, MAX and MIN.
+
+  `torch.compile`'s functional collectives don't work either (they need a
+  C++ backend), nor does `TORCH_DISTRIBUTED_DEBUG=DETAIL`.
 - **One or the other.** Use `gpubridge.init()` or the backend in one process,
   not both. With the backend, gpubridge's own functions (`gpubridge.all_reduce`,
   observers, `in_flight()`) work too.
