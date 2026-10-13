@@ -32,6 +32,7 @@ END_TO_END = {
     "gpukit.py": "imported by check, bench, probe and device_map",
     "check.py": "every job below, and test_gpu_kit.py",
     "bench_all_reduce.py": "test_step_03, 04, 05, 07, the node pair",
+    "bench_compression.py": "test_step_04, 07, the node pair, test_amd_node_job",
     "summarize.py": "every job below",
     "probe.py": "test_step_01 and 07 (fails on CPU: no GPU)",
     "device_map.py": "test_step_03 (fails on CPU: no GPU)",
@@ -242,7 +243,10 @@ def test_a_two_node_rendezvous_never_looks_up_the_host_name(tmp_path):
     (site / "sitecustomize.py").write_text(
         "import socket\nsocket.getfqdn = lambda name='': 'unresolvable.invalid'\n")
     worker = tmp_path / "worker.py"
-    worker.write_text("import os\nprint(os.environ['RANK'], os.environ['MASTER_ADDR'])\n")
+    # One write per line: the two workers share a pipe and may run unbuffered, where
+    # print() writes each piece separately and two lines can interleave.
+    worker.write_text("import os\nos.write(1, f\"{os.environ['RANK']} "
+                      "{os.environ['MASTER_ADDR']}\\n\".encode())\n")
     env = cluster_env(tmp_path, PYTHONPATH=str(site))
     result = subprocess.run(
         ["srun", "--nodes=2", "--ntasks-per-node=1", "--kill-on-bad-exit=1", sys.executable,

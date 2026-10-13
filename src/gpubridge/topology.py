@@ -14,12 +14,14 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from gpubridge.config import (
+    BRIDGE_COMPRESSION_ENV,
     CPU_ONLY_ENV,
     GPU_BACKEND,
     PINNED_STAGING_ENV,
     SPLIT_TEST_ENV,
     VENDOR_ENV,
     Config,
+    bridge_compression_setting,
     gpu_identity,
     hostname,
     pinned_staging_setting,
@@ -123,6 +125,8 @@ class PeerInfo:
     """The physical GPU this rank drives (UUID, PCI address); empty if unknown, None on CPU."""
     pinned_staging: bool = False
     """This rank's ``GPUBRIDGE_PINNED_STAGING``: stage the default bridge in pinned memory."""
+    bridge_compression: str = ""
+    """This rank's ``GPUBRIDGE_BRIDGE_COMPRESSION`` (``bf16`` or ``fp8``), or empty when off."""
 
     @property
     def torch_version(self) -> str:
@@ -165,6 +169,11 @@ def describe_local(
     except ValueError as exc:
         pinned = False
         problems.append(str(exc))
+    try:
+        compression = bridge_compression_setting()
+    except ValueError as exc:
+        compression = ""
+        problems.append(str(exc))
     vendor: str | None
     try:
         vendor = detect_vendor()
@@ -200,6 +209,7 @@ def describe_local(
         policy_settings=settings,
         gpu=gpu_identity(config.device),
         pinned_staging=pinned,
+        bridge_compression=compression,
     )
     return local, config
 
@@ -212,8 +222,8 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
     Raises:
         RuntimeError: if any rank reported problems, if some ranks run on CPU and
             others on GPUs, or if ranks picked different bridge transports,
-            collective policies, policy settings, split-test modes or pinned
-            staging.
+            collective policies, policy settings, split-test modes, pinned
+            staging or bridge compression.
     """
     failing = [(rank, peer) for rank, peer in enumerate(peers) if peer.problems]
     if failing:
@@ -279,6 +289,15 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
             f"{off}. Set it to the same value on every rank, so a run is one "
             "configuration or the other."
         )
+    compression: dict[str, list[int]] = {}
+    for rank, peer in enumerate(peers):
+        compression.setdefault(peer.bridge_compression or "off", []).append(rank)
+    if len(compression) > 1:
+        detail = "; ".join(f"{mode} on ranks {ranks}" for mode, ranks in compression.items())
+        raise RuntimeError(
+            f"Ranks disagree on {BRIDGE_COMPRESSION_ENV}: {detail}. Set it to the same value on "
+            "every rank, or on none: it decides what the bridge sends."
+        )
     # CUDA and ROCm builds of one release differ only in the local version
     # suffix, e.g. 2.5.1+cu124 and 2.5.1+rocm6.2.
     releases = sorted({peer.torch_version.split("+")[0] for peer in peers}, key=_release_key)
@@ -334,6 +353,12 @@ class Topology:
     def pinned_staging(self) -> bool:
         """Whether ``GPUBRIDGE_PINNED_STAGING`` is on: the same on every rank (discovery checks)."""
         return self.peers[self.rank].pinned_staging
+
+    @property
+    def bridge_compression(self) -> str:
+        """``GPUBRIDGE_BRIDGE_COMPRESSION`` (``bf16``, ``fp8``, or empty when off): the same on
+        every rank (discovery checks)."""
+        return self.peers[self.rank].bridge_compression
 
     @property
     def bridge_group(self) -> ProcessGroup | None:

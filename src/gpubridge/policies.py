@@ -29,6 +29,13 @@ Built in:
 ``reduce-bridge-broadcast`` otherwise. It never picks the pipelined, sharded or
 auto-tuned policies: they are opt-in until validated on GPUs.
 
+Bridge compression (``GPUBRIDGE_BRIDGE_COMPRESSION=bf16|fp8``, off by default)
+is the one exception to "policies never change what a collective computes":
+the three bridged policies (reduce-bridge-broadcast, pipelined, sharded) then
+compress the bridge step of floating-point SUM reductions (AVG included), as
+:mod:`gpubridge.compression` describes. Their island steps, every other op and
+dtype, and the native-only and flat-gloo policies are unaffected.
+
 What each built-in policy carries:
 
 ==========================  =====================  ==========================
@@ -58,6 +65,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp
 
+from gpubridge import compression as _compression
 from gpubridge import staging as _staging
 from gpubridge.config import GPU_BACKEND, THRESHOLDS_ENV, chunk_bytes_setting
 from gpubridge.observe import phase
@@ -262,7 +270,30 @@ class ReduceBridgeBroadcast(CollectivePolicy):
     #: (``device_tensors``): the bridge step then makes no host copy at all.
     direct_bridge: bool = False
 
+    #: Bridge compression for this instance: None follows ``GPUBRIDGE_BRIDGE_COMPRESSION``
+    #: (``topology.bridge_compression``), ``""`` turns it off and ``"bf16"`` or ``"fp8"``
+    #: picks a mode, e.g. to compare modes in one job (``bench_all_reduce.py
+    #: --compression``). Every rank must construct the same.
+    compression: str | None = None
+    #: Set up on bridge members when compression is on; None otherwise.
+    compressor: _compression.BridgeCompressor | None = None
+
+    def __init__(self, compression: str | None = None) -> None:
+        self.compression = compression
+
+    def _setup_compression(self, topology: Topology, member: bool) -> None:
+        mode = (getattr(topology, "bridge_compression", "") if self.compression is None
+                else self.compression)
+        self.compressor = (_compression.BridgeCompressor(mode)
+                           if mode and member and topology.layout.needs_bridge else None)
+
+    def _compresses(self, tensor: torch.Tensor, op: ReduceOp.RedOpType) -> bool:
+        """Whether this bridge step is compressed: the same answer on every bridge member."""
+        return (self.compressor is not None and op == ReduceOp.SUM and tensor.numel() > 0
+                and self.compressor.applies(tensor.dtype))
+
     def setup(self, topology: Topology) -> None:
+        self._setup_compression(topology, member=topology.is_leader)
         if not (topology.layout.needs_bridge and topology.is_leader):
             return
         self.direct_bridge = (topology.device.type == "cuda"
@@ -274,6 +305,7 @@ class ReduceBridgeBroadcast(CollectivePolicy):
         if self.staging_buffer is not None:
             self.staging_buffer.close()
             self.staging_buffer = None
+        self.compressor = None
 
     def _to_host(self, tensor: torch.Tensor) -> torch.Tensor:
         if self.direct_bridge:
@@ -305,12 +337,24 @@ class ReduceBridgeBroadcast(CollectivePolicy):
             dist.reduce(tensor, dst=leader, op=op, group=topology.island_group)
         if topology.is_leader:
             assert topology.bridge is not None
-            with phase("bridge"):
-                staged = self._to_host(tensor)
-                _bridge_all_reduce(topology.bridge, staged, op)
-                self._to_device(tensor, staged)
+            if self._compresses(tensor, op):
+                self._compressed_bridge(tensor, tensor, topology)
+            else:
+                with phase("bridge"):
+                    staged = self._to_host(tensor)
+                    _bridge_all_reduce(topology.bridge, staged, op)
+                    self._to_device(tensor, staged)
         with phase("island-broadcast"):
             dist.broadcast(tensor, src=leader, group=topology.island_group)
+
+    def _compressed_bridge(self, tensor: torch.Tensor, buffer: torch.Tensor,
+                           topology: Topology) -> None:
+        """The leaders' bridge step, compressed: phases compress, bridge, decompress.
+        ``buffer`` is the caller's tensor, whose error feedback residual this uses."""
+        assert self.compressor is not None and topology.bridge is not None
+        self.compressor.all_reduce(tensor.view(-1), _compression.buffer_key(buffer),
+                                   topology.bridge, topology.layout.bridge_ranks,
+                                   rank=topology.rank, direct=self.direct_bridge)
 
     def broadcast(self, tensor: torch.Tensor, src: int, topology: Topology) -> None:
         src_island = topology.layout.island_of(src)
@@ -361,10 +405,13 @@ class ReduceBridgeBroadcast(CollectivePolicy):
             dist.reduce(work, dst=island.leader, group=topology.island_group)
         if topology.is_leader:
             assert topology.bridge is not None
-            with phase("bridge"):
-                staged = self._to_host(work)
-                topology.bridge.all_reduce(staged)
-                self._to_device(work, staged)
+            if self._compresses(work, ReduceOp.SUM):
+                self._compressed_bridge(work, input, topology)
+            else:
+                with phase("bridge"):
+                    staged = self._to_host(work)
+                    topology.bridge.all_reduce(staged)
+                    self._to_device(work, staged)
         with phase("island-scatter"):
             slices = work.view(world, -1)
             dist.scatter(output.view(-1),
@@ -464,7 +511,8 @@ class PipelinedReduceBridgeBroadcast(ReduceBridgeBroadcast):
     SLOTS = 3
     DEFAULT_CHUNK_BYTES = 4 * 2**20
 
-    def __init__(self, chunk_bytes: int | None = None) -> None:
+    def __init__(self, chunk_bytes: int | None = None, compression: str | None = None) -> None:
+        super().__init__(compression)
         self.chunk_bytes = chunk_bytes
         self.staging: _staging.Staging | None = None
         #: The last copy back out of each host slot, kept from one collective to
@@ -472,6 +520,10 @@ class PipelinedReduceBridgeBroadcast(ReduceBridgeBroadcast):
         #: (only the caller's stream waits for them), so the next one, perhaps
         #: from another stream, must not reuse a slot before they are done.
         self.copied_back: list[Any] = [None] * self.SLOTS
+        #: With compression: host slots for the other islands' payload chunks
+        #: (SLOTS per other island), and the last copy back out of each.
+        self.recv_staging: _staging.Staging | None = None
+        self.recv_back: list[Any] = []
 
     @classmethod
     def settings(cls) -> dict[str, Any]:
@@ -481,14 +533,22 @@ class PipelinedReduceBridgeBroadcast(ReduceBridgeBroadcast):
         if self.chunk_bytes is None:
             self.chunk_bytes = int(topology.policy_settings.get("chunk_bytes",
                                                                 self.DEFAULT_CHUNK_BYTES))
+        self._setup_compression(topology, member=topology.is_leader)
         if topology.layout.needs_bridge and topology.is_leader:
             self.staging = _staging.make_staging(topology.device, self.chunk_bytes, self.SLOTS)
+            if self.compressor is not None:
+                slots = self.SLOTS * (len(topology.layout.islands) - 1)
+                self.recv_staging = _staging.make_staging(topology.device, self.chunk_bytes, slots)
+                self.recv_back = [None] * slots
 
     def close(self) -> None:
-        if self.staging is not None:
-            self.staging.close()
-            self.staging = None
+        for staging in (self.staging, self.recv_staging):
+            if staging is not None:
+                staging.close()
+        self.staging = self.recv_staging = None
         self.copied_back = [None] * self.SLOTS
+        self.recv_back = []
+        self.compressor = None
 
     def all_reduce(self, tensor: torch.Tensor, topology: Topology,
                    op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
@@ -498,11 +558,71 @@ class PipelinedReduceBridgeBroadcast(ReduceBridgeBroadcast):
         if topology.is_leader:
             bridge = topology.bridge
             assert bridge is not None
-            with phase("bridge"):
-                self._pipeline(tensor, lambda host: _bridge_all_reduce(bridge, host, op),
-                               send=True, receive=True)
+            if self._compresses(tensor, op):
+                self._compressed_pipeline(tensor, topology)
+            else:
+                with phase("bridge"):
+                    self._pipeline(tensor, lambda host: _bridge_all_reduce(bridge, host, op),
+                                   send=True, receive=True)
         with phase("island-broadcast"):
             dist.broadcast(tensor, src=leader, group=topology.island_group)
+
+    def _compressed_pipeline(self, tensor: torch.Tensor, topology: Topology) -> None:
+        """Compress the whole island sum once, exchange the payloads chunk by chunk
+        through the host slots, then decompress once.
+
+        Payload chunks are ``chunk_bytes`` long. For chunk k, every leader
+        broadcasts its own slice in leader order; the copy of this leader's
+        chunk k+1 to the host and of the others' chunk k-1 back to the GPU
+        overlap those broadcasts, as in :meth:`_pipeline`.
+        """
+        assert self.compressor is not None and topology.bridge is not None
+        bridge, members = topology.bridge, topology.layout.bridge_ranks
+        me = members.index(topology.rank)
+        flat = tensor.view(-1)
+        gathered = self.compressor.compress(flat, _compression.buffer_key(tensor), members, me)
+        with phase("bridge"):
+            self._exchange(gathered, me, members, bridge)
+        self.compressor.decompress(gathered, flat)
+
+    def _exchange(self, gathered: torch.Tensor, me: int, members: tuple[int, ...],
+                  bridge: BridgeTransport) -> None:
+        staging, recv, slots = self.staging, self.recv_staging, self.SLOTS
+        assert staging is not None and recv is not None and self.chunk_bytes is not None
+        width = gathered.shape[1]
+        cuts = [(lo, min(lo + self.chunk_bytes, width)) for lo in range(0, width, self.chunk_bytes)]
+        others = [i for i in range(len(members)) if i != me]
+        mine = gathered[me]
+        copied_out: list[Any] = [None] * len(cuts)
+        last_back = None
+
+        def copy_out(k: int) -> None:
+            lo, hi = cuts[k]
+            slot = staging.slot(k % slots, mine[lo:hi])
+            # The slot may still be read by a copy back from an uncompressed collective.
+            copied_out[k] = staging.to_host(slot, mine[lo:hi], after=self.copied_back[k % slots])
+
+        staging.begin(gathered)
+        recv.begin(gathered)
+        if cuts:
+            copy_out(0)
+        for k, (lo, hi) in enumerate(cuts):
+            if k + 1 < len(cuts):
+                copy_out(k + 1)  # overlaps this chunk's broadcasts
+            hosts: dict[int, torch.Tensor] = {}
+            for j, i in enumerate(others):
+                index = (k % slots) * len(others) + j
+                # The bridge is about to overwrite this slot: its last copy back must be done.
+                recv.wait_host(self.recv_back[index])
+                hosts[i] = recv.slot(index, gathered[i, lo:hi])
+            staging.wait_host(copied_out[k])
+            hosts[me] = staging.slot(k % slots, mine[lo:hi])
+            for i, src in enumerate(members):
+                bridge.broadcast(hosts[i], src=src)
+            for j, i in enumerate(others):
+                index = (k % slots) * len(others) + j
+                self.recv_back[index] = last_back = recv.to_device(gathered[i, lo:hi], hosts[i])
+        recv.end(last_back)
 
     def broadcast(self, tensor: torch.Tensor, src: int, topology: Topology) -> None:
         src_island = topology.layout.island_of(src)
@@ -591,10 +711,12 @@ class ShardedBridge(ReduceBridgeBroadcast):
 
     name = "sharded-bridge"
 
-    def __init__(self) -> None:
+    def __init__(self, compression: str | None = None) -> None:
+        super().__init__(compression)
         self.k = 1
         self.index = 0  # this rank's position in its island
         self.link: BridgeTransport | None = None  # link ``index``, on ranks below k
+        self.link_members: tuple[int, ...] = ()  # its global ranks, ascending
         self._created: list[BridgeTransport] = []
 
     def setup(self, topology: Topology) -> None:
@@ -617,11 +739,15 @@ class ShardedBridge(ReduceBridgeBroadcast):
             self.link = topology.bridge
         elif self.index < self.k:
             self.link = links[self.index - 1]
+        if self.index < self.k:
+            self.link_members = tuple(sorted(island.ranks[self.index] for island in islands))
+        self._setup_compression(topology, member=self.index < self.k)
 
     def close(self) -> None:
         for link in self._created:
             link.close()
         self._created, self.link = [], None
+        self.compressor = None
 
     def all_reduce(self, tensor: torch.Tensor, topology: Topology,
                    op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
@@ -642,11 +768,17 @@ class ShardedBridge(ReduceBridgeBroadcast):
                 mine = segments[self.index]
         if self.link is not None:
             assert mine is not None
-            with phase("bridge"):
-                staged = _stage_to_host(mine)
-                _bridge_all_reduce(self.link, staged, op)
-                if staged is not mine:
-                    mine.copy_(staged)
+            if self._compresses(mine, op):
+                assert self.compressor is not None
+                # Segment j's own residual: the same segment of the same buffer next time.
+                self.compressor.all_reduce(mine, _compression.buffer_key(tensor, self.index),
+                                           self.link, self.link_members, rank=topology.rank)
+            else:
+                with phase("bridge"):
+                    staged = _stage_to_host(mine)
+                    _bridge_all_reduce(self.link, staged, op)
+                    if staged is not mine:
+                        mine.copy_(staged)
         self._reassemble(padded, mine, topology)
         if padded is not flat:
             flat.copy_(padded[:flat.numel()])

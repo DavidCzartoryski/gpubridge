@@ -42,6 +42,15 @@ the fastest per size and writes a thresholds file for the ``auto-tuned``
 policy: point GPUBRIDGE_THRESHOLDS at it on every rank. Measure on the cluster
 and layout you will train on; thresholds don't carry over.
 
+--compression none,bf16,fp8 also times the active policy (if it bridges:
+reduce-bridge-broadcast, pipelined or sharded) with each bridge compression
+mode, on its own instance (rows ``compression:<mode>``; GPUBRIDGE_BRIDGE_COMPRESSION
+needn't be set). With --phases each row gets its compress, bridge and decompress
+times, so the bridge step's own time shows with and without compression. Each
+row also says, for one random tensor per size, the largest error against the
+uncompressed result (relative to its largest magnitude) and whether every rank
+ended with the same bits; summary.md says from which size each mode is faster.
+
 Rank 0 writes OUT/bench.csv, OUT/bench.json and OUT/summary.md. Runs on CPU in
 simulation mode too (use a smaller --max-bytes):
 
@@ -53,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import statistics
 import sys
 import time
@@ -65,11 +75,13 @@ import torch.distributed as dist
 from gpukit import KIT_VERSION, default_timeout, environment, run_info, sync, write_json
 
 import gpubridge
+from gpubridge import observe
 from gpubridge.config import chunk_bytes_setting
 from gpubridge.policies import (
     THRESHOLDS_FORMAT,
     FlatGloo,
     PipelinedReduceBridgeBroadcast,
+    ReduceBridgeBroadcast,
     choose_policy,
     resolve_policy,
 )
@@ -81,7 +93,9 @@ UNITS = {"K": 2**10, "M": 2**20, "G": 2**30}
 DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 FIELDS = ["op", "policy", "baseline", "run_kind", "split_test", "islands", "world_size", "bytes",
           "dtype", "trials", "timer",
-          "median_us", "p90_us", "min_us", "algbw_GBps", "busbw_GBps", "host_median_us"]
+          "median_us", "p90_us", "min_us", "algbw_GBps", "busbw_GBps", "host_median_us",
+          "max_rel_error", "identical"]
+COMPRESSION_MODES = ("none", "bf16", "fp8")
 #: The baseline when there is no ``native`` row: each island on its own.
 ISLAND_BASELINE = "island-native (fewer ranks, best case)"
 
@@ -165,7 +179,7 @@ def row(op: str, info: dict[str, Any], nbytes: int, dtype: str, lat: list[float]
     median = statistics.median(lat)
     p90 = sorted(lat)[max(0, int(round(0.9 * len(lat))) - 1)]
     algbw = nbytes / median / 1e9
-    if op == "gpubridge":
+    if op == "gpubridge" or op.startswith("compression:"):
         policy = info["policy"]
     elif op.startswith("policy:"):
         policy = op.removeprefix("policy:")
@@ -314,6 +328,98 @@ def candidate_ops(names: str, topology: gpubridge.Topology) -> dict[str, Any]:
     return ops
 
 
+def compression_ops(modes: str, topology: gpubridge.Topology, policy: str) -> dict[str, Any]:
+    """One timed op per bridge compression mode, on an instance of the active policy.
+
+    Calls go through ``observe.collective`` like gpubridge.all_reduce, so --phases
+    sees their compress, bridge and decompress steps. Every rank builds the same
+    instances in the same order.
+    """
+    cls = choose_policy(resolve_policy(policy), topology.layout)
+    if not issubclass(cls, ReduceBridgeBroadcast) or not topology.layout.needs_bridge:
+        if topology.rank == 0:
+            print(f"--compression: {cls.name} on this layout has no bridge step to compress; "
+                  "skipped", file=sys.stderr)
+        return {}
+    chunk = chunk_bytes_setting(PipelinedReduceBridgeBroadcast.DEFAULT_CHUNK_BYTES)
+    ops: dict[str, Any] = {}
+    for mode in modes.split(","):
+        if mode not in COMPRESSION_MODES:
+            raise SystemExit(f"--compression: unknown mode {mode!r}; use {COMPRESSION_MODES}")
+        compression = "" if mode == "none" else mode
+        instance = (cls(chunk_bytes=chunk, compression=compression)
+                    if issubclass(cls, PipelinedReduceBridgeBroadcast) else cls(compression=compression))
+        instance.setup(topology)
+
+        def run(t, p=instance):
+            with observe.collective(topology, "all_reduce", t, policy=p.name, reduce_op="sum"):
+                p.all_reduce(t, topology)
+
+        run.instance = instance
+        ops[f"compression:{mode}"] = run
+    return ops
+
+
+def compression_quality(op, uncompressed, numel: int, dtype, device, topology) -> dict[str, Any]:
+    """Largest error against the uncompressed result, for one random tensor, and whether
+    every rank ended with the same bits."""
+    g = torch.Generator().manual_seed(1000 + topology.rank)
+    x = torch.randn(numel, generator=g).to(dtype).to(device)
+    want, got = x.clone(), x.clone()
+    uncompressed(want)
+    op(got)
+    sync(device)
+    scale = want.double().abs().max().item() or 1.0
+    error = (got.double() - want.double()).abs().max().item() / scale
+    digests: list[Any] = [None] * topology.world_size
+    dist.all_gather_object(digests, hashlib.sha256(got.cpu().view(torch.uint8).numpy().tobytes())
+                           .hexdigest())
+    errors: list[Any] = [None] * topology.world_size
+    dist.all_gather_object(errors, error)
+    return {"max_rel_error": float(f"{max(errors):.3g}"), "identical": len(set(digests)) == 1}
+
+
+def compression_table(rows: list[dict]) -> str:
+    """Median time and bridge phase per mode and size, and where each mode starts to win."""
+    by: dict[int, dict[str, dict]] = {}
+    for r in rows:
+        if r["op"].startswith("compression:"):
+            by.setdefault(r["bytes"], {})[r["op"].removeprefix("compression:")] = r
+    if not by:
+        return ""
+    modes = [m for m in COMPRESSION_MODES if any(m in cells for cells in by.values())]
+    lines = ["", "## Bridge compression", "",
+             "Median time per all_reduce (bridge phase, slowest rank, in ms, with --phases); "
+             "max relative error against uncompressed; whether every rank had the same bits.", "",
+             "| size | " + " | ".join(modes) + " |", "|" + " --- |" * (len(modes) + 1)]
+    for nbytes in sorted(by):
+        cells = []
+        for m in modes:
+            r = by[nbytes].get(m)
+            if r is None:
+                cells.append("-")
+                continue
+            bridge = r.get("phases_ms", {}).get("bridge")
+            cell = f"{r['median_us']} us"
+            if bridge is not None:
+                cell += f" (bridge {bridge})"
+            if m != "none":
+                cell += f", err {r.get('max_rel_error')}, {'same' if r.get('identical') else 'DIFFER'}"
+            cells.append(cell)
+        lines.append(f"| {human(nbytes)} | " + " | ".join(cells) + " |")
+    for m in modes:
+        if m == "none":
+            continue
+        faster = [n for n in sorted(by) if m in by[n] and "none" in by[n]
+                  and by[n][m]["median_us"] < by[n]["none"]["median_us"]]
+        sizes = sorted(n for n in by if m in by[n] and "none" in by[n])
+        start = next((n for n in sizes if all(k in faster for k in sizes if k >= n)), None)
+        lines.append("")
+        lines.append(f"{m}: faster than uncompressed from {human(start)} up." if start is not None
+                     else f"{m}: not faster than uncompressed at any measured size.")
+    return "\n".join(lines) + "\n"
+
+
 def derive_thresholds(rows: list[dict], info: dict[str, Any], chunk_bytes: int) -> dict:
     """The fastest candidate per size, merged into rules for the auto-tuned policy."""
     by_size: dict[int, list[dict]] = {}
@@ -370,6 +476,9 @@ def main() -> int:
                         help="also time gpubridge's all_reduce under these policies (comma list)")
     parser.add_argument("--write-thresholds", type=Path, default=None, metavar="PATH",
                         help="time the candidates and write an auto-tuned thresholds file")
+    parser.add_argument("--compression", default=None, metavar="MODES",
+                        help="also time the active policy with bridge compression: a comma "
+                             "list of none, bf16, fp8 (rows compression:<mode>)")
     args = parser.parse_args()
     if args.write_thresholds and not args.candidates:
         args.candidates = DEFAULT_CANDIDATES
@@ -407,6 +516,12 @@ def main() -> int:
         ops["flat-gloo"] = lambda t: flat.all_reduce(t, topology)
     if args.candidates:
         ops.update(candidate_ops(args.candidates, topology))
+    squeezed = compression_ops(args.compression, topology, args.policy) if args.compression else {}
+    ops.update(squeezed)
+    uncompressed = None
+    if squeezed:
+        off = compression_ops("none", topology, args.policy)["compression:none"]
+        uncompressed = lambda t: off.instance.all_reduce(t, topology)  # noqa: E731
 
     baseline = baseline_of(ops)
     phases = PhaseTimes() if args.phases else None
@@ -433,11 +548,14 @@ def main() -> int:
                            host=slowest(on_host), timer=timer)]
             for r in new:
                 r["baseline"] = baseline
-            if name == "gpubridge" and phases is not None:
+            if (name == "gpubridge" or name in squeezed) and phases is not None:
                 # time_op synchronized the device, so every mark is ready. Only the
                 # timed trials count, not the warmup.
                 timed = phases.records[len(phases.records) - len(per_trial):]
                 new[0]["phases_ms"] = slowest_phases(phase_medians(timed))
+            if name in squeezed and uncompressed is not None:
+                new[0].update(compression_quality(op, uncompressed, tensor.numel(), dtype,
+                                                  device, topology))
             rows += new
             if topology.rank == 0:
                 for r in new:
@@ -463,7 +581,7 @@ def main() -> int:
             "argv": sys.argv, "run": info, "environment": environment(), "baseline": baseline,
             "rows": rows,
         })
-        table = summary_table(rows, info)
+        table = summary_table(rows, info) + compression_table(rows)
         (args.out / "summary.md").write_text(f"# {args.out.name}: all_reduce benchmark\n\n{table}")
         print(table)
         if args.write_thresholds:

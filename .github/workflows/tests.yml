@@ -31,9 +31,15 @@ jobs:
       - run: uv pip install "${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
       - run: python -c "import torch; print(torch.__version__)"
       - run: uv pip install -e ".[test]"
+      # Bridge compression's Triton kernels run in Triton's CPU interpreter here
+      # (tests/test_compression_kernels.py). Not a test extra: on an AMD GPU node,
+      # PyPI's triton would shadow the ROCm build's own.
+      - run: uv pip install triton
       # shellcheck ships with ubuntu-latest; the kit's tests also run it when present.
       - run: shellcheck scripts/*.sh scripts/gpu/*.sh scripts/gpu/*/*.sh scripts/gpu/explorer/*.sbatch tests/fake_cluster/*
       - run: pytest ${{ matrix.pytest-args }}
+        env:
+          GPUBRIDGE_REQUIRE_TRITON: "1"  # the kernel tests fail instead of skipping
       - run: python examples/simulate_two_islands.py
 
   ucx:

@@ -36,6 +36,7 @@ if [ -z "${GPUBRIDGE_VENDOR:-}${GPUBRIDGE_CPU_ONLY:-}" ]; then
 fi
 # GPU-only correctness tests (tests/test_gpu.py): every policy against flat-gloo,
 # fp32/fp16/bf16, odd and large sizes, async on non-default streams.
-step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" -q \
-    -p no:cacheprovider --junitxml="$RESULTS/gpu_tests.xml"
+step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" \
+    "$REPO_DIR/tests/test_compression_kernels.py" -q -p no:cacheprovider \
+    --junitxml="$RESULTS/gpu_tests.xml"
 finish
