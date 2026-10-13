@@ -576,6 +576,20 @@ def test_cpu_tensors_go_to_gloo_only_on_gpu_jobs():
         torch_backend._cpu_only("gather", [torch.ones(1, device="meta")])
 
 
+def test_shutdown_never_raises_even_if_releasing_gpubridge_fails(monkeypatch):
+    def fails(drain=True):
+        raise RuntimeError("boom")
+
+    pg = torch_backend.GpubridgeProcessGroup(0, 1, "test", None)
+    monkeypatch.setattr(torch_backend, "_owner", pg)
+    monkeypatch.setattr(gpubridge.topology, "is_initialized", lambda: True)
+    monkeypatch.setattr(gpubridge, "_release", fails)
+    with pytest.warns(RuntimeWarning, match="releasing gpubridge's state failed: boom"):
+        pg.shutdown()
+    assert torch_backend._owner is None
+    pg.shutdown()  # once released, again does nothing
+
+
 # ---- on GPUs (written; skipped without one) ------------------------------------------------
 
 def _gpu_device_id(rank, init_file, world):
