@@ -12,6 +12,7 @@ Every collective takes ``async_op``. With ``async_op=True`` it returns a
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable
 
 import torch
@@ -252,6 +253,14 @@ def _start(topology: Topology, op: str, run: Callable[[], None],
 
 
 def _reduce_op_name(op: ReduceOp.RedOpType, fn: str) -> str:
+    try:
+        # ReduceOp.SUM and the others: one lookup. torch.distributed.ReduceOp objects, which
+        # the torch backend passes, don't match a key and take the loop below.
+        name = REDUCE_OPS.get(op)
+    except TypeError:  # an unhashable op object: the loop compares it
+        name = None
+    if name is not None:
+        return name
     for candidate, name in REDUCE_OPS.items():
         try:
             if op == candidate:  # also matches dist.ReduceOp instances
@@ -274,13 +283,28 @@ def _check_avg(name: str, dtype: torch.dtype, fn: str) -> None:
 
 
 def _check_reduce_op(policy: CollectivePolicy, name: str, topology: Topology, fn: str) -> None:
-    supported = policy.supported_reduce_ops(topology)
+    supported = _supported_reduce_ops(policy, topology)
     if name not in supported:
         raise NotImplementedError(
             f"gpubridge.{fn} with {name.upper()}: collective policy {policy.name!r} with bridge "
             f"transport {topology.peers[topology.rank].bridge!r} supports only "
             f"{', '.join(sorted(n.upper() for n in supported))}."
         )
+
+
+def _supported_reduce_ops(policy: CollectivePolicy, topology: Topology) -> frozenset[str]:
+    """``policy.supported_reduce_ops(topology)``, asked once per policy and topology and
+    remembered on the policy: the policy, its settings and the bridge transport are fixed
+    from init() on, and the same on every rank. Every call still checks its op against it."""
+    cached = getattr(policy, "_gpubridge_reduce_ops", None)
+    if cached is not None and cached[0]() is topology:
+        return cached[1]
+    supported = policy.supported_reduce_ops(topology)
+    try:  # weakly: no cycle keeps a destroyed topology (and its groups) alive
+        policy._gpubridge_reduce_ops = (weakref.ref(topology), supported)  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):  # __slots__, or a topology without weakrefs: ask each call
+        pass
+    return supported
 
 
 def _check_implements(policy: CollectivePolicy, fn: str, topology: Topology) -> None:

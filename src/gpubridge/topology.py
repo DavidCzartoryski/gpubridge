@@ -9,6 +9,7 @@ import warnings
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
+from functools import cached_property
 from typing import Any, cast
 
 import torch
@@ -424,11 +425,12 @@ class Topology:
             return "cpu"
         return "gpu-mixed" if self.layout.needs_bridge else "gpu-single-vendor"
 
-    @property
+    @cached_property
     def island(self) -> Island:
+        """This rank's island. Looked up once: the layout and the rank never change."""
         return self.layout.island_of(self.rank)
 
-    @property
+    @cached_property
     def is_leader(self) -> bool:
         return self.island.leader == self.rank
 

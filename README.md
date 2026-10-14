@@ -371,6 +371,47 @@ cause, and every later collective on that rank refuses to start, because the
 process groups may be inconsistent. `destroy()` runs whatever is still queued
 before tearing down.
 
+### Per-call overhead on small messages
+
+Measured on CPU only, in simulation mode: every group on Gloo, 4 ranks as two
+islands of 2 in a Linux container limited to 4 cores (`docker run
+--cpuset-cpus=0-3`), torch 2.14.1+cpu, Python 3.12, rank 0's times
+(`scripts/bench_per_call.py`, which records its setup in its JSON output).
+The numbers show what gpubridge's Python adds to a call, not what a GPU
+collective costs.
+
+| A 4-byte all_reduce, per call (median) | sync | async |
+| --- | --- | --- |
+| one `torch.distributed.all_reduce` on the world group | 197 µs | |
+| reduce-bridge-broadcast's torch.distributed calls, made directly | 239 µs | |
+| `gpubridge.all_reduce` (reduce-bridge-broadcast) | 278 µs | 318 µs |
+
+- **gpubridge's own work** per sync call, with communication stubbed out
+  (`--stub-comm`; the median of the `gpubridge` rows):
+  - 3.4 µs on reduce-bridge-broadcast and auto-tuned's default;
+  - 1.8 µs on native-only and 2.1 µs on flat-gloo;
+  - 5.1 µs on the pipelined policy;
+  - 14.6 µs on sharded-bridge, which splits even a small tensor into
+    segments.
+
+  An observer adds about 4 µs: timing marks for the call and for each phase.
+- **Between real collectives that work runs cold.** With `--host-time` (each
+  sync call's time outside torch.distributed calls), a reduce-bridge-broadcast
+  call spends 17 µs of host time where making the same calls directly spends
+  2.5: 9.8 µs on native-only, 11 µs on flat-gloo, 25 µs on the pipelined
+  policy and 54 µs on sharded-bridge. That host time sits between
+  collectives on every rank, so the end-to-end gap is larger still: 39 µs in
+  the table.
+- **`async_op=True` hands the call to gpubridge's worker thread:** about
+  40 µs more on this setup.
+- **Worked out once, not per call:** each rank's island and whether it leads
+  (`Topology.island`, `is_leader`), and the policy's supported reduce ops
+  (asked once per policy and topology). Every per-call check that keeps
+  ranks in step stays: the tensor's dtype, device and contiguity, the op,
+  AVG on integer tensors, and the FIFO order of async collectives.
+- **Not measured: GPUs.** There, the island steps run on NCCL or RCCL, and
+  the copies to and from the host around the bridge add their own costs.
+
 ### DistributedDataParallel
 
 DDP needs a process group that spans every rank. In a mixed job the only one
