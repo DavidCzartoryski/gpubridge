@@ -44,12 +44,14 @@ load_modules() {
     set -u
 }
 
-# job_setup STEP: point RESULTS at results/explorer/STEP, load modules, activate
-# the venv and record the node's GPUs, interconnect topology and job details.
+# job_setup STEP: point RESULTS at results/explorer/STEP, record the job's start
+# (job.jsonl), load modules, activate the venv and record the node's GPUs,
+# interconnect topology and job details.
 job_setup() {
     RESULTS="$RESULTS_ROOT/$1"
     export RESULTS
     run mkdir -p "$RESULTS"
+    job_started
     load_modules "$MODULES"
     activate_venv "$VENV"
     capture "$RESULTS/nvidia-smi.txt" nvidia-smi

@@ -18,6 +18,10 @@
 #                    a step that checks something fails as it should; passes only
 #                    if CMD exits 0 and REGEX appears in its output, within SECONDS
 #   limited CMD      run CMD under coreutils timeout (STEP_TIMEOUT), or print it
+#                    If the step fails, the job's own output gets the last 20
+#                    lines of NAME.log after the FAILED line (before torchrun's
+#                    failure report and the NCCL/RCCL logs)
+#   job_started      start $RESULTS/job.jsonl, the job's start, errors and end
 #   finish      print the step table; exit non-zero if any step failed
 #   load_env_file F  read NAME=value settings from file F, if it exists
 
@@ -67,7 +71,58 @@ load_env_file() {
 }
 
 log() { printf '[gpubridge-kit %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
-die() { log "ERROR: $*"; exit 1; }
+die() {
+    log "ERROR: $*"
+    job_event error "\"message\": \"$(json_string "$(redacted "$*")")\""
+    exit 1
+}
+
+# redacted TEXT: TEXT with what the kit's JSON records never hold replaced, as gpukit
+# does: /projects/<name> and PROJECT_DIR become $PROJECT_DIR, the home directory ~,
+# and the user name as a path segment $USER.
+redacted() {
+    # shellcheck disable=SC2016  # the literal $PROJECT_DIR and $USER, not their values
+    local text=$1 project='$PROJECT_DIR' home='~' user
+    [ -z "${PROJECT_DIR:-}" ] || text=${text//"$PROJECT_DIR"/$project}
+    [ -z "${HOME:-}" ] || [ "$HOME" = / ] || text=${text//"$HOME"/$home}
+    # shellcheck disable=SC2016
+    text=$(printf '%s' "$text" | sed -E 's#/projects/[^/[:space:]]+#$PROJECT_DIR#g')
+    if [ -n "${USER:-}" ]; then
+        user=${USER//./\\.}
+        text=$(printf '%s' "$text" | sed -E "s#/${user}(/|\$|[[:space:]:;,])#/\$USER\1#g")
+    fi
+    printf '%s' "$text"
+}
+
+# json_string TEXT: TEXT escaped for a JSON string (quotes, backslashes, control characters).
+json_string() {
+    local text=$1
+    text=${text//\\/\\\\}
+    text=${text//\"/\\\"}
+    printf '%s' "${text//[$'\001'-$'\037']/ }"
+}
+
+# job_started: begin $RESULTS/job.jsonl for this job (one line per event, appended,
+# so reruns of a step keep their history): started, error (die, redacted), finished
+# (finish) and exit (the script's exit code). triage.py lists a job whose last start
+# has no end as unfinished, with its error or exit code: a job that stops before or
+# during its first step otherwise leaves no steps.jsonl line to find. An empty
+# steps.jsonl marks the directory as a job's from the start.
+job_started() {
+    [ "$DRY_RUN" = 0 ] || return 0
+    JOB_EVENTS="$RESULTS/job.jsonl"
+    touch "$RESULTS/steps.jsonl"
+    job_event started
+    # Also how the script ended: a command failing under set -e leaves no error line.
+    trap 'job_event exit "\"code\": $?"' EXIT
+}
+
+# job_event EVENT [JSON MEMBERS]: append an event to job.jsonl, once job_started ran.
+job_event() {
+    [ -n "${JOB_EVENTS:-}" ] || return 0
+    printf '{"event": "%s", "job_id": "%s", "time": "%s"%s}\n' "$1" "${SLURM_JOB_ID:-local}" \
+        "$(date +%Y-%m-%dT%H:%M:%S%z)" "${2:+, $2}" >>"$JOB_EVENTS"
+}
 
 quote() { printf '%q ' "$@"; }
 
@@ -156,7 +211,12 @@ step() {
         log "step $name ran out of time (STEP_TIMEOUT=${STEP_TIMEOUT}s)" 2>&1 |
             tee -a "$RESULTS/$name.log"
     fi
+    local own_tail=""
     if [ "$code" != 0 ]; then
+        # The step's own last lines: before torchrun's failure report, which names the
+        # ranks that failed but not why, and before the NCCL/RCCL logs added below.
+        own_tail=$(awk '/failed \(exitcode: -?[0-9]+\) local_rank:/ {exit} {print}' \
+            "$RESULTS/$name.log" | tail -n 20)
         nccl_report "$nccl_dir" >>"$RESULTS/$name.log"
     fi
     rmdir "$nccl_dir" "$RESULTS/nccl" 2>/dev/null || true  # only if empty (CPU runs)
@@ -169,6 +229,8 @@ step() {
         FAILED_STEPS+=("$name")
         log "step $name FAILED (exit $code); continuing. Log, with the end of any" \
             "NCCL/RCCL logs: $RESULTS/$name.log"
+        log "the last 20 lines of $name.log, before any torchrun failure report:"
+        printf '%s\n' "${own_tail:-(empty)}" | sed 's/^/    | /' >&2
     fi
     return 0
 }
@@ -188,6 +250,7 @@ negative_step() {
 
 finish() {
     log "passed: ${PASSED_STEPS[*]:-none}"
+    job_event finished "\"failed\": ${#FAILED_STEPS[@]}"
     if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
         log "FAILED: ${FAILED_STEPS[*]}"
         return 1

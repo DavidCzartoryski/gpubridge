@@ -133,7 +133,9 @@ squeue -u "$USER"
   line per step in `steps.jsonl`, and JSON records. A failed step's log ends
   with the tail of its NCCL logs.
 - **Pass:** the job log ends with `all steps passed`. Otherwise it ends with
-  `FAILED: <steps>`, and the job exits 1.
+  `FAILED: <steps>`, and the job exits 1. Each failed step's `FAILED` line in
+  the job log is followed by the last 20 lines of its output, which say why:
+  for `probe`, a `FAIL` line naming the check and its values.
 
 ```bash
 sacct -u "$USER" -S today --format=JobID,JobName%30,State,Elapsed,ExitCode
@@ -183,10 +185,10 @@ It needs Python 3.10 or later (no torch), so it runs with the venv's Python
 that setup made: a login node's `python3` may be older. If setup never
 finished, any Python 3.10 or later works.
 
-triage reads only job directories with a `steps.jsonl`. A job that died
-before or during its first step has none, so triage leaves it out, and its
-verdict can still say everything that ran passed. The setup job writes no
-results at all. The `sacct` lines catch both.
+Each job records its start, any error that stopped it, and its end in
+`job.jsonl`, so triage lists a job that stopped before or during its first
+step as `UNFINISHED`, with the error if there was one. The setup job writes
+no results at all: the `sacct` lines catch it.
 
 Paste back:
 1. **The triage output.**
@@ -214,8 +216,8 @@ public repository: step logs, stack dumps and NCCL logs are not redacted.
 | "set PROJECT_DIR to your group's project space" | `local.env` is missing or misspelled: step 2. |
 | A job PENDING for a long time | `squeue -u "$USER" -o "%i %j %T %r"` shows the reason. `Resources` or `Priority` just means waiting. `AssocGrpGRES` means the request doesn't fit what you may use: check partition, account and GPU type against step 00. `ReqNodeNotAvail` usually means the nodes are down or reserved. |
 | The setup job FAILED | The end of its log says why: a module that won't load, or a download that failed. `SETUP_MODULES=""` in `local.env` loads no module, but the `explorer` module is what gives compute nodes their proxy to the internet: without it, downloads fail. |
-| sacct says TIMEOUT | Slurm's time limit ran out mid-step. The kit's own limit per launch (`STEP_TIMEOUT`, 20 minutes) is longer than step 01's 10-minute Slurm limit, and `probe` has none. That step then has no line in `steps.jsonl`: paste the end of the job log (step 8). |
-| `FAILED: probe` or another step | triage shows the error lines. The full log is `results/explorer/<job>/<step>.log` (for example `01_probe/probe.log`), with NCCL's logs under `<job>/nccl/<step>/`. Paste the triage output. |
+| sacct says TIMEOUT | Slurm's time limit ran out mid-step. Each launch's own limit (`STEP_TIMEOUT`) is capped at the job's Slurm limit less 2 minutes, so one stuck launch is stopped and recorded first; steps that add up to more than the limit still run out. triage lists the step that was cut off, and the job, as `UNFINISHED`. |
+| `FAILED: probe` or another step | The job log has the step's last 20 lines after its `FAILED` line; for `probe`, a `FAIL` line names the check and its values (for example `FAIL target_in_build: device 0 target sm_120 not in arch_list [...]`). triage shows the error lines too. The full log is `results/explorer/<job>/<step>.log` (for example `01_probe/probe.log`), with NCCL's logs under `<job>/nccl/<step>/`. Paste the triage output. |
 | `shared_gpu_check: check did not fire` | The shared-GPU refusal didn't show, or the run failed some other way (a crash, or its time limit): `shared_gpu_check.log` says which. Paste it either way. |
 
 Don't rerun a failed step before pasting: the first failure's records are the

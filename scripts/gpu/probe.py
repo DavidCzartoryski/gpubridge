@@ -1,7 +1,9 @@
 """Single-process environment probe for the GPU validation kit.
 
 Records gpubridge.probe(), every visible GPU and the PyTorch build, and checks
-that this build can run on these GPUs. Writes OUT/probe.json.
+that this build can run on these GPUs. Writes OUT/probe.json. If a check
+fails, it prints one line per failure on stderr, naming the check and its
+values, and exits 1.
 
     python scripts/gpu/probe.py --out results/explorer/01_probe
 """
@@ -32,9 +34,13 @@ def main() -> int:
     with rec.stage("build_supports_gpus") as entry:
         unsupported = [d for d in env["devices"]
                        if isinstance(d, dict) and not d["target_in_build"]]
+        # A device whose properties couldn't be read: its entry is the error.
+        unreadable = {i: d for i, d in enumerate(env["devices"]) if not isinstance(d, dict)}
         entry["arch_list"] = env["arch_list"]
         entry["unsupported"] = unsupported
-        entry["ok"] = not unsupported
+        if unreadable:
+            entry["unreadable"] = unreadable
+        entry["ok"] = not unsupported and not unreadable
         if unsupported:
             entry["error"] = (
                 f"this PyTorch build has no kernels for {[d['target'] for d in unsupported]}; "
@@ -46,11 +52,41 @@ def main() -> int:
         entry["nccl_available"] = probe["nccl_available"]
         entry["gloo_available"] = probe["gloo_available"]
         entry["ok"] = probe["gloo_available"] and (probe["nccl_available"] or args.allow_no_gpu)
-    devices = ", ".join(f"{d['name']} ({d['target']})" for d in env["devices"]
-                        if isinstance(d, dict)) or "none"
+    devices = ", ".join(f"{d['name']} ({d['target']}, {d['target_match'] or 'not in the build'})"
+                        for d in env["devices"] if isinstance(d, dict)) or "none"
     print(f"torch {env['torch']} (cuda {env['torch_cuda']}, hip {env['torch_hip']}, "
           f"nccl/rccl {env['nccl_version']}); GPUs: {devices}")
-    return rec.finish()
+    code = rec.finish()
+    for line in failures(rec.data["stages"]):
+        print(line, file=sys.stderr)
+    return code
+
+
+def failures(stages: list[dict]) -> list[str]:
+    """One line per failed check, naming it and its values."""
+    lines = []
+    for stage in stages:
+        if stage.get("ok") is not False:
+            continue
+        name = stage["name"]
+        if name == "gpus_visible":
+            lines.append(f"FAIL gpus_visible: device_count {stage['device_count']}: "
+                         f"{stage['error']}")
+        elif name == "build_supports_gpus":
+            for index, error in stage.get("unreadable", {}).items():
+                lines.append(f"FAIL device_info: device {index}: {error}")
+            for d in stage["unsupported"]:
+                cap = d["capability"]
+                rules = (f" (nor an sm_{cap.split('.')[0]}x cubin at or below {cap}, nor PTX at "
+                         f"or below {cap})" if d["target"].startswith("sm_") else "")
+                lines.append(f"FAIL target_in_build: device {d['index']} target {d['target']} "
+                             f"not in arch_list {stage['arch_list']}{rules}")
+        elif name == "backends":
+            lines.append(f"FAIL backends: nccl_available {stage['nccl_available']}, "
+                         f"gloo_available {stage['gloo_available']}")
+        else:
+            lines.append(f"FAIL {name}: {stage.get('error', 'failed')}")
+    return lines
 
 
 if __name__ == "__main__":

@@ -4,12 +4,13 @@
 # output to --output. A ":" separates the components of a heterogeneous job.
 # The first node of the job (or of component 0) is 127.0.0.1, so a script's
 # rendezvous on "the first node" works; the others are fake-node-N.
-# Appends "sbatch ARGS" and "job ID exit CODE" to $FAKE_SLURM_LOG.
+# Appends "sbatch ARGS" and "job ID exit CODE" to $FAKE_SLURM_LOG. With --parsable it
+# prints only the job id, as sbatch does.
 set -euo pipefail
 log="${FAKE_SLURM_LOG:-/dev/null}"
 echo "sbatch $*" >>"$log"
 job_id=$((RANDOM % 90000 + 10000))
-name="" output="" script="" component=0 gpus=0
+name="" output="" script="" component=0 gpus=0 parsable=0
 nodes=(1)
 for arg in "$@"; do
     case $arg in
@@ -17,6 +18,7 @@ for arg in "$@"; do
     --output=*) output=${arg#*=} ;;
     --nodes=*) nodes[component]=${arg#*=} ;;
     --gres=gpu:*) [ "$component" != 0 ] || gpus=${arg##*:} ;;
+    --parsable) parsable=1 ;;
     :) component=$((component + 1)) && nodes[component]=1 ;;
     -*) ;;
     *) script=$arg ;;
@@ -54,4 +56,4 @@ fi
 code=$?
 set -e
 echo "job $job_id exit $code" >>"$log"
-echo "Submitted batch job $job_id"
+if [ "$parsable" = 1 ]; then echo "$job_id"; else echo "Submitted batch job $job_id"; fi

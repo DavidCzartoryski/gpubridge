@@ -25,11 +25,27 @@ so a script bug shows up before it can cost GPU time.
   `srun` launch, through coreutils `timeout`, so one hung step can't use up
   the job. `steps.jsonl` marks such a step `"timed_out": true`.
 - Slurm's `--time` on every Explorer job (`TIME_01` ... `TIME_07` in `submit.sh`).
+  `submit.sh` caps each job's `STEP_TIMEOUT` at its `--time` less
+  `STEP_MARGIN` (120 s), so a single hung launch is stopped and recorded
+  before Slurm ends the job: step 01's 10 minutes give 480 s.
 
 **NCCL/RCCL logs.** Every step runs with `NCCL_DEBUG=INFO`, written to
 `results/<target>/nccl/<step>/<host>.<pid>.log` instead of the
 console. When a step fails, the last 40 lines of each of its logs are appended
 to `<step>.log`, so the first thing to read already has them.
+
+**Failures in the job log.** When a step fails, the job's own log (Slurm's
+`.out` file) gets the last 20 lines of the step's output right after its
+`FAILED` line, before torchrun's failure report. `probe.py` ends a failed
+probe with one line per failed check, naming it and its values, such as
+`FAIL target_in_build: device 0 target sm_120 not in arch_list [...]`.
+
+**Each job's start and end.** `job_setup` (steps 01 to 07) begins `job.jsonl`
+in the job's results directory: a line when the job starts, one for an error
+that stops it (`die`), one when it reaches `finish`, and one with the script's
+exit code. A job that stops before or during its first step has no
+`steps.jsonl` line, but `triage.py` still lists it as unfinished from this
+file, with its error or exit code.
 
 ## Split-test mode, in one paragraph
 
@@ -545,6 +561,8 @@ both `results/mixed-*/check/rank*.json` sets into one directory and run
 - `steps.jsonl` and `<step>.log`: exit code (and `timed_out`) and full output
   of every scripted step. A failed step's log ends with the last lines of its
   NCCL/RCCL logs.
+- `job.jsonl` (Explorer jobs): when each job started, the error that stopped it,
+  if any, and when it finished.
 - `nccl/<step>/<host>.<pid>.log`: NCCL/RCCL's `NCCL_DEBUG=INFO` output, one file
   per rank.
 - `preflight/preflight-<role>.json` (steps 05 and 07): every pair of interfaces
@@ -574,7 +592,8 @@ What a record may hold from the environment is an allowlist (`ENV_NAMES` and
 a kit record holds, tracebacks and command lines included, is redacted before
 it is written: `/projects/<name>` and `PROJECT_DIR` become `$PROJECT_DIR`, the
 home directory `~`, the user name as a path segment `$USER`, and credentials in
-a URL `***`. The step logs (`<step>.log`), stack dumps (`rank*.stacks.txt`)
+a URL `***`. `job.jsonl`'s error messages get the same path replacements.
+The step logs (`<step>.log`), stack dumps (`rank*.stacks.txt`)
 and NCCL/RCCL logs are not redacted: keep them, and the results tarballs, out
 of anything public.
 
@@ -587,10 +606,12 @@ review:
     python scripts/gpu/triage.py results/explorer
     python scripts/gpu/triage.py kaggle-t4x2-20261014-0930.tgz
 
-- **Problems first:** each step that failed, timed out or never finished (a
-  log with no `steps.jsonl` line: the job was killed or ran out of Slurm time),
-  with the last error lines of its log. Then the skipped steps, with their
-  reasons. A step run again counts as its last attempt.
+- **Problems first:** an Explorer job that started but never finished (in
+  `job.jsonl`), with the error that stopped it if it recorded one; each step
+  that failed, timed out or never finished (a log with no `steps.jsonl` line:
+  the job was killed or ran out of Slurm time), with the last error lines of
+  its log. Then the skipped steps, with their reasons. A step run again counts
+  as its last attempt.
 - **For each job:** what it ran on (hosts numbered, GPU models, driver, torch,
   CUDA or ROCm, NCCL or RCCL, the gpubridge commit).
 - **Key numbers:** gpubridge's bus bandwidth against the baseline's; the
@@ -699,12 +720,12 @@ to read the ratio:
 | 07: "not a heterogeneous job" | the script was submitted with plain `sbatch` | submit with `submit.sh 07` |
 | 05 or 07: stops after `preflight` | no pair of interfaces connects the nodes both ways, or (07) a GPU the build can't run | read `pairs` in `preflight/preflight-*.json` (which connection failed, from which address) and `probe_*/probe.json`; a pair that connects one way only means a firewall between the partitions |
 | 05 or 07: the preflight chose a slow interface | the fast one didn't connect both ways, or isn't routed between the nodes | compare the pairs' MB/s in `preflight-*.json`; set `GLOO_SOCKET_IFNAME` to force one |
-| 01: `build_supports_gpus` fails | wheel without kernels for this GPU | set `CUDA_INDEX` (cu126 for V100; cu128/cu130 for newer GPUs), rerun setup |
+| 01: `build_supports_gpus` fails | wheel without kernels for this GPU | the job log's `FAIL target_in_build` line names the GPU's target and the build's arch list; set `CUDA_INDEX` (cu126 for V100; cu128/cu130 for newer GPUs), rerun setup. A GPU counts as covered by its own `sm_XY`, a cubin for an earlier minor of its major, or PTX at or below its capability; `target_match` in `probe.json` says which |
 | 01: no GPU visible | job didn't get a GPU, or driver problem | check `nvidia-smi.txt` and `slurm-job.txt` in the results |
 | 01/AMD: `local_rank_check` fails | init() succeeded with more processes than GPUs, or failed for another reason | read `expected_init_error` in `local_rank_check/rank*.json`; if init succeeded, the visible-device count isn't what PyTorch reports (item 12) |
 | 02: `shared_gpu_check` fails, `"result": "check did not fire"` | init() succeeded with two ranks of one island on the GPU, failed for another reason, or hung past `SHARED_GPU_CHECK_SECONDS` | read `shared_gpu_check.log` and `expected_init_error` in `shared_gpu_check/rank*.json`; if the log has init()'s "could not check" warning, PyTorch reported neither a UUID nor a PCI address for the GPU, so the island went unchecked (item 24) |
 | `init` stuck (summary says "stuck in this stage") | new_group / NCCL init problem (item 3) | read `rank*.stacks.txt` and the NCCL/RCCL log lines at the end of `<step>.log` (all of them in `nccl/<step>/`); this is a real finding, file it |
-| `steps.jsonl` says `"timed_out": true` | the launch ran past `STEP_TIMEOUT` | read `<step>.log` and `rank*.stacks.txt`; raise `STEP_TIMEOUT` only if the step was still making progress |
+| `steps.jsonl` says `"timed_out": true` | the launch ran past `STEP_TIMEOUT` | read `<step>.log` and `rank*.stacks.txt`; raise `STEP_TIMEOUT` only if the step was still making progress, and on Explorer the job's `TIME_0N` with it: `submit.sh` caps `STEP_TIMEOUT` at `TIME_0N` less `STEP_MARGIN` |
 | `busy_gpu` wrong values | stream ordering bug in the bridge (item 6) | serious; keep the JSON and open an issue |
 | `dtypes` mismatch | precision or reduction-order problem (item 7) | check `max_abs_error` in the stage |
 | `reductions`, `all_gather` or `reduce_scatter` mismatch | a MAX/MIN/AVG or tensor-collective path differs on NCCL/RCCL (item 15) | the failing `cases` name the dtype and op; rerun with `--policy flat-gloo` to see whether the policy or the backend is at fault |

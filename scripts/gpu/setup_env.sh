@@ -23,7 +23,9 @@ CUDA_INDEX="${CUDA_INDEX:-cu126}"
 ROCM_INDEX="${ROCM_INDEX:-rocm7.2}"
 # Where the torch wheel comes from; default: the PyTorch index for CUDA_INDEX/ROCM_INDEX.
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-}"
-PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
+# The venv's Python. Not PYTHON_VERSION: Python's Docker images set that to their own
+# full version (e.g. 3.12.15), which uv would then try to find or download.
+VENV_PYTHON="${VENV_PYTHON:-3.12}"
 VENV="${VENV:-${WORK_DIR:-$HOME/gpubridge-gpu}/venv}"
 SYSTEM_PYTHON="${SYSTEM_PYTHON:-python3}"
 # -------------------------------------------------------------------------------
@@ -71,8 +73,8 @@ if [ ! -x "$VENV/bin/python" ]; then
         log "creating $VENV on top of $SYSTEM_PYTHON (reusing its PyTorch)"
         run uv venv --system-site-packages --python "$SYSTEM_PYTHON" "$VENV"
     else
-        log "creating $VENV with Python $PYTHON_VERSION"
-        run uv venv --python "$PYTHON_VERSION" "$VENV"
+        log "creating $VENV with Python $VENV_PYTHON"
+        run uv venv --python "$VENV_PYTHON" "$VENV"
     fi
 fi
 

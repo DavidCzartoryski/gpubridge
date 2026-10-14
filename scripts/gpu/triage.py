@@ -6,9 +6,11 @@
 
 Every directory under the path with a steps.jsonl is one job (as for
 validation_tables.py): an Explorer step directory, a mixed or AMD target, or a
-Kaggle run. Problems come first: each step that failed, timed out or never
-finished (a log with no steps.jsonl line: the job was killed), with the last
-error lines of its log, and the skipped steps with their reasons. Then, per job:
+Kaggle run. Problems come first: an Explorer job that started but never
+finished (job.jsonl: its last start has no end), with the error that stopped
+it if it recorded one; each step that failed, timed out or never finished (a
+log with no steps.jsonl line: the job was killed), with the last error lines
+of its log; and the skipped steps with their reasons. Then, per job:
 
 - what it ran on: hosts (numbered), GPU models, driver, torch, CUDA or ROCm,
   NCCL or RCCL, the gpubridge commit;
@@ -57,7 +59,7 @@ TAIL = 3
 WIDTH = 160
 """Characters per printed line."""
 ERROR = re.compile(r"\b\w*(Error|Exception)\b[:(]|FAILED|Traceback|ran out of time|Killed|"
-                   r"CANCELLED|NCCL WARN|timed out|not found|No such file")
+                   r"CANCELLED|NCCL WARN|timed out|not found|No such file|^FAIL \w+:")
 #: torchrun's failure footer: says that a rank failed, not why.
 BOILERPLATE = re.compile(r"error_file:|traceback\s*:|To enable traceback|Root Cause|Failures:|"
                          r"^[=\-]+$|<NO_OTHER_FAILURES>|exitcode\s*:|local_rank:|host\s*:|time\s*:|"
@@ -176,7 +178,45 @@ class Report:
         self.run = run_row(job, hosts)
         self.counts = {"passed": 0, "failed": 0, "timed out": 0, "unfinished": 0, "skipped": 0}
         self.problems: list[tuple[str, list[str]]] = []  # (line, log tail)
+        self.unfinished_job = False
         self._steps()
+        self._job_events()
+
+    def _job_events(self) -> None:
+        """job.jsonl (Explorer jobs): whether the job's last start reached its end."""
+        events = _jsonl(self.job.path / "job.jsonl")
+        starts = [i for i, event in enumerate(events) if event.get("event") == "started"]
+        if not starts:
+            return
+        start = events[starts[-1]]
+        mine = [e for e in events[starts[-1] + 1:] if e.get("job_id") == start.get("job_id")]
+        kinds = [str(e.get("event")) for e in mine]
+        end = kinds.index("finished") if "finished" in kinds else None
+        errors = [(i, str(e.get("message", ""))) for i, e in enumerate(mine)
+                  if e.get("event") == "error"]
+        job = f"job {start.get('job_id', '?')}"
+        lines = []
+        if end is None:
+            self.unfinished_job = True
+            codes = [e.get("code") for e in mine if e.get("event") == "exit"]
+            if errors:
+                why = f"it stopped with an error: {errors[-1][1]}"
+            elif codes and isinstance(codes[-1], int) and codes[-1] > 128:
+                why = f"it ended on signal {codes[-1] - 128}: killed, or out of Slurm time"
+            elif codes:
+                why = (f"it exited with code {codes[-1]} before its end: a command failed "
+                       "(the job log says which)")
+            else:
+                why = "killed, out of Slurm time, or still running"
+            lines.append(f"  UNFINISHED {job}, started {start.get('time', '?')}: no end "
+                         f"recorded; {why}. Its job log has the rest")
+        else:
+            lines += [f"  ERROR in {job}, which went on to its end: {message}"
+                      for i, message in errors if i < end]
+            stops = [message for i, message in errors if i > end]
+            if stops:
+                lines.append(f"  STOPPED {job} early: {stops[-1]}")
+        self.problems[:0] = [(line, []) for line in lines]
 
     def _steps(self) -> None:
         last: dict[str, dict[str, Any]] = {}
@@ -215,7 +255,8 @@ class Report:
 
     @property
     def ok(self) -> bool:
-        return not (self.counts["failed"] or self.counts["timed out"] or self.counts["unfinished"])
+        return not (self.counts["failed"] or self.counts["timed out"] or self.counts["unfinished"]
+                    or self.unfinished_job)
 
     def header(self) -> list[str]:
         r = self.run
@@ -326,6 +367,9 @@ def summarize(root: Path, label: str, max_lines: int = 80) -> tuple[str, bool]:
     totals = {k: sum(r.counts[k] for r in reports) for k in reports[0].counts}
     digests, agree = digest_line(jobs)
     bad = [f"{totals[k]} {k}" for k in ("failed", "timed out", "unfinished") if totals[k]]
+    unfinished_jobs = sum(r.unfinished_job for r in reports)
+    if unfinished_jobs:
+        bad.append(f"{unfinished_jobs} job(s) unfinished")
     ok = not bad and agree
     simulated = any(job.simulated for job in jobs)
     head = [f"gpubridge results triage: {label}, {len(jobs)} job(s)"

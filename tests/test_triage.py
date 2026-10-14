@@ -216,6 +216,88 @@ def test_killed_rerun_and_negative_steps(tmp_path, capsys):
     assert "(log outside the results directory)" in out and "localhost" not in out
 
 
+def job_events(path: Path, *events: tuple) -> None:
+    """job.jsonl, as common.sh writes it: (event, job id[, message])."""
+    path.mkdir(parents=True, exist_ok=True)
+    lines = [{"event": e[0], "job_id": e[1], "time": f"T{e[1]}",
+              **({"message": e[2]} if len(e) > 2 else {}),
+              **({"failed": 0} if e[0] == "finished" else {})} for e in events]
+    (path / "job.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
+def test_jobs_that_started_but_never_finished(tmp_path, capsys):
+    stuck = tmp_path / "01_probe"  # killed in its first step: a log, no steps.jsonl line
+    steps(stuck)
+    job_events(stuck, ("started", "11"))
+    (stuck / "probe.log").write_text("torch 2.14.1+cu126\n")
+    broken = tmp_path / "02_split_shared_gpu"  # stopped before its first step
+    steps(broken)
+    job_events(broken, ("started", "12"),
+               ("error", "12", "no venv at /projects/secret-lab/alice/gpubridge-gpu/venv; run "
+                               "setup first"))
+    done = tmp_path / "03_single_island"
+    steps(done, ok("check"))
+    job_events(done, ("started", "13"), ("finished", "13"))
+    rerun = tmp_path / "04_split_4gpu"  # the earlier job finished; its rerun didn't
+    steps(rerun, ok("check_half"))
+    job_events(rerun, ("started", "14"), ("finished", "14"), ("started", "15"))
+    stopped = tmp_path / "05_multinode"  # finish, then die: stopped on purpose
+    steps(stopped, {"step": "preflight", "exit_code": 1, "seconds": 5, "log": "preflight.log",
+                    "timed_out": False})
+    job_events(stopped, ("started", "16"), ("finished", "16"),
+               ("error", "16", "stopping before torchrun: the preflight failed"))
+    code, out = run(tmp_path, capsys=capsys)
+    assert code == 1
+    assert ("UNFINISHED job 11, started T11: no end recorded; killed, out of Slurm time, or "
+            "still running. Its job log has the rest") in out
+    assert "UNFINISHED probe: a log but no steps.jsonl line" in out
+    assert ("UNFINISHED job 12, started T12: no end recorded; it stopped with an error: no venv "
+            "at $PROJECT_DIR/gpubridge-gpu/venv; run setup first") in out
+    assert "job 13" not in out and "job 14" not in out and "UNFINISHED job 15" in out
+    assert "STOPPED job 16 early: stopping before torchrun: the preflight failed" in out
+    assert out.splitlines()[-1] == "verdict: 1 failed, 1 unfinished, 3 job(s) unfinished"
+
+
+def test_job_events_in_order_and_by_job(tmp_path, capsys):
+    went_on = tmp_path / "02_split_shared_gpu"  # an error from a subshell, then the end
+    steps(went_on, ok("check"))
+    job_events(went_on, ("started", "21"), ("error", "21", "a helper gave up"),
+               ("finished", "21"))
+    other = tmp_path / "03_single_island"  # another job's end doesn't end this one
+    steps(other, ok("check"))
+    job_events(other, ("started", "22"), ("started", "23"), ("finished", "22"))
+    failed_cmd = tmp_path / "05_multinode"  # set -e: the exit code, no error line
+    steps(failed_cmd)
+    job_events(failed_cmd, ("started", "24"))
+    with open(failed_cmd / "job.jsonl", "a") as fh:
+        fh.write(json.dumps({"event": "exit", "job_id": "24", "time": "T", "code": 1}) + "\n")
+    killed = tmp_path / "06_scaling"  # SIGTERM from Slurm: 128 + 15
+    steps(killed)
+    job_events(killed, ("started", "25"))
+    with open(killed / "job.jsonl", "a") as fh:
+        fh.write(json.dumps({"event": "exit", "job_id": "25", "time": "T", "code": 143}) + "\n")
+    code, out = run(tmp_path, "--max-lines", "0", capsys=capsys)
+    assert code == 1
+    assert "ERROR in job 21, which went on to its end: a helper gave up" in out
+    assert "STOPPED job 21" not in out and "UNFINISHED job 21" not in out
+    assert "UNFINISHED job 23" in out and "job 22" not in out
+    assert ("UNFINISHED job 24, started T24: no end recorded; it exited with code 1 before its "
+            "end: a command failed") in out
+    assert "UNFINISHED job 25, started T25: no end recorded; it ended on signal 15" in out
+
+
+def test_probe_fail_lines_are_the_error_lines(tmp_path, capsys):
+    path = tmp_path / "01_probe"
+    steps(path, {"step": "probe", "exit_code": 1, "seconds": 9, "log": "probe.log",
+                 "timed_out": False})
+    (path / "probe.log").write_text(
+        "nvidia-smi: not found\n"
+        "torch 2.14.1+cu126 (cuda 12.6); GPUs: X (sm_120, not in the build)\n"
+        "FAIL target_in_build: device 0 target sm_120 not in arch_list ['sm_90']\n")
+    code, out = run(tmp_path, capsys=capsys)
+    assert code == 1 and "| FAIL target_in_build: device 0 target sm_120" in out
+
+
 def test_cpu_simulation_says_so_and_a_clean_run_passes(tmp_path, capsys):
     path = tmp_path / "sim"
     steps(path, ok("probe"))
