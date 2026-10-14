@@ -3,9 +3,10 @@
 **Opt-in, changes results, not validated on GPUs.** On the first GPU run, a
 V100, two of the kernel tests failed: the fp8 error-feedback residual
 differed from the reference, from a codec overflow and a fused multiply-add,
-both fixed in #50. A rerun on a V100 after the fix passed them. Otherwise
-everything here has run on CPU only: the Triton kernels in Triton's
-interpreter, and whole jobs in simulation mode.
+both fixed in #50. Since then the kernels have matched the CPU reference on
+NVIDIA V100, T4, A100, L40S and H200 GPUs and an AMD MI50 (the
+[CHANGELOG](../CHANGELOG.md)'s runs). Compressed collectives in whole jobs
+have run on CPU only, in simulation mode.
 [HARDWARE_VALIDATION.md](../HARDWARE_VALIDATION.md) items 28 and 29 list what
 a GPU run must show.
 
@@ -215,6 +216,167 @@ its PTX has no fused multiply-add.
   codes and scale from every member's payload, adds in float32 and writes
   the output.
 
+## Kernel speed
+
+### Measured
+
+`bench_compression.py` at 1 GB, fusion off, as a share of the GPU's measured
+device-to-device copy bandwidth (GB/s of the bytes each kernel must move, over
+the copy's):
+
+| GPU | copy bandwidth | commit | `bf16` mode, quantize and dequantize (float32) | `fp8` quantize float32 | `fp8` dequantize float32 | `fp8` quantize bfloat16 | `fp8` dequantize bfloat16 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| NVIDIA V100 (sm_70) | 780 GB/s | df80abb | - | 101% | 81% | 99% | 52% |
+| AMD MI50 (gfx906) | 775 GB/s | df80abb | 102 to 105% | 78% | 55% | 63% | 39% |
+| NVIDIA H200 (sm_90) | 4,236 GB/s | 4a478f4 | 97 to 99% | 72% | 40% | 61% | 24% |
+
+The `bf16` mode keeps up with memory everywhere. The `fp8` kernels don't,
+and not only on the fast GPU: the MI50 has the V100's bandwidth and is
+compute-bound like the H200.
+
+**Why: operations per byte.** The `bf16` mode does a few integer operations
+per value; `fp8`'s integer-emulated E4M3 encode and decode do tens. What a GPU
+can afford per byte is its issue rate over its bandwidth. Estimates, from
+published SM and CU counts and boost clocks at one instruction per lane per
+cycle, not measured:
+
+| GPU | lane operations per second | per byte of copy bandwidth |
+| --- | --- | --- |
+| V100 | 80 SMs × 128 lanes × 1.53 GHz ≈ 15.7 T | ≈ 20 |
+| MI50 | 60 CUs × 64 lanes × 1.725 GHz ≈ 6.6 T | ≈ 8.5 |
+| H200 | 132 SMs × 128 lanes × 1.98 GHz ≈ 33.5 T | ≈ 7.9 |
+
+The MI50 and the H200 can afford less than half the V100's operations per
+byte. Dequantize to bfloat16 does the most per byte it moves: for each value
+and member a decode, the scale multiply and the tiny-value test after each
+addition, then integer bfloat16 rounding, all for about 4 bytes of traffic.
+It is the slowest kernel on all three.
+
+### The plan, in order (designed, not built)
+
+Each step keeps every payload and result bit-identical to the CPU reference,
+on every vendor. The reference stays as it is, as the specification: each
+faster kernel path is shown equal to it, exhaustively where the inputs allow.
+
+**1. A lookup table for the E4M3 decode (dequantize).**
+
+- *What:* the 256 decoded values, float32, computed once on the host by the
+  reference's own decode (`_decode_e4m3(arange(256))`), uploaded once per
+  device (1 KB) and passed to the kernel. The decode becomes one gather,
+  `table[code]`, then the scale multiply as now. Quantize's decode of its own
+  codes, for the residual, uses it too.
+- *Why first:* dequantize is the slowest kernel on every GPU measured, and the
+  decode is most of its work per value. A table needs no vendor instruction,
+  so it serves the V100, the MI50 and the H200 alike.
+- *Bit-exact by construction:* each entry is the reference's decode of that
+  code, bits and all: the two NaN codes (0x7F, 0xFF) hold the reference's NaN
+  (0x7FC00000), 0x80 holds -0.0. Everything after the decode is unchanged (a
+  multiply by a power of two, additions in member order, zeroing below
+  2^-100), so the output is too.
+- *How, in Triton:* a gather from the table in global memory (1 KB stays in
+  L1), or the table loaded once per program and `tl.gather` from on-chip
+  memory. Measure both: a warp's 32 lookups can hit 32 different words, and
+  how well each GPU's L1 or LDS serves that decides between them.
+- *Plan B,* if the gather is slower than the arithmetic: build the float32
+  bits directly. Normal codes are `sign << 31 | (exp + 120) << 23 | mant <<
+  20`, subnormal codes (exp 0) are `mant × 2^-9`, NaN by a select: about half
+  today's operations, checked against the reference on all 256 codes.
+- *Tests:*
+  - CPU: the table equals the reference decode on all 256 codes, bit for bit,
+    NaN bits included;
+  - the interpreter tests against the reference, every mode, output dtype,
+    member count and size, unchanged;
+  - GPU: `test_gpu_dequantize_accumulate_matches_the_cpu_reference` on each
+    GPU, and the fixed-input digests unchanged from before the change;
+  - the bench, before and after, on a V100, an MI50 and an H200.
+
+**2. A cheaper integer encode (quantize).**
+
+- *What:* today's encode computes both the normal and the subnormal E4M3 path
+  for every value and selects one (roughly 28 operations, an estimate).
+  Instead, with |q| clamped at 448 first and the sign or'ed in as now (about
+  13 operations):
+  - normal codes (|q| >= 2^-6): `((bits + 0x7FFFF + ((bits >> 20) & 1)) >> 20)
+    - (120 << 3)`, which rounds the mantissa to 3 bits, half to even, by
+    adding a bias; a carry into the exponent is the next binade's code, as it
+    should be;
+  - subnormal codes (|q| < 2^-6): the bits of `|q| + 2^14` less those of
+    `2^14`. One float32 addition rounds |q| to a multiple of 2^-9 (round to
+    nearest even), and the low bits of the sum are that multiple, 0 to 8 (8
+    is the smallest normal code, 0x08).
+- *Bit-exact:* both are round-to-nearest-even onto the reference's grid.
+  Checked exhaustively on CPU against `_encode_e4m3`: every float32 with
+  |x| <= 512, both signs (2,281,701,378 values), all equal, in 27 s on six
+  cores. The float32 addition is correctly rounded on every GPU, and a
+  float32 subnormal |q| rounds to 0 whether or not the GPU flushes it, so
+  flushing can't change a code.
+- *Tests:* that exhaustive equivalence in CPU CI (or a strided subset there
+  and the full sweep on demand, if 27 s is too much); the interpreter and GPU
+  tests against the reference; the digests unchanged; the bench.
+
+**3. A hardware fp8 path for sm_89 and later (last).**
+
+- *What:* on NVIDIA GPUs of compute capability 8.9 or later (L40S, H100,
+  H200, Blackwell), `cvt.rn.satfinite.e4m3x2.f32` for the encode, two values
+  per instruction, and `cvt.rn.f16x2.e4m3x2` then `cvt.f32.f16` for the decode
+  where that beats the table.
+  - **Selection:** at launch, from the device's capability, as a constexpr, so
+    each path compiles on its own.
+  - **Where the integer path stays:** sm_70, sm_75, sm_80, and every AMD GPU.
+    MI300's fp8 instructions implement the FNUZ variant, a different format.
+  - **An override:** a local setting forces either path, for tests and
+    benchmarks, as `GPUBRIDGE_COMPRESSION_KERNELS` does. Ranks may differ,
+    since the bits don't.
+- *Bit-exact:* the instruction only ever rounds what the reference rounds.
+  - Its inputs are finite, non-negative and at most 448. The shared code
+    clamps |q| at 448, takes the sign from `q < 0`, and selects 0x7F for
+    values that aren't finite, as now. q is never -0, because v's zeros are
+    +0. So the saturation and NaN rules of `.satfinite` never apply, and
+    neither does the sign of a zero.
+  - On [0, 448] it rounds to nearest even onto the E4M3 grid: subnormals in
+    steps of 2^-9, at most 448. That is the reference's grid and rule. A
+    float32 subnormal input rounds to +0 either way, so whether the hardware
+    flushes inputs can't matter.
+  - Decode: every E4M3 value is exact in float16 and float32. The NaN codes
+    are selected to the reference's NaN explicitly. So every code decodes to
+    the reference's bits.
+- **Not Triton's own cast on sm_89.** Triton 3.8 compiles `x.to(tl.float8e4nv,
+  fp_downcast_rounding="rtne")` to `cvt.rn.satfinite.e4m3x2.f32` on sm_90 and
+  sm_100. On sm_89 it compiles it to `cvt.rz.f16.f32` then
+  `cvt.rn.satfinite.e4m3x2.f16x2`: a truncation to float16, then the rounding.
+  - **How often it differs:** emulated on CPU over every float32 in
+    [2^-14, 448], that double rounding differs from the reference for 516,033
+    of 190,840,833 values (0.27%).
+  - **An example:** 0x3A800001, just above 2^-10, encodes to 0x01 directly and
+    to 0x00 through float16.
+  - **So:** the encode uses inline PTX for that one instruction on every
+    sm_89+ target, or the path starts at sm_90.
+- *Tests:*
+  - CPU, offline PTX, as for fused multiply-adds:
+    - the hardware variant for sm_89, sm_90 and sm_100 contains
+      `cvt.rn.satfinite.e4m3x2.f32` and no `cvt.rz.f16.f32`;
+    - the integer variant for sm_80 has no fp8 conversion;
+    - dispatch by capability, and the override.
+  - GPU, on an sm_89 (L40S) and an sm_90 (H200) GPU, both on Explorer:
+    - the hardware encode against the integer encode on every float32 with
+      |x| <= 512, both signs (2.28e9 values, seconds on a GPU);
+    - all 256 codes through both decodes;
+    - the existing GPU tests on the hardware path;
+    - the fixed-input digests equal to the integer path's on the same GPU,
+      and to the other vendors';
+    - the bench.
+- *Possibly also:* bfloat16 output by `cvt.rn.bf16.f32` (sm_80 and later),
+  with an explicit NaN select. It is identical to the integer rounding, since
+  the float32 sum is never subnormal (zeroed below 2^-100) and overflow to
+  inf rounds the same way. That is what remains of dequantize-to-bfloat16's
+  cost after step 1.
+
+**Before step 1:** one Nsight Compute run of the two `fp8` kernels on the
+H200, and `rocprofv3` on the MI50 if counters are available. They show where
+dequantize stalls: on instruction issue, which steps 1 and 2 cut, or on
+memory latency and occupancy, where more values per thread or wider loads
+would help more.
+
 ## Measuring it
 
 - `scripts/gpu/bench_compression.py` times both kernels per mode, dtype and
@@ -236,9 +398,11 @@ its PTX has no fused multiply-add.
 
 ## Not done
 
-- Kernel speed, where compression pays off, the cost of compiling without
-  fused multiply-adds, and the kernels' bit-identity across NVIDIA and AMD are
-  open (items 28 and 29).
+- The `fp8` kernels are compute-bound on the MI50 and the H200 ([Kernel
+  speed](#kernel-speed)): a plan, not built.
+- Where compression pays off in a real job, the cost of compiling without
+  fused multiply-adds, and a mixed job's digests across vendors are open
+  (items 28 and 29).
 - No training-accuracy study: loss curves with and without compression over
   many steps (`examples/train_synthetic.py` would do).
 - Compressed broadcast, all_gather, or a compressed island step.
