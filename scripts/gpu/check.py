@@ -50,12 +50,15 @@ from datetime import timedelta
 from pathlib import Path
 
 import torch
-from gpukit import Record, default_timeout, rank_from_env, run_info, sync
+from gpukit import Record, default_timeout, queue_gpu_delay, rank_from_env, run_info, sync
 
 import gpubridge
 from gpubridge.collectives import SUPPORTED_DTYPES
 
 DTYPES = {str(dtype).removeprefix("torch."): dtype for dtype in SUPPORTED_DTYPES}
+#: What busy_gpu's and async's tensors hold until the queued GPU work is done: no
+#: rank's value, so a copy that ran early gives a wrong sum.
+POISON = -1000.0
 
 
 def _values64(shape: tuple[int, ...], dtype: torch.dtype, rank: int) -> torch.Tensor:
@@ -109,8 +112,9 @@ def main() -> int:
                         help="bridge transport for gpubridge.init: gloo, or ucx")
     parser.add_argument("--large-numel", type=int, default=None,
                         help="elements in the busy-GPU tensor (default: 64M on GPU, 1M on CPU)")
-    parser.add_argument("--busy-iters", type=int, default=20,
-                        help="matmuls queued before the busy-GPU all_reduce")
+    parser.add_argument("--busy-seconds", type=float, default=0.05,
+                        help="GPU work queued before the busy-GPU and async all_reduces "
+                             "(no BLAS: torch's spin kernel)")
     parser.add_argument("--in-flight-settle", type=float, default=1.0,
                         help="seconds every other rank's in_flight() must stay unchanged "
                              "before the late rank joins")
@@ -167,12 +171,14 @@ def main() -> int:
             entry["megabytes"] = round(numel * 4 / 2**20, 1)
             tensor = torch.full((numel,), float(rank + 1), device=device)
             if device.type == "cuda":
-                # Queue real work ahead of the all_reduce and make the tensor depend
-                # on it, so the bridge's .cpu() copy must wait for the GPU.
-                work = torch.randn(2048, 2048, device=device)
-                for _ in range(args.busy_iters):
-                    work = torch.tanh(work @ work)
-                tensor.add_(work.sum() * 0)
+                # Queue GPU work ahead of the all_reduce and write the tensor after it,
+                # so the bridge's .cpu() copy must wait for the GPU: until then the
+                # tensor holds a poison value, so a copy that didn't wait sends it.
+                # No matmuls: some ROCm builds have no BLAS kernels for the GPU, and
+                # gpubridge needs none.
+                tensor.fill_(POISON)
+                queue_gpu_delay(device, args.busy_seconds)
+                tensor.fill_(float(rank + 1))
             start = time.perf_counter()
             gpubridge.all_reduce(tensor)
             sync(device)
@@ -233,12 +239,12 @@ def main() -> int:
             numel = 4 * 2**20 if device.type == "cuda" else 2**16
             tensor = torch.full((numel,), float(rank + 1), device=device)
             if device.type == "cuda":
-                # Queue real work on this stream and make the tensor depend on it: the
-                # worker's stream must wait for it before the all_reduce reads the tensor.
-                work_matrix = torch.randn(2048, 2048, device=device)
-                for _ in range(args.busy_iters):
-                    work_matrix = torch.tanh(work_matrix @ work_matrix)
-                tensor.add_(work_matrix.sum() * 0)
+                # Queue GPU work on this stream and write the tensor after it: the
+                # worker's stream must wait for it before the all_reduce reads the
+                # tensor, which holds a poison value until then.
+                tensor.fill_(POISON)
+                queue_gpu_delay(device, args.busy_seconds)
+                tensor.fill_(float(rank + 1))
             work = gpubridge.all_reduce(tensor, async_op=True)
             work.wait()  # orders this stream after the collective; no host sync
             correct = tensor == world * (world + 1) / 2  # queued after wait() on this stream

@@ -18,10 +18,22 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   (`AMD_NODES_CONFIRMED=1` in `submit.sh`, no library code; the records say
   df80abb+dirty): driver 570.86.15, torch 2.14.1+cu126, NCCL 2.29.3. Step 02
   passed; `gpu_tests` 26 passed, 8 skipped, in 437 s.
-- **AMD MI50 (gfx906), setup:** `setup-rocm` succeeded with torch
-  2.14.1+rocm7.2 (HIP 7.2.53211, RCCL 2.27.7), and the probe found gfx906 in
-  the build's arch list (an exact match). The single-node AMD step's result
-  is still to come.
+- **NVIDIA Tesla T4 (sm_75), commit df80abb** with the same local line:
+  driver 570.86.15. Step 02 passed; `gpu_tests` 26 passed, 8 skipped, in
+  205 s.
+- **NVIDIA L40S (sm_89), commit df80abb** with the same local line, `sharing`
+  partition: driver 545.23.08. Step 02 passed; `gpu_tests` 26 passed, 8
+  skipped, in 186 s. The probe found the build covers it with sm_86 cubins
+  (`target_match` "compatible").
+- **AMD MI50 (gfx906)**, `sharing` partition, torch 2.14.1+rocm7.2, HIP
+  7.2.53211, RCCL 2.27.7: `setup-rocm` succeeded, and the probe found gfx906
+  in the build's arch list (an exact match). The single-node AMD step:
+  `gpu_tests` 24 passed, 2 failed, 8 skipped; `check_1gpu` and
+  `check_split_shared_gpu` aborted (exit -6); the compression kernels matched
+  the CPU reference in 3 of 3 cases. Every failure was the wheel's rocBLAS,
+  which has no kernels for gfx906, in a matmul used as busy work, which #52
+  replaces. `diag_fp8_residual.py` found every fp8 payload and residual
+  matching the CPU reference, for float32 and float64, with fusion on and off.
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
@@ -56,6 +68,13 @@ hardware.
   with multiply-add contraction on (gpubridge's own launches have it off since
   #50), a probe of what the device computes, and counts the compiled code's
   fused multiply-adds and flush-to-zero instructions (#48).
+- `scripts/gpu/stream_mutations.py`: undoes each stream-ordering fix in turn
+  (`GPUBRIDGE_TEST_MUTATION` in `tests/test_gpu.py`) and checks that the GPU
+  test guarding it fails, and that the tests pass without one (#52).
+- `scripts/gpu/time_triton_cache.py`: how long the compression kernels take
+  to build and to load from Triton's cache, by cache location (#52).
+- `probe.py` records whether BLAS works (`blas_available`, with the error),
+  from a matmul in a child process, without failing the probe (#52).
 - `scripts/gpu/bench_compression.py --fp-fusion`: launches the compression
   kernels with multiply-add contraction on, so a run each way times what
   gpubridge's default (off) costs (#50).
@@ -82,6 +101,10 @@ hardware.
   version (#49).
 - `results/explorer/` is gitignored: its step logs, stack dumps and NCCL logs
   are not redacted (#50).
+- Explorer jobs build Triton's kernels in a node-local cache, filled from
+  `$WORK_DIR/triton-cache` at the start and saved back at the end, instead of
+  Triton's default `~/.triton/cache` in the home directory
+  (`TRITON_CACHE_STORE`; a `TRITON_CACHE_DIR` you set wins) (#52).
 - The GPU kit's `gpu_tests` step (Explorer 02 and 04, `amd/run_all.sh`, the
   Kaggle runner) runs pytest with `--durations=15`, so the slowest tests and
   their times end its log (#51).
@@ -95,6 +118,15 @@ hardware.
 
 ### Fixed
 
+- The stream-ordering checks (`check.py`'s `busy_gpu` and `async` stages,
+  `tests/test_gpu.py`) queued matmuls as busy work, and failed or aborted
+  where rocBLAS has no kernels for the GPU (gfx906 on the ROCm 7.2 wheel).
+  They queue a calibrated spin kernel instead (`gpukit.queue_gpu_delay`); no
+  BLAS anywhere in the checks. `check.py --busy-iters` is now
+  `--busy-seconds` (#52).
+- The AMD driver was recorded as `rocm-smi`'s whole CSV output (`name,
+  value "Driver version", "5.14.0-..."`). Records hold the version now, and
+  triage reads older ones the same way (#52).
 - ROCm runs printed `(null): No such file or directory` once per GPU per
   process: the ROCm wheel's bundled libdrm couldn't find its GPU-name table.
   The kit now points `AMDGPU_ASIC_ID_TABLE_PATHS` at the copy the wheel ships

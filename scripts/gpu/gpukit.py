@@ -145,8 +145,12 @@ def driver_version() -> str | None:
         out = _command("nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader")
         return out.splitlines()[0].strip() if out else None
     if torch.version.hip:
-        return _read("/sys/module/amdgpu/version") or _command(
-            "rocm-smi", "--showdriverversion", "--csv")
+        # An in-tree amdgpu (no DKMS package) has no module version: rocm-smi then
+        # reports the kernel's release, as CSV, which driver_text reduces to the value.
+        from validation_tables import driver_text
+
+        return _read("/sys/module/amdgpu/version") or driver_text(_command(
+            "rocm-smi", "--showdriverversion", "--csv"))
     return None
 
 
@@ -364,3 +368,99 @@ def sync(device: torch.device) -> None:
     """Wait for queued GPU work, so timings and checks see finished results."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+# ---- GPU work without BLAS --------------------------------------------------------
+#
+# Stream-ordering checks queue GPU work and write their input after it, so that a
+# copy that didn't wait would read stale data. That work used to be matmuls, but the
+# ROCm wheels' rocBLAS has no kernels for some older GPUs (gfx906: "Cannot read
+# .../TensileLibrary.dat"), and gpubridge itself never needs BLAS.
+
+#: Cycles per second of torch.cuda._sleep, per device index; 0 where it can't run.
+_SPIN_RATE: dict[int, float] = {}
+#: Seconds per elementwise pass over _DELAY_NUMEL float32 values, per device index.
+_PASS_SECONDS: dict[int, float] = {}
+_DELAY_NUMEL = 1 << 24  # 64 MB: each pass is GPU work, not launch overhead
+
+
+def queue_gpu_delay(device: torch.device, seconds: float) -> None:
+    """Queue about ``seconds`` of GPU work on the current stream; the host doesn't wait.
+
+    Anything queued after it on that stream waits for it. No BLAS: torch's spin kernel
+    (``torch.cuda._sleep``), calibrated once per device, or, where that is missing or
+    fails, a calibrated chain of elementwise multiplies. Nothing on CPU.
+    """
+    if device.type != "cuda" or seconds <= 0:
+        return
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _SPIN_RATE:
+        _SPIN_RATE[index] = _spin_rate(index)
+    if _SPIN_RATE[index] > 0:
+        with torch.cuda.device(index):
+            torch.cuda._sleep(max(1, int(_SPIN_RATE[index] * seconds)))
+        return
+    if index not in _PASS_SECONDS:
+        _PASS_SECONDS[index] = _pass_seconds(index)
+    x = torch.ones(_DELAY_NUMEL, device=device)
+    for _ in range(max(1, round(seconds / _PASS_SECONDS[index]))):
+        x.mul_(1.0)
+
+
+def _timed(index: int, fn: Callable[[], None]) -> float:
+    """Seconds ``fn``'s GPU work takes, timed with events on a stream of its own."""
+    with torch.cuda.device(index), torch.cuda.stream(torch.cuda.Stream(index)):
+        fn()  # warms up: the first launch loads the kernel
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        end.synchronize()
+    return start.elapsed_time(end) / 1e3
+
+
+def _spin_rate(index: int) -> float:
+    sleep = getattr(torch.cuda, "_sleep", None)
+    if sleep is None:
+        return 0.0
+    cycles = 20_000_000
+    try:
+        seconds = _timed(index, lambda: sleep(cycles))
+    except RuntimeError:
+        return 0.0
+    # A spin that took no time doesn't spin: fall back to elementwise work. (Real GPU
+    # clocks are 10 MHz to a few GHz: 20M cycles take 2 ms to 2 s.)
+    return cycles / seconds if 1e-4 < seconds < 10 else 0.0
+
+
+def _pass_seconds(index: int) -> float:
+    x = torch.ones(_DELAY_NUMEL, device=torch.device("cuda", index))
+    passes = 10
+
+    def run() -> None:
+        for _ in range(passes):
+            x.mul_(1.0)
+
+    return max(_timed(index, run) / passes, 1e-6)
+
+
+def blas_check(index: int = 0, timeout: float = 120) -> dict[str, Any]:
+    """Whether a tiny matmul runs on GPU ``index``, and why not. In a child process:
+    rocBLAS without kernels for the GPU aborts its process ("rocBLAS error: Cannot read
+    .../TensileLibrary.dat", exit -6) rather than raise. gpubridge never needs BLAS;
+    the record says so for whoever reads why a matmul elsewhere failed."""
+    code = ("import torch; a = torch.ones(4, 4, device='cuda:%d'); "
+            "print(float((a @ a).sum()))" % index)
+    try:
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                                timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"blas_available": False, "error": f"a 4x4 matmul ran past {timeout:g} s"}
+    if result.returncode == 0 and result.stdout.strip() == "64.0":
+        return {"blas_available": True}
+    lines = [line for line in (result.stderr + result.stdout).splitlines() if line.strip()]
+    # The BLAS error itself, not a warning printed before it (hipBLASLt warns first).
+    error = next((line for line in lines if "error" in line.lower() and "blas" in line.lower()),
+                 next((line for line in lines if "error" in line.lower()),
+                      lines[-1] if lines else "no output"))
+    return {"blas_available": False, "exit_code": result.returncode, "error": error[:1000]}

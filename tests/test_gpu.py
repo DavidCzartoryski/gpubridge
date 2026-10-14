@@ -33,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import sys
 import time
 from collections.abc import Callable
 from datetime import timedelta
@@ -43,7 +44,10 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-import gpubridge
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "gpu"))
+from gpukit import queue_gpu_delay  # noqa: E402
+
+import gpubridge  # noqa: E402
 from gpubridge import ucx
 from gpubridge.policies import implements
 
@@ -179,6 +183,7 @@ def _rank_main(rank: int, world: int, fn: Callable[[int, int, Path], None], tmp_
     count = torch.cuda.device_count()
     os.environ["LOCAL_RANK"] = str(rank % count if count else 0)
     torch.set_num_threads(1)
+    apply_mutation(os.environ.get(MUTATION_ENV))
     fn(rank, world, tmp_path)
 
 
@@ -334,12 +339,99 @@ def native_only(rank: int, world: int, tmp_path: Path, *, numels: tuple[int, ...
     bad.raise_if_any()
 
 
-def busy(device: torch.device, iters: int) -> torch.Tensor:
-    """Queue ``iters`` matmuls on the current stream, so whatever comes next waits."""
-    a = torch.randn(2048, 2048, device=device)
-    for _ in range(iters):
-        a = torch.tanh(a @ a)
-    return a
+#: Fills a tensor before its real data is copied in: no rank's data (values in [-8, 8])
+#: or sum of them, and exact in every dtype tested.
+POISON = 1000.0
+
+
+def poisoned(numel: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    return torch.full((numel,), POISON, dtype=dtype, device=device)
+
+
+def busy(device: torch.device, seconds: float) -> None:
+    """Queue about ``seconds`` of GPU work on the current stream, so whatever comes next
+    waits. No matmuls (gpukit.queue_gpu_delay): some ROCm builds have no BLAS kernels
+    for the GPU, and gpubridge needs none."""
+    queue_gpu_delay(device, seconds)
+
+
+# ---- mutations: each undoes one stream-ordering fix ----------------------------------
+#
+# GPUBRIDGE_TEST_MUTATION=<name> applies one in every rank, so that the GPU test that
+# guards the fix can be shown to fail without it (scripts/gpu/stream_mutations.py runs
+# each). Test code only: gpubridge has no such switch.
+
+MUTATION_ENV = "GPUBRIDGE_TEST_MUTATION"
+
+
+def _worker_ignores_caller() -> None:
+    from gpubridge import work
+
+    run_one = work._Worker._run_one
+
+    def mutated(self, item, fn, ready, tensors):
+        if self.stream is not None:  # an event that is already done: waits for nothing
+            ready = torch.cuda.Event()
+            ready.record(self.stream)
+        return run_one(self, item, fn, ready, tensors)
+
+    work._Worker._run_one = mutated
+
+
+def _staging_ignores_caller() -> None:
+    from gpubridge import staging
+
+    def begin(self, tensor):  # the copy streams no longer wait for the caller's
+        tensor.record_stream(self.out_stream)
+        tensor.record_stream(self.back_stream)
+
+    staging.CudaStaging.begin = begin
+
+
+def _wait_skips_stream() -> None:
+    from gpubridge import work
+
+    wait = work.Work.wait
+
+    def mutated(self, timeout=None):  # blocks the host, but orders no stream
+        event, self._event = self._event, None
+        try:
+            return wait(self, timeout)
+        finally:
+            self._event = event
+
+    work.Work.wait = mutated
+
+
+def _slots_forget_copies_back() -> None:
+    from gpubridge import policies
+
+    pipeline = policies.PipelinedReduceBridgeBroadcast._pipeline
+
+    def mutated(self, *args, **kwargs):  # each collective forgets the last one's copies back
+        self.copied_back = [None] * self.SLOTS
+        return pipeline(self, *args, **kwargs)
+
+    policies.PipelinedReduceBridgeBroadcast._pipeline = mutated
+
+
+STREAMS_TEST = "test_bridge_copies_wait_for_the_callers_stream_and_the_island_reduce"
+SLOTS_TEST = "test_pinned_slots_are_not_reused_before_their_copies_back"
+#: Each mutation, and the GPU test that must fail with it.
+MUTATIONS = {
+    "worker-ignores-caller": (_worker_ignores_caller, STREAMS_TEST),
+    "staging-ignores-caller": (_staging_ignores_caller, STREAMS_TEST),
+    "wait-skips-stream": (_wait_skips_stream, STREAMS_TEST),
+    "slots-forget-copies-back": (_slots_forget_copies_back, SLOTS_TEST),
+}
+
+
+def apply_mutation(name: str | None) -> None:
+    if not name:
+        return
+    if name not in MUTATIONS:
+        raise ValueError(f"{MUTATION_ENV}={name!r}: not one of {', '.join(MUTATIONS)}")
+    MUTATIONS[name][0]()
 
 
 # Streams on GPUs; on CPU (the simulation self-test) a stand-in that does nothing.
@@ -357,10 +449,10 @@ def sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def streams(rank: int, world: int, tmp_path: Path, *, numel: int, iters: int) -> None:
+def streams(rank: int, world: int, tmp_path: Path, *, numel: int, seconds: float) -> None:
     """Bridge copies and the async worker, with the caller on non-default streams.
 
-    The input is written at the end of a queue of matmuls on a side stream, and
+    The input is written at the end of queued GPU work on a side stream, and
     is large enough that the island reduce takes a while, so a device-to-host
     copy that didn't wait for the input or for the island reduce would stage
     stale or partial data and the sums would be wrong. The pipelined policy
@@ -377,11 +469,19 @@ def streams(rank: int, world: int, tmp_path: Path, *, numel: int, iters: int) ->
             side, other = new_stream(device), new_stream(device)
             want = expected_reduce("sum", world, numel, torch.float32).to(device)
 
+            # The input lands on the GPU before the delay and is copied into a
+            # poisoned tensor behind it, device to device: so the host never waits
+            # for the delay, and a copy that didn't wait for it reads the poison.
+            # (Copying from host memory after the delay would make the host wait.)
+            source = rank_data(rank, numel, torch.float32, device)
+            sources = [rank_data(rank + i, 4099, torch.float16, device) for i in range(4)]
+            sync(device)
+
             # Sync, on a side stream: the bridge copy runs on the caller's stream.
             with on(side):
-                tensor = torch.empty(numel, device=device)
-                busy(device, iters)
-                tensor.copy_(rank_data(rank, numel, torch.float32, device))
+                tensor = poisoned(numel, torch.float32, device)
+                busy(device, seconds)
+                tensor.copy_(source)
                 gpubridge.all_reduce(tensor)
                 got = tensor.clone()
             sync(device)
@@ -390,9 +490,9 @@ def streams(rank: int, world: int, tmp_path: Path, *, numel: int, iters: int) ->
             # Async from a side stream, waited on another: the worker's stream
             # must wait for the side stream, and wait() must order the other one.
             with on(side):
-                tensor = torch.empty(numel, device=device)
-                busy(device, iters)
-                tensor.copy_(rank_data(rank, numel, torch.float32, device))
+                tensor = poisoned(numel, torch.float32, device)
+                busy(device, seconds)
+                tensor.copy_(source)
                 work = gpubridge.all_reduce(tensor, async_op=True)
             with on(other):
                 work.wait()
@@ -403,10 +503,10 @@ def streams(rank: int, world: int, tmp_path: Path, *, numel: int, iters: int) ->
             # Several async collectives in flight, waited in order on the default stream.
             tensors, works = [], []
             with on(side):
-                busy(device, iters)
-                for i in range(4):
-                    tensor = rank_data(rank + i, 4099, torch.float16, device)
-                    tensors.append(tensor)
+                tensors = [poisoned(4099, torch.float16, device) for _ in range(4)]
+                busy(device, seconds)
+                for tensor, source_i in zip(tensors, sources, strict=True):
+                    tensor.copy_(source_i)
                     works.append(gpubridge.all_reduce(tensor, async_op=True))
             for i, (tensor, work) in enumerate(zip(tensors, works, strict=True)):
                 work.wait()
@@ -426,12 +526,12 @@ def streams(rank: int, world: int, tmp_path: Path, *, numel: int, iters: int) ->
     bad.raise_if_any()
 
 
-def slot_reuse(rank: int, world: int, tmp_path: Path, *, iters: int) -> None:
+def slot_reuse(rank: int, world: int, tmp_path: Path, *, seconds: float) -> None:
     """The pipelined bridge's pinned slots, reused by the next collective.
 
     A pipelined collective returns before its copies back out of the pinned
     slots have run: only the caller's stream waits for them. Here the receiving
-    island holds them back behind a queue of matmuls, and the next broadcast
+    island holds them back behind queued GPU work, and the next broadcast
     starts at once, on the same stream or another one. If its bridge step
     wrote into a slot before that slot's last copy back had run, the first
     result would hold the second one's data.
@@ -445,13 +545,16 @@ def slot_reuse(rank: int, world: int, tmp_path: Path, *, iters: int) -> None:
         numel = 2 * SLOT_CHUNK_BYTES // 4  # two float32 chunks: no reuse within one call
         side, other = new_stream(device), new_stream(device)
         for case, then in (("the same stream", side), ("another stream", other)):
+            # Both tensors on the GPU first: copying from host memory behind the
+            # delay would make the host wait it out, and nothing would be held back.
+            first = rank_data(rank, numel, torch.float32, device)
+            second = rank_data(rank + 1, numel, torch.float32, device)
+            sync(device)
             with on(side):
                 if receiving:
-                    busy(device, iters)  # the copies back wait for this queue
-                first = rank_data(rank, numel, torch.float32, device)
+                    busy(device, seconds)  # the copies back wait for this queue
                 gpubridge.broadcast(first, 0)
             with on(then):
-                second = rank_data(rank + 1, numel, torch.float32, device)
                 gpubridge.broadcast(second, 0)
             sync(device)
             bad.equal(f"broadcast, then another on {case}: first", first,
@@ -627,13 +730,13 @@ def test_native_only_matches_flat_gloo_on_one_island(tmp_path):
 @pytest.mark.gpu
 @requires_gpu
 def test_bridge_copies_wait_for_the_callers_stream_and_the_island_reduce(tmp_path):
-    spawn(partial(streams, numel=16 * 1024 * 1024, iters=40), gpu_ranks(), tmp_path, SPLIT)
+    spawn(partial(streams, numel=16 * 1024 * 1024, seconds=0.1), gpu_ranks(), tmp_path, SPLIT)
 
 
 @pytest.mark.gpu
 @requires_gpu
 def test_pinned_slots_are_not_reused_before_their_copies_back(tmp_path):
-    spawn(partial(slot_reuse, iters=80), gpu_ranks(), tmp_path, SPLIT)
+    spawn(partial(slot_reuse, seconds=0.2), gpu_ranks(), tmp_path, SPLIT)
 
 
 @pytest.mark.gpu
@@ -704,8 +807,8 @@ def test_gpu_test_logic_in_simulation(tmp_path):
     def each(fn: Callable[[int, int, Path], None], world: int, name: str) -> None:
         spawn(fn, world, tmp_path / name, split)
 
-    each(partial(streams, numel=10_007, iters=0), 4, "streams")
-    each(partial(slot_reuse, iters=0), 4, "slots")
+    each(partial(streams, numel=10_007, seconds=0), 4, "streams")
+    each(partial(slot_reuse, seconds=0), 4, "slots")
     each(partial(completion, numel=100_003), 2, "completion")
     each(partial(pinned_reuse, numel=10_007), 4, "pinned")
     if UCX:

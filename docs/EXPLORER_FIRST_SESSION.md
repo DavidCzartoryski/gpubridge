@@ -146,6 +146,29 @@ cat results/explorer/02_split_shared_gpu/check/summary.md
 A failed step doesn't stop the job: the kit runs the next step and records
 each one.
 
+**Kernel builds.** gpubridge's compression kernels are Triton kernels, built
+the first time each variant runs. Each job builds and loads them in a
+node-local cache, `/tmp/gpubridge-triton-$USER` (the same path on every node,
+since Triton's cache records its files by absolute path), filled at the start
+from `$PROJECT_DIR/$USER/gpubridge-gpu/triton-cache` and added to it at the
+end. So the first job after the kernels change, or on a new GPU model, builds
+them all (about 90 variants in `gpu_tests`), and later jobs load them. Only
+the batch node's kernels are kept: the other nodes of a two-node job build
+their own. Triton's own default would be `~/.triton/cache`, in the home
+directory. To measure the difference on a node (one GPU):
+
+```bash
+srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 --mem=16G --time=00:20:00 \
+    "$PROJECT_DIR/$USER/gpubridge-gpu/venv/bin/python" scripts/gpu/time_triton_cache.py \
+    --out results/explorer/triton_cache.json
+```
+
+It times each variant's build and its load from the cache, with the cache in
+`~/.triton`, in `/tmp` and under `$WORK_DIR`. `rm -rf
+"$PROJECT_DIR/$USER/gpubridge-gpu/triton-cache"` empties the kept kernels, and
+`TRITON_CACHE_STORE=` in `local.env` goes back to Triton's default.
+`/tmp/gpubridge-triton-$USER` stays on the node after a job, for the next one.
+
 ## 7. If you have the multigpu partition (rungs 1 and 2, continued)
 
 Only once step 6's jobs passed: GPU time on a rung waits for the one below
@@ -226,7 +249,31 @@ gitignored, because step logs, stack dumps and NCCL logs are not redacted.
 | The setup job FAILED | The end of its log says why: a module that won't load, or a download that failed. `SETUP_MODULES=""` in `local.env` loads no module, but the `explorer` module is what gives compute nodes their proxy to the internet: without it, downloads fail. |
 | sacct says TIMEOUT | Slurm's time limit ran out mid-step. Each launch's own limit (`STEP_TIMEOUT`) is capped at the job's Slurm limit less 2 minutes, so one stuck launch is stopped and recorded first; steps that add up to more than the limit still run out. triage lists the step that was cut off, and the job, as `UNFINISHED`. |
 | `FAILED: probe` or another step | The job log has the step's last 20 lines after its `FAILED` line; for `probe`, a `FAIL` line names the check and its values (for example `FAIL target_in_build: device 0 target sm_120 not in arch_list [...]`). triage shows the error lines too. The full log is `results/explorer/<job>/<step>.log` (for example `01_probe/probe.log`), with NCCL's logs under `<job>/nccl/<step>/`. Paste the triage output. |
+| `rocBLAS error: Cannot read .../torch/lib/rocblas/library/TensileLibrary.dat` on an AMD node, and steps that abort with exit -6 | The ROCm wheel's rocBLAS has no kernels for that GPU (below: gfx906, the MI50). gpubridge needs no BLAS, and its checks and tests no longer use any. Only a matmul elsewhere hits it, such as the training demos (`train_*` steps). `probe.json`'s `blas` stage records it. |
 | `shared_gpu_check: check did not fire` | The shared-GPU refusal didn't show, or the run failed some other way (a crash, or its time limit): `shared_gpu_check.log` says which. Paste it either way. |
 
 Don't rerun a failed step before pasting: the first failure's records are the
 most useful ones.
+
+## AMD nodes: no matmuls on gfx906
+
+The MI50 nodes in `sharing` are gfx906. With torch 2.14.1+rocm7.2, the
+default ROCm build, the collectives and gpubridge's Triton compression kernels
+work there (the kernels matched the CPU reference), and matmuls don't. On the
+first run, the two GPU tests and two `check.py` steps that failed or aborted
+all did so in a matmul used as busy work, which #52 replaces. The wheel's rocBLAS ships Tensile kernels only for newer GPUs
+(files like `TensileLibrary_lazy_gfx950.dat`), none for gfx906, so any matmul
+aborts its process with `rocBLAS error: Cannot read
+.../TensileLibrary.dat`. Explorer's `ROCm/6.3.0` module is a HIP runtime
+without rocBLAS, so it offers no way around it.
+
+- **gpubridge never calls BLAS**, and since #52 neither does the kit's busy
+  work: `check.py` and `tests/test_gpu.py` queue a spin kernel
+  (`gpukit.queue_gpu_delay`) where they used to queue matmuls.
+- **The probe says so** without failing: `probe.json`'s `blas` stage has
+  `blas_available` and the error, and the job log a `note: no BLAS` line.
+- **What would still fail there:** anything that multiplies matrices, such as
+  the training demos (`examples/train_synthetic.py`, the `train_*` steps of
+  `amd/run_all.sh`), which use linear layers. That is the wheel's limit for
+  this GPU, not gpubridge's.
+

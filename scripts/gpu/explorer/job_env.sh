@@ -21,6 +21,9 @@ OPT_IN_POLICIES="${OPT_IN_POLICIES:-pipelined-reduce-bridge-broadcast sharded-br
 # the gpubridge benchmark over bridge="ucx" (docs/RDMA_TRANSPORT.md). Needs UCX
 # there (e.g. MODULES="ucx") and a C++ compiler. Off by default.
 UCX_BRIDGE="${UCX_BRIDGE:-0}"
+# Triton's kernels persist here between jobs; each job builds and reads them in a
+# node-local copy (triton_cache_begin in common.sh). "" = Triton's own default cache.
+export TRITON_CACHE_STORE="${TRITON_CACHE_STORE-$WORK_DIR/triton-cache}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
 # load_modules "NAMES": `module load` each space-separated name. Finds Lmod if
@@ -54,6 +57,7 @@ job_setup() {
     job_started
     load_modules "$MODULES"
     activate_venv "$VENV"
+    triton_cache_begin
     capture "$RESULTS/nvidia-smi.txt" nvidia-smi
     capture "$RESULTS/nvidia-smi-topo.txt" nvidia-smi topo -m
     capture "$RESULTS/slurm-job.txt" scontrol show job "${SLURM_JOB_ID:-none}"
