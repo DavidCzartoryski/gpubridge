@@ -269,7 +269,18 @@ without rocBLAS, so it offers no way around it.
 
 - **gpubridge never calls BLAS**, and since #52 neither does the kit's busy
   work: `check.py` and `tests/test_gpu.py` queue a spin kernel
-  (`gpukit.queue_gpu_delay`) where they used to queue matmuls.
+  (`gpukit.queue_gpu_delay`) where they used to queue matmuls. To show that
+  the stream-ordering tests still catch the bugs they guard, on one AMD GPU
+  (or `--partition=gpu --gres=gpu:1` with `venv` on an NVIDIA one):
+
+  ```bash
+  srun --partition=sharing --gres=gpu:<amd type>:1 --cpus-per-task=4 --mem=32G --time=00:45:00 \
+      "$PROJECT_DIR/$USER/gpubridge-gpu/venv-rocm/bin/python" scripts/gpu/stream_mutations.py \
+      --out results/explorer/stream_mutations_amd
+  ```
+
+  Each mutation undoes one ordering fix; the run must end with "every
+  mutation was caught, and the tests pass without one".
 - **The probe says so** without failing: `probe.json`'s `blas` stage has
   `blas_available` and the error, and the job log a `note: no BLAS` line.
 - **What would still fail there:** anything that multiplies matrices, such as
