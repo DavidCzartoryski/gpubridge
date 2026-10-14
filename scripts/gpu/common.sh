@@ -22,6 +22,7 @@
 #                    lines of NAME.log after the FAILED line (before torchrun's
 #                    failure report and the NCCL/RCCL logs)
 #   job_started      start $RESULTS/job.jsonl, the job's start, errors and end
+#   rocm_asic_ids PYTHON  point a ROCm wheel's libdrm at the amdgpu.ids it ships
 #   finish      print the step table; exit non-zero if any step failed
 #   load_env_file F  read NAME=value settings from file F, if it exists
 
@@ -115,6 +116,28 @@ job_started() {
     job_event started
     # Also how the script ended: a command failing under set -e leaves no error line.
     trap 'job_event exit "\"code\": $?"' EXIT
+}
+
+# rocm_asic_ids PYTHON: export AMDGPU_ASIC_ID_TABLE_PATHS (unless it is set) as the
+# directory of the GPU-name table that PYTHON's torch ships, torch/share/libdrm/amdgpu.ids
+# (ROCm wheels only; nothing for CUDA ones). The libdrm_amdgpu bundled in the ROCm wheels
+# looks for /opt/amdgpu/share/libdrm/amdgpu.ids, then walks the directory tree from the
+# Python executable, and when that fails too it prints "(null): No such file or
+# directory" for every GPU each process opens. torch is located, not imported.
+rocm_asic_ids() {
+    [ -z "${AMDGPU_ASIC_ID_TABLE_PATHS:-}" ] || return 0
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "+ export AMDGPU_ASIC_ID_TABLE_PATHS=<torch>/share/libdrm (if the wheel ships it)"
+        return 0
+    fi
+    local dir
+    dir=$("$1" -c 'import importlib.util, os
+spec = importlib.util.find_spec("torch")
+d = os.path.join(os.path.dirname(spec.origin), "share", "libdrm") if spec and spec.origin else ""
+print(d if d and os.path.isfile(os.path.join(d, "amdgpu.ids")) else "")' 2>/dev/null) || return 0
+    [ -n "$dir" ] || return 0
+    export AMDGPU_ASIC_ID_TABLE_PATHS="$dir"
+    log "AMDGPU_ASIC_ID_TABLE_PATHS=$dir: the GPU-name table this ROCm build ships"
 }
 
 # job_event EVENT [JSON MEMBERS]: append an event to job.jsonl, once job_started ran.

@@ -377,7 +377,8 @@ class Runner:
         if note:
             log(note)
         self.run(name, [str(self.py), "-m", "pytest", "-m", "gpu", *map(str, tests), "-q",
-                               "-p", "no:cacheprovider", f"--junitxml={self.results / 'gpu_tests.xml'}"],
+                               "-p", "no:cacheprovider", "--durations=15",
+                               f"--junitxml={self.results / 'gpu_tests.xml'}"],
                  extra_env=extra, cwd=self.repo, note=note)
 
     def two_gpus(self, name: str) -> bool:

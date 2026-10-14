@@ -3,7 +3,7 @@
 **Opt-in, changes results, not validated on GPUs.** On the first GPU run, a
 V100, two of the kernel tests failed: the fp8 error-feedback residual
 differed from the reference, from a codec overflow and a fused multiply-add,
-both fixed since (#50). No GPU run has checked the fix yet. Otherwise
+both fixed in #50. A rerun on a V100 after the fix passed them. Otherwise
 everything here has run on CPU only: the Triton kernels in Triton's
 interpreter, and whole jobs in simulation mode.
 [HARDWARE_VALIDATION.md](../HARDWARE_VALIDATION.md) items 28 and 29 list what
@@ -236,9 +236,9 @@ its PTX has no fused multiply-add.
 
 ## Not done
 
-- No GPU run has checked #50's fix yet. Kernel speed, where compression pays
-  off, the cost of compiling without fused multiply-adds, and the kernels'
-  bit-identity across NVIDIA and AMD are open (items 28 and 29).
+- Kernel speed, where compression pays off, the cost of compiling without
+  fused multiply-adds, and the kernels' bit-identity across NVIDIA and AMD are
+  open (items 28 and 29).
 - No training-accuracy study: loss curves with and without compression over
   many steps (`examples/train_synthetic.py` would do).
 - Compressed broadcast, all_gather, or a compressed island step.

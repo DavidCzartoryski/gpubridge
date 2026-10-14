@@ -82,8 +82,9 @@ RESULTS_ROOT="${RESULTS_ROOT:-$REPO_DIR/results/explorer}"
 # ------------------------------------------------------------------------------
 
 # setup-rocm, amd and 07 only print their commands until step 00 shows AMD GPUs in
-# $PARTITION_AMD. Set this to 1 in a reviewed change once the hardware is confirmed.
-AMD_NODES_CONFIRMED=0
+# $PARTITION_AMD. Once it does, set AMD_NODES_CONFIRMED=1 in explorer/local.env (or the
+# environment): a local setting, so runs keep a clean commit (git_dirty false).
+AMD_NODES_CONFIRMED="${AMD_NODES_CONFIRMED:-0}"
 
 LOG_DIR="$WORK_DIR/logs"
 export GPUBRIDGE_REPO="$REPO_DIR" WORK_DIR VENV VENV_ROCM SETUP_MODULES MODULES RESULTS_ROOT
@@ -153,6 +154,13 @@ gpu_request() {
     )
     site_options
     cap_step_timeout "$time"
+    if [ "$partition" = "$PARTITION_1GPU" ] && [ $((nodes * gpus)) -gt 1 ]; then
+        log "warning: this job asks the $partition partition for $((nodes * gpus)) GPUs" \
+            "($nodes node(s) x $gpus). On Explorer that partition's QOS allows 1 GPU per job" \
+            "in total, so Slurm holds it PENDING (QOSMaxGRESPerJob). 2+ GPUs, on one node or" \
+            "several, need PARTITION_MULTI=multigpu, which takes an access request" \
+            "(docs/EXPLORER_FIRST_SESSION.md, step 7)."
+    fi
 }
 
 # sbatch_job NAME SCRIPT OPTIONS...: submit SCRIPT and print its job id and log
@@ -193,7 +201,8 @@ amd_gate() {
     fi
     [ "$AMD_NODES_CONFIRMED" = 1 ] || die "the Explorer mixed-vendor path is dry-run only \
 until step 00 shows AMD GPUs in the $PARTITION_AMD partition. Check \
-$RESULTS_ROOT/00_partitions/gpu-types.txt, then set AMD_NODES_CONFIRMED=1 in $0."
+$RESULTS_ROOT/00_partitions/gpu-types.txt, then add AMD_NODES_CONFIRMED=1 to \
+$KIT_DIR/explorer/local.env (or set it in the environment)."
     [ -n "$GPU_TYPE_AMD" ] || die "set GPU_TYPE_AMD to the AMD GPUs' --gres type from \
 $RESULTS_ROOT/00_partitions/gpu-types.txt"
     AMD_TYPE=$GPU_TYPE_AMD

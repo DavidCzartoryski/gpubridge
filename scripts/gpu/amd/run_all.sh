@@ -38,6 +38,7 @@ if [ "$SKIP_SETUP" != 1 ]; then
     step setup "$KIT_DIR/setup_env.sh" --flavor "$TORCH_FLAVOR" --venv "$VENV"
 fi
 activate_venv "$VENV"
+rocm_asic_ids python  # the ROCm wheel's GPU-name table (common.sh)
 capture "$RESULTS/rocm-smi.txt" rocm-smi
 capture "$RESULTS/rocm-smi-detail.txt" rocm-smi --showproductname --showdriverversion \
     --showbus --showmeminfo vram
@@ -65,10 +66,11 @@ rccl_version() {
 }
 step rccl_version rccl_version
 # GPU-only correctness tests (tests/test_gpu.py): every policy against flat-gloo,
-# fp32/fp16/bf16, odd and large sizes, async on non-default streams.
+# fp32/fp16/bf16, odd and large sizes, async on non-default streams. --durations=15:
+# the slowest tests and their times end the log.
 step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" \
     "$REPO_DIR/tests/test_compression_kernels.py" \
-    "$REPO_DIR/tests/test_torch_backend.py" -q -p no:cacheprovider \
+    "$REPO_DIR/tests/test_torch_backend.py" -q -p no:cacheprovider --durations=15 \
     --junitxml="$RESULTS/gpu_tests.xml"
 # Bridge compression kernels (item 28): the same bits as the CPU reference, and their
 # throughput against the GPU's memory bandwidth. One GPU is enough.

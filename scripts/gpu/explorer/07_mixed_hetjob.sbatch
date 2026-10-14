@@ -70,6 +70,9 @@ mixed_torchrun() {
 }
 
 job_setup 07_mixed_hetjob   # on the gpu node, with the CUDA venv
+# The AMD side's ROCm wheel needs its GPU-name table pointed out (common.sh); srun
+# passes the variable to both components.
+rocm_asic_ids "$VENV_ROCM/bin/python"
 capture "$RESULTS/rocm-smi.txt" srun --het-group=1 --ntasks=1 rocm-smi
 capture "$RESULTS/amd-smi-static.txt" srun --het-group=1 --ntasks=1 amd-smi static
 step probe both @VENV@/bin/python "$KIT_DIR/probe.py" --out "$RESULTS/probe_@SIDE@"

@@ -149,8 +149,16 @@ each one.
 ## 7. If you have the multigpu partition (rungs 1 and 2, continued)
 
 Only once step 6's jobs passed: GPU time on a rung waits for the one below
-(the runbook's ladder). Without multigpu access, `sbatch` may refuse the job
-when you submit it, and `submit.sh multi` then stops at 03.
+(the runbook's ladder). Two limits decide where these steps can run:
+
+- **The `gpu` partition takes 1 GPU per job, in total.** Its QOS counts every
+  GPU of every node in the job, so a job asking for 2 GPUs, or 2 nodes with 1
+  GPU each, sits PENDING with the reason `QOSMaxGRESPerJob` and never starts.
+  Steps 03 to 06 can't run there, and setting `PARTITION_MULTI=gpu` doesn't
+  help: `submit.sh` warns before it submits such a job.
+- **`multigpu` takes an access request** to Research Computing. Without it,
+  `sbatch` refuses the job when you submit it, and `submit.sh multi` then stops
+  at 03.
 
 ```bash
 scripts/gpu/explorer/submit.sh --dry-run multi   # look first
@@ -214,7 +222,7 @@ gitignored, because step logs, stack dumps and NCCL logs are not redacted.
 | What you see | What it means, and what to do |
 | --- | --- |
 | "set PROJECT_DIR to your group's project space" | `local.env` is missing or misspelled: step 2. |
-| A job PENDING for a long time | `squeue -u "$USER" -o "%i %j %T %r"` shows the reason. `Resources` or `Priority` just means waiting. `AssocGrpGRES` means the request doesn't fit what you may use: check partition, account and GPU type against step 00. `ReqNodeNotAvail` usually means the nodes are down or reserved. |
+| A job PENDING for a long time | `squeue -u "$USER" -o "%i %j %T %r"` shows the reason. `Resources` or `Priority` just means waiting. `AssocGrpGRES` means the request doesn't fit what you may use: check partition, account and GPU type against step 00. `QOSMaxGRESPerJob` on the `gpu` partition means the job asks for more than its 1 GPU per job (step 7): cancel it (`scancel <job id>`), since it will never start. `ReqNodeNotAvail` usually means the nodes are down or reserved. |
 | The setup job FAILED | The end of its log says why: a module that won't load, or a download that failed. `SETUP_MODULES=""` in `local.env` loads no module, but the `explorer` module is what gives compute nodes their proxy to the internet: without it, downloads fail. |
 | sacct says TIMEOUT | Slurm's time limit ran out mid-step. Each launch's own limit (`STEP_TIMEOUT`) is capped at the job's Slurm limit less 2 minutes, so one stuck launch is stopped and recorded first; steps that add up to more than the limit still run out. triage lists the step that was cut off, and the job, as `UNFINISHED`. |
 | `FAILED: probe` or another step | The job log has the step's last 20 lines after its `FAILED` line; for `probe`, a `FAIL` line names the check and its values (for example `FAIL target_in_build: device 0 target sm_120 not in arch_list [...]`). triage shows the error lines too. The full log is `results/explorer/<job>/<step>.log` (for example `01_probe/probe.log`), with NCCL's logs under `<job>/nccl/<step>/`. Paste the triage output. |
