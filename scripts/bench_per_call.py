@@ -147,7 +147,7 @@ def run_policy(topology, policy: str, args, samples: dict[str, list[int]]) -> No
     quiet = Quiet()
     cases = []
     for numel in args.numels:
-        for async_op in (False, True):
+        for async_op in [m == "async" for m in args.modes]:
             mode = "async" if async_op else "sync"
             for observed in (False, True):
                 cases.append((f"{policy}|{numel}|{mode}|gpubridge|{'observer' if observed else '-'}",
@@ -228,6 +228,7 @@ def parse(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--calls", type=int, default=400, help="timed calls per case per round")
     p.add_argument("--warmup", type=int, default=50, help="untimed calls before each case")
     p.add_argument("--rounds", type=int, default=5)
+    p.add_argument("--modes", default="sync,async", help="sync, async or both (default)")
     p.add_argument("--all-ranks", action="store_true", help="pool every rank's times (default rank 0)")
     p.add_argument("--profile", metavar="POLICY", help="cProfile rank 0's sync calls instead")
     p.add_argument("--observer", action="store_true", help="with --profile: an observer attached")
@@ -244,6 +245,7 @@ def parse(argv: list[str]) -> argparse.Namespace:
     else:
         args.policies = ["native-only"] if single else list(MIXED)
     args.numels = [int(x) for x in args.numels.split(",")]
+    args.modes = args.modes.split(",")
     return args
 
 

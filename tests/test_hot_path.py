@@ -3,7 +3,11 @@ call, and that every call still makes the same checks."""
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from functools import partial
+from pathlib import Path
 
 import pytest
 import torch
@@ -119,3 +123,17 @@ def test_reduce_ops_are_named_by_lookup_and_by_comparison():
         assert collectives._reduce_op_name(torch.distributed.ReduceOp(op), "all_reduce") == name
     with pytest.raises(ValueError, match="PRODUCT is not supported yet"):
         collectives._reduce_op_name(ReduceOp.PRODUCT, "all_reduce")
+
+
+def test_the_per_call_benchmark_runs(tmp_path):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "bench_per_call.py"
+    out = tmp_path / "per_call.json"
+    done = subprocess.run([sys.executable, str(script), "--stub-comm", "--policies",
+                           "reduce-bridge-broadcast", "--numels", "1", "--calls", "5", "--warmup", "1",
+                           "--rounds", "1", "--out", str(out)], capture_output=True, text=True,
+                          timeout=300)
+    assert done.returncode == 0, done.stderr[-2000:]
+    rows = json.loads(out.read_text())["rows"]
+    paths = {(r["mode"], r["path"], r["observer"]) for r in rows}
+    assert ("sync", "gpubridge", "observer") in paths and ("async", "bare, same calls", "-") in paths
+    assert all(r["overhead_us"] is not None for r in rows if r["path"] == "gpubridge")

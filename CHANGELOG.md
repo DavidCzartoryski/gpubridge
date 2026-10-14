@@ -15,9 +15,17 @@ still needs real hardware. Numbers in parentheses are pull requests.
   can run (CUDA events, bfloat16, Triton) and skips or adapts the rest with
   the reason. The results are the kit's usual records and validation tables,
   in one tarball (#43).
+- `scripts/bench_per_call.py`: the per-call time of small all_reduces through
+  each policy, sync and async, with and without an observer, against the same
+  torch.distributed calls made directly. `--stub-comm` leaves only gpubridge's
+  own work; `--profile` runs cProfile on rank 0 (#44).
 
 ### Changed
 
+- A rank's island and whether it leads, and a policy's supported reduce ops,
+  are worked out once instead of on every collective. Every call still checks
+  its op. On CPU, gpubridge's own work per small reduce-bridge-broadcast call
+  went from 4.0 to 3.4 µs; the README has the per-call numbers (#44).
 - The README opens with a pitch, badges, a one-line status, an architecture
   diagram, a quickstart and a feature table with each feature's status. New
   diagrams for all_reduce and HSDP (docs/img, light and dark). New

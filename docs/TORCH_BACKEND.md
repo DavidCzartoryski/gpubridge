@@ -337,7 +337,9 @@ fully_shard(model, mesh=mesh)
 - **Point-to-point, all-to-all, and gather and scatter of GPU tensors:**
   gpubridge has no cross-vendor implementation of them yet.
 - **Overhead:** each collective goes through Python and gpubridge's worker
-  thread, as `gpubridge.all_reduce(async_op=True)` does today.
+  thread, as `gpubridge.all_reduce(async_op=True)` does today. CPU
+  measurements of both are in the README, "Per-call overhead on small
+  messages".
 
 ## How it is tested
 
