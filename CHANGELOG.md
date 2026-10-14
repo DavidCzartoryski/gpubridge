@@ -27,6 +27,13 @@ still needs real hardware. Numbers in parentheses are pull requests.
   fresh login: the clone in the project space, `local.env`, step 00, the setup
   job, the first rungs of the ladder, how to follow the jobs, where results
   land, what to do when a step fails and what to paste back (#46).
+- `scripts/gpu/diag_fp8_residual.py`: reruns the fp8 error-feedback case of
+  the GPU kernel test on one device and prints, for each value whose residual,
+  code or scale differs from the CPU reference, every intermediate value with
+  its bits and whether it is subnormal in float32. It also runs the kernel
+  compiled without multiply-add contraction, a probe of what the device
+  computes, and counts the compiled code's fused multiply-adds and
+  flush-to-zero instructions. The kernel is unchanged (#48).
 
 ### Changed
 

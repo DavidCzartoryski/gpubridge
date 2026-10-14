@@ -180,3 +180,60 @@ def test_gpu_dequantize_accumulate_matches_the_cpu_reference(mode, out_dtype):
         tri = torch.empty(n, dtype=out_dtype, device="cuda")
         K.dequantize_accumulate(mode, payloads.cuda(), tri)
         assert _same(ref, tri.cpu()), n
+
+
+# ---- scripts/gpu/diag_fp8_residual.py, on CPU through the interpreter ---------------------------
+
+def _diagnostic():
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "gpu"))
+    import diag_fp8_residual
+    return diag_fp8_residual
+
+
+def test_the_fp8_residual_diagnostic_reruns_the_gpu_test_case():
+    diag = _diagnostic()
+    for n in SIZES:
+        for dtype in FLOATS:
+            assert _same(diag.awkward(n, dtype, n), _awkward(n, dtype, n))
+        expected = torch.randn(n, generator=torch.Generator().manual_seed(5)) * 1e-3
+        assert torch.equal(diag.prior_residual(n), expected)
+
+
+#: The script's own run on a GPU is the real thing; these check it through the interpreter.
+interpreter_only = pytest.mark.skipif(GPU, reason="on a GPU, run the script itself")
+
+
+@interpreter_only
+def test_the_fp8_residual_diagnostic_finds_nothing_where_the_kernels_match(capsys):
+    assert _diagnostic().main(["--n", "255", "--dtype", "float32", "float16"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("residual: 0 of 255 differ in their bits") == 2
+    assert "all payloads and residuals match the reference" in out
+
+
+@interpreter_only
+def test_the_fp8_residual_diagnostic_shows_a_fused_residual(monkeypatch, capsys):
+    # A stand-in for a device that fuses v - decoded * scale into one rounding:
+    # the reference, with that residual instead.
+    diag = _diagnostic()
+
+    def fused(mode, x, residual, payload):
+        prior = residual.clone()
+        C.quantize_reference(mode, x, residual, payload)
+        v, finite = C._prepare(x, prior)
+        scales, codes = diag.split(payload, x.numel())
+        exact = (v.double() - C._decode_e4m3(codes).double()
+                 * diag.blocks_of(scales, x.numel()).double())
+        residual.copy_(torch.where(finite, exact.float(), 0.0))
+
+    monkeypatch.setattr(diag.K, "quantize", fused)
+    assert diag.main(["--n", "255", "--dtype", "float32", "--limit", "3"]) == 1
+    out = capsys.readouterr().out
+    assert "payload: identical" in out
+    assert "residual: 1 of 255 differ in their bits; indices [41]" in out
+    assert "the device's equals the fused value (v - decoded * scale, rounded once) at 1" in out
+    block = out[out.index("index 41"):]
+    assert "inf" in block.split("sent = decoded * scale")[1].splitlines()[0]
+    assert "the device's residual is the fused value" in block
+    assert "some payloads or residuals differ" in out
