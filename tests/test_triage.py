@@ -162,3 +162,15 @@ def test_not_a_results_directory(tmp_path, capsys):
     assert triage.main([str(tmp_path)]) == 1
     assert "no steps.jsonl" in capsys.readouterr().out
     assert triage.main([str(tmp_path / "missing")]) == 2
+
+
+def test_triage_needs_no_torch(tmp_path):
+    # On a laptop or a login node: plain python3, no torch or gpubridge installed.
+    import subprocess
+
+    kaggle_tree(tmp_path)
+    code = ("import sys; sys.modules['torch'] = None; sys.modules['gpubridge'] = None; "
+            f"sys.path.insert(0, {str(REPO / 'scripts' / 'gpu')!r}); import triage; "
+            f"sys.exit(triage.main([{str(tmp_path)!r}]))")
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0 and "verdict:" in done.stdout, done.stderr

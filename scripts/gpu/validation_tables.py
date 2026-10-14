@@ -34,7 +34,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from gpukit import redact, write_json
 
 #: Island layouts that run on GPUs; simulation is told apart by device instead.
 GPU_KINDS = {"split-test", "gpu-mixed", "gpu-single-vendor"}
@@ -519,6 +518,8 @@ def markdown(tables: dict[str, Any]) -> str:
           r["MBps"], r["rtt_ms"], r["predicted_ms"], r["measured_ms"],
           r["measured_over_predicted"]]
          for r in tables["predicted"]])
+    from gpukit import redact  # here, not at the top: reading results needs no torch
+
     return redact("\n".join(lines) + "\n")
 
 
@@ -542,6 +543,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     out = args.out or args.paths[0]
     text = markdown(tables)
+    from gpukit import write_json
+
     write_json(out / "validation_tables.json", tables)
     (out / "validation_tables.md").write_text(text)
     print(text)
