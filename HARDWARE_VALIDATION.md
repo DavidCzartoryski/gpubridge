@@ -10,7 +10,9 @@ answered for the CPU side by running real builds without GPUs; see
 maps every item below to a scripted step: Explorer (Slurm) for NVIDIA, a rented
 AMD machine, and a real mixed job between two cloud machines. If Explorer's
 `sharing` partition turns out to have AMD GPUs, the mixed job can instead run
-inside Explorer as one heterogeneous Slurm job.
+inside Explorer as one heterogeneous Slurm job. For a first session there,
+[docs/EXPLORER_FIRST_SESSION.md](docs/EXPLORER_FIRST_SESSION.md) has the
+commands in order, from a fresh login to the ladder's first rungs.
 
 **GPU results:** none yet. After GPU runs,
 [`scripts/gpu/validation_tables.py`](scripts/gpu/validation_tables.py) turns

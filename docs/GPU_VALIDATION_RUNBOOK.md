@@ -171,7 +171,7 @@ as of 2026-10-06; **verify each one**:
 | `ACCOUNT` | empty | whether jobs need `--account` |
 | `CPUS_PER_GPU`, `MEM_PER_GPU` | `4`, `32G` | per-GPU CPU and memory limits |
 | `CPUS_SETUP`, `MEM_SETUP`, `TIME_SETUP` | `4`, `16G`, 1 h | limits of the setup partition |
-| `TIME_01` ... `TIME_07` | 10-30 min | maximum walltime per partition |
+| `TIME_01` ... `TIME_07` | 10-40 min (`TIME_04` is 40) | maximum walltime per step's job |
 | `PROJECT_DIR` | none: **required** | your group's project space, e.g. `/projects/<your-project>`; set it in the environment or in `scripts/gpu/explorer/local.env` (see [Steps](#steps)) |
 | `WORK_DIR` | `$PROJECT_DIR/$USER/gpubridge-gpu` | venvs, caches and job logs: ~7 GB, ~25 GB with the ROCm venv. Not home, which is capped at 75 GB |
 | `VENV`, `VENV_ROCM` | `$WORK_DIR/venv`, `$WORK_DIR/venv-rocm` | - |
@@ -199,9 +199,15 @@ Also check:
 
 ### Steps
 
+For a first session, [EXPLORER_FIRST_SESSION.md](EXPLORER_FIRST_SESSION.md)
+has every command from a fresh login, what each prints, and what to paste
+back. In short:
+
 ```bash
+PROJECT_DIR=/projects/<your-project>
+mkdir -p "$PROJECT_DIR/$USER" && cd "$PROJECT_DIR/$USER"   # the project space, not home
 git clone https://github.com/DavidCzartoryski/gpubridge && cd gpubridge
-echo 'PROJECT_DIR=/projects/<your-project>' > scripts/gpu/explorer/local.env   # once
+echo "PROJECT_DIR=$PROJECT_DIR" > scripts/gpu/explorer/local.env   # once
 scripts/gpu/explorer/submit.sh 00               # GPU types per partition (sinfo, seconds)
 scripts/gpu/explorer/submit.sh --dry-run free   # see what will be submitted
 scripts/gpu/explorer/submit.sh setup            # a short CPU job, once (~10 min)
@@ -245,7 +251,11 @@ nothing. It writes to `results/explorer/00_partitions/`:
 - `gpu-types.txt`: every GPU type per partition, labelled `amd`, `nvidia` or `unknown` from its name, and a closing line that says whether `sharing` has AMD GPUs.
 
 Job logs go to `$WORK_DIR/logs/`, and results to `results/explorer/<step>/`.
-Commit the results directory when a step passes.
+Keep the raw results on the cluster: the step logs, stack dumps and NCCL logs
+aren't redacted (see [Reading results](#reading-results)). For review, paste
+the output of `"$PROJECT_DIR/$USER/gpubridge-gpu/venv/bin/python" scripts/gpu/triage.py results/explorer`
+(the venv's Python: a login node's `python3` may be older than 3.10). What
+gets published is the validation tables, not the results.
 
 ### Mixed-vendor job inside Explorer
 

@@ -23,6 +23,10 @@ still needs real hardware. Numbers in parentheses are pull requests.
   results directory or tarball, under 80 lines, to paste into a review. It shows
   each failed, timed-out or skipped step and why, the GPUs and versions, the
   key benchmark numbers and the compression check (#45).
+- `docs/EXPLORER_FIRST_SESSION.md`: a first Explorer session in order, from a
+  fresh login: the clone in the project space, `local.env`, step 00, the setup
+  job, the first rungs of the ladder, how to follow the jobs, where results
+  land, what to do when a step fails and what to paste back (#46).
 
 ### Changed
 
