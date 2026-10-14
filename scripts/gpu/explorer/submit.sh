@@ -17,6 +17,11 @@
 #   setup-rocm  create the ROCm venv in a job on an AMD node    dry-run only until
 #   amd    one AMD node: RCCL checks, AMD split test (rung 3)    step 00 shows
 #   07     real mixed job: gpu + sharing, one heterogeneous job   AMD GPUs
+#   net-nvidia, net-amd   one node's network: InfiniBand, NCCL/RCCL's transport
+#   08     comparison matrix, V100 + MI50: every gpubridge policy, flat Gloo
+#   08-nvidia-pair, 08-amd-pair   the matrix's native baselines and same-vendor
+#          bridge, two V100s or two MI50s     refused until SAME_PARTITION_PAIRS_OK=1
+#   train-nvidia, train-amd   training throughput on one GPU alone (train_bench.py)
 #
 # See docs/GPU_VALIDATION_RUNBOOK.md for what each step proves.
 set -euo pipefail
@@ -57,6 +62,9 @@ TIME_05="${TIME_05:-00:30:00}"
 TIME_06="${TIME_06:-00:30:00}"
 TIME_07="${TIME_07:-00:30:00}"
 TIME_AMD="${TIME_AMD:-00:30:00}"
+TIME_NET="${TIME_NET:-00:10:00}"
+TIME_08="${TIME_08:-00:40:00}"
+TIME_TRAIN="${TIME_TRAIN:-00:30:00}"
 # Each job's STEP_TIMEOUT (common.sh: the limit on each launch) is capped at its
 # Slurm limit less STEP_MARGIN seconds, so a stuck launch is stopped and recorded
 # as timed out before Slurm ends the job.
@@ -85,6 +93,13 @@ RESULTS_ROOT="${RESULTS_ROOT:-$REPO_DIR/results/explorer}"
 # $PARTITION_AMD. Once it does, set AMD_NODES_CONFIRMED=1 in explorer/local.env (or the
 # environment): a local setting, so runs keep a clean commit (git_dirty false).
 AMD_NODES_CONFIRMED="${AMD_NODES_CONFIRMED:-0}"
+# 08-nvidia-pair and 08-amd-pair ask for two GPUs of one type, as two 1-GPU components of
+# one heterogeneous job, both in one partition (PARTITION_PAIR_NVIDIA, PARTITION_PAIR_AMD).
+# Whether that is within the partitions' intended use is Research Computing's call, so
+# they are refused until SAME_PARTITION_PAIRS_OK=1 (explorer/local.env or the environment).
+SAME_PARTITION_PAIRS_OK="${SAME_PARTITION_PAIRS_OK:-0}"
+PARTITION_PAIR_NVIDIA="${PARTITION_PAIR_NVIDIA:-$PARTITION_1GPU}"
+PARTITION_PAIR_AMD="${PARTITION_PAIR_AMD:-$PARTITION_AMD}"
 
 LOG_DIR="$WORK_DIR/logs"
 export GPUBRIDGE_REPO="$REPO_DIR" WORK_DIR VENV VENV_ROCM SETUP_MODULES MODULES RESULTS_ROOT
@@ -208,6 +223,28 @@ $RESULTS_ROOT/00_partitions/gpu-types.txt"
     AMD_TYPE=$GPU_TYPE_AMD
 }
 
+pair_gate() {
+    [ "$SAME_PARTITION_PAIRS_OK" = 1 ] && return 0
+    if [ "$DRY_RUN" = 1 ]; then
+        log "dry-run only: same-partition GPU pairs wait for Research Computing's answer" \
+            "(SAME_PARTITION_PAIRS_OK=1 once they say yes)"
+        return 0
+    fi
+    die "waiting on Research Computing: $1 asks for two GPUs of one type as one \
+heterogeneous job in one partition. Once they confirm it is within the partitions' intended \
+use, add SAME_PARTITION_PAIRS_OK=1 to $KIT_DIR/explorer/local.env (or the environment)."
+}
+
+# matrix_job PAIR TIME PARTITION_0 TYPE_0 PARTITION_1 TYPE_1: submit step 08 for PAIR.
+matrix_job() {
+    local nvidia
+    export MATRIX_PAIR=$1
+    gpu_request "$3" "$4" 1 1 "$2"
+    nvidia=("${REQUEST[@]}")
+    gpu_request "$5" "$6" 1 1 "$2"
+    sbatch_job "08_matrix_$1" 08_bench_matrix.sbatch "${nvidia[@]}" : "${REQUEST[@]}"
+}
+
 setup_job() {
     local name=$1
     shift
@@ -250,11 +287,45 @@ amd)
     gpu_request "$PARTITION_AMD" "$AMD_TYPE" 1 "$GPUS_MIXED_AMD" "$TIME_07"
     sbatch_job 07_mixed_hetjob 07_mixed_hetjob.sbatch "${nvidia[@]}" : "${REQUEST[@]}"
     ;;
+net-nvidia)
+    export NET_SIDE=nvidia
+    submit net_check.sbatch "$TIME_NET" 1 1 "$PARTITION_1GPU" "$GPU_TYPE_1GPU"
+    ;;
+net-amd)
+    amd_gate
+    export NET_SIDE=amd
+    submit net_check.sbatch "$TIME_NET" 1 1 "$PARTITION_AMD" "$AMD_TYPE"
+    ;;
+08)
+    amd_gate
+    matrix_job nvidia-amd "$TIME_08" "$PARTITION_MIXED_NVIDIA" "$GPU_TYPE_1GPU" \
+        "$PARTITION_AMD" "$AMD_TYPE"
+    ;;
+08-nvidia-pair)
+    pair_gate 08-nvidia-pair
+    matrix_job nvidia-nvidia "$TIME_08" "$PARTITION_PAIR_NVIDIA" "$GPU_TYPE_1GPU" \
+        "$PARTITION_PAIR_NVIDIA" "$GPU_TYPE_1GPU"
+    ;;
+08-amd-pair)
+    amd_gate
+    pair_gate 08-amd-pair
+    matrix_job amd-amd "$TIME_08" "$PARTITION_PAIR_AMD" "$AMD_TYPE" "$PARTITION_PAIR_AMD" \
+        "$AMD_TYPE"
+    ;;
+train-nvidia)
+    export TRAIN_SIDE=nvidia
+    submit train_bench.sbatch "$TIME_TRAIN" 1 1 "$PARTITION_1GPU" "$GPU_TYPE_1GPU"
+    ;;
+train-amd)
+    amd_gate
+    export TRAIN_SIDE=amd
+    submit train_bench.sbatch "$TIME_TRAIN" 1 1 "$PARTITION_AMD" "$AMD_TYPE"
+    ;;
 free | multi)
     # DRY_RUN is exported, so the recursive calls inherit --dry-run.
     steps=(01 02)
     [ "${ARGS[0]}" = multi ] && steps=(03 04 05 06)
     for s in "${steps[@]}"; do "$0" "$s"; done
     ;;
-*) sed -n '2,21p' "$0" >&2; exit 2 ;;
+*) sed -n '2,26p' "$0" >&2; exit 2 ;;
 esac

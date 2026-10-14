@@ -34,6 +34,9 @@ END_TO_END = {
     "check.py": "every job below, and test_gpu_kit.py",
     "bench_all_reduce.py": "test_step_03, 04, 05, 07, the node pair",
     "bench_compression.py": "test_step_04, 07, the node pair, test_amd_node_job",
+    "bench_matrix.py": "test_step_08_*, test_net_check_job, test_gpu_kit.py",
+    "train_bench.py": "test_step_07_*, test_train_bench_job, test_gpu_kit.py",
+    "net_report.sh": "test_step_08_*, test_net_check_job",
     "stream_mutations.py": "test_gpu_kit.py: its plan, each mutation, and its refusal without a "
                            "GPU (the mutated tests themselves need one)",
     "time_triton_cache.py": "test_gpu_kit.py: filesystems and its refusal without a GPU (the "
@@ -58,7 +61,10 @@ END_TO_END = {
     "explorer/04_split_4gpu.sbatch": "test_step_04_split_4gpu",
     "explorer/05_multinode.sbatch": "test_step_05_two_nodes",
     "explorer/06_scaling.sbatch": "test_step_06_scaling",
-    "explorer/07_mixed_hetjob.sbatch": "test_step_07_mixed_hetjob",
+    "explorer/07_mixed_hetjob.sbatch": "test_step_07_mixed_hetjob, test_step_07_training_only",
+    "explorer/08_bench_matrix.sbatch": "test_step_08_*",
+    "explorer/net_check.sbatch": "test_net_check_job",
+    "explorer/train_bench.sbatch": "test_train_bench_job",
     "explorer/amd_node.sbatch": "test_amd_node_job",
     "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines",
     "amd/run_all.sh": "test_gpu_kit.py: test_amd_script_keeps_going_*",
@@ -83,6 +89,10 @@ def cluster_env(tmp_path: Path, **extra: str) -> dict[str, str]:
         "RDZV_PORT": str(_free_port()),
         "PREFLIGHT_PORT": str(_free_port()),
         "PREFLIGHT_SECONDS": "0.3",
+        # train_bench.py's smallest model, briefly; one chunk size for step 08.
+        "TRAIN_BENCH_MODELS": "tiny-gpt",
+        "TRAIN_BENCH_ARGS": "--steps 2 --warmup-steps 1 --comm-trials 1",
+        "PIPELINE_CHUNKS": "4K",
         **extra,
     })
 
@@ -373,10 +383,106 @@ def test_step_07_mixed_hetjob(tmp_path):
     check = summary(out / "check")
     assert check["ok"] and check["split_test"] is None
     assert (out / "train_ddp.json").exists() and (out / "thresholds.json").exists()
+    bench = json.loads((out / "train_bench_tiny-gpt.json").read_text())
+    assert bench["world_size"] == 2 and [r["vendor"] for r in bench["ranks"]] == ["nvidia", "amd"]
     # Every job step after the preflight runs with each side's chosen interface.
     chosen = json.loads((out / "preflight" / "preflight-master.json").read_text())["chosen_ifname"]
     later = (tmp_path / "slurm.log").read_text().split("preflight.py", 1)[1]
     assert f"env GLOO_SOCKET_IFNAME={chosen}" in later
+
+
+def test_step_07_training_only(tmp_path):
+    code = sbatch(tmp_path, "--job-name=gpubridge-07_mixed_hetjob", "--nodes=1",
+                  "--gres=gpu:1", ":", "--nodes=1", "--gres=gpu:mi100:1",
+                  str(EXPLORER / "07_mixed_hetjob.sbatch"),
+                  FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
+                  FAKE_SLURM_HET_ENV_1="GPUBRIDGE_VENDOR=amd", STEPS_07="training")
+    out = tmp_path / "results" / "07_mixed_hetjob"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)
+    assert list(steps(out)) == ["probe", "preflight", "train_ddp", "train_bench_tiny-gpt",
+                                "train_fsdp2_backend", "verify_fsdp2_backend",
+                                "train_hsdp_backend", "verify_hsdp_backend"]
+
+
+# ---- step 08, the network check and training throughput ------------------------------
+
+def test_step_08_matrix_on_the_mixed_pair(tmp_path):
+    code = submit(tmp_path, "08", AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
+                  FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
+                  FAKE_SLURM_HET_ENV_1="GPUBRIDGE_VENDOR=amd")
+    out = tmp_path / "results" / "08_matrix_nvidia-amd"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    runs = sorted(p.parent.name for p in (out / "matrix").glob("*/bench.json"))
+    assert runs == ["D-bf16", "D-default", "D-default-repeat", "D-fp8", "D-pinned",
+                    "D-pipelined-4K", "D-sharded", "E"]
+
+    def bench(name):
+        return json.loads((out / "matrix" / name / "bench.json").read_text())
+
+    assert bench("D-pinned")["environment"]["env"]["GPUBRIDGE_PINNED_STAGING"] == "1"
+    assert bench("D-pipelined-4K")["run"]["policy"] == "pipelined-reduce-bridge-broadcast"
+    assert bench("D-fp8")["environment"]["env"]["GPUBRIDGE_BRIDGE_COMPRESSION"] == "fp8"
+    assert {r["op"] for r in bench("E")["rows"]} == {"flat-gloo"}
+    assert all(r.get("phases_ms") for r in bench("D-default")["rows"])
+    assert {p.name for p in (out / "network").iterdir()} == {"nvidia", "amd"}
+    md = (out / "matrix.md").read_text()
+    assert "| D-fp8 |" in md and "Measured / predicted" in md
+    assert "Without A1 and A2" in md
+
+
+@pytest.mark.parametrize(("target", "vendor", "names"),
+                         [("08-nvidia-pair", "nvidia", ["A1", "A2", "C", "E-nvidia"]),
+                          ("08-amd-pair", "amd", ["B1", "B2", "C-amd", "E-amd"])])
+def test_step_08_matrix_on_a_same_vendor_pair(target, vendor, names, tmp_path):
+    code = submit(tmp_path, target, AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
+                  SAME_PARTITION_PAIRS_OK="1", GPUBRIDGE_VENDOR=vendor)
+    pair = f"{vendor}-{vendor}"
+    out = tmp_path / "results" / f"08_matrix_{pair}"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)
+    assert sorted(p.parent.name for p in (out / "matrix").glob("*/bench.json")) == sorted(names)
+    native, tcp, bridged = (json.loads((out / "matrix" / n / "bench.json").read_text())
+                            for n in names[:3])
+    assert {r["op"] for r in native["rows"]} == {"native"}
+    chosen = json.loads((out / "preflight" / "preflight-master.json").read_text())["chosen_ifname"]
+    assert tcp["environment"]["env"]["NCCL_IB_DISABLE"] == "1"
+    assert tcp["environment"]["env"]["NCCL_SOCKET_IFNAME"] == chosen
+    assert bridged["run"]["split_test"] == "node" and len(bridged["run"]["islands"]) == 2
+    md = (out / "matrix.md").read_text()
+    if vendor == "nvidia":
+        assert re.search(r"\| 1KB \| A2 \| [^|]+ \| [^|]+ \| 1\.00x \|", md), md
+
+
+def test_same_partition_pairs_wait_for_research_computing(tmp_path):
+    for target in ("08-nvidia-pair", "08-amd-pair"):
+        result = subprocess.run(["bash", str(EXPLORER / "submit.sh"), target],
+                                env=cluster_env(tmp_path, AMD_NODES_CONFIRMED="1",
+                                                GPU_TYPE_AMD="mi50"),
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 1, result.stderr
+        assert "waiting on Research Computing" in result.stderr
+    assert not (tmp_path / "slurm.log").exists()  # nothing reached sbatch
+
+
+def test_net_check_job(tmp_path):
+    code = submit(tmp_path, "net-nvidia")
+    out = tmp_path / "results" / "net_check_nvidia"
+    assert code == 0 and failed(out) == set(), job_output(tmp_path)
+    assert list(steps(out)) == ["network", "net_default", "net_tcp", "matrix"]
+    side = out / "network" / "nvidia"
+    assert {p.name for p in side.iterdir()} == {"sys_class_infiniband.txt", "ibstat.txt",
+                                                "ibv_devinfo.txt", "ip_addr.txt"}
+    assert "## Network" in (out / "matrix.md").read_text()
+    log = (tmp_path / "slurm.log").read_text()
+    assert "--partition=gpu" in log and "--time=00:10:00" in log
+
+
+def test_train_bench_job(tmp_path):
+    code = submit(tmp_path, "train-nvidia")
+    out = tmp_path / "results" / "train_bench_nvidia"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    record = json.loads((out / "train_bench_tiny-gpt.json").read_text())
+    assert record["world_size"] == 1 and record["samples_per_s"] > 0
+    assert record["ranks"][0]["waiting_ms"] == 0.0
 
 
 def test_amd_node_job(tmp_path):

@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -22,8 +23,10 @@ KIT = REPO / "scripts" / "gpu"
 sys.path.insert(0, str(KIT))
 
 import bench_all_reduce  # noqa: E402
+import bench_matrix  # noqa: E402
 import preflight  # noqa: E402
 import summarize  # noqa: E402
+import train_bench  # noqa: E402
 import validation_tables  # noqa: E402
 
 SHELL_SCRIPTS = sorted(
@@ -499,11 +502,14 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     # probe, preflight, check, bench, a check per opt-in policy, the candidates bench,
     # DDP training, then FSDP2 on the torch.distributed backend (trained, then verified),
     # then HSDP the same way (one GPU per side by default: as many on each side)
-    assert len(sruns) >= 11
+    # then train_bench.py on each of its models
+    assert len(sruns) >= 13
     assert any("--policy pipelined-reduce-bridge-broadcast" in line for line in sruns[4:])
     assert any("--policy sharded-bridge" in line for line in sruns[4:])
-    assert "--write-thresholds" in sruns[-6]
-    assert "examples/train_synthetic.py" in sruns[-5] and "train_ddp.json" in sruns[-5]
+    assert "--write-thresholds" in sruns[-8]
+    assert "examples/train_synthetic.py" in sruns[-7] and "train_ddp.json" in sruns[-7]
+    assert "train_bench.py --model gpt2-small" in sruns[-6]
+    assert "train_bench.py --model resnet50" in sruns[-5]
     assert "examples/fsdp2_torch_backend.py" in sruns[-4] and "--verify" in sruns[-3]
     assert "--hsdp 2 --json" in sruns[-2] and "--verify --hsdp 2" in sruns[-1]
     for line in sruns:
@@ -1702,3 +1708,237 @@ def test_tables_name_the_bridge_and_its_path(tmp_path):
     tables = validation_tables.build([tmp_path])
     assert {(r["bridge"], r["staging"]) for r in tables["benchmarks"]} == {("ucx", "ucx direct")}
     assert {(r["bridge"], r["staging"]) for r in tables["predicted"]} == {("ucx", "ucx direct")}
+
+
+# ---- the comparison matrix (step 08) and training throughput -------------------------
+
+def test_submit_08_is_one_heterogeneous_job_of_a_v100_and_an_mi50():
+    out = dry_run(KIT / "explorer" / "submit.sh", "08", GPU_TYPE_1GPU="v100-sxm2",
+                  GPU_TYPE_AMD="mi50").stdout
+    sbatch = [line for line in out.splitlines() if line.startswith("+ sbatch ")]
+    assert len(sbatch) == 1, out
+    nvidia, amd = sbatch[0].split(" : ")
+    assert "--partition=gpu " in nvidia and "--gres=gpu:v100-sxm2:1 " in nvidia
+    assert "--job-name=gpubridge-08_matrix_nvidia-amd" in nvidia
+    assert "--time=00:40:00" in nvidia and "--time=00:40:00" in amd
+    assert "--partition=sharing " in amd and "--gres=gpu:mi50:1 " in amd
+    assert amd.rstrip().endswith("08_bench_matrix.sbatch")
+
+
+@pytest.mark.parametrize(("target", "partition", "gres"),
+                         [("08-nvidia-pair", "gpu", "gpu:v100-sxm2:1"),
+                          ("08-amd-pair", "sharing", "gpu:mi50:1")])
+def test_submit_same_vendor_pairs_are_ready_but_dry_run_only(target, partition, gres):
+    result = dry_run(KIT / "explorer" / "submit.sh", target, GPU_TYPE_1GPU="v100-sxm2",
+                     GPU_TYPE_AMD="mi50")
+    assert "same-partition GPU pairs wait for Research Computing" in result.stderr
+    sbatch = [line for line in result.stdout.splitlines() if line.startswith("+ sbatch ")]
+    first, second = sbatch[0].split(" : ")
+    for side in (first, second):
+        assert f"--partition={partition} " in side and f"--gres={gres} " in side
+
+
+def _matrix_launches(pair: str, **env: str) -> dict[str, str]:
+    result = dry_run(KIT / "explorer" / "08_bench_matrix.sbatch", WORK_DIR="/w",
+                     MATRIX_PAIR=pair, **env)
+    assert result.returncode == 0, result.stderr
+    found = {}
+    for line in result.stdout.replace("\\", "").splitlines():
+        if (m := re.search(r"--out /\S+/matrix/(\S+) ", line)) and "srun" in line:
+            found[m[1]] = line
+    return found
+
+
+def test_matrix_job_runs_every_policy_on_the_mixed_pair():
+    runs = _matrix_launches("nvidia-amd")
+    assert list(runs) == ["D-default", "D-pinned", "D-pipelined-1M", "D-pipelined-4M",
+                          "D-pipelined-16M", "D-pipelined-64M", "D-sharded", "D-bf16", "D-fp8",
+                          "E", "D-default-repeat"]
+    assert "GPUBRIDGE_PINNED_STAGING=1" in runs["D-pinned"]
+    assert "GPUBRIDGE_CHUNK_BYTES=16M" in runs["D-pipelined-16M"]
+    assert "--policy pipelined-reduce-bridge-broadcast" in runs["D-pipelined-16M"]
+    assert "--policy sharded-bridge" in runs["D-sharded"]
+    assert "GPUBRIDGE_BRIDGE_COMPRESSION=fp8" in runs["D-fp8"]
+    assert "--ops flat-gloo" in runs["E"]
+    for line in runs.values():
+        nvidia, amd = line.split(" : ")
+        assert "/w/venv/bin/torchrun" in nvidia and "/w/venv-rocm/bin/torchrun" in amd
+        assert "--phases" in line or "flat-gloo" in line
+        assert "--max-bytes 1G" in line
+
+
+@pytest.mark.parametrize(("pair", "names", "venv"),
+                         [("nvidia-nvidia", ["A1", "A2", "C", "E-nvidia"], "/w/venv/"),
+                          ("amd-amd", ["B1", "B2", "C-amd", "E-amd"], "/w/venv-rocm/")])
+def test_matrix_job_runs_the_native_baselines_on_same_vendor_pairs(pair, names, venv):
+    runs = _matrix_launches(pair)
+    assert list(runs) == names
+    native, tcp, bridged, _ = (runs[name] for name in names)
+    assert "--ops native" in native and "NCCL_IB_DISABLE" not in native
+    assert "--ops native" in tcp and "NCCL_IB_DISABLE=1" in tcp
+    assert "GPUBRIDGE_SPLIT_TEST=node" in bridged and "--ops gpubridge --phases" in bridged
+    for line in runs.values():
+        for side in line.split(" : "):
+            assert f"{venv}bin/torchrun" in side
+
+
+def _bench(op: str, us: dict[int, float], *, env: dict | None = None, phases=None,
+           islands=None, **run: Any) -> dict:
+    islands = islands or [{"vendor": "nvidia", "ranks": [0]}, {"vendor": "amd", "ranks": [1]}]
+    return {"run": {"kind": "gpu-mixed", "split_test": None, "world_size": 2,
+                    "islands": islands, "policy": "reduce-bridge-broadcast", **run},
+            "environment": {"env": env or {}, "collective_library": "nccl",
+                            "hostname": "gpunode17.cluster.example.edu"},
+            "rows": [{"op": op, "bytes": n, "median_us": t, "busbw_GBps": n / t / 1e3,
+                      "islands": len(islands), "timer": "cuda-events",
+                      **({"phases_ms": phases(n)} if phases else {})}
+                     for n, t in us.items()]}
+
+
+def _write(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
+
+
+def _matrix_tree(root: Path) -> None:
+    sizes = (2**10, 2**20, 2**30)
+    pair = root / "08_matrix_nvidia-nvidia"
+    nvidia = [{"vendor": "nvidia", "ranks": [0, 1]}]
+    _write(pair / "matrix" / "A1" / "bench.json",
+           _bench("native", {n: 10 + n / 10e3 for n in sizes}, islands=nvidia))
+    _write(pair / "matrix" / "A2" / "bench.json",
+           _bench("native", {n: 20 + n / 1e3 for n in sizes}, islands=nvidia,
+                  env={"NCCL_IB_DISABLE": "1", "NCCL_SOCKET_IFNAME": "eth1"}))
+    mixed = root / "08_matrix_nvidia-amd"
+    _write(mixed / "preflight" / "preflight-master.json",
+           {"role": "master", "hostname": "gpunode17",
+            "bandwidth": {"MBps_in": 1000.0, "MBps_out": 1200.0, "rtt_ms": 0.1}})
+    _write(mixed / "matrix" / "D-default" / "bench.json",
+           _bench("gpubridge", {n: 40 + n / 500 for n in sizes},
+                  phases=lambda n: {"island-reduce": 0.01, "bridge": n / 5e5, "island-broadcast": 0.01}))
+    _write(mixed / "matrix" / "D-bf16" / "bench.json",
+           _bench("gpubridge", {n: 40 + n / 900 for n in sizes},
+                  env={"GPUBRIDGE_BRIDGE_COMPRESSION": "bf16"},
+                  phases=lambda n: {"compress": 0.1, "bridge": n / 1e6, "decompress": 0.1}))
+    _write(mixed / "matrix" / "E" / "bench.json", _bench("flat-gloo", {n: 30 + n / 450 for n in sizes}))
+    side = mixed / "network" / "nvidia"
+    side.mkdir(parents=True)
+    (side / "sys_class_infiniband.txt").write_text("mlx5_0\n")
+    (side / "ibstat.txt").write_text("CA 'mlx5_0'\n\tPort 1:\n\t\tState: Active\n\t\tRate: 100\n"
+                                     "\t\tLink layer: InfiniBand\n")
+    (side / "ibv_devinfo.txt").write_text("hca_id:\tmlx5_0\n\t\tport:\t1\n\t\t\tstate:\t\t"
+                                          "PORT_ACTIVE (4)\n\t\t\tlink_layer:\t\tInfiniBand\n")
+    (side / "ip_addr.txt").write_text("lo UNKNOWN 127.0.0.1/8\neth1 UP 10.0.12.34/16\n")
+    amd = mixed / "network" / "amd"
+    amd.mkdir(parents=True)
+    (amd / "sys_class_infiniband.txt").write_text("")
+    (amd / "ibstat.txt").write_text("ibstat: not installed on this node\n")
+    (amd / "ibv_devinfo.txt").write_text("ibv_devinfo: not installed on this node\n")
+    logs = mixed / "nccl" / "matrix_D-default"
+    logs.mkdir(parents=True)
+    (logs / "gpunode17.1.log").write_text(
+        "gpunode17:1:1 [0] NCCL INFO cudaDriverVersion 12030\n"
+        "gpunode17:1:1 [0] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB [RO]; OOB eth1:10.0.12.34<0>\n"
+        "gpunode17:1:1 [0] NCCL INFO Using network IB\n")
+    (logs / "amdnode3.2.log").write_text(
+        "amdnode3:2:2 [0] NCCL INFO ROCr version 1.18\n"
+        "amdnode3:2:2 [0] NCCL INFO Bootstrap: Using ibs8:172.16.5.6<0>\n"
+        "amdnode3:2:2 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] [send] via NET/Socket/0\n")
+
+
+def test_matrix_compares_every_run_with_both_native_baselines(tmp_path):
+    _matrix_tree(tmp_path)
+    runs = bench_matrix.find_runs([tmp_path])
+    assert [r.name for r in runs] == ["A1", "A2", "D-default", "D-bf16", "E"]
+    rows = {(r["run"], r["bytes"]): r for r in bench_matrix.matrix_rows(runs)}
+    big = 2**30
+    a2, a1 = rows[("A2", big)]["median_us"], rows[("A1", big)]["median_us"]
+    d = rows[("D-default", big)]
+    assert d["x_A2"] == pytest.approx(d["median_us"] / a2, abs=0.01)
+    assert d["x_A1"] == pytest.approx(d["median_us"] / a1, abs=0.01)
+    assert rows[("A2", big)]["x_A2"] == 1.0
+    # Predicted from the preflight's slower direction (1000 MB/s) and round trip.
+    assert d["predicted_bridge_ms"] == pytest.approx(0.1 + big / 1e9 * 1e3, abs=1e-3)
+    assert d["measured_over_predicted"] == pytest.approx(d["bridge_ms"] / d["predicted_bridge_ms"],
+                                                         abs=0.01)
+    # bf16 sends half the bytes, so half the prediction (plus the round trip).
+    assert rows[("D-bf16", big)]["predicted_bridge_ms"] == pytest.approx(
+        0.1 + big / 2 / 1e9 * 1e3, abs=1e-3)
+    assert "predicted_bridge_ms" not in rows[("E", big)]  # flat Gloo has no bridge phase
+    assert bench_matrix.described(runs[1]) == "native NCCL, NCCL_IB_DISABLE=1, NCCL_SOCKET_IFNAME=eth1"
+    assert "bf16 compression" in bench_matrix.described(runs[3])
+
+
+def test_matrix_markdown_has_a_table_per_size_range_and_no_hosts_or_addresses(tmp_path):
+    _matrix_tree(tmp_path)
+    assert bench_matrix.main([str(tmp_path), "--pending", "B1,B2=waiting on access"]) == 0
+    md = (tmp_path / "matrix.md").read_text()
+    for title in ("## Small", "## Medium", "## Large", "## Phases of the gpubridge runs",
+                  "## Network", "A2 against C is gpubridge's own cost"):
+        assert title in md
+    assert "**B1** (waiting on access); **B2** (waiting on access)" in md
+    assert "| 1GB | D-default |" in md
+    # The network: InfiniBand on the V100 node, none on the other; what each library chose.
+    assert "mlx5_0:1 InfiniBand, Active, 100 Gb/s" in md
+    assert "ibstat and ibv_devinfo not installed" in md
+    assert "Using network IB" in md and "channels via NET/Socket/0" in md
+    assert "OOB eth1" in md and "Bootstrap: Using ibs8" in md
+    for secret in ("gpunode17", "amdnode3", "10.0.12.", "172.16.", "example.edu"):
+        assert secret not in md
+    data = json.loads((tmp_path / "matrix.json").read_text())
+    assert {r["run"] for r in data["runs"]} == {"A1", "A2", "D-default", "D-bf16", "E"}
+    assert (tmp_path / "matrix.csv").read_text().startswith("run,job,what,bytes,median_us")
+
+
+def test_matrix_without_baselines_says_so(tmp_path):
+    _matrix_tree(tmp_path)
+    shutil.rmtree(tmp_path / "08_matrix_nvidia-nvidia")
+    assert bench_matrix.main([str(tmp_path)]) == 0
+    md = (tmp_path / "matrix.md").read_text()
+    assert "Without A1 and A2, the x A2 and x A1 columns are empty." in md
+
+
+def test_matrix_needs_results(tmp_path, capsys):
+    assert bench_matrix.main([str(tmp_path)]) == 1
+    assert "no matrix runs" in capsys.readouterr().err
+
+
+def test_matrix_names_runs_in_order():
+    names = ["E", "D-default-repeat", "D-pipelined-1M", "A2", "C-amd", "D-default", "C", "A1"]
+    assert sorted(names, key=bench_matrix.order_key) == [
+        "A1", "A2", "C", "C-amd", "D-default", "D-pipelined-1M", "D-default-repeat", "E"]
+
+
+def test_train_bench_splits_the_step_into_compute_waiting_and_exposed_communication():
+    # Rank 0 computes in 1.0 s, rank 1 in 1.5 s; the ddp step takes 2.0 s; the
+    # gradients alone take 0.8 s, of which 0.5 s stayed exposed.
+    out = train_bench.decompose([[1.0, 1.0, 1.0], [1.5, 1.5, 1.5]],
+                                [[2.0, 1.9, 2.1], [2.0, 2.0, 2.0]],
+                                [[0.8, 0.8], [0.7, 0.8]], batch=8)
+    assert out["step_ms"] == 2000.0 and out["samples_per_s"] == 8.0
+    assert out["slowest_compute_ms"] == 1500.0 and out["exposed_comm_ms"] == 500.0
+    assert out["comm_alone_ms"] == 800.0 and out["hidden_comm_ms"] == 300.0
+    assert [r["waiting_ms"] for r in out["ranks"]] == [500.0, 0.0]
+    assert [r["alone_samples_per_s"] for r in out["ranks"]] == [8.0, 5.333]
+
+
+def test_train_bench_models_are_the_real_sizes():
+    count = {name: sum(p.numel() for p in train_bench.build(name).parameters())
+             for name in ("gpt2-small", "resnet50")}
+    assert count == {"gpt2-small": 124_439_808, "resnet50": 25_557_032}
+
+
+def test_train_bench_runs_ddp_through_gpubridge_on_cpu(tmp_path):
+    out = tmp_path / "train_bench.json"
+    result = torchrun(2, KIT / "train_bench.py", "--model", "tiny-resnet", "--steps", "2",
+                      "--warmup-steps", "1", "--comm-trials", "1", "--json", str(out),
+                      GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode == 0, result.stderr[-3000:]
+    record = json.loads(out.read_text())
+    assert record["world_size"] == 2 and record["run"]["split_test"] == "half"
+    assert record["grad_sync"] == "DistributedDataParallel + gpubridge.ddp_comm_hook"
+    assert record["buckets"] >= 1 and record["model"]["gradient_bytes"] > 0
+    assert record["params_identical"] and record["params_finite"]
+    assert [r["vendor"] for r in record["ranks"]] == ["nvidia", "amd"]
+    assert record["samples_per_s"] > 0 and len(record["environments"]) == 2
+    assert "SPLIT TEST" in record["warning"]
