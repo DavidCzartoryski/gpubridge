@@ -406,3 +406,5 @@ would help more.
 - No training-accuracy study: loss curves with and without compression over
   many steps (`examples/train_synthetic.py` would do).
 - Compressed broadcast, all_gather, or a compressed island step.
+
+<!-- CI probe: a docs-only change to check that the heavy jobs skip; this PR is closed unmerged. -->
