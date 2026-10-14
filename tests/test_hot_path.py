@@ -83,8 +83,12 @@ class _Asked:
         return frozenset({str(id(topology))})
 
 
+class _Topology:  # weak-referenceable, as gpubridge's is
+    pass
+
+
 def test_a_new_topology_is_never_given_an_old_answer():
-    policy, first, second = _Asked(), object(), object()
+    policy, first, second = _Asked(), _Topology(), _Topology()
     ask = partial(collectives._supported_reduce_ops, policy)
     assert ask(first) == ask(first) == {str(id(first))} and policy.asked == 1
     assert ask(second) == {str(id(second))} and policy.asked == 2  # after destroy() and init()
@@ -101,7 +105,7 @@ def test_a_policy_with_slots_is_asked_every_call():
             self.asked += 1
             return frozenset({"sum"})
 
-    policy, topology = Slotted(), object()
+    policy, topology = Slotted(), _Topology()
     for _ in range(3):
         assert collectives._supported_reduce_ops(policy, topology) == {"sum"}
     assert policy.asked == 3

@@ -12,6 +12,7 @@ Every collective takes ``async_op``. With ``async_op=True`` it returns a
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable
 
 import torch
@@ -294,12 +295,12 @@ def _supported_reduce_ops(policy: CollectivePolicy, topology: Topology) -> froze
     remembered on the policy: the policy, its settings and the bridge transport are fixed
     from init() on, and the same on every rank. Every call still checks its op against it."""
     cached = getattr(policy, "_gpubridge_reduce_ops", None)
-    if cached is not None and cached[0] is topology:
+    if cached is not None and cached[0]() is topology:
         return cached[1]
     supported = policy.supported_reduce_ops(topology)
-    try:
-        policy._gpubridge_reduce_ops = (topology, supported)  # type: ignore[attr-defined]
-    except AttributeError:  # a policy with __slots__: asked every call
+    try:  # weakly: no cycle keeps a destroyed topology (and its groups) alive
+        policy._gpubridge_reduce_ops = (weakref.ref(topology), supported)  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):  # __slots__, or a topology without weakrefs: ask each call
         pass
     return supported
 
