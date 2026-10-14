@@ -19,6 +19,10 @@ still needs real hardware. Numbers in parentheses are pull requests.
   each policy, sync and async, with and without an observer, against the same
   torch.distributed calls made directly. `--stub-comm` leaves only gpubridge's
   own work; `--profile` runs cProfile on rank 0 (#44).
+- `scripts/gpu/triage.py`: a short plain-text summary of an Explorer or Kaggle
+  results directory or tarball, under 80 lines, to paste into a review. It shows
+  each failed, timed-out or skipped step and why, the GPUs and versions, the
+  key benchmark numbers and the compression check (#45).
 
 ### Changed
 
