@@ -1359,6 +1359,7 @@ def test_verdict_counts_only_gpu_runs():
         [evidence("a", True, False), evidence("b", False, False)]) == "FAIL (1 of 2)"
 
 
+@pytest.mark.docs
 def test_tables_cover_every_hardware_validation_item():
     text = (REPO / "HARDWARE_VALIDATION.md").read_text().split("## Mixed build results")[0]
     numbers = {int(m) for m in re.findall(r"^(\d+)\. ", text, flags=re.MULTILINE)}

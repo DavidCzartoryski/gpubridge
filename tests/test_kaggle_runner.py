@@ -167,6 +167,7 @@ def test_the_feature_check_runs_and_writes_a_kit_record_without_a_gpu(tmp_path):
                             "triton_bfloat16": True}  # nothing checked: nothing skipped
 
 
+@pytest.mark.docs
 def test_the_notebook_holds_this_script_and_runs_every_step():
     assert make_notebook.main(["--check"]) == 0, "run python scripts/gpu/kaggle/make_notebook.py"
     nb = json.loads(make_notebook.NOTEBOOK.read_text())
