@@ -80,12 +80,17 @@ class Redact:
         self.hosts = hosts
 
     def __call__(self, text: str) -> str:
-        names = sorted(((name, label) for name, label in self.hosts.names.items() if name),
-                       key=lambda kv: -len(kv[0]))
-        for name, label in names:
-            for form in {name, name.split(".")[0]}:
+        forms: dict[str, str] = {}
+        for name, label in self.hosts.names.items():
+            for form in (name, name.split(".")[0]) if name else ():
                 if len(form) >= 3:
-                    text = re.sub(rf"(?<![\w-]){re.escape(form)}(?![\w-])", label, text)
+                    forms.setdefault(form, label)
+        if forms:
+            # One pass, longest first: a full name wins over its short form (which would
+            # leave "host 1.cluster.example.edu"), and no label is replaced again.
+            ordered = sorted(forms, key=lambda f: (-len(f), f))
+            pattern = r"(?<![\w-])(?:" + "|".join(map(re.escape, ordered)) + r")(?![\w-])"
+            text = re.sub(pattern, lambda m: forms[m.group()], text)
         text = self.HOME.sub("~", self.PROJECT.sub("$PROJECT_DIR", text))
         return self.IPV4.sub("<ip>", text)
 
