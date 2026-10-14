@@ -35,9 +35,10 @@ if [ -z "${GPUBRIDGE_VENDOR:-}${GPUBRIDGE_CPU_ONLY:-}" ]; then
     step summarize_shared_gpu python "$KIT_DIR/summarize.py" "$RESULTS/shared_gpu_check"
 fi
 # GPU-only correctness tests (tests/test_gpu.py): every policy against flat-gloo,
-# fp32/fp16/bf16, odd and large sizes, async on non-default streams.
+# fp32/fp16/bf16, odd and large sizes, async on non-default streams. --durations=15:
+# the slowest tests and their times end the log.
 step gpu_tests limited python -m pytest -m gpu "$REPO_DIR/tests/test_gpu.py" \
     "$REPO_DIR/tests/test_compression_kernels.py" \
-    "$REPO_DIR/tests/test_torch_backend.py" -q -p no:cacheprovider \
+    "$REPO_DIR/tests/test_torch_backend.py" -q -p no:cacheprovider --durations=15 \
     --junitxml="$RESULTS/gpu_tests.xml"
 finish

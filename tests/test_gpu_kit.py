@@ -467,9 +467,12 @@ def test_submit_free_and_multi_submit_every_step():
                                         "--expect-init-error would\\ share\\ a\\ GPU",
                                         # its own limit, not STEP_TIMEOUT
                                         "timeout --kill-after=30 60 env "
-                                        "GPUBRIDGE_SPLIT_TEST=alternate"]),
+                                        "GPUBRIDGE_SPLIT_TEST=alternate",
+                                        # the slowest tests end gpu_tests' log
+                                        "pytest -m gpu", "--durations=15"]),
         ("03_single_island.sbatch", ["device_map.py", "check.py", "bench_all_reduce.py"]),
         ("04_split_4gpu.sbatch", ["check_half", "check_alternate", "bench_all_reduce.py",
+                                  "--durations=15",
                                   "--policy pipelined-reduce-bridge-broadcast",
                                   "--policy sharded-bridge", "--write-thresholds",
                                   "--policy auto-tuned", "train_synthetic.py",
@@ -507,7 +510,8 @@ def test_amd_dry_run_with_several_gpus():
                  "nccl/check_1gpu/", "--nproc-per-node=8",
                  "GPUBRIDGE_SPLIT_TEST=half", "bench_all_reduce.py", "train_n4", "tar -czf",
                  "--policy pipelined-reduce-bridge-broadcast", "--policy sharded-bridge",
-                 "train_ddp_split.json", "GPUBRIDGE_PINNED_STAGING=1", "bench_pinned"]:
+                 "train_ddp_split.json", "GPUBRIDGE_PINNED_STAGING=1", "bench_pinned",
+                 "--durations=15"]:
         assert text in out, text
     assert "train_n5" not in out
 

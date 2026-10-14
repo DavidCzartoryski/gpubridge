@@ -3,12 +3,18 @@
 All notable changes to gpubridge. Versions follow the release tags; every
 release so far is an alpha. Numbers in parentheses are pull requests.
 
-**GPU runs so far: one.** On Explorer, one NVIDIA V100 (sm_70), torch
-2.14.1+cu126, NCCL 2.29.3, at commit af51b20: the bridge on device tensors and
-the shared-GPU check passed; two fp8 error-feedback residual tests failed, from
-FMA contraction plus a codec overflow, fixed in #50. Everything else is
-**validated on CPU only**: [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)
-lists what still needs real hardware.
+**GPU runs so far**, on Explorer:
+
+- **NVIDIA V100 (sm_70), commit af51b20**, torch 2.14.1+cu126, NCCL 2.29.3: the
+  bridge on device tensors and the shared-GPU check passed; two fp8
+  error-feedback residual tests failed, from FMA contraction plus a codec
+  overflow, fixed in #50.
+- **NVIDIA V100 (SXM2), commit df80abb**, step 02 rerun after #50: passed;
+  `gpu_tests` 26 passed, 8 skipped.
+
+Everything else is **validated on CPU only**:
+[HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
+hardware.
 
 ## [Unreleased]
 
@@ -65,6 +71,9 @@ lists what still needs real hardware.
   version (#49).
 - `results/explorer/` is gitignored: its step logs, stack dumps and NCCL logs
   are not redacted (#50).
+- The GPU kit's `gpu_tests` step (Explorer 02 and 04, `amd/run_all.sh`, the
+  Kaggle runner) runs pytest with `--durations=15`, so the slowest tests and
+  their times end its log (#51).
 
 ### Fixed
 

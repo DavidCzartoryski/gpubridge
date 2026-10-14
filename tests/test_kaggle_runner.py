@@ -93,6 +93,7 @@ def test_without_triton_the_kernel_steps_run_on_pytorch_under_other_names(tmp_pa
     out = capsys.readouterr().out
     assert "step gpu_tests_without_triton" in out and "test_compression_kernels.py" not in out.split(
         "step gpu_tests_without_triton")[1].split("\n")[0]
+    assert "--durations=15" in out.split("step gpu_tests_without_triton")[1].split("\n")[0]
     assert "step bench_compression_torch_kernels" in out
     assert out.count("GPUBRIDGE_COMPRESSION_KERNELS=torch") == 2
     assert "compute capability 7.5: triton_float32 failed on sm_75" in out
