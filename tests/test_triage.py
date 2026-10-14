@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -150,10 +151,18 @@ def test_a_full_host_name_is_redacted_whole_under_any_hash_seed():
             "h('c2187.explorer.example.edu'); h('c2188'); "
             "print(triage.Redact(h)('c2187.explorer.example.edu, c2187, c2188.explorer'))")
     for seed in range(16):
-        out = subprocess.run([sys.executable, "-c", code, str(REPO / "scripts" / "gpu")],
-                             env={"PYTHONHASHSEED": str(seed)}, capture_output=True, text=True,
-                             timeout=60, check=True).stdout.strip()
-        assert out == "host 1, host 1, host 2.explorer", (seed, out)
+        done = subprocess.run([sys.executable, "-c", code, str(REPO / "scripts" / "gpu")],
+                              env={**os.environ, "PYTHONHASHSEED": str(seed)},
+                              capture_output=True, text=True, timeout=60)
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip() == "host 1, host 1, host 2.explorer", (seed, done.stdout)
+
+
+def test_a_host_named_like_a_label_doesnt_rewrite_the_labels():
+    hosts = triage.Hosts()
+    hosts("node-a.example.edu")
+    hosts("host")
+    assert triage.Redact(hosts)("node-a.example.edu and host") == "host 1 and host 2"
 
 
 def test_problems_come_first_and_the_limit_counts_printed_lines(tmp_path, capsys):
