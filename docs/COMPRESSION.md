@@ -228,7 +228,7 @@ the copy's):
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | NVIDIA V100 (sm_70) | 780 GB/s | df80abb | - | 101% | 81% | 99% | 52% |
 | AMD MI50 (gfx906) | 775 GB/s | df80abb | 102 to 105% | 78% | 55% | 63% | 39% |
-| NVIDIA H200 (sm_90) | 4,236 GB/s | 4a478f4 | 97 to 99% | 72% | 40% | 61% | 24% |
+| NVIDIA H200 (sm_90) | 4,236 GB/s | df80abb | 97 to 99% | 72% | 40% | 61% | 24% |
 
 The `bf16` mode keeps up with memory everywhere. The `fp8` kernels don't,
 and not only on the fast GPU: the MI50 has the V100's bandwidth and is
