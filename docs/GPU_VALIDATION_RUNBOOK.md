@@ -386,7 +386,8 @@ T4s are compute capability 7.5, so the runner first checks CUDA events,
 bfloat16 and Triton on them, and skips or adapts what they can't run, saying
 why. Upload `scripts/gpu/kaggle/kaggle_gpubridge.ipynb` and follow the clicks
 in [scripts/gpu/kaggle/README.md](../scripts/gpu/kaggle/README.md); the
-results come back as one tarball. It is a split test, not a mixed-vendor run.
+results come back as one tarball, and `python scripts/gpu/triage.py <tarball>`
+summarizes it. It is a split test, not a mixed-vendor run.
 
 ## AMD cloud machine
 
@@ -566,6 +567,29 @@ home directory `~`, the user name as a path segment `$USER`, and credentials in
 a URL `***`. The step logs (`<step>.log`), stack dumps (`rank*.stacks.txt`)
 and NCCL/RCCL logs are not redacted: keep them, and the results tarballs, out
 of anything public.
+
+### A summary to paste: triage.py
+
+`scripts/gpu/triage.py` turns a results directory or tarball, Explorer's or
+Kaggle's, into a short plain-text summary, under 80 lines, to paste into a
+review:
+
+    python scripts/gpu/triage.py results/explorer
+    python scripts/gpu/triage.py kaggle-t4x2-20261014-0930.tgz
+
+- **For each job:** what it ran on (hosts numbered, GPU models, driver, torch,
+  CUDA or ROCm, NCCL or RCCL, the gpubridge commit), each step that failed or
+  timed out with the last error lines of its log, and the skipped steps with
+  their reasons.
+- **Key numbers:** gpubridge's bus bandwidth as a share of the baseline's, the
+  bridge phase against the preflight's prediction, and the compression
+  kernels' check against the CPU reference.
+- **Last:** whether the compression digests agree across runs, and one verdict
+  line.
+
+It exits 1 if a step failed. Like the tables, it numbers hosts and shows no
+paths. The error lines come from the unredacted step logs, so read the output
+before pasting it anywhere public.
 
 ### The validation tables
 

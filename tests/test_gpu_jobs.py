@@ -39,6 +39,7 @@ END_TO_END = {
     "preflight.py": "test_step_05, 07, the node pair, test_gpu_kit.py",
     "node_ifname.sh": "test_step_05, test_each_node_uses_its_own_preflight_choice",
     "validation_tables.py": "test_step_05, test_gpu_kit.py",
+    "triage.py": "test_triage.py: Explorer, Kaggle and CPU-simulation results trees, and tarballs",
     "setup_env.sh": "test_setup_job_creates_the_cuda_venv",
     "explorer/submit.sh": "every test_step_*, and test_gpu_kit.py for 00",
     "explorer/job_env.sh": "sourced by every Explorer job",
