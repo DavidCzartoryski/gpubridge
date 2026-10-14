@@ -254,8 +254,10 @@ def _start(topology: Topology, op: str, run: Callable[[], None],
 
 def _reduce_op_name(op: ReduceOp.RedOpType, fn: str) -> str:
     try:
-        name = REDUCE_OPS.get(op)  # ReduceOp.SUM and the others: one lookup
-    except TypeError:  # an unhashable op object; the loop below compares it
+        # ReduceOp.SUM and the others: one lookup. torch.distributed.ReduceOp objects, which
+        # the torch backend passes, don't match a key and take the loop below.
+        name = REDUCE_OPS.get(op)
+    except TypeError:  # an unhashable op object: the loop compares it
         name = None
     if name is not None:
         return name

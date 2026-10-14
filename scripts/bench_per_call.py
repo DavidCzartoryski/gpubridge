@@ -20,6 +20,13 @@ one that does nothing, it compares:
 ``overhead`` is gpubridge's median minus the same calls' median. Cases are
 interleaved over ``--rounds`` so that drift on the host spreads across all of them.
 
+With ``--host-time`` (sync calls only), each call's time minus the time spent inside
+torch.distributed calls on the calling thread: the host work around the collectives.
+
+The ``GPUBRIDGE_*`` settings that change what a policy does (compression, pinned staging,
+chunk size, thresholds, the split test) must be unset, so that "bare, same calls" stays the
+same calls; the script refuses to run otherwise. Its JSON output records its setup.
+
 With ``--stub-comm``, torch.distributed's collectives (reduce, broadcast, all_reduce,
 all_gather and reduce_scatter, the tensor forms included) return at
 once after init: what is left is gpubridge's own work per call (checks, policy,
@@ -33,10 +40,12 @@ import cProfile
 import io
 import json
 import os
+import platform
 import pstats
 import statistics
 import sys
 import tempfile
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -70,6 +79,20 @@ def _no_comm(*args, async_op: bool = False, **kwargs):
 
 STUBBED = ("reduce", "broadcast", "all_reduce", "all_gather", "all_gather_into_tensor", "reduce_scatter",
            "reduce_scatter_tensor")
+
+
+_inside = threading.local()
+
+
+def _timed(real):
+    """``real``, adding the time spent in it to this thread's ``_inside.ns``."""
+    def call(*args, **kwargs):
+        start = time.perf_counter_ns()
+        try:
+            return real(*args, **kwargs)
+        finally:
+            _inside.ns = getattr(_inside, "ns", 0) + time.perf_counter_ns() - start
+    return call
 
 
 class Quiet(gpubridge.CollectiveObserver):
@@ -112,12 +135,15 @@ def gpubridge_call(t: torch.Tensor, async_op: bool) -> None:
 
 
 def time_calls(fn, t: torch.Tensor, async_op: bool, calls: int) -> list[int]:
+    """Each call's time in ns: all of it, or with --host-time the part outside
+    torch.distributed calls on this thread."""
     out = []
     clock = time.perf_counter_ns
     for _ in range(calls):
+        _inside.ns = 0
         start = clock()
         fn(t, async_op)
-        out.append(clock() - start)
+        out.append(clock() - start - _inside.ns)
     return out
 
 
@@ -134,6 +160,9 @@ def rank_main(rank: int, args: argparse.Namespace, init_file: str, result_file: 
             if args.stub_comm:
                 for name in STUBBED:
                     setattr(dist, name, _no_comm)
+            elif args.host_time:
+                for name in STUBBED:
+                    setattr(dist, name, _timed(real[name]))
             run_policy(topology, policy, args, samples)
         finally:
             for name, fn in real.items():
@@ -232,6 +261,8 @@ def parse(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--all-ranks", action="store_true", help="pool every rank's times (default rank 0)")
     p.add_argument("--profile", metavar="POLICY", help="cProfile rank 0's sync calls instead")
     p.add_argument("--observer", action="store_true", help="with --profile: an observer attached")
+    p.add_argument("--host-time", action="store_true",
+                   help="sync calls: time outside torch.distributed calls, not the whole call")
     p.add_argument("--stub-comm", action="store_true",
                    help="torch.distributed's calls return at once: gpubridge's own work only")
     p.add_argument("--out", type=Path, help="write the rows as JSON here")
@@ -246,11 +277,24 @@ def parse(argv: list[str]) -> argparse.Namespace:
         args.policies = ["native-only"] if single else list(MIXED)
     args.numels = [int(x) for x in args.numels.split(",")]
     args.modes = args.modes.split(",")
+    if not set(args.modes) <= {"sync", "async"}:
+        p.error(f"--modes takes sync, async or both, not {','.join(args.modes)}")
+    if args.observer and not args.profile:
+        p.error("--observer goes with --profile")
+    if args.host_time and args.stub_comm:
+        p.error("--host-time and --stub-comm don't mix")
+    if args.host_time:
+        args.modes = ["sync"]  # an async call's collectives run on the worker thread
     return args
 
 
 def main(argv: list[str]) -> int:
     args = parse(argv)
+    settings = sorted(k for k in os.environ if k.startswith("GPUBRIDGE_") and k != VENDOR_ENV)
+    if settings:
+        print(f"bench_per_call.py: unset {', '.join(settings)} first: they change what the "
+              "policies do, so the bare calls would no longer be the same calls", file=sys.stderr)
+        return 2
     with tempfile.TemporaryDirectory() as tmp:
         result = os.path.join(tmp, "samples")
         mp.spawn(rank_main, args=(args, os.path.join(tmp, "rendezvous"), result),
@@ -264,10 +308,14 @@ def main(argv: list[str]) -> int:
     rows = summarize(samples)
     print(f"{len(args.vendors)} ranks ({','.join(args.vendors)}), torch {torch.__version__}, "
           f"gpubridge {gpubridge.__version__}, CPU simulation"
-          f"{', communication stubbed' if args.stub_comm else ''}\n{table(rows)}")
+          f"{', communication stubbed' if args.stub_comm else ''}"
+          f"{', host time only' if args.host_time else ''}\n{table(rows)}")
     if args.out:
+        cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
         args.out.write_text(json.dumps({"vendors": args.vendors, "torch": torch.__version__,
-                                        "stub_comm": args.stub_comm,
+                                        "stub_comm": args.stub_comm, "host_time": args.host_time,
+                                        "argv": argv, "cpus": cpus, "python": platform.python_version(),
+                                        "platform": platform.platform(),
                                         "gpubridge": gpubridge.__version__, "rows": rows},
                                        indent=1) + "\n")
     return 0

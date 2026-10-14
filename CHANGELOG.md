@@ -26,6 +26,9 @@ still needs real hardware. Numbers in parentheses are pull requests.
   are worked out once instead of on every collective. Every call still checks
   its op. On CPU, gpubridge's own work per small reduce-bridge-broadcast call
   went from 4.0 to 3.4 µs; the README has the per-call numbers (#44).
+- For policy authors: `CollectivePolicy.supported_reduce_ops()` is asked once
+  per policy instance and topology, at the first collective, and its answer
+  must not change after that (#44).
 - The README opens with a pitch, badges, a one-line status, an architecture
   diagram, a quickstart and a feature table with each feature's status. New
   diagrams for all_reduce and HSDP (docs/img, light and dark). New

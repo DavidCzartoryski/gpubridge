@@ -18,7 +18,7 @@ from gpubridge import ReduceOp, collectives
 from gpubridge.topology import Layout
 
 POLICIES = ("reduce-bridge-broadcast", "pipelined-reduce-bridge-broadcast", "sharded-bridge",
-            "flat-gloo", "auto-tuned")
+            "flat-gloo", "auto-tuned")  # flat-gloo never needs the island: the control
 
 
 def _island_looked_up_once(topology: gpubridge.Topology) -> None:
