@@ -252,6 +252,12 @@ def _start(topology: Topology, op: str, run: Callable[[], None],
 
 
 def _reduce_op_name(op: ReduceOp.RedOpType, fn: str) -> str:
+    try:
+        name = REDUCE_OPS.get(op)  # ReduceOp.SUM and the others: one lookup
+    except TypeError:  # an unhashable op object; the loop below compares it
+        name = None
+    if name is not None:
+        return name
     for candidate, name in REDUCE_OPS.items():
         try:
             if op == candidate:  # also matches dist.ReduceOp instances
@@ -274,13 +280,28 @@ def _check_avg(name: str, dtype: torch.dtype, fn: str) -> None:
 
 
 def _check_reduce_op(policy: CollectivePolicy, name: str, topology: Topology, fn: str) -> None:
-    supported = policy.supported_reduce_ops(topology)
+    supported = _supported_reduce_ops(policy, topology)
     if name not in supported:
         raise NotImplementedError(
             f"gpubridge.{fn} with {name.upper()}: collective policy {policy.name!r} with bridge "
             f"transport {topology.peers[topology.rank].bridge!r} supports only "
             f"{', '.join(sorted(n.upper() for n in supported))}."
         )
+
+
+def _supported_reduce_ops(policy: CollectivePolicy, topology: Topology) -> frozenset[str]:
+    """``policy.supported_reduce_ops(topology)``, asked once per policy and topology and
+    remembered on the policy: the policy, its settings and the bridge transport are fixed
+    from init() on, and the same on every rank. Every call still checks its op against it."""
+    cached = getattr(policy, "_gpubridge_reduce_ops", None)
+    if cached is not None and cached[0] is topology:
+        return cached[1]
+    supported = policy.supported_reduce_ops(topology)
+    try:
+        policy._gpubridge_reduce_ops = (topology, supported)  # type: ignore[attr-defined]
+    except AttributeError:  # a policy with __slots__: asked every call
+        pass
+    return supported
 
 
 def _check_implements(policy: CollectivePolicy, fn: str, topology: Topology) -> None:

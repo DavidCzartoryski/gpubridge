@@ -195,7 +195,9 @@ class CollectivePolicy(abc.ABC):
         """The reductions this policy can carry on this cluster.
 
         Depends only on state that is identical on every rank, so a call it
-        rejects is rejected everywhere. The default is :attr:`reduce_ops`.
+        rejects is rejected everywhere, and on nothing that changes after
+        ``init()``: the collectives ask once per policy and remember the answer.
+        The default is :attr:`reduce_ops`.
         """
         return self.reduce_ops
 
