@@ -258,6 +258,46 @@ def test_jobs_that_started_but_never_finished(tmp_path, capsys):
     assert out.splitlines()[-1] == "verdict: 1 failed, 1 unfinished, 3 job(s) unfinished"
 
 
+def test_job_events_in_order_and_by_job(tmp_path, capsys):
+    went_on = tmp_path / "02_split_shared_gpu"  # an error from a subshell, then the end
+    steps(went_on, ok("check"))
+    job_events(went_on, ("started", "21"), ("error", "21", "a helper gave up"),
+               ("finished", "21"))
+    other = tmp_path / "03_single_island"  # another job's end doesn't end this one
+    steps(other, ok("check"))
+    job_events(other, ("started", "22"), ("started", "23"), ("finished", "22"))
+    failed_cmd = tmp_path / "05_multinode"  # set -e: the exit code, no error line
+    steps(failed_cmd)
+    job_events(failed_cmd, ("started", "24"))
+    with open(failed_cmd / "job.jsonl", "a") as fh:
+        fh.write(json.dumps({"event": "exit", "job_id": "24", "time": "T", "code": 1}) + "\n")
+    killed = tmp_path / "06_scaling"  # SIGTERM from Slurm: 128 + 15
+    steps(killed)
+    job_events(killed, ("started", "25"))
+    with open(killed / "job.jsonl", "a") as fh:
+        fh.write(json.dumps({"event": "exit", "job_id": "25", "time": "T", "code": 143}) + "\n")
+    code, out = run(tmp_path, "--max-lines", "0", capsys=capsys)
+    assert code == 1
+    assert "ERROR in job 21, which went on to its end: a helper gave up" in out
+    assert "STOPPED job 21" not in out and "UNFINISHED job 21" not in out
+    assert "UNFINISHED job 23" in out and "job 22" not in out
+    assert ("UNFINISHED job 24, started T24: no end recorded; it exited with code 1 before its "
+            "end: a command failed") in out
+    assert "UNFINISHED job 25, started T25: no end recorded; it ended on signal 15" in out
+
+
+def test_probe_fail_lines_are_the_error_lines(tmp_path, capsys):
+    path = tmp_path / "01_probe"
+    steps(path, {"step": "probe", "exit_code": 1, "seconds": 9, "log": "probe.log",
+                 "timed_out": False})
+    (path / "probe.log").write_text(
+        "nvidia-smi: not found\n"
+        "torch 2.14.1+cu126 (cuda 12.6); GPUs: X (sm_120, not in the build)\n"
+        "FAIL target_in_build: device 0 target sm_120 not in arch_list ['sm_90']\n")
+    code, out = run(tmp_path, capsys=capsys)
+    assert code == 1 and "| FAIL target_in_build: device 0 target sm_120" in out
+
+
 def test_cpu_simulation_says_so_and_a_clean_run_passes(tmp_path, capsys):
     path = tmp_path / "sim"
     steps(path, ok("probe"))

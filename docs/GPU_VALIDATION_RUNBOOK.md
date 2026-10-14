@@ -40,11 +40,12 @@ to `<step>.log`, so the first thing to read already has them.
 probe with one line per failed check, naming it and its values, such as
 `FAIL target_in_build: device 0 target sm_120 not in arch_list [...]`.
 
-**Each job's start and end.** `job_setup` begins `job.jsonl` in the job's
-results directory: a line when the job starts, one for an error that stops it
-(`die`), and one when it reaches `finish`. A job that stops before or during
-its first step has no `steps.jsonl` line, but `triage.py` still lists it as
-unfinished from this file, with the error if there was one.
+**Each job's start and end.** `job_setup` (steps 01 to 07) begins `job.jsonl`
+in the job's results directory: a line when the job starts, one for an error
+that stops it (`die`), one when it reaches `finish`, and one with the script's
+exit code. A job that stops before or during its first step has no
+`steps.jsonl` line, but `triage.py` still lists it as unfinished from this
+file, with its error or exit code.
 
 ## Split-test mode, in one paragraph
 
@@ -591,7 +592,8 @@ What a record may hold from the environment is an allowlist (`ENV_NAMES` and
 a kit record holds, tracebacks and command lines included, is redacted before
 it is written: `/projects/<name>` and `PROJECT_DIR` become `$PROJECT_DIR`, the
 home directory `~`, the user name as a path segment `$USER`, and credentials in
-a URL `***`. The step logs (`<step>.log`), stack dumps (`rank*.stacks.txt`)
+a URL `***`. `job.jsonl`'s error messages get the same path replacements.
+The step logs (`<step>.log`), stack dumps (`rank*.stacks.txt`)
 and NCCL/RCCL logs are not redacted: keep them, and the results tarballs, out
 of anything public.
 
@@ -723,7 +725,7 @@ to read the ratio:
 | 01/AMD: `local_rank_check` fails | init() succeeded with more processes than GPUs, or failed for another reason | read `expected_init_error` in `local_rank_check/rank*.json`; if init succeeded, the visible-device count isn't what PyTorch reports (item 12) |
 | 02: `shared_gpu_check` fails, `"result": "check did not fire"` | init() succeeded with two ranks of one island on the GPU, failed for another reason, or hung past `SHARED_GPU_CHECK_SECONDS` | read `shared_gpu_check.log` and `expected_init_error` in `shared_gpu_check/rank*.json`; if the log has init()'s "could not check" warning, PyTorch reported neither a UUID nor a PCI address for the GPU, so the island went unchecked (item 24) |
 | `init` stuck (summary says "stuck in this stage") | new_group / NCCL init problem (item 3) | read `rank*.stacks.txt` and the NCCL/RCCL log lines at the end of `<step>.log` (all of them in `nccl/<step>/`); this is a real finding, file it |
-| `steps.jsonl` says `"timed_out": true` | the launch ran past `STEP_TIMEOUT` | read `<step>.log` and `rank*.stacks.txt`; raise `STEP_TIMEOUT` only if the step was still making progress |
+| `steps.jsonl` says `"timed_out": true` | the launch ran past `STEP_TIMEOUT` | read `<step>.log` and `rank*.stacks.txt`; raise `STEP_TIMEOUT` only if the step was still making progress, and on Explorer the job's `TIME_0N` with it: `submit.sh` caps `STEP_TIMEOUT` at `TIME_0N` less `STEP_MARGIN` |
 | `busy_gpu` wrong values | stream ordering bug in the bridge (item 6) | serious; keep the JSON and open an issue |
 | `dtypes` mismatch | precision or reduction-order problem (item 7) | check `max_abs_error` in the stage |
 | `reductions`, `all_gather` or `reduce_scatter` mismatch | a MAX/MIN/AVG or tensor-collective path differs on NCCL/RCCL (item 15) | the failing `cases` name the dtype and op; rerun with `--policy flat-gloo` to see whether the policy or the backend is at fault |

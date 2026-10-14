@@ -65,8 +65,9 @@ still needs real hardware. Numbers in parentheses are pull requests.
   caps each job's `STEP_TIMEOUT` at its Slurm limit less `STEP_MARGIN` (120 s),
   and the probe runs under it (#49).
 - `triage.py` couldn't see a job that stopped before or during its first step.
-  Explorer jobs now write `job.jsonl` (their start, an error that stopped them,
-  their end), and triage lists such a job as unfinished, with its error (#49).
+  Explorer steps 01 to 07 now write `job.jsonl` (their start, an error that
+  stopped them, their end and exit code), and triage lists such a job as
+  unfinished, with its error or exit code (#49).
 
 ## [0.4.0-alpha] - 2026-10-13
 

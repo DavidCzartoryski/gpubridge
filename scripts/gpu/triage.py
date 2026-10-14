@@ -59,7 +59,7 @@ TAIL = 3
 WIDTH = 160
 """Characters per printed line."""
 ERROR = re.compile(r"\b\w*(Error|Exception)\b[:(]|FAILED|Traceback|ran out of time|Killed|"
-                   r"CANCELLED|NCCL WARN|timed out|not found|No such file")
+                   r"CANCELLED|NCCL WARN|timed out|not found|No such file|^FAIL \w+:")
 #: torchrun's failure footer: says that a rank failed, not why.
 BOILERPLATE = re.compile(r"error_file:|traceback\s*:|To enable traceback|Root Cause|Failures:|"
                          r"^[=\-]+$|<NO_OTHER_FAILURES>|exitcode\s*:|local_rank:|host\s*:|time\s*:|"
@@ -188,17 +188,35 @@ class Report:
         starts = [i for i, event in enumerate(events) if event.get("event") == "started"]
         if not starts:
             return
-        start, later = events[starts[-1]], events[starts[-1] + 1:]
-        errors = [str(e.get("message", "")) for e in later if e.get("event") == "error"]
+        start = events[starts[-1]]
+        mine = [e for e in events[starts[-1] + 1:] if e.get("job_id") == start.get("job_id")]
+        kinds = [str(e.get("event")) for e in mine]
+        end = kinds.index("finished") if "finished" in kinds else None
+        errors = [(i, str(e.get("message", ""))) for i, e in enumerate(mine)
+                  if e.get("event") == "error"]
         job = f"job {start.get('job_id', '?')}"
-        if not any(event.get("event") == "finished" for event in later):
+        lines = []
+        if end is None:
             self.unfinished_job = True
-            why = (f"it stopped with an error: {errors[-1]}" if errors else
-                   "killed, out of Slurm time, or still running")
-            self.problems.insert(0, (f"  UNFINISHED {job}, started {start.get('time', '?')}: "
-                                     f"no end recorded; {why}. Its job log has the rest", []))
-        elif errors:
-            self.problems.insert(0, (f"  STOPPED {job} early: {errors[-1]}", []))
+            codes = [e.get("code") for e in mine if e.get("event") == "exit"]
+            if errors:
+                why = f"it stopped with an error: {errors[-1][1]}"
+            elif codes and isinstance(codes[-1], int) and codes[-1] > 128:
+                why = f"it ended on signal {codes[-1] - 128}: killed, or out of Slurm time"
+            elif codes:
+                why = (f"it exited with code {codes[-1]} before its end: a command failed "
+                       "(the job log says which)")
+            else:
+                why = "killed, out of Slurm time, or still running"
+            lines.append(f"  UNFINISHED {job}, started {start.get('time', '?')}: no end "
+                         f"recorded; {why}. Its job log has the rest")
+        else:
+            lines += [f"  ERROR in {job}, which went on to its end: {message}"
+                      for i, message in errors if i < end]
+            stops = [message for i, message in errors if i > end]
+            if stops:
+                lines.append(f"  STOPPED {job} early: {stops[-1]}")
+        self.problems[:0] = [(line, []) for line in lines]
 
     def _steps(self) -> None:
         last: dict[str, dict[str, Any]] = {}

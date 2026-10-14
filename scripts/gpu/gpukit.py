@@ -179,7 +179,8 @@ def target_match(target: str, capability: tuple[int, int] | None,
 
     - ``exact``: the list has the GPU's own target (sm_70, gfx906);
     - ``compatible``: a cubin for the same major and an earlier minor (sm_80 for an 8.6
-      GPU), which CUDA runs unchanged on later minors of its major;
+      GPU), which CUDA runs unchanged on later minors of its major (Tegra parts, such
+      as sm_72 and sm_87, are the exception: none is a target here);
     - ``ptx``: PTX for the GPU's capability or below (compute_70 for 9.0), which the
       driver compiles when it loads.
 

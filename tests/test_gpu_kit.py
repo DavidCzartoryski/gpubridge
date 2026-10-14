@@ -117,7 +117,10 @@ def test_submit_dry_run(step, expected):
         ("03", {}, "1080s (its Slurm limit, 00:20:00, less 120s), not 1200s"),
         ("05", {"STEP_TIMEOUT": "0", "TIME_05": "1-00"}, "86280s"),  # 0 = no limit: capped
         ("06", {"TIME_06": "01:30"}, "60s"),                 # never below a minute
-        ("04", {"STEP_TIMEOUT": "300"}, None),               # already short enough
+        ("04", {"STEP_TIMEOUT": "400"}, None),               # already short enough
+        ("04", {"TIME_04": "0"}, None),                      # Slurm's "no limit"
+        ("04", {"TIME_04": "UNLIMITED"}, None),
+        ("04", {"TIME_04": "infinite"}, None),
     ],
 )
 def test_each_jobs_step_timeout_fits_inside_its_slurm_limit(step, env, cap):
@@ -127,6 +130,31 @@ def test_each_jobs_step_timeout_fits_inside_its_slurm_limit(step, env, cap):
         assert "STEP_TIMEOUT for this job" not in result.stderr
     else:
         assert f"STEP_TIMEOUT for this job: {cap}" in result.stderr
+    # Only a cap at or below KIT_TIMEOUT (300 s) warns.
+    assert ("is not above KIT_TIMEOUT" in result.stderr) is (cap == "60s")
+
+
+def test_job_events_are_redacted_and_record_the_exit_code(tmp_path):
+    # job.jsonl, as job_setup starts it: a die message loses the project, home and user,
+    # and a command failing under set -e still leaves its exit code.
+    script = f"""
+source {KIT}/common.sh
+RESULTS={tmp_path}
+PROJECT_DIR=/projects/example-lab USER=someuser HOME=/home/someuser
+job_started
+(die "no venv at /projects/example-lab/someuser/venv; see /home/someuser/x")
+false
+"""
+    result = subprocess.run(["bash", "-e", "-c", script], env=clean_env(), capture_output=True,
+                            text=True, timeout=60)
+    assert result.returncode == 1
+    lines = (tmp_path / "job.jsonl").read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    # A subshell has no EXIT trap, so only the script's own exit (false's) is recorded.
+    assert [e["event"] for e in events] == ["started", "error", "exit"]
+    assert events[1]["message"] == "no venv at $PROJECT_DIR/$USER/venv; see ~/x"
+    assert events[2]["code"] == 1
+    assert "someuser" not in "".join(lines) and "example-lab" not in "".join(lines)
 
 
 def test_submit_rejects_a_time_limit_it_cant_read():

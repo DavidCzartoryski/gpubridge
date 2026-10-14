@@ -120,9 +120,13 @@ seconds() {
 }
 
 # cap_step_timeout TIME: lower STEP_TIMEOUT (exported by common.sh, so the job gets
-# it) to TIME less STEP_MARGIN, at least 60 s, if it is above that or 0 (none).
+# it) to TIME less STEP_MARGIN, at least 60 s, if it is above that or 0 (none). A
+# TIME of 0, UNLIMITED or INFINITE is no Slurm limit: nothing to fit inside.
 cap_step_timeout() {
     local cap
+    case $(printf '%s' "$1" | tr '[:lower:]' '[:upper:]') in
+    0 | UNLIMITED | INFINITE) return 0 ;;
+    esac
     cap=$(seconds "$1") || exit 1
     cap=$((cap - STEP_MARGIN))
     [ "$cap" -ge 60 ] || cap=60
@@ -130,6 +134,11 @@ cap_step_timeout() {
         log "STEP_TIMEOUT for this job: ${cap}s (its Slurm limit, $1, less" \
             "${STEP_MARGIN}s), not ${STEP_TIMEOUT}s"
         STEP_TIMEOUT=$cap
+    fi
+    if [ "$STEP_TIMEOUT" -le "$KIT_TIMEOUT" ]; then
+        log "warning: STEP_TIMEOUT (${STEP_TIMEOUT}s) is not above KIT_TIMEOUT" \
+            "(${KIT_TIMEOUT}s): a stuck collective reaches the launch's limit before its" \
+            "own timeout can name it. Raise the job's Slurm limit ($1)."
     fi
 }
 

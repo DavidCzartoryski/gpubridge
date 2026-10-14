@@ -201,8 +201,8 @@ def test_step_01_probe(tmp_path):
     # Each launch's limit stays inside the job's: 10 minutes less 2.
     record = json.loads((out / "probe.json").read_text())
     assert record["environment"]["env"]["STEP_TIMEOUT"] == "480"
-    assert [(e["event"], e.get("failed")) for e in events(out)] == [("started", None),
-                                                                     ("finished", 1)]
+    assert [(e["event"], e.get("failed", e.get("code"))) for e in events(out)] == [
+        ("started", None), ("finished", 1), ("exit", 1)]
 
 
 def test_a_job_that_stops_in_its_setup_is_one_triage_lists(tmp_path):
@@ -210,7 +210,7 @@ def test_a_job_that_stops_in_its_setup_is_one_triage_lists(tmp_path):
     code = submit(tmp_path, "01", VENV=str(tmp_path / "no-venv"))
     out = tmp_path / "results" / "01_probe"
     assert code == 1 and (out / "steps.jsonl").read_text() == ""
-    assert [e["event"] for e in events(out)] == ["started", "error"]
+    assert [e["event"] for e in events(out)] == ["started", "error", "exit"]
     assert "no venv at" in events(out)[1]["message"]
     triage = subprocess.run([sys.executable, str(KIT / "triage.py"), str(tmp_path / "results")],
                             capture_output=True, text=True, timeout=60)

@@ -73,8 +73,25 @@ load_env_file() {
 log() { printf '[gpubridge-kit %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() {
     log "ERROR: $*"
-    job_event error "\"message\": \"$(json_string "$*")\""
+    job_event error "\"message\": \"$(json_string "$(redacted "$*")")\""
     exit 1
+}
+
+# redacted TEXT: TEXT with what the kit's JSON records never hold replaced, as gpukit
+# does: /projects/<name> and PROJECT_DIR become $PROJECT_DIR, the home directory ~,
+# and the user name as a path segment $USER.
+redacted() {
+    # shellcheck disable=SC2016  # the literal $PROJECT_DIR and $USER, not their values
+    local text=$1 project='$PROJECT_DIR' home='~' user
+    [ -z "${PROJECT_DIR:-}" ] || text=${text//"$PROJECT_DIR"/$project}
+    [ -z "${HOME:-}" ] || [ "$HOME" = / ] || text=${text//"$HOME"/$home}
+    # shellcheck disable=SC2016
+    text=$(printf '%s' "$text" | sed -E 's#/projects/[^/[:space:]]+#$PROJECT_DIR#g')
+    if [ -n "${USER:-}" ]; then
+        user=${USER//./\\.}
+        text=$(printf '%s' "$text" | sed -E "s#/${user}(/|\$|[[:space:]:;,])#/\$USER\1#g")
+    fi
+    printf '%s' "$text"
 }
 
 # json_string TEXT: TEXT escaped for a JSON string (quotes, backslashes, control characters).
@@ -86,15 +103,18 @@ json_string() {
 }
 
 # job_started: begin $RESULTS/job.jsonl for this job (one line per event, appended,
-# so reruns of a step keep their history). triage.py lists a job whose last start
-# has no end as unfinished, with any error (die) it recorded: a job that stops
-# before or during its first step otherwise leaves no steps.jsonl line to find.
-# An empty steps.jsonl marks the directory as a job's from the start.
+# so reruns of a step keep their history): started, error (die, redacted), finished
+# (finish) and exit (the script's exit code). triage.py lists a job whose last start
+# has no end as unfinished, with its error or exit code: a job that stops before or
+# during its first step otherwise leaves no steps.jsonl line to find. An empty
+# steps.jsonl marks the directory as a job's from the start.
 job_started() {
     [ "$DRY_RUN" = 0 ] || return 0
     JOB_EVENTS="$RESULTS/job.jsonl"
     touch "$RESULTS/steps.jsonl"
     job_event started
+    # Also how the script ended: a command failing under set -e leaves no error line.
+    trap 'job_event exit "\"code\": $?"' EXIT
 }
 
 # job_event EVENT [JSON MEMBERS]: append an event to job.jsonl, once job_started ran.
