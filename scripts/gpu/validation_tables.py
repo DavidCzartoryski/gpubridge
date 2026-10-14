@@ -34,7 +34,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from gpukit import redact, write_json
 
 #: Island layouts that run on GPUs; simulation is told apart by device instead.
 GPU_KINDS = {"split-test", "gpu-mixed", "gpu-single-vendor"}
@@ -173,9 +172,21 @@ def _load(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _steps(path: Path) -> list[dict[str, Any]]:
+    """steps.jsonl's entries; a line cut short (the job was killed mid-write) is skipped."""
+    steps = []
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            steps.append(entry)
+    return steps
+
+
 def load_job(path: Path, root: Path) -> Job:
-    steps = [json.loads(line) for line in (path / "steps.jsonl").read_text().splitlines()
-             if line.strip()]
+    steps = _steps(path / "steps.jsonl")
     name = path.relative_to(root).as_posix() if path != root else path.name
     job = Job(path=path, name=name, steps=steps)
     for file in sorted(path.rglob("*.json")):
@@ -245,8 +256,8 @@ def _gloo_ifname(env: dict[str, Any]) -> str:
 
 
 def run_row(job: Job, hosts: Hosts) -> dict[str, Any]:
-    failed = [s["step"] for s in job.steps if s["exit_code"] != 0]
-    negative = {s["step"]: s["result"] for s in job.steps if "result" in s}
+    failed = [s.get("step") for s in job.steps if s.get("exit_code", 1) != 0]
+    negative = {s.get("step"): s["result"] for s in job.steps if "result" in s}
     kinds = sorted({r["run"]["kind"] for ranks in job.checks.values() for r in ranks.values()
                     if r.get("run")})
     records = job.records
@@ -519,6 +530,8 @@ def markdown(tables: dict[str, Any]) -> str:
           r["MBps"], r["rtt_ms"], r["predicted_ms"], r["measured_ms"],
           r["measured_over_predicted"]]
          for r in tables["predicted"]])
+    from gpukit import redact  # here, not at the top: reading results needs no torch
+
     return redact("\n".join(lines) + "\n")
 
 
@@ -542,6 +555,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     out = args.out or args.paths[0]
     text = markdown(tables)
+    from gpukit import write_json
+
     write_json(out / "validation_tables.json", tables)
     (out / "validation_tables.md").write_text(text)
     print(text)

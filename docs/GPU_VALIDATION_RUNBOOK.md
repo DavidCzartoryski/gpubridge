@@ -386,7 +386,8 @@ T4s are compute capability 7.5, so the runner first checks CUDA events,
 bfloat16 and Triton on them, and skips or adapts what they can't run, saying
 why. Upload `scripts/gpu/kaggle/kaggle_gpubridge.ipynb` and follow the clicks
 in [scripts/gpu/kaggle/README.md](../scripts/gpu/kaggle/README.md); the
-results come back as one tarball. It is a split test, not a mixed-vendor run.
+results come back as one tarball, and `python scripts/gpu/triage.py <tarball>`
+summarizes it. It is a split test, not a mixed-vendor run.
 
 ## AMD cloud machine
 
@@ -566,6 +567,34 @@ home directory `~`, the user name as a path segment `$USER`, and credentials in
 a URL `***`. The step logs (`<step>.log`), stack dumps (`rank*.stacks.txt`)
 and NCCL/RCCL logs are not redacted: keep them, and the results tarballs, out
 of anything public.
+
+### A summary to paste: triage.py
+
+`scripts/gpu/triage.py` turns a results directory or tarball, Explorer's or
+Kaggle's, into a short plain-text summary, under 80 lines, to paste into a
+review:
+
+    python scripts/gpu/triage.py results/explorer
+    python scripts/gpu/triage.py kaggle-t4x2-20261014-0930.tgz
+
+- **Problems first:** each step that failed, timed out or never finished (a
+  log with no `steps.jsonl` line: the job was killed or ran out of Slurm time),
+  with the last error lines of its log. Then the skipped steps, with their
+  reasons. A step run again counts as its last attempt.
+- **For each job:** what it ran on (hosts numbered, GPU models, driver, torch,
+  CUDA or ROCm, NCCL or RCCL, the gpubridge commit).
+- **Key numbers:** gpubridge's bus bandwidth against the baseline's; the
+  bridge phase against the preflight's prediction; and the compression
+  kernels' check against the CPU reference, with the kernels that ran.
+- **Last:** whether the compression digests agree across every compression
+  record, and one verdict line.
+
+It needs only Python 3.10 or later, no torch. It exits 0 if everything that
+ran passed, 1 if something failed, timed out or never finished (or nothing was
+found), and 2 if it can't read the input. Host names become `host N`, IPv4
+addresses `<ip>`, and paths lose their owner (`$PROJECT_DIR`, `~`). The error
+lines still come from the step logs, so read the output before pasting it
+anywhere public.
 
 ### The validation tables
 

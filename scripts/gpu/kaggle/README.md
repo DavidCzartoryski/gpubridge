@@ -41,6 +41,10 @@ Labels are as of October 2026; Kaggle renames things now and then.
    with a download button beside it.
 8. **Stop the session** (the power icon at the top) when you're done, to save
    GPU quota.
+9. **Summarize it** on your machine, from a gpubridge checkout:
+   `python scripts/gpu/triage.py kaggle-t4x2-<date>.tgz`. That prints a short
+   plain-text summary to paste into a review: each step that failed, timed out
+   or was skipped, and why; the GPUs and versions; and the key numbers.
 
 To keep a run's output as a saved version instead: **Save Version** → **Save
 & Run All (Commit)**. The tarball then appears in that version's **Output**
