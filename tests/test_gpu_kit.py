@@ -85,6 +85,8 @@ def test_setup_dry_run(flavor, tmp_path):
         assert "torch==2.14.1+cu126" in result.stdout
     if flavor == "rocm":
         assert "torch==2.14.1+rocm7.2" in result.stdout
+    # The ROCm wheel's GPU-name table, for its libdrm; nothing of the kind for CUDA.
+    assert ("AMDGPU_ASIC_ID_TABLE_PATHS" in result.stdout) is (flavor != "cuda")
     if flavor == "system":
         assert "--system-site-packages" in result.stdout
     assert not (tmp_path / "v").exists(), "dry-run must not create anything"
@@ -373,6 +375,83 @@ def test_explorer_mixed_path_is_dry_run_only_until_amd_gpus_are_confirmed(step, 
     assert "SUBMITTED" not in result.stdout
 
 
+def test_amd_nodes_confirmed_comes_from_local_env(tmp_path):
+    # A local setting, so turning the AMD path on doesn't make the clone git_dirty.
+    local_env = tmp_path / "local.env"
+    local_env.write_text("AMD_NODES_CONFIRMED=1\nGPU_TYPE_AMD=mi50\n")
+    path = fake_command(tmp_path / "bin", "sbatch", "echo 4242\n")
+    result = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), "amd"],
+                            env=clean_env(GPUBRIDGE_REPO=str(REPO), PATH=path,
+                                          WORK_DIR=str(tmp_path),
+                                          EXPLORER_LOCAL_ENV=str(local_env)),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert "submitted gpubridge-amd_node: job 4242" in result.stderr
+
+
+def test_the_amd_gate_says_where_to_turn_it_on(tmp_path):
+    path = fake_command(tmp_path / "bin", "sbatch", "echo 4242\n")
+    result = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), "amd"],
+                            env=clean_env(GPUBRIDGE_REPO=str(REPO), PATH=path,
+                                          GPU_TYPE_AMD="mi50", WORK_DIR=str(tmp_path)),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1
+    assert "add AMD_NODES_CONFIRMED=1 to" in result.stderr and "explorer/local.env" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("step", "env", "warns"),
+    [
+        # The gpu partition's QOS caps a job at 1 GPU in total, across its nodes.
+        ("05", {"PARTITION_MULTI": "gpu", "GPU_TYPE_MULTI": "v100-sxm2",
+                "GPUS_PER_NODE_MULTINODE": "1"}, "2 GPUs (2 node(s) x 1)"),
+        ("03", {"PARTITION_MULTI": "gpu"}, "2 GPUs (1 node(s) x 2)"),
+        ("01", {}, None),
+        ("02", {}, None),
+        ("03", {}, None),  # multigpu
+        ("05", {}, None),
+    ],
+)
+def test_submit_warns_before_asking_the_gpu_partition_for_more_than_one_gpu(step, env, warns):
+    result = dry_run(KIT / "explorer" / "submit.sh", step, **env)
+    assert result.returncode == 0, result.stderr
+    if warns is None:
+        assert "QOSMaxGRESPerJob" not in result.stderr
+    else:
+        assert f"asks the gpu partition for {warns}" in result.stderr
+        assert "QOSMaxGRESPerJob" in result.stderr and "PARTITION_MULTI=multigpu" in result.stderr
+
+
+def _asic_ids(tmp_path, *, ships: bool, preset: str | None = None) -> str:
+    """rocm_asic_ids against a stand-in torch package; prints the variable after it."""
+    package = tmp_path / "site" / "torch"
+    (package / "share" / "libdrm").mkdir(parents=True)
+    (package / "__init__.py").write_text("raise SystemExit('torch must not be imported')\n")
+    if ships:
+        (package / "share" / "libdrm" / "amdgpu.ids").write_text("# 1.0.0\n")
+    script = f'source {KIT}/common.sh; rocm_asic_ids {sys.executable}; ' \
+             'echo "AMDGPU_ASIC_ID_TABLE_PATHS=${AMDGPU_ASIC_ID_TABLE_PATHS:-}"'
+    env = {"PYTHONPATH": str(tmp_path / "site"),
+           **({"AMDGPU_ASIC_ID_TABLE_PATHS": preset} if preset else {})}
+    result = subprocess.run(["bash", "-c", script], env=clean_env(**env), capture_output=True,
+                            text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip().splitlines()[-1]
+
+
+def test_rocm_asic_ids_points_libdrm_at_the_table_the_wheel_ships(tmp_path):
+    # The ROCm wheels' libdrm otherwise prints "(null): No such file or directory" for
+    # every GPU each process opens.
+    expected = tmp_path / "site" / "torch" / "share" / "libdrm"
+    assert _asic_ids(tmp_path, ships=True) == f"AMDGPU_ASIC_ID_TABLE_PATHS={expected}"
+
+
+def test_rocm_asic_ids_leaves_cuda_builds_and_a_set_variable_alone(tmp_path):
+    assert _asic_ids(tmp_path / "a", ships=False) == "AMDGPU_ASIC_ID_TABLE_PATHS="
+    assert _asic_ids(tmp_path / "b", ships=True, preset="/mine") == (
+        "AMDGPU_ASIC_ID_TABLE_PATHS=/mine")
+
+
 def test_submit_amd_is_one_job_on_an_amd_node():
     out = dry_run(KIT / "explorer" / "submit.sh", "amd", GPU_TYPE_AMD="mi100").stdout
     sbatch = [line for line in out.splitlines() if line.startswith("+ sbatch ")]
@@ -490,7 +569,8 @@ def test_submit_free_and_multi_submit_every_step():
                                  "--bridge ucx", "[bench_ucx]"]),
         ("07_mixed_hetjob.sbatch", ["[check_pinned]", "[bench_pinned]"]),
         ("06_scaling.sbatch", ["--nproc-per-node=4", "train_synthetic.py", "summarize.py"]),
-        ("07_mixed_hetjob.sbatch", ["--het-group=1", "--rdzv-backend=c10d", "summarize.py"]),
+        ("07_mixed_hetjob.sbatch", ["--het-group=1", "--rdzv-backend=c10d", "summarize.py",
+                                    "export AMDGPU_ASIC_ID_TABLE_PATHS="]),
     ],
 )
 def test_explorer_jobs_dry_run(job, expected):
@@ -511,7 +591,7 @@ def test_amd_dry_run_with_several_gpus():
                  "GPUBRIDGE_SPLIT_TEST=half", "bench_all_reduce.py", "train_n4", "tar -czf",
                  "--policy pipelined-reduce-bridge-broadcast", "--policy sharded-bridge",
                  "train_ddp_split.json", "GPUBRIDGE_PINNED_STAGING=1", "bench_pinned",
-                 "--durations=15"]:
+                 "--durations=15", "export AMDGPU_ASIC_ID_TABLE_PATHS="]:
         assert text in out, text
     assert "train_n5" not in out
 

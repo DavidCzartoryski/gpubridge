@@ -100,6 +100,9 @@ else
     done
 fi
 
+# A ROCm build's libdrm needs its GPU-name table pointed out (common.sh), or every
+# process that opens the GPUs below prints "(null): No such file or directory".
+[ "$flavor" = cuda ] || rocm_asic_ids "$VENV/bin/python"
 log "installing gpubridge from $REPO_DIR"
 # [test] adds pytest, for the GPU-only tests (pytest -m gpu tests/test_gpu.py).
 run uv pip install --python "$VENV/bin/python" -e "${REPO_DIR}[test]"

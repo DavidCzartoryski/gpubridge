@@ -291,7 +291,7 @@ scripts/gpu/explorer/submit.sh 00                  # then read 00_partitions/gpu
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh --dry-run setup-rocm
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh --dry-run amd
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh --dry-run 07
-# once the hardware is confirmed and AMD_NODES_CONFIRMED=1 is merged in submit.sh:
+# once the hardware is confirmed and AMD_NODES_CONFIRMED=1 is in explorer/local.env:
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh setup-rocm   # ROCm venv (~16 GB), on an AMD node
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh amd          # rung 3: one AMD node on its own
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh 07           # rung 4, once amd passes
@@ -301,8 +301,10 @@ GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh 07           # rung 4, once a
 runs `amd/run_all.sh` on one AMD node with the ROCm venv, skipping its setup
 and its results tarball; `GPUS_AMD_NODE` (default 1) sets how many GPUs. Until
 the hardware is confirmed, `setup-rocm`, `amd` and `07` stop with an error
-unless `--dry-run` is given. The switch, `AMD_NODES_CONFIRMED` in `submit.sh`, is deliberately not
-an environment variable: turning the path on is a reviewed one-line change.
+unless `--dry-run` is given. The switch is `AMD_NODES_CONFIRMED=1` in
+`scripts/gpu/explorer/local.env` (or the environment): a local setting, so
+turning the path on leaves the clone at a clean commit, and the records'
+`git_dirty` false.
 
 [`07_mixed_hetjob.sbatch`](../scripts/gpu/explorer/07_mixed_hetjob.sbatch)
 runs each phase as one heterogeneous job step (`srun --het-group=0 ... :
@@ -393,6 +395,16 @@ GRES type usually names the model:
 `setup-rocm` ends with a probe on the AMD node, and fails if the build has no
 kernels for the GPU. `results/explorer/setup_rocm/probe.json` lists the GPU's
 target and the build's targets.
+
+**`(null): No such file or directory`, once per GPU per process.** The
+`libdrm_amdgpu` that the ROCm wheels bundle looks for its GPU-name table,
+`amdgpu.ids`, in `/opt/amdgpu/share/libdrm` and then by walking the directory
+tree from the Python executable. When both fail, it prints that line, with
+`(null)` where the path should be, for each GPU a process opens. The wheel
+ships the table itself (`torch/share/libdrm/amdgpu.ids`), so the kit exports
+`AMDGPU_ASIC_ID_TABLE_PATHS` pointing there before any ROCm step
+(`rocm_asic_ids` in `common.sh`), unless you set it. The line is harmless
+either way: only the GPU's marketing name comes from that table.
 
 The CUDA side stays at 2.14.1. On CPU, mixed releases from 2.9.1 to 2.14.1
 worked (item 2 in HARDWARE_VALIDATION.md). An older ROCm-side release is

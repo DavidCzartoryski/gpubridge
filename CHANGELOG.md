@@ -9,8 +9,19 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   bridge on device tensors and the shared-GPU check passed; two fp8
   error-feedback residual tests failed, from FMA contraction plus a codec
   overflow, fixed in #50.
+- **NVIDIA H200 (sm_90), commit 4a478f4** (#50's branch before it merged):
+  driver 570.86.15, torch 2.14.1+cu126, CUDA 12.6, NCCL 2.29.3. Step 02
+  passed; `gpu_tests` 26 passed, 8 skipped, in 162 s.
 - **NVIDIA V100 (SXM2), commit df80abb**, step 02 rerun after #50: passed;
-  `gpu_tests` 26 passed, 8 skipped.
+  `gpu_tests` 26 passed, 8 skipped, in 782 s.
+- **NVIDIA A100-SXM4-80GB (sm_80), commit df80abb** with one local change
+  (`AMD_NODES_CONFIRMED=1` in `submit.sh`, no library code; the records say
+  df80abb+dirty): driver 570.86.15, torch 2.14.1+cu126, NCCL 2.29.3. Step 02
+  passed; `gpu_tests` 26 passed, 8 skipped, in 437 s.
+- **AMD MI50 (gfx906), setup:** `setup-rocm` succeeded with torch
+  2.14.1+rocm7.2 (HIP 7.2.53211, RCCL 2.27.7), and the probe found gfx906 in
+  the build's arch list (an exact match). The single-node AMD step's result
+  is still to come.
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
@@ -74,9 +85,20 @@ hardware.
 - The GPU kit's `gpu_tests` step (Explorer 02 and 04, `amd/run_all.sh`, the
   Kaggle runner) runs pytest with `--durations=15`, so the slowest tests and
   their times end its log (#51).
+- `AMD_NODES_CONFIRMED` is a setting, read from `explorer/local.env` or the
+  environment, instead of a line to edit in `submit.sh`, which left runs
+  git_dirty (#51).
+- `submit.sh` warns before it submits a job asking the `gpu` partition for
+  more than one GPU: that partition's QOS allows one per job in total, so
+  such a job sits PENDING with `QOSMaxGRESPerJob`. EXPLORER_FIRST_SESSION.md
+  describes that limit and multigpu's access request (#51).
 
 ### Fixed
 
+- ROCm runs printed `(null): No such file or directory` once per GPU per
+  process: the ROCm wheel's bundled libdrm couldn't find its GPU-name table.
+  The kit now points `AMDGPU_ASIC_ID_TABLE_PATHS` at the copy the wheel ships
+  (#51).
 - Bridge compression: a finite value near float32's maximum could arrive as
   inf, and leave a residual of -inf for the next step. In `fp8` a block above
   448 · 2^119 got the scale 2^120, so a code could decode to 2^128; in `bf16`

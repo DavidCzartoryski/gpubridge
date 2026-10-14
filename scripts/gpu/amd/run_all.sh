@@ -38,6 +38,7 @@ if [ "$SKIP_SETUP" != 1 ]; then
     step setup "$KIT_DIR/setup_env.sh" --flavor "$TORCH_FLAVOR" --venv "$VENV"
 fi
 activate_venv "$VENV"
+rocm_asic_ids python  # the ROCm wheel's GPU-name table (common.sh)
 capture "$RESULTS/rocm-smi.txt" rocm-smi
 capture "$RESULTS/rocm-smi-detail.txt" rocm-smi --showproductname --showdriverversion \
     --showbus --showmeminfo vram

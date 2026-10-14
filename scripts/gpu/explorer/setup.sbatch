@@ -34,6 +34,7 @@ log "creating the $FLAVOR venv at $VENV on $(hostname)"
 load_modules "$SETUP_MODULES"
 "$KIT_DIR/setup_env.sh" --flavor "$FLAVOR" --venv "$VENV"
 if [ "$FLAVOR" = rocm ]; then
+    rocm_asic_ids "$VENV/bin/python"
     # Fails, naming the GPU's gfx target and the build's, if this ROCm build can't run it.
     run "$VENV/bin/python" "$KIT_DIR/probe.py" --out "$RESULTS_ROOT/setup_rocm" ||
         die "the ROCm build can't run this node's GPU; pick another ROCM_INDEX and" \
