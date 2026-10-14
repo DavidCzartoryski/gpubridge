@@ -55,7 +55,18 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 import gpubridge
-from gpubridge.config import VENDOR_ENV
+from gpubridge.config import (
+    BRIDGE_COMPRESSION_ENV,
+    CHUNK_BYTES_ENV,
+    PINNED_STAGING_ENV,
+    SPLIT_TEST_ENV,
+    THRESHOLDS_ENV,
+    VENDOR_ENV,
+)
+
+CHANGES_POLICIES = (BRIDGE_COMPRESSION_ENV, PINNED_STAGING_ENV, CHUNK_BYTES_ENV, THRESHOLDS_ENV,
+                    SPLIT_TEST_ENV)
+"""Settings that change what a policy does: with one set, the bare calls aren't the same calls."""
 
 MIXED = ("reduce-bridge-broadcast", "pipelined-reduce-bridge-broadcast", "sharded-bridge",
          "flat-gloo", "auto-tuned")
@@ -290,9 +301,9 @@ def parse(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse(argv)
-    settings = sorted(k for k in os.environ if k.startswith("GPUBRIDGE_") and k != VENDOR_ENV)
+    settings = [k for k in CHANGES_POLICIES if os.environ.get(k)]
     if settings:
-        print(f"bench_per_call.py: unset {', '.join(settings)} first: they change what the "
+        print(f"bench_per_call.py: unset {', '.join(settings)} first. These settings change what the "
               "policies do, so the bare calls would no longer be the same calls", file=sys.stderr)
         return 2
     with tempfile.TemporaryDirectory() as tmp:
