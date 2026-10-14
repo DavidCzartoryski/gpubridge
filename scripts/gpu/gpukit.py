@@ -158,21 +158,66 @@ def _nccl_version() -> str | None:
     return ".".join(map(str, version)) if isinstance(version, tuple) else str(version)
 
 
+#: A CUDA arch-list entry: a cubin (sm_XY) or PTX (compute_XY) for capability X.Y. Entries
+#: with a suffix (sm_90a, sm_100f) are for one architecture or family only: never counted.
+_CUDA_ARCH = re.compile(r"(sm|compute)_(\d+)")
+
+
+def gpu_target(props: Any) -> str:
+    """A GPU's build target: on ROCm its gcnArchName without the feature flags
+    ("gfx906:sramecc+:xnack-" is gfx906); on CUDA sm_XY from its compute capability.
+    CUDA builds of PyTorch have a gcnArchName too, holding the product name, so only
+    ROCm builds read it."""
+    if torch.version.hip:
+        return (getattr(props, "gcnArchName", "") or "").split(":")[0] or "unknown"
+    return f"sm_{props.major}{props.minor}"
+
+
+def target_match(target: str, capability: tuple[int, int] | None,
+                 arch_list: list[str]) -> str | None:
+    """Which rule says a PyTorch build with ``arch_list`` can run a GPU, or None:
+
+    - ``exact``: the list has the GPU's own target (sm_70, gfx906);
+    - ``compatible``: a cubin for the same major and an earlier minor (sm_80 for an 8.6
+      GPU), which CUDA runs unchanged on later minors of its major;
+    - ``ptx``: PTX for the GPU's capability or below (compute_70 for 9.0), which the
+      driver compiles when it loads.
+
+    ``capability`` is None on ROCm, where only an exact match counts.
+    """
+    names = {entry.split(":")[0] for entry in arch_list}
+    if target in names:
+        return "exact"
+    if capability is None:
+        return None
+    cubins, ptx = [], []
+    for entry in names:
+        found = _CUDA_ARCH.fullmatch(entry)
+        if found and len(found.group(2)) >= 2:
+            version = (int(found.group(2)[:-1]), int(found.group(2)[-1]))
+            (cubins if found.group(1) == "sm" else ptx).append(version)
+    if any(major == capability[0] and minor <= capability[1] for major, minor in cubins):
+        return "compatible"
+    if any(version <= capability for version in ptx):
+        return "ptx"
+    return None
+
+
 def device_info(index: int) -> dict[str, Any]:
     props = torch.cuda.get_device_properties(index)
-    arch = getattr(props, "gcnArchName", None)  # ROCm, e.g. "gfx942:sramecc+:xnack-"
-    if arch:
-        target = arch.split(":")[0]
-    else:
-        target = f"sm_{props.major}{props.minor}"
+    target = gpu_target(props)
     arch_list = _safe(torch.cuda.get_arch_list, [])
+    match = target_match(target, None if torch.version.hip else (props.major, props.minor),
+                         arch_list)
     return {
         "index": index,
         "name": props.name,
         "capability": f"{props.major}.{props.minor}",
         "target": target,
         # False means this PyTorch build has no kernels for this GPU: pick another wheel.
-        "target_in_build": target in arch_list or target.replace("sm_", "compute_") in arch_list,
+        "target_in_build": match is not None,
+        # The rule that matched (exact, compatible or ptx: target_match), or None.
+        "target_match": match,
         "total_memory_gb": round(props.total_memory / 2**30, 1),
         "pci_bus_id": getattr(props, "pci_bus_id", None),
         "pci_device_id": getattr(props, "pci_device_id", None),

@@ -46,7 +46,7 @@ capture "$RESULTS/rocminfo.txt" rocminfo
 
 GPUS=$(gpu_count)
 log "$GPUS GPU(s) visible"
-step probe python "$KIT_DIR/probe.py" --out "$RESULTS/probe"
+step probe limited python "$KIT_DIR/probe.py" --out "$RESULTS/probe"
 step device_map python "$KIT_DIR/device_map.py" --out "$RESULTS/device_map"
 # Item 12: one more process than GPUs. The extra rank's LOCAL_RANK has no GPU,
 # so init() must fail on every rank, naming it. Real GPUs only: simulation

@@ -41,6 +41,32 @@ still needs real hardware. Numbers in parentheses are pull requests.
   diagram, a quickstart and a feature table with each feature's status. New
   diagrams for all_reduce and HSDP (docs/img, light and dark). New
   CONTRIBUTING.md, SECURITY.md and issue templates (#42).
+- The GPU kit says why a step failed where you look first: the job's own log
+  has the step's last 20 lines (before torchrun's failure report) after its
+  `FAILED` line, and a failed `probe.py` ends with one line per failed check,
+  naming it and its values (#49).
+- `setup_env.sh`: the venv's Python is `VENV_PYTHON` (default 3.12). It was
+  `PYTHON_VERSION`, which Python's Docker images set to their own full
+  version (#49).
+
+### Fixed
+
+- `probe.py` took a CUDA GPU's build target from `gcnArchName`, which CUDA
+  builds of PyTorch fill with the product name, so its build check could fail
+  for a GPU the build covers. The target is `gcnArchName` without its feature
+  flags on ROCm, and `sm_XY` from the compute capability on CUDA. A GPU counts
+  as covered by its own target, a cubin for an earlier minor of its major, or
+  PTX at or below its capability; `probe.json` records which in
+  `target_match` (#49).
+- `submit.sh setup` printed `<job id>` in its log's path. Every submission now
+  prints its job id and log (#49).
+- Step 01's probe had no limit of its own, and the kit's `STEP_TIMEOUT` (20
+  minutes) was longer than the job's 10-minute Slurm limit. `submit.sh` now
+  caps each job's `STEP_TIMEOUT` at its Slurm limit less `STEP_MARGIN` (120 s),
+  and the probe runs under it (#49).
+- `triage.py` couldn't see a job that stopped before or during its first step.
+  Explorer jobs now write `job.jsonl` (their start, an error that stopped them,
+  their end), and triage lists such a job as unfinished, with its error (#49).
 
 ## [0.4.0-alpha] - 2026-10-13
 

@@ -6,9 +6,11 @@
 
 Every directory under the path with a steps.jsonl is one job (as for
 validation_tables.py): an Explorer step directory, a mixed or AMD target, or a
-Kaggle run. Problems come first: each step that failed, timed out or never
-finished (a log with no steps.jsonl line: the job was killed), with the last
-error lines of its log, and the skipped steps with their reasons. Then, per job:
+Kaggle run. Problems come first: an Explorer job that started but never
+finished (job.jsonl: its last start has no end), with the error that stopped
+it if it recorded one; each step that failed, timed out or never finished (a
+log with no steps.jsonl line: the job was killed), with the last error lines
+of its log; and the skipped steps with their reasons. Then, per job:
 
 - what it ran on: hosts (numbered), GPU models, driver, torch, CUDA or ROCm,
   NCCL or RCCL, the gpubridge commit;
@@ -176,7 +178,27 @@ class Report:
         self.run = run_row(job, hosts)
         self.counts = {"passed": 0, "failed": 0, "timed out": 0, "unfinished": 0, "skipped": 0}
         self.problems: list[tuple[str, list[str]]] = []  # (line, log tail)
+        self.unfinished_job = False
         self._steps()
+        self._job_events()
+
+    def _job_events(self) -> None:
+        """job.jsonl (Explorer jobs): whether the job's last start reached its end."""
+        events = _jsonl(self.job.path / "job.jsonl")
+        starts = [i for i, event in enumerate(events) if event.get("event") == "started"]
+        if not starts:
+            return
+        start, later = events[starts[-1]], events[starts[-1] + 1:]
+        errors = [str(e.get("message", "")) for e in later if e.get("event") == "error"]
+        job = f"job {start.get('job_id', '?')}"
+        if not any(event.get("event") == "finished" for event in later):
+            self.unfinished_job = True
+            why = (f"it stopped with an error: {errors[-1]}" if errors else
+                   "killed, out of Slurm time, or still running")
+            self.problems.insert(0, (f"  UNFINISHED {job}, started {start.get('time', '?')}: "
+                                     f"no end recorded; {why}. Its job log has the rest", []))
+        elif errors:
+            self.problems.insert(0, (f"  STOPPED {job} early: {errors[-1]}", []))
 
     def _steps(self) -> None:
         last: dict[str, dict[str, Any]] = {}
@@ -215,7 +237,8 @@ class Report:
 
     @property
     def ok(self) -> bool:
-        return not (self.counts["failed"] or self.counts["timed out"] or self.counts["unfinished"])
+        return not (self.counts["failed"] or self.counts["timed out"] or self.counts["unfinished"]
+                    or self.unfinished_job)
 
     def header(self) -> list[str]:
         r = self.run
@@ -326,6 +349,9 @@ def summarize(root: Path, label: str, max_lines: int = 80) -> tuple[str, bool]:
     totals = {k: sum(r.counts[k] for r in reports) for k in reports[0].counts}
     digests, agree = digest_line(jobs)
     bad = [f"{totals[k]} {k}" for k in ("failed", "timed out", "unfinished") if totals[k]]
+    unfinished_jobs = sum(r.unfinished_job for r in reports)
+    if unfinished_jobs:
+        bad.append(f"{unfinished_jobs} job(s) unfinished")
     ok = not bad and agree
     simulated = any(job.simulated for job in jobs)
     head = [f"gpubridge results triage: {label}, {len(jobs)} job(s)"

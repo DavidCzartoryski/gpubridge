@@ -109,6 +109,42 @@ def test_submit_dry_run(step, expected):
     assert "--account" not in result.stdout
 
 
+@pytest.mark.parametrize(
+    ("step", "env", "cap"),
+    [
+        ("01", {}, "480s (its Slurm limit, 00:10:00, less 120s), not 1200s"),
+        ("02", {}, None),                                    # 25 minutes: 1200 s fits
+        ("03", {}, "1080s (its Slurm limit, 00:20:00, less 120s), not 1200s"),
+        ("05", {"STEP_TIMEOUT": "0", "TIME_05": "1-00"}, "86280s"),  # 0 = no limit: capped
+        ("06", {"TIME_06": "01:30"}, "60s"),                 # never below a minute
+        ("04", {"STEP_TIMEOUT": "300"}, None),               # already short enough
+    ],
+)
+def test_each_jobs_step_timeout_fits_inside_its_slurm_limit(step, env, cap):
+    result = dry_run(KIT / "explorer" / "submit.sh", step, **env)
+    assert result.returncode == 0, result.stderr
+    if cap is None:
+        assert "STEP_TIMEOUT for this job" not in result.stderr
+    else:
+        assert f"STEP_TIMEOUT for this job: {cap}" in result.stderr
+
+
+def test_submit_rejects_a_time_limit_it_cant_read():
+    result = dry_run(KIT / "explorer" / "submit.sh", "01", TIME_01="ten minutes")
+    assert result.returncode == 1 and "can't read the time limit 'ten minutes'" in result.stderr
+
+
+@pytest.mark.parametrize(("env", "python"), [({}, "3.12"),
+                                             ({"PYTHON_VERSION": "3.12.15"}, "3.12"),
+                                             ({"VENV_PYTHON": "3.11"}, "3.11")])
+def test_setup_venv_python_ignores_python_version(env, python, tmp_path):
+    # Python's Docker images set PYTHON_VERSION to their own full version.
+    result = dry_run(KIT / "setup_env.sh", "--flavor", "cuda", "--venv", str(tmp_path / "v"),
+                     **env)
+    assert result.returncode == 0, result.stderr
+    assert f"uv venv --python {python} " in result.stdout
+
+
 def fake_command(directory: Path, name: str, body: str) -> str:
     """Put an executable NAME on a PATH that starts with DIRECTORY; returns that PATH."""
     directory.mkdir(exist_ok=True)
@@ -784,6 +820,119 @@ def test_environment_names_versions_driver_and_interfaces(monkeypatch):
         assert key in env
     if not torch.version.cuda and not torch.version.hip:  # a CPU build of PyTorch
         assert env["collective_library"] is None and env["driver_version"] is None
+
+
+#: The arch list of PyTorch's cu126 wheels.
+CU126 = ["sm_50", "sm_60", "sm_70", "sm_75", "sm_80", "sm_86", "sm_90"]
+
+
+def fake_device(monkeypatch, *, name: str, capability: tuple[int, int], arch_list: list[str],
+                gcn: str | None = None, hip: str | None = None) -> dict:
+    """gpukit.device_info for one made-up GPU. CUDA builds of PyTorch fill gcnArchName
+    with the product name, so that is the default."""
+    import gpukit
+
+    props = SimpleNamespace(name=name, major=capability[0], minor=capability[1],
+                            gcnArchName=name if gcn is None else gcn, total_memory=32 * 2**30)
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: props)
+    monkeypatch.setattr(torch.cuda, "get_arch_list", lambda: list(arch_list))
+    return gpukit.device_info(0)
+
+
+@pytest.mark.parametrize(
+    ("gpu", "target", "match"),
+    [
+        # A CUDA device whose gcnArchName is its product name: the target comes from
+        # the compute capability instead.
+        ({"name": "NVIDIA A100-SXM4-40GB", "capability": (8, 0), "arch_list": CU126},
+         "sm_80", "exact"),
+        # A V100 on the cu126 build: its gcnArchName, "Tesla V100-SXM2-32GB", is not
+        # its target.
+        ({"name": "Tesla V100-SXM2-32GB", "capability": (7, 0), "arch_list": CU126},
+         "sm_70", "exact"),
+        # ROCm: gcnArchName without its feature flags.
+        ({"name": "AMD Instinct MI50", "capability": (9, 0), "gcn": "gfx906:sramecc+:xnack-",
+          "hip": "6.4.43482", "arch_list": ["gfx900", "gfx906", "gfx908", "gfx90a"]},
+         "gfx906", "exact"),
+        # Only PTX for an earlier capability: the driver compiles it at load time.
+        ({"name": "NVIDIA H100 80GB HBM3", "capability": (9, 0),
+          "arch_list": ["sm_70", "sm_80", "compute_80"]}, "sm_90", "ptx"),
+        # A cubin for an earlier minor of the same major runs unchanged.
+        ({"name": "NVIDIA L40S", "capability": (8, 9), "arch_list": CU126},
+         "sm_89", "compatible"),
+        # A genuine miss: no sm_12x cubin and no PTX, so the probe must still fail.
+        ({"name": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "capability": (12, 0),
+          "arch_list": CU126}, "sm_120", None),
+    ],
+)
+def test_device_target_and_the_rule_that_covers_it(monkeypatch, gpu, target, match):
+    info = fake_device(monkeypatch, **gpu)
+    assert (info["target"], info["target_match"]) == (target, match)
+    assert info["target_in_build"] is (match is not None)
+
+
+@pytest.mark.parametrize(
+    ("target", "capability", "arch_list", "match"),
+    [
+        ("sm_80", (8, 0), ["sm_86"], None),            # a later minor's cubin doesn't run
+        ("sm_80", (8, 0), ["sm_70"], None),            # nor an earlier major's
+        ("sm_80", (8, 0), ["compute_90"], None),       # PTX above the capability doesn't
+        ("sm_90", (9, 0), ["sm_90a", "sm_100f"], None),  # arch- and family-specific cubins
+        ("sm_75", (7, 5), ["sm_70", "compute_70"], "compatible"),  # the cubin is preferred
+        ("sm_120", (12, 0), ["compute_90"], "ptx"),
+        ("gfx90a", None, ["gfx90a:xnack-"], "exact"),  # ROCm list entries with flags
+        ("gfx942", None, ["gfx90a", "sm_90"], None),
+        ("sm_70", (7, 0), [], None),
+    ],
+)
+def test_target_match_rules(target, capability, arch_list, match):
+    import gpukit
+
+    assert gpukit.target_match(target, capability, arch_list) == match
+
+
+def run_probe(monkeypatch, tmp_path, devices: list, *, nccl: bool = True) -> int:
+    """probe.py's main() on a made-up environment."""
+    import gpukit
+    import probe
+
+    env = {"device_count": len(devices), "devices": devices, "arch_list": CU126,
+           "probe": {"nccl_available": nccl, "gloo_available": True}, "torch": "2.14.1+cu126",
+           "torch_cuda": "12.6", "torch_hip": None, "nccl_version": "2.21.5"}
+    monkeypatch.setattr(gpukit, "environment", lambda: env)
+    monkeypatch.setattr(sys, "argv", ["probe.py", "--out", str(tmp_path)])
+    return probe.main()
+
+
+def test_probe_passes_a_gpu_its_build_covers(monkeypatch, tmp_path, capsys):
+    v100 = fake_device(monkeypatch, name="Tesla V100-SXM2-32GB", capability=(7, 0),
+                       arch_list=CU126)
+    assert run_probe(monkeypatch, tmp_path, [v100]) == 0
+    out = capsys.readouterr()
+    assert "GPUs: Tesla V100-SXM2-32GB (sm_70, exact)" in out.out and "FAIL" not in out.err
+    record = json.loads((tmp_path / "probe.json").read_text())
+    assert record["ok"] and record["environment"]["devices"][0]["target_match"] == "exact"
+
+
+def test_probe_names_each_failed_check_and_its_values(monkeypatch, tmp_path, capsys):
+    blackwell = fake_device(monkeypatch, name="NVIDIA RTX PRO 6000", capability=(12, 0),
+                            arch_list=CU126)
+    unreadable = "error: RuntimeError: CUDA error: unknown error"
+    assert run_probe(monkeypatch, tmp_path, [blackwell, unreadable], nccl=False) == 1
+    assert capsys.readouterr().err.splitlines() == [
+        f"FAIL device_info: device 1: {unreadable}",
+        f"FAIL target_in_build: device 0 target sm_120 not in arch_list {CU126} (nor an sm_12x "
+        "cubin at or below 12.0, nor PTX at or below 12.0)",
+        "FAIL backends: nccl_available False, gloo_available True",
+    ]
+
+
+def test_probe_without_a_gpu_says_so(monkeypatch, tmp_path, capsys):
+    assert run_probe(monkeypatch, tmp_path, []) == 1
+    assert capsys.readouterr().err.splitlines() == [
+        "FAIL gpus_visible: device_count 0: no GPU visible to PyTorch (check the job's GPU "
+        "request and driver)"]
 
 
 #: Must never reach a record: credentials, who ran it, where the project lives.

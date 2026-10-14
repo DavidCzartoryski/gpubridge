@@ -11,6 +11,7 @@ fails here instead of in the first GPU allocation.
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -82,11 +83,26 @@ def cluster_env(tmp_path: Path, **extra: str) -> dict[str, str]:
 
 def submit(tmp_path: Path, step: str, **extra: str) -> int:
     """Run submit.sh STEP through the fake sbatch; return the job's exit code."""
+    return submit_output(tmp_path, step, **extra)[0]
+
+
+def submit_output(tmp_path: Path, step: str, **extra: str) -> tuple[int, str]:
+    """submit(), and what submit.sh itself printed on stderr."""
     result = subprocess.run(["bash", str(EXPLORER / "submit.sh"), step],
                             env=cluster_env(tmp_path, **extra), capture_output=True,
                             text=True, timeout=900)
     assert result.returncode == 0, result.stderr
-    return job_exit(tmp_path)
+    return job_exit(tmp_path), result.stderr
+
+
+def job_id(tmp_path: Path) -> str:
+    """The fake sbatch's job id (one job)."""
+    return re.findall(r"^job (\d+) exit", (tmp_path / "slurm.log").read_text(), re.M)[0]
+
+
+def events(results: Path) -> list[dict]:
+    """job.jsonl: the job's start, errors and end."""
+    return [json.loads(line) for line in (results / "job.jsonl").read_text().splitlines()]
 
 
 def sbatch(tmp_path: Path, *args: str, **extra: str) -> int:
@@ -143,8 +159,12 @@ def test_every_job_script_sets_a_walltime():
 
 def test_setup_job_creates_the_cuda_venv(tmp_path):
     venv = make_venv(tmp_path / "work" / "venv")
-    code = submit(tmp_path, "setup", VENV=str(venv), HOME=str(tmp_path / "home"))
+    code, stderr = submit_output(tmp_path, "setup", VENV=str(venv), HOME=str(tmp_path / "home"))
     assert code == 0, job_output(tmp_path)
+    # The log's path, with the job's id in it (sbatch --parsable).
+    log_path = tmp_path / "work" / "logs" / f"gpubridge-setup-cuda-{job_id(tmp_path)}.out"
+    assert f"setup log: {log_path}." in stderr and log_path.exists()
+    assert "<job id>" not in stderr
     log = (tmp_path / "slurm.log").read_text()
     assert "--partition=short" in log and "--time=01:00:00" in log
     assert "module load explorer" in log  # the proxy, before installing
@@ -166,11 +186,38 @@ def test_setup_job_for_rocm_stops_with_a_clear_message_without_an_amd_gpu(tmp_pa
 # ---- steps 01 to 07 ------------------------------------------------------------
 
 def test_step_01_probe(tmp_path):
-    code = submit(tmp_path, "01")
+    code, stderr = submit_output(tmp_path, "01")
     out = tmp_path / "results" / "01_probe"
     assert failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
     assert code == 1
     assert "--time=00:10:00" in (tmp_path / "slurm.log").read_text()
+    assert f"job {job_id(tmp_path)}, log {tmp_path}/work/logs/gpubridge-01_probe-" in stderr
+    # The job's own log says why: the step's last lines, with probe's FAIL lines, after
+    # its FAILED line.
+    log = job_output(tmp_path)
+    after = log[log.index("step probe FAILED (exit 1)"):]
+    assert "the last 20 lines of probe.log, before any torchrun failure report:" in after
+    assert "    | FAIL gpus_visible: device_count 0: no GPU visible to PyTorch" in after
+    # Each launch's limit stays inside the job's: 10 minutes less 2.
+    record = json.loads((out / "probe.json").read_text())
+    assert record["environment"]["env"]["STEP_TIMEOUT"] == "480"
+    assert [(e["event"], e.get("failed")) for e in events(out)] == [("started", None),
+                                                                     ("finished", 1)]
+
+
+def test_a_job_that_stops_in_its_setup_is_one_triage_lists(tmp_path):
+    # No venv: job_setup stops the job before its first step, so steps.jsonl stays empty.
+    code = submit(tmp_path, "01", VENV=str(tmp_path / "no-venv"))
+    out = tmp_path / "results" / "01_probe"
+    assert code == 1 and (out / "steps.jsonl").read_text() == ""
+    assert [e["event"] for e in events(out)] == ["started", "error"]
+    assert "no venv at" in events(out)[1]["message"]
+    triage = subprocess.run([sys.executable, str(KIT / "triage.py"), str(tmp_path / "results")],
+                            capture_output=True, text=True, timeout=60)
+    assert triage.returncode == 1
+    assert f"UNFINISHED job {job_id(tmp_path)}, started" in triage.stdout
+    assert "it stopped with an error: no venv at" in triage.stdout
+    assert triage.stdout.splitlines()[-1] == "verdict: 1 job(s) unfinished"
 
 
 def test_step_02_split_on_one_gpu(tmp_path):

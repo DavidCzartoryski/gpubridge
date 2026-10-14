@@ -57,6 +57,10 @@ TIME_05="${TIME_05:-00:30:00}"
 TIME_06="${TIME_06:-00:30:00}"
 TIME_07="${TIME_07:-00:30:00}"
 TIME_AMD="${TIME_AMD:-00:30:00}"
+# Each job's STEP_TIMEOUT (common.sh: the limit on each launch) is capped at its
+# Slurm limit less STEP_MARGIN seconds, so a stuck launch is stopped and recorded
+# as timed out before Slurm ends the job.
+STEP_MARGIN="${STEP_MARGIN:-120}"
 # ---- Environment for the jobs -------------------------------------------------
 # Venvs, caches and logs: ~7 GB, ~25 GB with the ROCm venv. Home is capped at 75 GB,
 # so they go in your group's project space. Required: PROJECT_DIR or WORK_DIR.
@@ -95,8 +99,42 @@ site_options() {
     REQUEST+=("${extra[@]+"${extra[@]}"}")
 }
 
+# seconds TIME: a Slurm time limit (MM, MM:SS, HH:MM:SS, D-HH, D-HH:MM or
+# D-HH:MM:SS) in seconds.
+seconds() {
+    local days=0 rest=$1 parts=()
+    [[ $1 =~ ^([0-9]+-)?[0-9]+(:[0-9]+){0,2}$ ]] || die "can't read the time limit '$1'"
+    if [[ $rest == *-* ]]; then
+        days=${rest%%-*}
+        rest=${rest#*-}
+        IFS=: read -ra parts <<<"$rest"
+        parts+=(0 0)  # D-HH and D-HH:MM
+    else
+        IFS=: read -ra parts <<<"$rest"
+        case ${#parts[@]} in
+        1) parts=(0 "${parts[0]}" 0) ;;   # MM
+        2) parts=(0 "${parts[@]}") ;;     # MM:SS
+        esac
+    fi
+    echo $(((((10#$days * 24) + 10#${parts[0]}) * 60 + 10#${parts[1]}) * 60 + 10#${parts[2]}))
+}
+
+# cap_step_timeout TIME: lower STEP_TIMEOUT (exported by common.sh, so the job gets
+# it) to TIME less STEP_MARGIN, at least 60 s, if it is above that or 0 (none).
+cap_step_timeout() {
+    local cap
+    cap=$(seconds "$1") || exit 1
+    cap=$((cap - STEP_MARGIN))
+    [ "$cap" -ge 60 ] || cap=60
+    if [ "$STEP_TIMEOUT" = 0 ] || [ "$STEP_TIMEOUT" -gt "$cap" ]; then
+        log "STEP_TIMEOUT for this job: ${cap}s (its Slurm limit, $1, less" \
+            "${STEP_MARGIN}s), not ${STEP_TIMEOUT}s"
+        STEP_TIMEOUT=$cap
+    fi
+}
+
 # gpu_request PARTITION GPU_TYPE NODES GPUS TIME: sbatch options for one job, or
-# one component of a heterogeneous job, in REQUEST.
+# one component of a heterogeneous job, in REQUEST. Caps STEP_TIMEOUT under TIME.
 gpu_request() {
     local partition=$1 gpu_type=$2 nodes=$3 gpus=$4 time=$5
     REQUEST=(
@@ -105,20 +143,30 @@ gpu_request() {
         --cpus-per-gpu="$CPUS_PER_GPU" --mem-per-gpu="$MEM_PER_GPU"
     )
     site_options
+    cap_step_timeout "$time"
 }
 
-# sbatch_job NAME SCRIPT OPTIONS...: submit SCRIPT. A ":" in OPTIONS separates the
-# components of a heterogeneous job; the name and log file belong to the first.
+# sbatch_job NAME SCRIPT OPTIONS...: submit SCRIPT and print its job id and log
+# (JOB_LOG). A ":" in OPTIONS separates the components of a heterogeneous job; the
+# name and log file belong to the first.
 sbatch_job() {
-    local name=$1 script=$2
+    local name=$1 script=$2 id="<job id>"
     shift 2
     [ -n "$WORK_DIR" ] || die "set PROJECT_DIR to your group's project space, e.g." \
         "PROJECT_DIR=/projects/<your-project>, in the environment or in" \
         "scripts/gpu/explorer/local.env (gitignored); or set WORK_DIR. Venvs, caches and" \
         "logs go to \$PROJECT_DIR/\$USER/gpubridge-gpu, not home (capped at 75 GB)."
     run mkdir -p "$LOG_DIR"
-    run sbatch --job-name="gpubridge-$name" --output="$LOG_DIR/%x-%j.out" --export=ALL \
-        "$@" "$KIT_DIR/explorer/$script"
+    local cmd=(sbatch --parsable --job-name="gpubridge-$name" --output="$LOG_DIR/%x-%j.out"
+               --export=ALL "$@" "$KIT_DIR/explorer/$script")
+    if [ "$DRY_RUN" = 1 ]; then
+        run "${cmd[@]}"
+    else
+        id=$("${cmd[@]}") || die "sbatch refused gpubridge-$name (its message is above)"
+        id=${id%%;*}  # --parsable prints "id" or "id;cluster"
+    fi
+    JOB_LOG="$LOG_DIR/gpubridge-$name-$id.out"
+    log "submitted gpubridge-$name: job $id, log $JOB_LOG"
 }
 
 submit() {
@@ -147,7 +195,7 @@ setup_job() {
     shift
     export TORCH_FLAVOR=${name#setup-}
     sbatch_job "$name" setup.sbatch "$@"
-    log "setup log: $LOG_DIR/gpubridge-$name-<job id>.out. Wait for the job to finish" \
+    log "setup log: $JOB_LOG. Wait for the job to finish" \
         "(squeue -u \$USER) before submitting the steps that use its venv."
 }
 

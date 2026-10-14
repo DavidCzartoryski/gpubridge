@@ -216,6 +216,48 @@ def test_killed_rerun_and_negative_steps(tmp_path, capsys):
     assert "(log outside the results directory)" in out and "localhost" not in out
 
 
+def job_events(path: Path, *events: tuple) -> None:
+    """job.jsonl, as common.sh writes it: (event, job id[, message])."""
+    path.mkdir(parents=True, exist_ok=True)
+    lines = [{"event": e[0], "job_id": e[1], "time": f"T{e[1]}",
+              **({"message": e[2]} if len(e) > 2 else {}),
+              **({"failed": 0} if e[0] == "finished" else {})} for e in events]
+    (path / "job.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
+def test_jobs_that_started_but_never_finished(tmp_path, capsys):
+    stuck = tmp_path / "01_probe"  # killed in its first step: a log, no steps.jsonl line
+    steps(stuck)
+    job_events(stuck, ("started", "11"))
+    (stuck / "probe.log").write_text("torch 2.14.1+cu126\n")
+    broken = tmp_path / "02_split_shared_gpu"  # stopped before its first step
+    steps(broken)
+    job_events(broken, ("started", "12"),
+               ("error", "12", "no venv at /projects/secret-lab/alice/gpubridge-gpu/venv; run "
+                               "setup first"))
+    done = tmp_path / "03_single_island"
+    steps(done, ok("check"))
+    job_events(done, ("started", "13"), ("finished", "13"))
+    rerun = tmp_path / "04_split_4gpu"  # the earlier job finished; its rerun didn't
+    steps(rerun, ok("check_half"))
+    job_events(rerun, ("started", "14"), ("finished", "14"), ("started", "15"))
+    stopped = tmp_path / "05_multinode"  # finish, then die: stopped on purpose
+    steps(stopped, {"step": "preflight", "exit_code": 1, "seconds": 5, "log": "preflight.log",
+                    "timed_out": False})
+    job_events(stopped, ("started", "16"), ("finished", "16"),
+               ("error", "16", "stopping before torchrun: the preflight failed"))
+    code, out = run(tmp_path, capsys=capsys)
+    assert code == 1
+    assert ("UNFINISHED job 11, started T11: no end recorded; killed, out of Slurm time, or "
+            "still running. Its job log has the rest") in out
+    assert "UNFINISHED probe: a log but no steps.jsonl line" in out
+    assert ("UNFINISHED job 12, started T12: no end recorded; it stopped with an error: no venv "
+            "at $PROJECT_DIR/gpubridge-gpu/venv; run setup first") in out
+    assert "job 13" not in out and "job 14" not in out and "UNFINISHED job 15" in out
+    assert "STOPPED job 16 early: stopping before torchrun: the preflight failed" in out
+    assert out.splitlines()[-1] == "verdict: 1 failed, 1 unfinished, 3 job(s) unfinished"
+
+
 def test_cpu_simulation_says_so_and_a_clean_run_passes(tmp_path, capsys):
     path = tmp_path / "sim"
     steps(path, ok("probe"))
