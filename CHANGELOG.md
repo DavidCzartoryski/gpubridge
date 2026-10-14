@@ -8,8 +8,9 @@ release so far is an alpha. Numbers in parentheses are pull requests.
 - **NVIDIA V100 (sm_70), commit af51b20**, torch 2.14.1+cu126, NCCL 2.29.3: the
   bridge on device tensors and the shared-GPU check passed; two fp8
   error-feedback residual tests failed, from FMA contraction plus a codec
-  overflow, fixed in #50. Step 01's probe failed: it read the build target
-  as the GPU's product name, fixed in #49.
+  overflow, fixed in #50. Step 01's probe failed: it took the build target
+  from `gcnArchName`, which holds the product name on CUDA builds, fixed in
+  #49.
 - **NVIDIA V100 (sm_70), commit 14ed60c**, step 01 rerun after #49: driver
   545.23.08, torch 2.14.1+cu126, NCCL 2.29.3. The probe passed (an exact
   target match), and so did the job's other 2 steps.
@@ -29,7 +30,8 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   partition: driver 545.23.08. Step 02 passed; `gpu_tests` 26 passed, 8
   skipped, in 186 s. The probe found the build covers it with sm_86 cubins
   (`target_match` "compatible").
-- **AMD MI50 (gfx906), commit df80abb**, `sharing` partition, torch
+- **AMD MI50 (gfx906), commit df80abb** (from the clone's history; the
+  run's records were overwritten), `sharing` partition, torch
   2.14.1+rocm7.2, HIP 7.2.53211, RCCL 2.27.7: `setup-rocm` succeeded, and the
   probe found gfx906 in the build's arch list (an exact match). The
   single-node AMD step: `gpu_tests` 24 passed, 2 failed, 8 skipped;
@@ -74,8 +76,9 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   `gpu` and `sharing` partitions, one GPU and one rank each. V100: driver
   545.23.08, torch 2.14.1+cu126, NCCL 2.29.3. MI50: driver
   5.14.0-611.5.1.el9_7, torch 2.14.1+rocm7.2, RCCL 2.27.7. The Gloo bridge
-  ran over TCP between the two nodes (about 1.15 GB/s each way and a 0.05
-  to 0.07 ms round trip, by the preflight). The second run passed 15 of 20 steps:
+  ran over TCP between the two nodes; in both runs the preflight measured
+  about 1.15 GB/s each way and a 0.05 to 0.07 ms round trip. The second run
+  (`TIME_07=01:00:00`) passed 15 of 20 steps:
   - the bridge check on device tensors passed every stage on both ranks,
     with the default policy, with pinned staging, and with the pipelined and
     sharded policies;
@@ -84,19 +87,20 @@ release so far is an alpha. Numbers in parentheses are pull requests.
     for one flat Gloo group of both ranks;
   - bridge compression: `bf16` was faster than uncompressed from 1 MB up and
     `fp8` from 256 KB up, with every rank holding the same bits; the kernels
-    matched the CPU reference on both GPUs.
-
-  The 5 training steps failed: DDP with `gpubridge.ddp_comm_hook`, FSDP2 and
-  HSDP through the backend, and their bit-for-bit checks. In each, the MI50's
-  rank aborted at its first matmul (rocBLAS has no gfx906 kernels in this
-  wheel), and the V100's rank then lost its connection. The first run, with
-  the same commit and a 30-minute limit, passed 10 steps. In 4, Slurm
-  couldn't create the job step (`srun: error: Unable to create step ...
-  Unexpected message received`) while it still listed the previous step as
-  running, and a fifth summarized one of them; all 5 passed in the second
-  run, with a 1-hour limit (`TIME_07=01:00:00`). The first run's `train_ddp` failed differently: the
-  MI50's rank timed out (Gloo, 300 s) in DDP's parameter check while the
-  V100's printed nothing, cause unknown. The job then reached its limit.
+    matched the CPU reference on both GPUs;
+  - the 5 training steps failed: DDP with `gpubridge.ddp_comm_hook`, FSDP2
+    and HSDP through the backend, and the bit-for-bit checks of the last
+    two. In each, the MI50's rank aborted (exit -6) in rocBLAS, which has no
+    gfx906 kernels in this wheel, and the V100's rank then lost its
+    connection.
+  - The first run, at the same commit with a 30-minute limit, passed 10
+    steps. In 4, Slurm couldn't create the job step (`srun: error: Unable to
+    create step ... Unexpected message received`) while it still listed the
+    previous step as running, and `summarize_pinned` then had no records to
+    summarize; all 5 passed in the second run. `train_ddp` failed
+    differently: the MI50's rank timed out (Gloo, 300 s) in DDP's parameter
+    check while the V100's printed nothing, cause unknown. The job reached
+    its limit during `train_fsdp2_backend`.
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
