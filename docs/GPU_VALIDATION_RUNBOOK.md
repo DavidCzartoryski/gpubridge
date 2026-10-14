@@ -577,19 +577,24 @@ review:
     python scripts/gpu/triage.py results/explorer
     python scripts/gpu/triage.py kaggle-t4x2-20261014-0930.tgz
 
+- **Problems first:** each step that failed, timed out or never finished (a
+  log with no `steps.jsonl` line: the job was killed or ran out of Slurm time),
+  with the last error lines of its log. Then the skipped steps, with their
+  reasons. A step run again counts as its last attempt.
 - **For each job:** what it ran on (hosts numbered, GPU models, driver, torch,
-  CUDA or ROCm, NCCL or RCCL, the gpubridge commit), each step that failed or
-  timed out with the last error lines of its log, and the skipped steps with
-  their reasons.
-- **Key numbers:** gpubridge's bus bandwidth as a share of the baseline's, the
-  bridge phase against the preflight's prediction, and the compression
-  kernels' check against the CPU reference.
-- **Last:** whether the compression digests agree across runs, and one verdict
-  line.
+  CUDA or ROCm, NCCL or RCCL, the gpubridge commit).
+- **Key numbers:** gpubridge's bus bandwidth against the baseline's; the
+  bridge phase against the preflight's prediction; and the compression
+  kernels' check against the CPU reference, with the kernels that ran.
+- **Last:** whether the compression digests agree across every compression
+  record, and one verdict line.
 
-It exits 1 if a step failed. Like the tables, it numbers hosts and shows no
-paths. The error lines come from the unredacted step logs, so read the output
-before pasting it anywhere public.
+It needs only Python 3.10 or later, no torch. It exits 0 if everything that
+ran passed, 1 if something failed, timed out or never finished (or nothing was
+found), and 2 if it can't read the input. Host names become `host N`, IPv4
+addresses `<ip>`, and paths lose their owner (`$PROJECT_DIR`, `~`). The error
+lines still come from the step logs, so read the output before pasting it
+anywhere public.
 
 ### The validation tables
 
