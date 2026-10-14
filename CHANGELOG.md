@@ -8,7 +8,12 @@ release so far is an alpha. Numbers in parentheses are pull requests.
 - **NVIDIA V100 (sm_70), commit af51b20**, torch 2.14.1+cu126, NCCL 2.29.3: the
   bridge on device tensors and the shared-GPU check passed; two fp8
   error-feedback residual tests failed, from FMA contraction plus a codec
-  overflow, fixed in #50.
+  overflow, fixed in #50. Step 01's probe failed: it took the build target
+  from `gcnArchName`, which holds the product name on CUDA builds, fixed in
+  #49.
+- **NVIDIA V100 (sm_70), commit 14ed60c**, step 01 rerun after #49: driver
+  545.23.08, torch 2.14.1+cu126, NCCL 2.29.3. The probe passed (an exact
+  target match), and so did the job's other 2 steps.
 - **NVIDIA H200 (sm_90), commit 4a478f4** (#50's branch before it merged):
   driver 570.86.15, torch 2.14.1+cu126, CUDA 12.6, NCCL 2.29.3. Step 02
   passed; `gpu_tests` 26 passed, 8 skipped, in 162 s.
@@ -25,15 +30,77 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   partition: driver 545.23.08. Step 02 passed; `gpu_tests` 26 passed, 8
   skipped, in 186 s. The probe found the build covers it with sm_86 cubins
   (`target_match` "compatible").
-- **AMD MI50 (gfx906)**, `sharing` partition, torch 2.14.1+rocm7.2, HIP
-  7.2.53211, RCCL 2.27.7: `setup-rocm` succeeded, and the probe found gfx906
-  in the build's arch list (an exact match). The single-node AMD step:
-  `gpu_tests` 24 passed, 2 failed, 8 skipped; `check_1gpu` and
-  `check_split_shared_gpu` aborted (exit -6); the compression kernels matched
-  the CPU reference in 3 of 3 cases. Every failure was the wheel's rocBLAS,
-  which has no kernels for gfx906, in a matmul used as busy work, which #52
-  replaces. `diag_fp8_residual.py` found every fp8 payload and residual
-  matching the CPU reference, for float32 and float64, with fusion on and off.
+- **AMD MI50 (gfx906), commit df80abb** (from the clone's history; the
+  run's records were overwritten), `sharing` partition, torch
+  2.14.1+rocm7.2, HIP 7.2.53211, RCCL 2.27.7: `setup-rocm` succeeded, and the
+  probe found gfx906 in the build's arch list (an exact match). The
+  single-node AMD step: `gpu_tests` 24 passed, 2 failed, 8 skipped;
+  `check_1gpu` and `check_split_shared_gpu` aborted (exit -6); the
+  compression kernels matched the CPU reference in 3 of 3 cases. Every
+  failure was the wheel's rocBLAS, which has no kernels for gfx906, in a
+  matmul used as busy work, which #52 replaces. `diag_fp8_residual.py` found
+  every fp8 payload and residual matching the CPU reference, for float32 and
+  float64, with fusion on and off.
+- **Compression kernels at df80abb** (`bench_compression.py`; the records
+  say df80abb+dirty) on a V100, an MI50 and an H200: the kernels matched the
+  CPU reference in 3 of 3 cases on each. Their speed is in
+  [docs/COMPRESSION.md](docs/COMPRESSION.md). The float32 outputs differ
+  between vendors only in NaN bits, where the input is NaN: `0x7fffffff` on
+  the NVIDIA GPUs, `0x7fc00000` on the MI50, as in the CPU reference. The
+  check compares where the NaNs are, not their bits.
+- **AMD MI50 (gfx906), commit 4014234** (after #52), `sharing` partition:
+  driver 5.14.0-611.5.1.el9_7 (as `rocm-smi` reports it), torch
+  2.14.1+rocm7.2, HIP 7.2.53211, RCCL 2.27.7. The single-node AMD step passed
+  all 9 steps, in each of two runs: `gpu_tests` 26 passed, 8 skipped (in
+  170 s and 178 s); `check_1gpu` and `check_split_shared_gpu` passed; the
+  compression kernels matched the CPU reference in 3 of 3 cases. The wheel's
+  rocBLAS still has no gfx906 kernels (the probe's `blas` stage says so);
+  nothing in the checks needs it now.
+- **Stream mutations at 4014234** (`stream_mutations.py`, #52), on a V100
+  (sm_70; torch 2.14.1+cu126, NCCL 2.29.3) and on the MI50 (gfx906; torch
+  2.14.1+rocm7.2, RCCL 2.27.7), with the same results on both:
+  `worker-ignores-caller`, `staging-ignores-caller` and
+  `slots-forget-copies-back` were caught (the guarding test failed on wrong
+  values), and both guarding tests passed without a mutation.
+  `wait-skips-stream` was **not caught**: its test passed while `Work.wait()`
+  ordered no stream, so no GPU test yet shows that this ordering is needed.
+  The script doesn't record the driver.
+- **Triton's kernel cache at 4014234** (`time_triton_cache.py`, #52), on a
+  V100, torch 2.14.1+cu126, Triton 3.8.0, the median of 12 kernel variants:
+  a build took 4.14 s with the cache in the home directory (NFS), 0.32 s in
+  project space (NFS) and 0.13 s in node-local `/tmp` (XFS); a load from the
+  cache took 0.04 s, 0.009 s and 0.001 s. The home directory was timed first,
+  and each location's first build was its slowest (9.6 s, 2.7 s and 2.3 s).
+- **The first mixed-vendor job: an NVIDIA V100 (sm_70) and an AMD MI50
+  (gfx906), commit 4014234**, step 07: one heterogeneous Slurm job across the
+  `gpu` and `sharing` partitions, one GPU and one rank each. V100: driver
+  545.23.08, torch 2.14.1+cu126, NCCL 2.29.3. MI50: driver
+  5.14.0-611.5.1.el9_7, torch 2.14.1+rocm7.2, RCCL 2.27.7. The Gloo bridge
+  ran over TCP between the two nodes; in both runs the preflight measured
+  about 1.15 GB/s each way and a 0.05 to 0.07 ms round trip. The second run
+  (`TIME_07=01:00:00`) passed 15 of 20 steps:
+  - the bridge check on device tensors passed every stage on both ranks,
+    with the default policy, with pinned staging, and with the pipelined and
+    sharded policies;
+  - a 1 GB all_reduce took 1.69 s through the bridge (0.64 GB/s bus
+    bandwidth) and 1.28 s with pinned staging (0.84 GB/s), against 1.73 s
+    for one flat Gloo group of both ranks;
+  - bridge compression: `bf16` was faster than uncompressed from 1 MB up and
+    `fp8` from 256 KB up, with every rank holding the same bits; the kernels
+    matched the CPU reference on both GPUs;
+  - the 5 training steps failed: DDP with `gpubridge.ddp_comm_hook`, FSDP2
+    and HSDP through the backend, and the bit-for-bit checks of the last
+    two. In each, the MI50's rank aborted (exit -6) in rocBLAS, which has no
+    gfx906 kernels in this wheel, and the V100's rank then lost its
+    connection.
+  - The first run, at the same commit with a 30-minute limit, passed 10
+    steps. In 4, Slurm couldn't create the job step (`srun: error: Unable to
+    create step ... Unexpected message received`) while it still listed the
+    previous step as running, and `summarize_pinned` then had no records to
+    summarize; all 5 passed in the second run. `train_ddp` failed
+    differently: the MI50's rank timed out (Gloo, 300 s) in DDP's parameter
+    check while the V100's printed nothing, cause unknown. The job reached
+    its limit during `train_fsdp2_backend`.
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
