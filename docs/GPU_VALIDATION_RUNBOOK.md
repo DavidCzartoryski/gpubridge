@@ -373,6 +373,21 @@ worked (item 2 in HARDWARE_VALIDATION.md). An older ROCm-side release is
 untested, and `gpubridge.init()` warns when releases differ. For identical
 releases, set `TORCH_VERSION` (and `CUDA_INDEX` if needed) for `submit.sh setup` too.
 
+## Kaggle (free): two NVIDIA T4s
+
+A free Kaggle notebook with **GPU T4 x2** and internet on runs the
+single-machine NVIDIA part of the ladder:
+- the GPU-only tests and the probe on each GPU;
+- the split test on 2 GPUs, the all_reduce benchmark against native NCCL and
+  flat-gloo, and the FSDP2 example with `--verify`;
+- the compression kernels' bit-identical check.
+
+T4s are compute capability 7.5, so the runner first checks CUDA events,
+bfloat16 and Triton on them, and skips or adapts what they can't run, saying
+why. Upload `scripts/gpu/kaggle/kaggle_gpubridge.ipynb` and follow the clicks
+in [scripts/gpu/kaggle/README.md](../scripts/gpu/kaggle/README.md); the
+results come back as one tarball. It is a split test, not a mixed-vendor run.
+
 ## AMD cloud machine
 
 Pick any Linux machine or container with ROCm and AMD GPUs (e.g. MI300X). An
