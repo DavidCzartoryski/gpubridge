@@ -281,10 +281,26 @@ def test_project_dir_from_local_env_and_the_environment_wins(tmp_path):
     assert "--output=/projects/from-env/alice/gpubridge-gpu/logs/" in out
 
 
-def test_local_env_is_gitignored():
-    result = subprocess.run(["git", "check-ignore", "-q", "scripts/gpu/explorer/local.env"],
-                            cwd=REPO)
+@pytest.mark.parametrize("path", ["scripts/gpu/explorer/local.env",
+                                  "results/explorer/01_probe/probe.log",
+                                  "results/explorer/02_split_shared_gpu.tgz"])
+def test_local_settings_and_raw_explorer_results_are_gitignored(path):
+    # Raw results hold unredacted logs: a `git add -A` on the cluster must not take them.
+    result = subprocess.run(["git", "check-ignore", "-q", path], cwd=REPO)
     assert result.returncode == 0
+
+
+def test_bench_compression_fp_fusion_switch_without_triton_kernels(tmp_path):
+    # On CPU the benchmark times the PyTorch kernels, which have no such option.
+    result = subprocess.run(
+        [sys.executable, str(KIT / "bench_compression.py"), "--out", str(tmp_path),
+         "--min-bytes", "4K", "--max-bytes", "4K", "--modes", "fp8", "--dtypes", "float32",
+         "--warmup", "0", "--trials", "1", "--fp-fusion"],
+        env=clean_env(), capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "--fp-fusion: these are the PyTorch kernels" in result.stderr
+    record = json.loads((tmp_path / "compression.json").read_text())
+    assert record["fp_fusion"] is None and record["impl"] == "torch (CPU)"
 
 
 FAKE_SINFO = r"""

@@ -34,6 +34,11 @@ Formats:
   bfloat16, float32 and float64. The payload is the scales (float32) followed
   by the codes.
 
+A finite value always arrives finite, and its residual stays finite: values
+are saturated to float32's range before quantizing, the fp8 scale exponent is
+capped at :data:`MAX_SCALE_EXP` so the largest code times its scale fits in
+float32, and codes beyond a mode's largest finite value saturate to it.
+
 Kernels are Triton (:mod:`gpubridge._compression_kernels`, one source for
 CUDA and ROCm builds), used for GPU tensors when Triton is installed. The
 functions here are the plain-PyTorch reference they are tested against, and
@@ -60,6 +65,12 @@ if TYPE_CHECKING:
 BLOCK = 256
 #: The largest finite E4M3 value.
 FP8_MAX = 448.0
+#: The largest finite float32.
+FLT_MAX = torch.finfo(torch.float32).max
+#: The largest fp8 scale exponent. 448 * 2^119 (about 2.98e38) is the largest code
+#: times scale that float32 holds; 2^120 would overflow to inf. A block whose largest
+#: magnitude needs more saturates its codes at 448 instead.
+MAX_SCALE_EXP = 119
 #: Magnitudes below this (2^-100) count as zero, before quantizing and after every
 #: addition when dequantizing. It keeps every value the kernels handle a normal
 #: float32, so GPUs that flush subnormals to zero and those that don't agree.
@@ -119,10 +130,10 @@ def _pow2(exponent: torch.Tensor) -> torch.Tensor:
 
 
 def _encode_e4m3(q: torch.Tensor) -> torch.Tensor:
-    """E4M3 codes (int32 0..255) of finite float32 values with |q| <= 448, rounded to
-    nearest even."""
+    """E4M3 codes (int32 0..255) of finite float32 values, rounded to nearest even;
+    |q| above 448 saturates to 448 (in blocks whose scale exponent is capped)."""
     sign = torch.where(q < 0, 0x80, 0)
-    a = q.abs()
+    a = q.abs().clamp(max=FP8_MAX)
     bits = _bits(a)
     exp, mant = bits >> 23, bits & 0x7FFFFF
     # Normal codes (|q| >= 2^-6): keep 3 mantissa bits, round half to even.
@@ -151,11 +162,17 @@ def _decode_e4m3(code: torch.Tensor) -> torch.Tensor:
 
 
 def _prepare(x: torch.Tensor, residual: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
-    """x + residual in float32, tiny values zeroed; and which values are finite."""
-    v = x.reshape(-1).to(torch.float32)
+    """x + residual in float32, saturated to float32's range (a float64 value beyond
+    it, or one its residual pushes past it), tiny values zeroed; and which values are
+    finite: finite in x's own dtype, and not NaN after adding the residual."""
+    flat = x.reshape(-1)
+    finite = torch.isfinite(flat)
+    v = flat.to(torch.float32)
+    v = torch.where(finite, v.clamp(-FLT_MAX, FLT_MAX), v)  # ±inf and NaN stay themselves
     if residual is not None:
         v = v + residual
-    finite = torch.isfinite(v)
+        v = torch.where(finite, v.clamp(-FLT_MAX, FLT_MAX), v)
+    finite = finite & ~v.isnan()
     return torch.where(finite & (v.abs() < TINY), 0.0, v), finite
 
 
@@ -167,6 +184,13 @@ def _bf16_bits(v: torch.Tensor) -> torch.Tensor:
     return torch.where(torch.isnan(v), 0x7FC0, code)
 
 
+def _bf16_codes(v: torch.Tensor) -> torch.Tensor:
+    """bf16 mode's codes: :func:`_bf16_bits`, except that a finite value rounding to
+    ±inf (above about 3.3961e38) saturates to bfloat16's largest, ±3.3895e38."""
+    code = _bf16_bits(v)
+    return torch.where((code & 0x7FFF) == 0x7F80, code - 1, code)
+
+
 def quantize_reference(mode: str, x: torch.Tensor, residual: torch.Tensor | None,
                        payload: torch.Tensor) -> None:
     """Compress ``x`` (plus ``residual``) into ``payload``; leave the new residual.
@@ -175,12 +199,14 @@ def quantize_reference(mode: str, x: torch.Tensor, residual: torch.Tensor | None
     included (zeroed). ``residual``
     (float32, ``x.numel()`` values, or None for no error feedback) ends holding
     what this payload leaves out of each finite value; 0 for values that aren't
-    finite, which are sent as NaN (fp8) or as themselves (bf16).
+    finite, which are sent as NaN (fp8) or as themselves (bf16). A finite value is
+    sent finite and leaves a finite residual: beyond a mode's largest value (448 *
+    2^119 in fp8, bfloat16's largest in bf16) it is sent as that value.
     """
     n = x.numel()
     v, finite = _prepare(x, residual)
     if mode == "bf16":
-        code = _bf16_bits(v)
+        code = torch.where(finite, _bf16_codes(v), _bf16_bits(v))
         payload[:2 * n].view(torch.int16).copy_(code.to(torch.int16))
         payload[2 * n:].zero_()  # padding: the same bytes on the wire every time
         sent = _float(code << 16)
@@ -190,9 +216,10 @@ def quantize_reference(mode: str, x: torch.Tensor, residual: torch.Tensor | None
         padded[:n] = torch.where(finite, v, 0.0)
         amax = padded.abs().view(nb, BLOCK).amax(dim=1)
         bits = _bits(amax)
-        # The smallest power of two with amax / scale <= 448 (= 1.75 * 2^8).
+        # The smallest power of two with amax / scale <= 448 (= 1.75 * 2^8), but no
+        # larger than 2^MAX_SCALE_EXP: 448 times it must stay finite.
         k = ((bits >> 23) & 0xFF) - 135 + ((bits & 0x7FFFFF) > 0x600000).to(torch.int32)
-        k = torch.where(amax == 0, 0, k)
+        k = torch.where(amax == 0, 0, k.clamp(max=MAX_SCALE_EXP))
         scale = _pow2(k)
         q = (padded.view(nb, BLOCK) * _pow2(-k)[:, None]).view(-1)[:n]
         code = torch.where(finite, _encode_e4m3(q), 0x7F)

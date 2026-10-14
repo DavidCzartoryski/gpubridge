@@ -1,9 +1,14 @@
 # Changelog
 
 All notable changes to gpubridge. Versions follow the release tags; every
-release so far is an alpha that is **validated on CPU only**. Nothing has run
-on a GPU yet: [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what
-still needs real hardware. Numbers in parentheses are pull requests.
+release so far is an alpha. Numbers in parentheses are pull requests.
+
+**GPU runs so far: one.** On Explorer, one NVIDIA V100 (sm_70), torch
+2.14.1+cu126, NCCL 2.29.3, at commit af51b20: the bridge on device tensors and
+the shared-GPU check passed; two fp8 error-feedback residual tests failed, from
+FMA contraction plus a codec overflow, fixed in #50. Everything else is
+**validated on CPU only**: [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)
+lists what still needs real hardware.
 
 ## [Unreleased]
 
@@ -31,9 +36,12 @@ still needs real hardware. Numbers in parentheses are pull requests.
   the GPU kernel test on one device and prints, for each value whose residual,
   code or scale differs from the CPU reference, every intermediate value with
   its bits and whether it is subnormal in float32. It also runs the kernel
-  compiled without multiply-add contraction, a probe of what the device
-  computes, and counts the compiled code's fused multiply-adds and
-  flush-to-zero instructions. The kernel is unchanged (#48).
+  with multiply-add contraction on (gpubridge's own launches have it off since
+  #50), a probe of what the device computes, and counts the compiled code's
+  fused multiply-adds and flush-to-zero instructions (#48).
+- `scripts/gpu/bench_compression.py --fp-fusion`: launches the compression
+  kernels with multiply-add contraction on, so a run each way times what
+  gpubridge's default (off) costs (#50).
 
 ### Changed
 
@@ -55,9 +63,25 @@ still needs real hardware. Numbers in parentheses are pull requests.
 - `setup_env.sh`: the venv's Python is `VENV_PYTHON` (default 3.12). It was
   `PYTHON_VERSION`, which Python's Docker images set to their own full
   version (#49).
+- `results/explorer/` is gitignored: its step logs, stack dumps and NCCL logs
+  are not redacted (#50).
 
 ### Fixed
 
+- Bridge compression: a finite value near float32's maximum could arrive as
+  inf, and leave a residual of -inf for the next step. In `fp8` a block above
+  448 · 2^119 got the scale 2^120, so a code could decode to 2^128; in `bf16`
+  a value above bfloat16's largest rounded to inf. Both now saturate: `fp8`
+  caps the scale exponent at 119 and its codes at 448, `bf16` its codes at
+  bfloat16's largest, and a finite float64 beyond float32's range, or a value
+  its residual pushes past it, counts as float32's largest. Every finite value
+  arrives finite and leaves a finite residual. Payloads change only for blocks
+  holding such values (#50).
+- The Triton compression kernels are compiled without multiply-add
+  contraction (`enable_fp_fusion=False`), so they round every product as the
+  PyTorch reference does, whatever the compiler. On the V100, a fused
+  `v - decoded * scale` gave a finite residual where the reference's was
+  -inf (#50).
 - `probe.py` took a CUDA GPU's build target from `gcnArchName`, which CUDA
   builds of PyTorch fill with the product name, so its build check could fail
   for a GPU the build covers. The target is `gcnArchName` without its feature

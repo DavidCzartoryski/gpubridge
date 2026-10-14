@@ -160,6 +160,122 @@ def test_non_finite_values_stay_non_finite_and_tiny_ones_become_zero(mode):
     assert torch.equal(residual[1:4], torch.zeros(3))  # never poisons the next step
 
 
+FLT_MAX = torch.finfo(torch.float32).max
+#: The largest value each mode sends: 448 * 2^119 in fp8, bfloat16's largest in bf16.
+LARGEST = {"fp8": 448 * 2.0**119, "bf16": float(torch.finfo(torch.bfloat16).max)}
+
+
+def near_the_max() -> torch.Tensor:
+    """float32 values at and near float32's largest, on both sides of each mode's
+    largest sent value."""
+    up = lambda value: torch.nextafter(torch.tensor(value), torch.tensor(math.inf)).item()  # noqa: E731
+    values = [FLT_MAX, -FLT_MAX, torch.nextafter(torch.tensor(FLT_MAX), torch.tensor(0.0)).item(),
+              3.4e38, -3.4e38, 3.0e38, LARGEST["fp8"], up(LARGEST["fp8"]), -up(LARGEST["fp8"]),
+              LARGEST["bf16"], up(LARGEST["bf16"]), 3.3961e38, 1.0, -2.5]
+    return torch.tensor(values, dtype=torch.float32)
+
+
+def _quantize_once(mode, x, residual):
+    """The reference's payload, its dequantized values and what it was given (v)."""
+    n = x.numel()
+    v, finite = C._prepare(x, residual)
+    payload = torch.empty(C.payload_nbytes(mode, n), dtype=torch.uint8)
+    C.quantize_reference(mode, x, residual, payload)
+    sent = torch.empty(n)
+    C.dequantize_accumulate_reference(mode, payload[None], sent)
+    return payload, sent, v, finite
+
+
+@pytest.mark.parametrize("mode", C.MODES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_finite_values_near_float32s_max_arrive_finite_and_leave_finite_residuals(mode, dtype):
+    x = near_the_max().to(dtype)
+    if dtype == torch.float64:  # beyond float32's range: counts as float32's largest
+        x = torch.cat([x, torch.tensor([4e38, -1e39, 1e300], dtype=dtype)])
+    residual = torch.zeros(x.numel())
+    _, sent, v, finite = _quantize_once(mode, x, residual)
+    assert finite.all() and sent.isfinite().all() and residual.isfinite().all()
+    assert v.abs().max() <= FLT_MAX
+    # What crossed plus what stayed behind is exactly v: nothing is lost but the part of a
+    # float64 value beyond float32's range.
+    assert torch.equal(sent.double() + residual.double(), v.double())
+    largest = LARGEST[mode]
+    over = v.abs() > largest
+    assert over.any()
+    assert torch.equal(sent[over], torch.copysign(torch.tensor(largest), v[over]))
+    assert (sent.abs() <= largest).all()
+    # The stated error beyond the largest value (docs/COMPRESSION.md): up to 2^-3 |v| in
+    # fp8, within bf16's usual 2^-8 |v|.
+    error = (v.double() - sent.double()).abs()[over]
+    assert (error <= v.double().abs()[over] * (2.0**-3 if mode == "fp8" else 2.0**-8)).all()
+    if dtype == torch.float64:
+        assert torch.equal(v[-3:], torch.tensor([FLT_MAX, -FLT_MAX, FLT_MAX]))
+
+
+def test_the_fp8_scale_exponent_is_capped_so_448_times_it_fits():
+    assert C.MAX_SCALE_EXP == 119
+    assert math.isfinite(torch.tensor(448 * 2.0**119, dtype=torch.float32).item())
+    assert math.isinf(torch.tensor(448 * 2.0**120, dtype=torch.float32).item())
+    x = torch.tensor([3.4e38] + [1.0] * 255)
+    residual = torch.zeros(256)
+    payload, sent, _, _ = _quantize_once("fp8", x, residual)
+    assert payload[:4].view(torch.float32).item() == 2.0**119
+    # 448: saturated. The uncapped exponent, 120, sent code 256: 256 * 2^120 = 2^128,
+    # inf in float32, and a residual of -inf.
+    assert payload[4].item() == 0x7E and sent[0].item() == 448 * 2.0**119
+    assert residual[0].item() == torch.tensor(3.4e38).item() - 448 * 2.0**119
+    # 1.0 is far below this block's scale: code 0, all of it kept for the next step.
+    assert torch.equal(sent[1:], torch.zeros(255)) and torch.equal(residual[1:], torch.ones(255))
+
+
+def test_a_block_of_float32_subnormals_sends_zeros_and_keeps_no_residual():
+    # Every value below 2^-100 counts as zero, so no subnormal reaches a kernel.
+    x = torch.tensor([1e-40, -1e-42, 1.4e-45, -2.0**-140, 2.0**-127] * 60)
+    for mode in C.MODES:
+        residual = torch.zeros(300)
+        payload, sent, _, _ = _quantize_once(mode, x, residual)
+        assert torch.equal(sent, torch.zeros(300)) and torch.equal(residual, torch.zeros(300))
+        if mode == "fp8":
+            assert torch.equal(payload[:8].view(torch.float32), torch.ones(2))
+
+
+def test_a_block_mixing_1e_4_and_3e38():
+    # The small values are subnormal after scaling by 2^-119, so they send code 0 and keep
+    # all of themselves as residual; 3e38 is beyond 448 * 2^119 and saturates.
+    x = torch.tensor([3e38, -3e38] + [1e-4, -1e-4, 2.5e-4, 7e-5] * 63 + [1e-4, 3e-4])
+    residual = torch.zeros(256)
+    payload, sent, v, _ = _quantize_once("fp8", x, residual)
+    scale = payload[:4].view(torch.float32).item()
+    assert scale == 2.0**119
+    small = slice(2, None)
+    q = v[small] * 2.0**-119
+    assert (q.abs() < 2.0**-126).all() and (q != 0).all()  # float32 subnormals
+    assert torch.equal(sent[small], torch.zeros(254))
+    assert torch.equal(residual[small], v[small])
+    assert torch.equal(sent[:2], torch.tensor([LARGEST["fp8"], -LARGEST["fp8"]]))
+    assert torch.equal(residual[:2], v[:2] - sent[:2])
+    assert residual.isfinite().all()
+
+
+@pytest.mark.parametrize("mode", C.MODES)
+def test_error_feedback_stays_finite_step_after_step_at_float32s_max(mode):
+    # The same values every step, the largest ones included: v = x + residual saturates
+    # at float32's largest, so no residual grows past FLT_MAX - largest, and every step's
+    # v is exactly what was sent plus what stayed behind. (A value just above the largest
+    # sent one gains its excess every step: error feedback carrying it, up to that bound.)
+    torch.manual_seed(0)
+    x = torch.cat([near_the_max(), torch.tensor([3e38] + [1e-4] * 100),
+                   torch.randn(300) * 2.0 ** torch.randint(-30, 30, (300,))])
+    residual = torch.zeros(x.numel())
+    for _ in range(50):
+        _, sent, v, finite = _quantize_once(mode, x, residual)
+        assert finite.all() and sent.isfinite().all() and residual.isfinite().all()
+        assert torch.equal(sent.double() + residual.double(), v.double())
+        assert (residual.abs() <= FLT_MAX - LARGEST[mode]).all()
+    at_max = x.abs() == FLT_MAX
+    assert torch.equal(residual[at_max].abs(), torch.full((2,), FLT_MAX - LARGEST[mode]))
+
+
 def test_dequantize_adds_members_in_order_in_float32():
     n = 300
     rows = []

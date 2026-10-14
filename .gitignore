@@ -10,3 +10,6 @@ results/mixed_build/*/
 results/mixed_build_recheck/*/
 # Personal Explorer settings, e.g. PROJECT_DIR (see docs/GPU_VALIDATION_RUNBOOK.md).
 scripts/gpu/explorer/local.env
+# Raw Explorer results: step logs, stack dumps and NCCL logs are not redacted
+# (docs/EXPLORER_FIRST_SESSION.md). triage.py and validation_tables.py make what's shared.
+results/explorer/

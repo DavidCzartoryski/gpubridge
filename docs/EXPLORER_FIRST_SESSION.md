@@ -205,8 +205,8 @@ Paste back:
    pasting (for example `job 123 on <host>: results in $PROJECT_DIR/...`).
 
 Read the triage output before pasting all the same: its error lines come from
-the step logs. The raw results stay on the cluster. Don't commit `results/explorer/` to the
-public repository: step logs, stack dumps and NCCL logs are not redacted.
+the step logs. The raw results stay on the cluster: `results/explorer/` is
+gitignored, because step logs, stack dumps and NCCL logs are not redacted.
 `validation_tables.py` makes the publishable tables later.
 
 ## If something fails

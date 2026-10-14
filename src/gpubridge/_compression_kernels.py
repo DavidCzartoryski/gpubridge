@@ -7,6 +7,10 @@ integer arithmetic on float32 bit patterns, power-of-two scales, and float32
 additions in the same order. No vendor fp8 type is used, since NVIDIA and AMD
 GPUs implement different fp8 variants.
 
+They are compiled without multiply-add contraction (:data:`LAUNCH_OPTIONS`):
+PyTorch on CPU rounds every product before adding it, and a fused multiply-add
+that rounds once would differ whenever a product isn't exact.
+
 On CPU, Triton's interpreter runs them (``TRITON_INTERPRET=1``, set before
 Triton is first imported); the tests compare them with the reference that way.
 """
@@ -21,6 +25,10 @@ from gpubridge.compression import BLOCK, payload_nbytes
 
 #: Values per program for bf16, which has no scale blocks.
 BF16_BLOCK = 1024
+#: Triton options for every launch: no fused multiply-adds, so each product is rounded
+#: on its own, as in the reference. scripts/gpu/bench_compression.py --fp-fusion turns
+#: fusion back on, to time what this costs.
+LAUNCH_OPTIONS = {"enable_fp_fusion": False}
 
 
 @triton.jit
@@ -30,11 +38,22 @@ def _pow2(exponent):
 
 
 @triton.jit
+def _saturate(v):
+    """v clamped to float32's finite range, FLT_MAX; NaN stays NaN."""
+    v = tl.where(v > 3.4028234663852886e38, 3.4028234663852886e38, v)
+    return tl.where(v < -3.4028234663852886e38, -3.4028234663852886e38, v)
+
+
+@triton.jit
 def _prepare(x_ptr, res_ptr, offs, mask, EF: tl.constexpr):
-    v = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    finite = (x == x) & (tl.abs(x) != float("inf"))  # in x's own dtype
+    v = x.to(tl.float32)
+    v = tl.where(finite, _saturate(v), v)
     if EF:
         v = v + tl.load(res_ptr + offs, mask=mask, other=0.0)
-    finite = (v == v) & (tl.abs(v) != float("inf"))
+        v = tl.where(finite, _saturate(v), v)
+    finite = finite & (v == v)
     tiny = finite & (tl.abs(v) < 7.888609052210118e-31)  # 2^-100
     return tl.where(tiny, 0.0, v), finite
 
@@ -42,7 +61,7 @@ def _prepare(x_ptr, res_ptr, offs, mask, EF: tl.constexpr):
 @triton.jit
 def _encode_e4m3(q):
     sign = tl.where(q < 0, 0x80, 0)
-    a = tl.abs(q)
+    a = tl.minimum(tl.abs(q), 448.0)  # saturates, in blocks whose scale exponent is capped
     bits = a.to(tl.int32, bitcast=True)
     exp = bits >> 23
     mant = bits & 0x7FFFFF
@@ -80,6 +99,13 @@ def _bf16_bits(v):
 
 
 @triton.jit
+def _bf16_codes(v):
+    """bf16 mode's codes: a finite value rounding to ±inf saturates to bfloat16's largest."""
+    code = _bf16_bits(v)
+    return tl.where((code & 0x7FFF) == 0x7F80, code - 1, code)
+
+
+@triton.jit
 def _store(out_ptr, offs, acc, mask, OUT_BF16: tl.constexpr):
     if OUT_BF16:  # out_ptr is the output viewed as int16
         tl.store(out_ptr + offs, _bf16_bits(acc).to(tl.int16), mask=mask)
@@ -98,7 +124,7 @@ def _quantize_fp8(x_ptr, res_ptr, scale_ptr, code_ptr, n, BLOCK_SIZE: tl.constex
     amax = tl.max(tl.abs(kept), axis=0)
     bits = amax.to(tl.int32, bitcast=True)
     k = ((bits >> 23) & 0xFF) - 135 + ((bits & 0x7FFFFF) > 0x600000).to(tl.int32)
-    k = tl.where(amax == 0, 0, k)
+    k = tl.where(amax == 0, 0, tl.minimum(k, 119))  # MAX_SCALE_EXP: 448 * 2^k stays finite
     scale = _pow2(k)
     code = tl.where(finite, _encode_e4m3(kept * _pow2(-k)), 0x7F)
     tl.store(code_ptr + offs, code.to(tl.uint8), mask=mask)
@@ -114,7 +140,7 @@ def _quantize_bf16(x_ptr, res_ptr, code_ptr, n, BLOCK_SIZE: tl.constexpr, EF: tl
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < n
     v, finite = _prepare(x_ptr, res_ptr, offs, mask, EF)
-    code = _bf16_bits(v)
+    code = tl.where(finite, _bf16_codes(v), _bf16_bits(v))
     tl.store(code_ptr + offs, code.to(tl.int16), mask=mask)
     if EF:
         sent = (code << 16).to(tl.float32, bitcast=True)
@@ -162,13 +188,15 @@ def quantize(mode: str, x: torch.Tensor, residual: torch.Tensor | None,
     if mode == "bf16":
         codes = payload[:2 * n].view(torch.int16)
         _quantize_bf16[(triton.cdiv(n, BF16_BLOCK),)](flat, res, codes, n,
-                                                      BLOCK_SIZE=BF16_BLOCK, EF=ef)
+                                                      BLOCK_SIZE=BF16_BLOCK, EF=ef,
+                                                      **LAUNCH_OPTIONS)
         payload[2 * n:].zero_()
     elif mode == "fp8":
         nb = triton.cdiv(n, BLOCK)
         scales = payload[:4 * nb].view(torch.float32)
         codes = payload[4 * nb:4 * nb + n]
-        _quantize_fp8[(nb,)](flat, res, scales, codes, n, BLOCK_SIZE=BLOCK, EF=ef)
+        _quantize_fp8[(nb,)](flat, res, scales, codes, n, BLOCK_SIZE=BLOCK, EF=ef,
+                             **LAUNCH_OPTIONS)
         payload[4 * nb + n:].zero_()
     else:
         raise ValueError(f"unknown compression mode {mode!r}")
@@ -188,12 +216,13 @@ def dequantize_accumulate(mode: str, payloads: torch.Tensor, out: torch.Tensor) 
     if mode == "bf16":
         codes = payloads.view(torch.int16)  # (members, row / 2)
         _dequantize_bf16[(triton.cdiv(n, BF16_BLOCK),)](codes, flat, n, members, row // 2,
-                                                        BLOCK_SIZE=BF16_BLOCK, OUT_BF16=out_bf16)
+                                                        BLOCK_SIZE=BF16_BLOCK, OUT_BF16=out_bf16,
+                                                        **LAUNCH_OPTIONS)
     elif mode == "fp8":
         nb = triton.cdiv(n, BLOCK)
         scales = payloads.view(torch.float32)  # (members, row / 4): the first nb are scales
         codes = payloads[:, 4 * nb:]
         _dequantize_fp8[(nb,)](scales, codes, flat, n, members, row // 4, row,
-                               BLOCK_SIZE=BLOCK, OUT_BF16=out_bf16)
+                               BLOCK_SIZE=BLOCK, OUT_BF16=out_bf16, **LAUNCH_OPTIONS)
     else:
         raise ValueError(f"unknown compression mode {mode!r}")
