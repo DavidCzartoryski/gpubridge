@@ -33,6 +33,8 @@ END_TO_END = {
     "check.py": "every job below, and test_gpu_kit.py",
     "bench_all_reduce.py": "test_step_03, 04, 05, 07, the node pair",
     "bench_compression.py": "test_step_04, 07, the node pair, test_amd_node_job",
+    "diag_fp8_residual.py": "test_compression_kernels.py: on CPU through Triton's interpreter, "
+                            "and with a stand-in device that fuses the residual's multiply-add",
     "summarize.py": "every job below",
     "probe.py": "test_step_01 and 07 (fails on CPU: no GPU)",
     "device_map.py": "test_step_03 (fails on CPU: no GPU)",
