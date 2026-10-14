@@ -29,6 +29,23 @@ so a script bug shows up before it can cost GPU time.
   `STEP_MARGIN` (120 s), so a single hung launch is stopped and recorded
   before Slurm ends the job: step 01's 10 minutes give 480 s.
 
+**No BLAS in the checks.** The stream-ordering checks hold their input back
+behind queued GPU work so that a copy that didn't wait would read stale data.
+That work is a spin kernel (`gpukit.queue_gpu_delay`, `torch.cuda._sleep`
+calibrated once per device), not matmuls: some ROCm wheels have no BLAS
+kernels for older GPUs (gfx906), and gpubridge needs none. To show that the
+GPU tests still catch what they guard,
+[`stream_mutations.py`](../scripts/gpu/stream_mutations.py) undoes each
+ordering fix in turn (`GPUBRIDGE_TEST_MUTATION`) and checks that its test
+fails on wrong values, and that the tests pass without one (one GPU).
+
+**Triton's kernel cache.** Explorer jobs build Triton kernels in a node-local
+cache at a fixed path, `/tmp/gpubridge-triton-$USER`, filled from, and added
+to, `$WORK_DIR/triton-cache` (`TRITON_CACHE_STORE`; `triton_cache_begin` in
+`common.sh`). The path stays the same because Triton's cache names its files
+by absolute path. A `TRITON_CACHE_DIR` you set wins. `time_triton_cache.py`
+times builds and loads by cache location.
+
 **NCCL/RCCL logs.** Every step runs with `NCCL_DEBUG=INFO`, written to
 `results/<target>/nccl/<step>/<host>.<pid>.log` instead of the
 console. When a step fails, the last 40 lines of each of its logs are appended

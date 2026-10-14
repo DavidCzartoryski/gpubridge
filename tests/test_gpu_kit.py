@@ -1020,8 +1020,9 @@ def test_target_match_rules(target, capability, arch_list, match):
     assert gpukit.target_match(target, capability, arch_list) == match
 
 
-def run_probe(monkeypatch, tmp_path, devices: list, *, nccl: bool = True) -> int:
-    """probe.py's main() on a made-up environment."""
+def run_probe(monkeypatch, tmp_path, devices: list, *, nccl: bool = True,
+              blas: dict | None = None) -> int:
+    """probe.py's main() on a made-up environment (BLAS available unless ``blas``)."""
     import gpukit
     import probe
 
@@ -1029,8 +1030,232 @@ def run_probe(monkeypatch, tmp_path, devices: list, *, nccl: bool = True) -> int
            "probe": {"nccl_available": nccl, "gloo_available": True}, "torch": "2.14.1+cu126",
            "torch_cuda": "12.6", "torch_hip": None, "nccl_version": "2.21.5"}
     monkeypatch.setattr(gpukit, "environment", lambda: env)
+    monkeypatch.setattr(probe, "blas_check", lambda index: blas or {"blas_available": True})
     monkeypatch.setattr(sys, "argv", ["probe.py", "--out", str(tmp_path)])
     return probe.main()
+
+
+ROCBLAS_ABORT = ("rocBLAS error: Cannot read /venv-rocm/lib/python3.12/site-packages/torch/"
+                 "lib/rocblas/library/TensileLibrary.dat: No such file or directory")
+
+
+def test_probe_records_blas_without_failing_on_it(monkeypatch, tmp_path, capsys):
+    # gfx906 on the ROCm 7.2 wheel: rocBLAS has no kernels for it. gpubridge needs none.
+    mi50 = fake_device(monkeypatch, name="AMD Instinct MI50", capability=(9, 0),
+                       gcn="gfx906:sramecc+:xnack-", hip="7.2.53211", arch_list=["gfx906"])
+    blas = {"blas_available": False, "exit_code": -6, "error": ROCBLAS_ABORT}
+    assert run_probe(monkeypatch, tmp_path, [mi50], blas=blas) == 0
+    assert f"note: no BLAS on device 0 (gpubridge doesn't need it): {ROCBLAS_ABORT}" in (
+        capsys.readouterr().err)
+    stage = next(s for s in json.loads((tmp_path / "probe.json").read_text())["stages"]
+                 if s["name"] == "blas")
+    assert stage["ok"] and stage["blas_available"] is False and stage["exit_code"] == -6
+
+
+def test_blas_check_runs_the_matmul_in_a_child_and_keeps_its_blas_error(monkeypatch):
+    import gpukit
+
+    # rocBLAS aborts the process that asked (exit -6) rather than raise.
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, -6, stdout="",
+                                           stderr=f"some warning\n{ROCBLAS_ABORT}\n")
+
+    monkeypatch.setattr(gpukit.subprocess, "run", fake_run)
+    assert gpukit.blas_check(0) == {"blas_available": False, "exit_code": -6,
+                                    "error": ROCBLAS_ABORT}
+    assert seen["cmd"][0] == sys.executable and "cuda:0" in seen["cmd"][-1]
+    monkeypatch.setattr(gpukit.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 0, stdout="64.0\n", stderr=""))
+    assert gpukit.blas_check(0) == {"blas_available": True}
+
+
+def _gpu_tests_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("gpu_tests_mutations",
+                                                  REPO / "tests" / "test_gpu.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_each_stream_mutation_undoes_its_fix_and_names_its_test():
+    from gpubridge import policies, staging, work
+
+    tests = _gpu_tests_module()
+    saved = [(work._Worker, "_run_one"), (staging.CudaStaging, "begin"), (work.Work, "wait"),
+             (policies.PipelinedReduceBridgeBroadcast, "_pipeline")]
+    originals = [getattr(cls, name) for cls, name in saved]
+    try:
+        for name, (_, test) in tests.MUTATIONS.items():
+            before = [getattr(cls, attr) for cls, attr in saved]
+            tests.apply_mutation(name)
+            after = [getattr(cls, attr) for cls, attr in saved]
+            assert sum(a is not b for a, b in zip(before, after, strict=True)) == 1, name
+            assert hasattr(tests, test), test  # the guarding test exists
+    finally:
+        for (cls, attr), original in zip(saved, originals, strict=True):
+            setattr(cls, attr, original)
+    tests.apply_mutation(None)
+    tests.apply_mutation("")
+    with pytest.raises(ValueError, match="GPUBRIDGE_TEST_MUTATION='nope'"):
+        tests.apply_mutation("nope")
+
+
+def test_stream_mutations_plans_one_run_per_mutation_and_one_without():
+    result = subprocess.run([sys.executable, str(KIT / "stream_mutations.py"), "--dry-run"],
+                            env=clean_env(), capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert len(lines) == 5
+    for name in ("worker-ignores-caller", "staging-ignores-caller", "wait-skips-stream",
+                 "slots-forget-copies-back"):
+        assert any(f"GPUBRIDGE_TEST_MUTATION={name} " in line for line in lines), name
+    assert "GPUBRIDGE_TEST_MUTATION" not in lines[-1] and " or " in lines[-1]
+
+
+@pytest.mark.skipif(torch.cuda.is_available(), reason="checks the refusal without a GPU")
+def test_stream_mutations_says_when_the_gpu_tests_cannot_run(tmp_path):
+    result = subprocess.run([sys.executable, str(KIT / "stream_mutations.py"), "--out",
+                             str(tmp_path), "--mutation", "slots-forget-copies-back"],
+                            env=clean_env(), capture_output=True, text=True, timeout=600)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "needs a GPU" in result.stderr
+    rows = json.loads((tmp_path / "mutations.json").read_text())
+    assert [row["verdict"] for row in rows] == ["did not run (no GPU?)"] * 2
+
+
+def test_time_triton_cache_finds_each_directorys_filesystem(tmp_path):
+    sys.path.insert(0, str(KIT))
+    import time_triton_cache
+
+    mounts = ("sysfs /sys sysfs rw 0 0\n/dev/sda1 / xfs rw 0 0\n"
+              "tmpfs /tmp tmpfs rw 0 0\nnas:/home /home nfs4 rw 0 0\n"
+              "vast:/projects /projects nfs rw 0 0\n")
+    assert time_triton_cache.filesystem(Path("/home/someuser/.triton"), mounts) == "nfs4"
+    assert time_triton_cache.filesystem(Path("/tmp/x"), mounts) == "tmpfs"
+    assert time_triton_cache.filesystem(Path("/projects/lab/user"), mounts) == "nfs"
+    assert time_triton_cache.filesystem(Path("/opt/x"), mounts) == "xfs"
+    assert len(time_triton_cache.VARIANTS) == 12  # bf16 mode skips 16-bit inputs
+
+
+@pytest.mark.skipif(torch.cuda.is_available(), reason="checks the refusal without a GPU")
+def test_time_triton_cache_needs_a_gpu():
+    result = subprocess.run([sys.executable, str(KIT / "time_triton_cache.py")],
+                            env=clean_env(), capture_output=True, text=True, timeout=120)
+    assert result.returncode == 2 and "needs a GPU" in result.stderr
+
+
+def _triton_cache(tmp_path, *, store: str | None, preset: str | None = None,
+                  job: str = "77") -> str:
+    """triton_cache_begin, a new kernel built into the cache, triton_cache_end."""
+    script = f"""
+source {KIT}/common.sh
+RESULTS={tmp_path}
+triton_cache_begin
+echo "dir=${{TRITON_CACHE_DIR:-}}"
+new="${{TRITON_CACHE_DIR:-}}/newkernel"
+[ -z "${{TRITON_CACHE_DIR:-}}" ] || {{ mkdir -p "$new" && touch "$new/__grp__k.json"; }}
+finish >/dev/null 2>&1 || true
+left=no
+[ -z "${{TRITON_CACHE_DIR:-}}" ] || [ ! -d "$TRITON_CACHE_DIR" ] || left=yes
+echo "local_left=$left"
+"""
+    env = {"TRITON_CACHE_LOCAL": str(tmp_path / "node" / "triton"), "SLURM_JOB_ID": job}
+    if store is not None:
+        env["TRITON_CACHE_STORE"] = store
+    if preset:
+        env["TRITON_CACHE_DIR"] = preset
+    (tmp_path / "node").mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(["bash", "-c", script], env=clean_env(**env), capture_output=True,
+                            text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_a_job_builds_triton_kernels_in_a_node_local_cache_kept_in_the_store(tmp_path):
+    store = tmp_path / "store"
+    (store / "oldkernel").mkdir(parents=True)
+    (store / "oldkernel" / "k.json").write_text("{}")
+    out = _triton_cache(tmp_path, store=str(store))
+    local = tmp_path / "node" / "triton"
+    assert f"dir={local}" in out  # filled from the store, then used for the job
+    assert (local / "oldkernel" / "k.json").exists()
+    assert (store / "newkernel" / "__grp__k.json").exists()  # the job's new kernels kept
+    assert not list(store.glob(".incoming-*"))  # added by rename, nothing half-copied
+    # The same path for the next job: Triton's group files name kernels by absolute
+    # path, so the store's kernels only load where they were built.
+    assert f"dir={local}" in _triton_cache(tmp_path, store=str(store), job="78")
+    assert "local_left=yes" in out  # kept: other jobs on the node may be using it
+
+
+def test_a_triton_cache_directory_not_our_own_is_not_used(tmp_path):
+    # /tmp is shared, and Triton imports compiled code from its cache: a symlink (or a
+    # directory someone else made) is refused, and Triton keeps its default.
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    link = tmp_path / "node" / "triton"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target)
+    out = _triton_cache(tmp_path, store=str(tmp_path / "store"))
+    assert "dir=\n" in out
+
+
+def test_only_finished_kernels_reach_the_store(tmp_path):
+    store = tmp_path / "store"
+    local = tmp_path / "node" / "triton"
+    (local / "building").mkdir(parents=True)  # no __grp__ file yet: another job's build
+    (local / "building" / "k.cubin").write_text("half")
+    _triton_cache(tmp_path, store=str(store))
+    assert not (store / "building").exists()
+    assert not list(store.glob(".incoming-*"))
+
+
+def test_a_set_triton_cache_dir_or_an_empty_store_leaves_triton_alone(tmp_path):
+    assert "dir=/mine" in _triton_cache(tmp_path / "a", store=str(tmp_path / "s"),
+                                        preset="/mine")
+    assert "dir=\n" in _triton_cache(tmp_path / "b", store="")
+    assert "dir=\n" in _triton_cache(tmp_path / "c", store=None)  # no store: off
+
+
+def test_queue_gpu_delay_does_nothing_on_cpu():
+    import gpukit
+
+    gpukit.queue_gpu_delay(torch.device("cpu"), 1.0)  # returns at once, no error
+    gpukit.queue_gpu_delay(torch.device("cpu"), 0)
+
+
+def test_no_busy_work_uses_blas():
+    # Busy work stays BLAS-free: the ROCm wheels' rocBLAS has no kernels for gfx906.
+    for path in (KIT / "check.py", REPO / "tests" / "test_gpu.py"):
+        text = path.read_text()
+        assert not re.search(r"\w @ \w|\.mm\(|\bmatmul\(|\bbmm\(|\blinear\(", text), path.name
+
+
+ROCM_SMI_DRIVER = 'name, value\n"Driver version", "5.14.0-611.5.1.el9_7.x86_64"\n'
+
+
+@pytest.mark.parametrize(("raw", "want"), [
+    (ROCM_SMI_DRIVER, "5.14.0-611.5.1.el9_7.x86_64"),       # rocm-smi 6.x and later
+    ("device,Driver version\ncard0,6.7.0\ncard1,6.7.0\n", "6.7.0"),  # older, per card
+    ("550.54.15", "550.54.15"),                               # nvidia-smi: as is
+    (None, None),
+])
+def test_driver_text_reads_rocm_smi_csv(raw, want):
+    assert validation_tables.driver_text(raw) == want
+
+
+def test_amd_driver_version_is_recorded_as_the_value(monkeypatch):
+    import gpukit
+
+    monkeypatch.setattr(torch.version, "cuda", None)
+    monkeypatch.setattr(torch.version, "hip", "7.2.53211")
+    monkeypatch.setattr(gpukit, "_read", lambda path: None)  # an in-tree amdgpu
+    monkeypatch.setattr(gpukit, "_command", lambda *args: ROCM_SMI_DRIVER.strip())
+    assert gpukit.driver_version() == "5.14.0-611.5.1.el9_7.x86_64"
 
 
 def test_probe_passes_a_gpu_its_build_covers(monkeypatch, tmp_path, capsys):

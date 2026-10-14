@@ -23,6 +23,8 @@
 #                    failure report and the NCCL/RCCL logs)
 #   job_started      start $RESULTS/job.jsonl, the job's start, errors and end
 #   rocm_asic_ids PYTHON  point a ROCm wheel's libdrm at the amdgpu.ids it ships
+#   triton_cache_begin, triton_cache_end   a node-local Triton cache at a fixed path,
+#                    filled from and saved to TRITON_CACHE_STORE
 #   finish      print the step table; exit non-zero if any step failed
 #   load_env_file F  read NAME=value settings from file F, if it exists
 
@@ -138,6 +140,66 @@ print(d if d and os.path.isfile(os.path.join(d, "amdgpu.ids")) else "")' 2>/dev/
     [ -n "$dir" ] || return 0
     export AMDGPU_ASIC_ID_TABLE_PATHS="$dir"
     log "AMDGPU_ASIC_ID_TABLE_PATHS=$dir: the GPU-name table this ROCm build ships"
+}
+
+# triton_cache_begin: point Triton's kernel cache at a node-local directory, the same
+# path on every node and in every job (TRITON_CACHE_LOCAL, default
+# /tmp/gpubridge-triton-$USER), filled from TRITON_CACHE_STORE (persistent, e.g. in the
+# project space); triton_cache_end (called by finish) adds the kernels the job built
+# to the store. The path must not change: Triton's group files name their kernels by
+# absolute path and rebuild a kernel whose path is gone. Triton's default cache is
+# ~/.triton/cache, often network storage that each kernel build writes file by file.
+# Only the batch node's kernels are kept; other nodes of a job build their own. A
+# TRITON_CACHE_DIR you set wins, and an empty TRITON_CACHE_STORE turns this off. Never
+# fails a job: without the directory, Triton keeps its default.
+triton_cache_begin() {
+    [ -z "${TRITON_CACHE_DIR:-}" ] && [ -n "${TRITON_CACHE_STORE:-}" ] || return 0
+    local dir="${TRITON_CACHE_LOCAL:-/tmp/gpubridge-triton-${USER:-$(id -un)}}"
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '+ TRITON_CACHE_DIR=%s, filled from %s\n' "$dir" "$TRITON_CACHE_STORE"
+        return 0
+    fi
+    # Only a directory of our own: Triton imports compiled code from its cache, and
+    # /tmp is shared with every user of the node.
+    if ! mkdir -p "$dir" 2>/dev/null || [ -L "$dir" ] || [ ! -O "$dir" ] ||
+        [ ! -w "$dir" ]; then
+        log "warning: $dir isn't a directory of your own; Triton keeps its default cache"
+        return 0
+    fi
+    chmod 700 "$dir" 2>/dev/null || true
+    # Entries are whole directories, added to the store by rename (triton_cache_end),
+    # so these are complete ones; another job may be adding some meanwhile.
+    local entry
+    for entry in "$TRITON_CACHE_STORE"/*/; do
+        [ -d "$entry" ] || continue
+        [ -e "$dir/$(basename "$entry")" ] || cp -a "$entry" "$dir/" 2>/dev/null || true
+    done
+    TRITON_CACHE_SAVE="$dir"
+    export TRITON_CACHE_DIR="$dir"
+    log "Triton kernel cache: $dir, node-local; $(find "$dir" -mindepth 1 -maxdepth 1 \
+        ! -name '.*' | wc -l | tr -d ' ') entries, filled from $TRITON_CACHE_STORE"
+}
+
+triton_cache_end() {
+    [ -n "${TRITON_CACHE_SAVE:-}" ] && [ -d "$TRITON_CACHE_SAVE" ] || return 0
+    local entry name incoming
+    if mkdir -p "$TRITON_CACHE_STORE" 2>/dev/null; then
+        for entry in "$TRITON_CACHE_SAVE"/*/; do
+            [ -d "$entry" ] || continue
+            name=$(basename "$entry")
+            [ -e "$TRITON_CACHE_STORE/$name" ] && continue
+            # Finished kernels only: Triton writes the group file last, and another job
+            # on this node may still be building into the same directory.
+            compgen -G "$entry/__grp__*" >/dev/null || continue
+            # Copied under a temporary name, then renamed: never seen half-written.
+            incoming=$(mktemp -d "$TRITON_CACHE_STORE/.incoming-XXXXXX" 2>/dev/null) || continue
+            if cp -a "$entry" "$incoming/$name" 2>/dev/null; then
+                mv -T "$incoming/$name" "$TRITON_CACHE_STORE/$name" 2>/dev/null || true
+            fi
+            rm -rf "$incoming"
+        done
+    fi
+    TRITON_CACHE_SAVE=""  # the local directory stays: other jobs on this node may use it
 }
 
 # job_event EVENT [JSON MEMBERS]: append an event to job.jsonl, once job_started ran.
@@ -272,6 +334,7 @@ negative_step() {
 }
 
 finish() {
+    triton_cache_end
     log "passed: ${PASSED_STEPS[*]:-none}"
     job_event finished "\"failed\": ${#FAILED_STEPS[@]}"
     if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then

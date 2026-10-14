@@ -298,6 +298,21 @@ def test_probe_fail_lines_are_the_error_lines(tmp_path, capsys):
     assert code == 1 and "| FAIL target_in_build: device 0 target sm_120" in out
 
 
+def test_an_amd_driver_recorded_as_rocm_smi_csv_reads_as_its_version(tmp_path, capsys):
+    # What an MI50 node's probe recorded, whole: rocm-smi --showdriverversion --csv.
+    path = tmp_path / "amd_node"
+    steps(path, ok("probe"))
+    record = env("mi50-node", gpu="AMD Instinct MI50", device="cuda:0")
+    record["environment"].update(
+        driver_version='name, value\n"Driver version", "5.14.0-611.5.1.el9_7.x86_64"',
+        torch="2.14.1+rocm7.2", torch_cuda=None, torch_hip="7.2.53211")
+    (path / "probe.json").write_text(json.dumps({**record, "script": "scripts/gpu/probe.py"}))
+    code, out = run(tmp_path, capsys=capsys)
+    assert code == 0
+    assert "driver 5.14.0-611.5.1.el9_7.x86_64;" in out
+    assert "Driver version" not in out and "name, value" not in out
+
+
 def test_cpu_simulation_says_so_and_a_clean_run_passes(tmp_path, capsys):
     path = tmp_path / "sim"
     steps(path, ok("probe"))

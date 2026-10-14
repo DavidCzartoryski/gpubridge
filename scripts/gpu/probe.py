@@ -14,7 +14,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from gpukit import Record
+from gpukit import Record, blas_check
 
 
 def main() -> int:
@@ -52,6 +52,14 @@ def main() -> int:
         entry["nccl_available"] = probe["nccl_available"]
         entry["gloo_available"] = probe["gloo_available"]
         entry["ok"] = probe["gloo_available"] and (probe["nccl_available"] or args.allow_no_gpu)
+    with rec.stage("blas") as entry:
+        # Informational: gpubridge never needs BLAS, so this never fails the probe.
+        if env["device_count"]:
+            entry.update(blas_check(0))
+            if not entry["blas_available"]:
+                print(f"note: no BLAS on device 0 (gpubridge doesn't need it): "
+                      f"{entry['error']}", file=sys.stderr)
+        entry["ok"] = True
     devices = ", ".join(f"{d['name']} ({d['target']}, {d['target_match'] or 'not in the build'})"
                         for d in env["devices"] if isinstance(d, dict)) or "none"
     print(f"torch {env['torch']} (cuda {env['torch_cuda']}, hip {env['torch_hip']}, "

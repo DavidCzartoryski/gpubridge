@@ -34,6 +34,10 @@ END_TO_END = {
     "check.py": "every job below, and test_gpu_kit.py",
     "bench_all_reduce.py": "test_step_03, 04, 05, 07, the node pair",
     "bench_compression.py": "test_step_04, 07, the node pair, test_amd_node_job",
+    "stream_mutations.py": "test_gpu_kit.py: its plan, each mutation, and its refusal without a "
+                           "GPU (the mutated tests themselves need one)",
+    "time_triton_cache.py": "test_gpu_kit.py: filesystems and its refusal without a GPU (the "
+                            "timings need one)",
     "diag_fp8_residual.py": "test_compression_kernels.py: on CPU through Triton's interpreter, "
                             "and with a stand-in device that fuses the residual's multiply-add",
     "summarize.py": "every job below",
@@ -200,6 +204,8 @@ def test_step_01_probe(tmp_path):
     after = log[log.index("step probe FAILED (exit 1)"):]
     assert "the last 20 lines of probe.log, before any torchrun failure report:" in after
     assert "    | FAIL gpus_visible: device_count 0: no GPU visible to PyTorch" in after
+    # Triton's kernels: a node-local cache for the job, kept in WORK_DIR's store.
+    assert "Triton kernel cache: " in log and f"from {tmp_path}/work/triton-cache" in log
     # Each launch's limit stays inside the job's: 10 minutes less 2.
     record = json.loads((out / "probe.json").read_text())
     assert record["environment"]["env"]["STEP_TIMEOUT"] == "480"

@@ -27,6 +27,7 @@ no path is shown. The raw results keep the real names.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import sys
@@ -232,6 +233,26 @@ def _values(records: list[dict[str, Any]], get) -> str:
     return ", ".join(map(str, found)) or "-"
 
 
+def driver_text(raw: str | None) -> str | None:
+    """A driver version as recorded, or the version in ``rocm-smi --showdriverversion
+    --csv`` output, which older records hold whole. rocm-smi writes either ``name,
+    value`` rows (``"Driver version", "5.14.0-611.5.1.el9_7.x86_64"``) or a ``device,
+    Driver version`` header over a row per card."""
+    if not raw or "driver version" not in raw.lower():
+        return raw
+    rows = [[cell.strip() for cell in row]
+            for row in csv.reader(raw.strip().splitlines(), skipinitialspace=True) if row]
+    for row in rows:  # a "Driver version" row
+        if len(row) >= 2 and row[0].lower() == "driver version":
+            return row[1] or None
+    header = [cell.lower() for cell in rows[0]] if rows else []
+    if "driver version" in header and len(rows) > 1:  # a "Driver version" column
+        column = header.index("driver version")
+        values = {row[column] for row in rows[1:] if len(row) > column and row[column]}
+        return ", ".join(sorted(values)) or None
+    return raw
+
+
 def _commit(env: dict[str, Any]) -> str | None:
     commit = env.get("git_commit")
     return f"{commit}+dirty" if commit and env.get("git_dirty") else commit
@@ -272,7 +293,7 @@ def run_row(job: Job, hosts: Hosts) -> dict[str, Any]:
         "hosts": _values(records, lambda e: hosts(e.get("hostname"))),
         "gpus": _values(records, lambda e: [d.get("name") for d in e.get("devices") or []
                                            if isinstance(d, dict)]),
-        "driver": _values(records, lambda e: e.get("driver_version")),
+        "driver": _values(records, lambda e: driver_text(e.get("driver_version"))),
         "torch": _values(records, lambda e: e.get("torch")),
         "toolkit": _values(records, _toolkit),
         "collectives": _values(records, _collectives),
