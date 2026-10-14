@@ -159,6 +159,8 @@ def run_policy(topology, policy: str, args, samples: dict[str, list[int]]) -> No
                           same_calls("world", topology), numel, async_op, False))
     tensors = {numel: torch.zeros(numel) for numel in args.numels}
     if args.profile:
+        if args.observer:
+            gpubridge.add_observer(quiet)
         profile(topology, policy, tensors[args.numels[0]], args)
         return
     for _ in range(args.rounds):
@@ -228,6 +230,7 @@ def parse(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--rounds", type=int, default=5)
     p.add_argument("--all-ranks", action="store_true", help="pool every rank's times (default rank 0)")
     p.add_argument("--profile", metavar="POLICY", help="cProfile rank 0's sync calls instead")
+    p.add_argument("--observer", action="store_true", help="with --profile: an observer attached")
     p.add_argument("--stub-comm", action="store_true",
                    help="torch.distributed's calls return at once: gpubridge's own work only")
     p.add_argument("--out", type=Path, help="write the rows as JSON here")
