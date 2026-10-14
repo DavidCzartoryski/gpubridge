@@ -55,8 +55,9 @@ from gpubridge._compression_kernels import _decode_e4m3, _prepare  # noqa: E402
 
 DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32,
           "float64": torch.float64}
-#: The smallest normal float32, 2^-126, and the largest finite one.
+#: The smallest normal float32, 2^-126, the smallest subnormal and the largest finite one.
 MIN_NORMAL = 2.0**-126
+MIN_SUBNORMAL = 2.0**-149
 FLT_MAX = torch.finfo(torch.float32).max
 
 
@@ -120,7 +121,8 @@ def code_facts(compiled) -> str:
                 + ", ".join(f"{name}: {count}" for name, count in counts.items()))
     if "amdgcn" in asm:
         gcn = asm["amdgcn"]
-        fma = len(re.findall(r"\bv_(?:fma|fmac|mad|mac)\w*_f32\b", gcn))
+        # v_fma_f32, v_fmac_f32_e32, v_pk_fma_f32, v_dual_fmac_f32, v_mad_f32, ...
+        fma = len(re.findall(r"\bv_\w*?(?:fma|mac|mad)\w*?f32\w*", gcn))
         return f"AMDGCN: fma/mad f32 instructions: {fma}"
     return "not available (Triton's interpreter, or no PTX or AMDGCN in the compiled kernel)"
 
@@ -163,6 +165,8 @@ def kind32(value: float) -> str:
         return "inf"
     if value == 0:
         return "zero"
+    if abs(value) < MIN_SUBNORMAL:  # a float64 input: float32 rounds it to 0 or 2^-149
+        return "below float32's smallest subnormal"
     if abs(value) < MIN_NORMAL:
         return "SUBNORMAL"
     return "normal" if abs(value) <= FLT_MAX else "beyond float32's range"
@@ -213,17 +217,27 @@ def diagnose(dtype: torch.dtype, n: int, limit: int, device: str) -> bool:
         print(f"enable_fp_fusion=False: launch failed: {type(exc).__name__}: {exc}")
         nofuse = nofuse_r = None
 
-    # The compiled kernel's code, from a default launch (cached: the same binary).
-    again_r = on(prior)
-    compiled = launch(on(x), again_r, torch.zeros_like(ref_p, device=device))
+    # The compiled kernel's code, from a default launch (cached: the same binary). This
+    # and the probe are extras: if one fails, the table below is still printed.
+    compiled = again_r = dev_v = dev_sent = None
+    try:
+        again_r = on(prior)
+        compiled = launch(on(x), again_r, torch.zeros_like(ref_p, device=device))
+        again_r = again_r.cpu()
+    except Exception as exc:
+        print(f"second default launch failed: {type(exc).__name__}: {exc}")
+        again_r = None
 
     # The probe: v and decoded * scale on the device.
-    dev_v = torch.empty(n, device=device)
-    dev_sent = torch.empty(n, device=device)
-    scales_d, codes_d = on(dev_scales), on(dev_p[4 * nb:4 * nb + n])
-    _probe[(nb,)](on(x).reshape(-1), on(prior), scales_d, codes_d, dev_v,
-                  dev_sent, n, BLOCK_SIZE=C.BLOCK)
-    dev_v, dev_sent = dev_v.cpu(), dev_sent.cpu()
+    try:
+        v_d = torch.empty(n, device=device)
+        sent_d = torch.empty(n, device=device)
+        scales_d, codes_d = on(dev_scales), on(dev_p[4 * nb:4 * nb + n])
+        _probe[(nb,)](on(x).reshape(-1), on(prior), scales_d, codes_d, v_d, sent_d, n,
+                      BLOCK_SIZE=C.BLOCK)
+        dev_v, dev_sent = v_d.cpu(), sent_d.cpu()
+    except Exception as exc:
+        print(f"probe kernel failed: {type(exc).__name__}: {exc}")
 
     same_codes = torch.equal(ref_codes, dev_codes)
     same_scales = torch.equal(bits32(ref_scales), bits32(dev_scales))
@@ -238,17 +252,18 @@ def diagnose(dtype: torch.dtype, n: int, limit: int, device: str) -> bool:
           f" scales {'identical' if same_scales else 'differ'}, {nb} block(s))")
     print(f"residual: {len(r_diff)} of {n} differ in their bits"
           + (f"; indices {r_diff[:limit].tolist()}" if len(r_diff) else ""))
-    if not torch.equal(bits32(again_r), bits32(dev_r)):
+    if again_r is not None and not torch.equal(bits32(again_r), bits32(dev_r)):
         print("note: a second default launch gave a different residual from the first")
     if nofuse_r is not None:
         nd = int((bits32(ref_r) != bits32(nofuse_r)).sum())
         print(f"enable_fp_fusion=False: {nd} of {n} residuals differ from the reference")
-    vd = (bits32(v) != bits32(dev_v)).nonzero().flatten()
-    print(f"probe, v on the device: {len(vd)} of {n} differ from the reference's v"
-          + (f" (indices {vd[:limit].tolist()})" if len(vd) else ""))
-    sd = (bits32(sent) != bits32(dev_sent)) & ~(sent.isnan() & dev_sent.isnan())
-    print(f"probe, decoded * scale on the device: {int(sd.sum())} of {n} differ from the"
-          " reference's sent")
+    if dev_v is not None and dev_sent is not None:
+        vd = (bits32(v) != bits32(dev_v)).nonzero().flatten()
+        print(f"probe, v on the device: {len(vd)} of {n} differ from the reference's v"
+              + (f" (indices {vd[:limit].tolist()})" if len(vd) else ""))
+        sd = (bits32(sent) != bits32(dev_sent)) & ~(sent.isnan() & dev_sent.isnan())
+        print(f"probe, decoded * scale on the device: {int(sd.sum())} of {n} differ from the"
+              " reference's sent")
     print(f"compiled kernel: {code_facts(compiled)}")
     if nofuse_r is not None:
         print(f"compiled kernel, enable_fp_fusion=False: {code_facts(nofuse)}")
@@ -268,7 +283,8 @@ def diagnose(dtype: torch.dtype, n: int, limit: int, device: str) -> bool:
             ("x (input)", show_input(x[i]), float(x[i])),
             ("prior residual", show32(prior[i]), float(prior[i])),
             ("v = float32(x) + prior", show32(v[i]), float(v[i])),
-            ("v on the device (probe)", show32(dev_v[i]), float(dev_v[i])),
+            *([("v on the device (probe)", show32(dev_v[i]), float(dev_v[i]))]
+              if dev_v is not None else []),
             ("block amax", show32(amax[i]), float(amax[i])),
             ("scale exponent k", f"{int(k[i])} (scale 2^{int(k[i])} = {float(scale[i]):.9g})",
              None),
@@ -278,7 +294,8 @@ def diagnose(dtype: torch.dtype, n: int, limit: int, device: str) -> bool:
             ("code (device)", f"0x{int(dev_codes[i]):02x}", None),
             ("decoded code", show32(decoded[i]), float(decoded[i])),
             ("sent = decoded * scale", show32(sent[i]), float(sent[i])),
-            ("sent on the device (probe)", show32(dev_sent[i]), float(dev_sent[i])),
+            *([("sent on the device (probe)", show32(dev_sent[i]), float(dev_sent[i]))]
+              if dev_sent is not None else []),
             ("fused: v - decoded * scale", show32(fused[i]), float(fused[i])),
             ("residual, reference", show32(ref_r[i]), float(ref_r[i])),
             ("residual, device", show32(dev_r[i]), float(dev_r[i])),

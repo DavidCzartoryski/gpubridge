@@ -200,6 +200,11 @@ def test_the_fp8_residual_diagnostic_reruns_the_gpu_test_case():
         assert torch.equal(diag.prior_residual(n), expected)
 
 
+#: The script's own run on a GPU is the real thing; these check it through the interpreter.
+interpreter_only = pytest.mark.skipif(GPU, reason="on a GPU, run the script itself")
+
+
+@interpreter_only
 def test_the_fp8_residual_diagnostic_finds_nothing_where_the_kernels_match(capsys):
     assert _diagnostic().main(["--n", "255", "--dtype", "float32", "float16"]) == 0
     out = capsys.readouterr().out
@@ -207,6 +212,7 @@ def test_the_fp8_residual_diagnostic_finds_nothing_where_the_kernels_match(capsy
     assert "all payloads and residuals match the reference" in out
 
 
+@interpreter_only
 def test_the_fp8_residual_diagnostic_shows_a_fused_residual(monkeypatch, capsys):
     # A stand-in for a device that fuses v - decoded * scale into one rounding:
     # the reference, with that residual instead.
