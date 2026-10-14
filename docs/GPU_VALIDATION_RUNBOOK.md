@@ -37,7 +37,20 @@ kernels for older GPUs (gfx906), and gpubridge needs none. To show that the
 GPU tests still catch what they guard,
 [`stream_mutations.py`](../scripts/gpu/stream_mutations.py) undoes each
 ordering fix in turn (`GPUBRIDGE_TEST_MUTATION`) and checks that its test
-fails on wrong values, and that the tests pass without one (one GPU).
+fails on wrong values, and that the tests pass without one (one GPU):
+
+```bash
+# on Explorer (an AMD node: --partition=sharing, its --gres type, venv-rocm)
+srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 --mem=32G --time=00:45:00 \
+    "$PROJECT_DIR/$USER/gpubridge-gpu/venv/bin/python" scripts/gpu/stream_mutations.py \
+    --out results/explorer/stream_mutations
+# anywhere else with a GPU
+python scripts/gpu/stream_mutations.py --out results/stream_mutations
+```
+
+It ends with "every mutation was caught, and the tests pass without one", or
+names the run that wasn't, and writes `mutations.json`. Exit 2 means the GPU
+tests didn't run.
 
 **Triton's kernel cache.** Explorer jobs build Triton kernels in a node-local
 cache at a fixed path, `/tmp/gpubridge-triton-$USER`, filled from, and added
