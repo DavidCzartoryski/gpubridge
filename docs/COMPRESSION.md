@@ -1,11 +1,11 @@
 # Bridge compression
 
-**Opt-in, changes results, not validated on GPUs.** The kernels' tests have
-run on one GPU, a V100, where two failed: the fp8 error-feedback residual
+**Opt-in, changes results, not validated on GPUs.** On the first GPU run, a
+V100, two of the kernel tests failed: the fp8 error-feedback residual
 differed from the reference, from a codec overflow and a fused multiply-add,
-both fixed since (#50). No GPU run has checked the fix yet. Everything else
-here has run on CPU only: the Triton kernels in Triton's interpreter, and
-whole jobs in simulation mode.
+both fixed since (#50). No GPU run has checked the fix yet. Otherwise
+everything here has run on CPU only: the Triton kernels in Triton's
+interpreter, and whole jobs in simulation mode.
 [HARDWARE_VALIDATION.md](../HARDWARE_VALIDATION.md) items 28 and 29 list what
 a GPU run must show.
 
@@ -109,15 +109,18 @@ in float32), the value dequantized from its code differs from v by at most:
   E4M3's subnormal range.
 - **Beyond a mode's largest value:** `fp8` sends a value beyond 448 · 2^119
   (about 2.98e38, 87.5% of float32's maximum) as ±448 · 2^119, an error of up
-  to 2^-3 |v|. `bf16` sends one beyond bfloat16's largest (about 3.39e38) as
-  that, within its bound above. Error feedback keeps the excess for the next
-  step.
+  to 2^-3 |v|. `bf16` sends one that would round past bfloat16's largest
+  (from about 3.3961e38) as that largest, 3.3895e38, within its bound above.
+  The residual keeps the excess, but a value that stays that large is sent
+  as the largest again next step: then what crosses falls short every step.
 - **Either mode:** values below 2^-100 become 0.
 
 The result's error, against the exact sum of the island sums, is the sum of
 those bounds over the islands, plus float32 rounding while adding (at most
 (islands - 1) * 2^-24 of the summed magnitudes), plus one rounding to the
-output dtype. The tests check results against exactly this bound, and that
+output dtype. That holds while everything stays in range: not for a float64
+value beyond float32's, nor for a sum that overflows float32 or an output
+dtype (below). The tests check results against exactly this bound, and that
 it isn't loose: one quantization of 4,096 values over many magnitudes comes
 within 0.94 (`fp8`) and 0.97 (`bf16`) of it.
 
@@ -131,8 +134,12 @@ them: NaN and ±inf become NaN in `fp8`, and stay themselves in `bf16`. Their
 residual is 0, so one bad step doesn't poison the next. **Finite values stay
 finite:** one beyond a mode's largest is sent as that largest (above), and a
 finite float64 beyond float32's range, or a value its residual pushes past it,
-counts as float32's largest. So every residual is finite too. Negative zero
-arrives as zero.
+counts as float32's largest. So every dequantized value and every residual
+is a finite float32. Two things can still overflow, as uncompressed: adding
+the islands' values in float32 (two at 1.7e38 round up to 2^127 each and sum
+to inf, where the exact sum fits), and the result's dtype (a float16 value
+near 65504 can be sent as 65536, inf in float16). Negative zero arrives as
+zero.
 
 ## Error feedback
 
@@ -140,7 +147,9 @@ Each member keeps a float32 residual per buffer: what its last payload left
 out of each value. It adds that to the next call's values before quantizing.
 Summed over steps, what crossed the bridge is then the sum of the values
 minus the last residual. So the accumulated error stays about one step's
-bound instead of growing with the number of steps. The tests check that over
+bound instead of growing with the number of steps. The one exception is
+saturation at float32's largest: once a value plus its residual passes it,
+the part beyond is dropped, every step it does. The tests check that over
 500 steps with the same values every step: without error feedback the error
 ends 240 (`bf16`) to 325 (`fp8`) times larger.
 

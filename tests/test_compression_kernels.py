@@ -184,7 +184,10 @@ def test_kernels_error_feedback_loop_matches_the_reference_and_stays_finite(mode
 
 
 #: Compiles the kernels for NVIDIA targets without a GPU (Triton's own LLVM and ptxas)
-#: and counts fused multiply-adds in their PTX. Prints JSON, or "SKIP: why".
+#: and counts fused multiply-adds in their PTX. Prints JSON, or "SKIP: why" when this
+#: Triton has no offline-compile API of the shape used here. A failing compile fails.
+#: sm_80 and sm_90: every ptxas Triton ships still targets them (CUDA 13's dropped sm_70);
+#: contraction is decided before code generation, so the target doesn't change the answer.
 _PTX_COUNT = r"""
 import json, os, re, sys
 os.environ.pop("TRITON_INTERPRET", None)
@@ -212,21 +215,20 @@ KERNELS = {
                         "members": "i32", "code_stride": "i32", "BLOCK_SIZE": "constexpr",
                         "OUT_BF16": "constexpr"}, {"BLOCK_SIZE": 1024, "OUT_BF16": False}),
 }
+try:
+    sources = {name: ASTSource(fn=fn, signature=signature, constexprs=constexprs)
+               for name, (fn, signature, constexprs) in KERNELS.items()}
+    targets = {arch: GPUTarget("cuda", arch, 32) for arch in (80, 90)}
+except TypeError as exc:
+    print(f"SKIP: this Triton's offline-compile API differs ({exc})"); sys.exit(0)
 counts = {}
-for arch, fusions in ((70, (False, True)), (90, (False,))):
-    for name, (fn, signature, constexprs) in KERNELS.items():
+for arch, fusions in ((80, (False, True)), (90, (False,))):
+    for name, source in sources.items():
         for fuse in fusions:
-            options = {**K.LAUNCH_OPTIONS} if not fuse else {**K.LAUNCH_OPTIONS, "enable_fp_fusion": True}
-            try:
-                kernel = triton.compile(ASTSource(fn=fn, signature=signature, constexprs=constexprs),
-                                        target=GPUTarget("cuda", arch, 32), options=options)
-            except Exception as exc:
-                if "ptxas" in str(exc).lower():
-                    print(f"SKIP: no ptxas for an offline compile ({exc})"); sys.exit(0)
-                raise
-            ptx = kernel.asm["ptx"]
+            options = {**K.LAUNCH_OPTIONS, **({"enable_fp_fusion": True} if fuse else {})}
+            kernel = triton.compile(source, target=targets[arch], options=options)
             counts[f"sm_{arch} {name}{' fusion on' if fuse else ''}"] = len(
-                re.findall(r"\bfma\.rn(?:\.ftz)?\.f32\b", ptx))
+                re.findall(r"\bfma\.rn(?:\.ftz)?\.f32\b", kernel.asm["ptx"]))
 print(json.dumps(counts))
 """
 
@@ -246,8 +248,32 @@ def test_the_kernels_compile_without_fused_multiply_adds():
         pytest.skip(result.stdout.strip())
     counts = json.loads(result.stdout.strip().splitlines()[-1])
     assert {name: c for name, c in counts.items() if "fusion on" not in name and c} == {}
-    assert counts["sm_70 quantize_fp8 float32 fusion on"] > 0
-    assert counts["sm_70 dequantize_fp8 fusion on"] > 0
+    assert counts["sm_80 quantize_fp8 float32 fusion on"] > 0
+    assert counts["sm_80 dequantize_fp8 fusion on"] > 0
+
+
+def test_every_kernel_launch_passes_the_launch_options(monkeypatch):
+    # The compile test above checks what LAUNCH_OPTIONS produce; this, that every launch
+    # uses them.
+    seen = {}
+
+    class Recorder:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: seen.setdefault(self.name, kwargs)
+
+    names = ("_quantize_fp8", "_quantize_bf16", "_dequantize_fp8", "_dequantize_bf16")
+    for name in names:
+        monkeypatch.setattr(K, name, Recorder(name))
+    n = 300
+    for mode in C.MODES:
+        nbytes = C.payload_nbytes(mode, n)
+        K.quantize(mode, torch.zeros(n), torch.zeros(n), torch.zeros(nbytes, dtype=torch.uint8))
+        K.dequantize_accumulate(mode, torch.zeros((2, nbytes), dtype=torch.uint8), torch.zeros(n))
+    assert set(seen) == set(names)
+    assert all(kwargs.get("enable_fp_fusion") is False for kwargs in seen.values()), seen
 
 
 def test_empty_tensors_do_nothing():

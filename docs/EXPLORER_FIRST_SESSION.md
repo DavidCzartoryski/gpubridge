@@ -6,9 +6,9 @@ ladder ([GPU_VALIDATION_RUNBOOK.md](GPU_VALIDATION_RUNBOOK.md), "The ladder"):
 one NVIDIA GPU, then the split test on one GPU. More GPUs follow if the
 multigpu partition is open to you.
 
-Nothing in this repository has run on GPUs yet: this session is the first
-attempt, and any step may fail. That's what the session is for: the kit
-records what happened, and `triage.py` summarizes it.
+This session has run once so far (the [CHANGELOG](../CHANGELOG.md)'s header
+says what it showed), and any step may still fail. That's what the session is
+for: the kit records what happened, and `triage.py` summarizes it.
 
 `$PROJECT_DIR` below stands for your group's project space,
 `/projects/<your-project>`: the directory your group was given under

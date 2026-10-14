@@ -8,7 +8,8 @@ native NCCL or RCCL, and a bridge joins them.**
 [![release](https://img.shields.io/github/v/release/DavidCzartoryski/gpubridge?include_prereleases&sort=semver)](https://github.com/DavidCzartoryski/gpubridge/releases)
 
 **Status:** alpha. Validated on CPU, in simulation and with CUDA and ROCm
-builds of PyTorch joined in one job. Not yet run on GPUs.
+builds of PyTorch joined in one job. One GPU run so far: the
+[CHANGELOG](CHANGELOG.md)'s header says what it showed.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/architecture-dark.svg">

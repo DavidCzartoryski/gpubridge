@@ -71,12 +71,13 @@ lists what still needs real hardware.
 - Bridge compression: a finite value near float32's maximum could arrive as
   inf, and leave a residual of -inf for the next step. In `fp8` a block above
   448 · 2^119 got the scale 2^120, so a code could decode to 2^128; in `bf16`
-  a value above bfloat16's largest rounded to inf. Both now saturate: `fp8`
-  caps the scale exponent at 119 and its codes at 448, `bf16` its codes at
-  bfloat16's largest, and a finite float64 beyond float32's range, or a value
-  its residual pushes past it, counts as float32's largest. Every finite value
-  arrives finite and leaves a finite residual. Payloads change only for blocks
-  holding such values (#50).
+  a value from about 3.3961e38 (halfway past bfloat16's largest) rounded to
+  inf. Both now saturate: `fp8` caps the scale exponent at 119 and its codes
+  at 448, `bf16` its codes at bfloat16's largest, and a finite float64 beyond
+  float32's range, or a value its residual pushes past it, counts as
+  float32's largest. Every finite value is now sent as a finite float32 and
+  leaves a finite residual. Payloads change only for blocks holding such
+  values (#50).
 - The Triton compression kernels are compiled without multiply-add
   contraction (`enable_fp_fusion=False`), so they round every product as the
   PyTorch reference does, whatever the compiler. On the V100, a fused
