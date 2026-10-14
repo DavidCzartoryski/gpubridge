@@ -11,15 +11,25 @@ attempt, and any step may fail. That's what the session is for: the kit
 records what happened, and `triage.py` summarizes it.
 
 `$PROJECT_DIR` below stands for your group's project space,
-`/projects/<your-project>`. Venvs, caches and logs go under
-`$PROJECT_DIR/$USER/gpubridge-gpu`, never the home directory, which is
-capped at 75 GB.
+`/projects/<your-project>`: the directory your group was given under
+`/projects` (ask your group if you don't know it). Venvs, caches and logs go
+under `$PROJECT_DIR/$USER/gpubridge-gpu`, not the home directory, which is
+capped at 75 GB (only uv itself installs into `~/.local/bin`).
+
+In a new shell, for example after a long wait in the queue, set it again and
+go back to the clone first:
+
+```bash
+PROJECT_DIR=/projects/<your-project>
+cd "$PROJECT_DIR/$USER/gpubridge"
+```
 
 ## Before you start
 
 - An Explorer account, and a project space you can write to.
-- About an hour. Setup takes about 10 minutes once it runs, steps 01 and 02
-  about 2 and 3 minutes, and every job waits in the queue first.
+- About an hour. By the runbook's estimates (nothing has run yet), setup
+  takes about 10 minutes once it runs, steps 01 and 02 about 2 and 3
+  minutes, and every job waits in the queue first.
 - Nothing to install: the setup job builds the venv on a compute node.
 
 ## 1. Clone into the project space
@@ -50,10 +60,11 @@ cat scripts/gpu/explorer/local.env
   except 00 stops with "set PROJECT_DIR to your group's project space".
 - **Optional, only if your site needs them:**
   - `ACCOUNT=<slurm account>`, if jobs need `--account`;
-  - `GPU_TYPE_1GPU=<gres type>`, to ask for one GPU model on the gpu
-    partition;
+  - `GPU_TYPE_1GPU=<gres type>` and `GPU_TYPE_MULTI=<gres type>`, to ask for
+    one GPU model on the gpu and multigpu partitions;
   - `PARTITION_1GPU`, `PARTITION_MULTI`, `PARTITION_SETUP`, if the defaults
-    `gpu`, `multigpu` and `short` don't match.
+    `gpu`, `multigpu` and `short` don't match;
+  - `EXTRA_SBATCH`, for anything else every job needs, such as a `--qos`.
 
   Every setting and its default is at the top of
   `scripts/gpu/explorer/submit.sh`.
@@ -82,7 +93,7 @@ scripts/gpu/explorer/submit.sh --dry-run free
 It prints the `sbatch` commands steps 01 and 02 would run, without submitting
 anything. Check the partition, `--gres=gpu:...`, `--time` and `--account`.
 
-## 5. The setup job (about 10 minutes, plus the queue)
+## 5. The setup job (about 10 minutes, estimated, plus the queue)
 
 ```bash
 scripts/gpu/explorer/submit.sh setup
@@ -110,7 +121,7 @@ scripts/gpu/explorer/submit.sh free           # submits 01 and 02
 squeue -u "$USER"
 ```
 
-| Step | What it runs | Slurm limit | Expected |
+| Step | What it runs | Slurm limit | Expected (estimate) |
 | --- | --- | --- | --- |
 | 01 probe | 1 GPU: `probe.py` (the GPU, driver, torch, CUDA, NCCL), then two processes checking their local ranks | 10 min | about 2 min |
 | 02 split test | 1 GPU, 2 processes as two islands: `check.py` on device tensors, a shared-GPU check that must refuse, `pytest -m gpu` | 25 min | about 3 min |
@@ -135,17 +146,21 @@ each one.
 
 ## 7. If you have the multigpu partition (rungs 1 and 2, continued)
 
+Only once step 6's jobs passed: GPU time on a rung waits for the one below
+(the runbook's ladder). Without multigpu access, `sbatch` may refuse the job
+when you submit it, and `submit.sh multi` then stops at 03.
+
 ```bash
 scripts/gpu/explorer/submit.sh --dry-run multi   # look first
 scripts/gpu/explorer/submit.sh multi             # 03 to 06
 ```
 
-| Step | GPUs | Slurm limit | Expected |
+| Step | GPUs | Slurm limit | Expected (estimate) |
 | --- | --- | --- | --- |
 | 03 single island | 2 on 1 node | 20 min | about 5 min |
 | 04 split test | 4 on 1 node | 40 min | about 10 min |
 | 05 two nodes | 2 nodes, 2 GPUs each | 30 min | about 10 min |
-| 06 scaling | 1 to 4 GPUs | 30 min | about 10 min |
+| 06 scaling | 4 on 1 node, runs on 1 to 4 of them | 30 min | about 10 min |
 
 They are submitted back to back and queue on their own.
 
@@ -168,16 +183,27 @@ It needs Python 3.10 or later (no torch), so it runs with the venv's Python
 that setup made: a login node's `python3` may be older. If setup never
 finished, any Python 3.10 or later works.
 
+triage reads only job directories with a `steps.jsonl`. A job that died
+before or during its first step has none, so triage leaves it out, and its
+verdict can still say everything that ran passed. The setup job writes no
+results at all. The `sacct` lines catch both.
+
 Paste back:
 1. **The triage output.**
 2. **`git log --oneline -1`** of the clone.
 3. **The `sacct` lines** of today's jobs (command in step 6).
-4. **Only if triage says "no steps.jsonl"** (a job that ended before its first
-   step): the last 30 lines of that job's log under
-   `$PROJECT_DIR/$USER/gpubridge-gpu/logs/`.
+4. **`cat results/explorer/00_partitions/gpu-types.txt`**: step 00's GPU
+   types and counts per partition, and whether `sharing` has AMD GPUs. Not
+   the `sinfo-*` or `gres-*` files: they name nodes.
+5. **For every job `sacct` shows FAILED, TIMEOUT or CANCELLED that triage
+   doesn't list** (or all of them, if triage says "no steps.jsonl"), and for
+   a failed setup job: the last 30 lines of its job log under
+   `$PROJECT_DIR/$USER/gpubridge-gpu/logs/`. Those lines are raw: replace the
+   host name, the project directory and your user name in them before
+   pasting (for example `job 123 on <host>: results in $PROJECT_DIR/...`).
 
-Read it before pasting all the same: the error lines come from the step logs.
-The raw results stay on the cluster. Don't commit `results/explorer/` to the
+Read the triage output before pasting all the same: its error lines come from
+the step logs. The raw results stay on the cluster. Don't commit `results/explorer/` to the
 public repository: step logs, stack dumps and NCCL logs are not redacted.
 `validation_tables.py` makes the publishable tables later.
 
@@ -186,11 +212,11 @@ public repository: step logs, stack dumps and NCCL logs are not redacted.
 | What you see | What it means, and what to do |
 | --- | --- |
 | "set PROJECT_DIR to your group's project space" | `local.env` is missing or misspelled: step 2. |
-| A job PENDING for a long time | `squeue -u "$USER" -o "%i %j %T %r"` shows the reason. `Resources` or `Priority` just means waiting. `AssocGrpGRES` or `ReqNodeNotAvail` means the request doesn't fit what you may use: check partition, account and GPU type against step 00. |
-| The setup job FAILED | The end of its log says why: a module that won't load (`SETUP_MODULES`; `""` loads none), or a download that failed (the node's network). |
-| sacct says TIMEOUT | Slurm's walltime ran out. Step 01's 10-minute limit is shorter than the kit's 20-minute limit per step, so a stuck step can be killed by Slurm first. Then its line is missing from `steps.jsonl`; the job log shows where it stopped. |
-| `FAILED: probe` or another step | triage shows the error lines; the full log is `results/explorer/<step>/<step>.log`, with NCCL's logs under `nccl/`. Paste the triage output. |
-| `shared_gpu_check: check did not fire` | The split test's shared-GPU refusal didn't happen: a real finding, paste it. |
+| A job PENDING for a long time | `squeue -u "$USER" -o "%i %j %T %r"` shows the reason. `Resources` or `Priority` just means waiting. `AssocGrpGRES` means the request doesn't fit what you may use: check partition, account and GPU type against step 00. `ReqNodeNotAvail` usually means the nodes are down or reserved. |
+| The setup job FAILED | The end of its log says why: a module that won't load, or a download that failed. `SETUP_MODULES=""` in `local.env` loads no module, but the `explorer` module is what gives compute nodes their proxy to the internet: without it, downloads fail. |
+| sacct says TIMEOUT | Slurm's time limit ran out mid-step. The kit's own limit per launch (`STEP_TIMEOUT`, 20 minutes) is longer than step 01's 10-minute Slurm limit, and `probe` has none. That step then has no line in `steps.jsonl`: paste the end of the job log (step 8). |
+| `FAILED: probe` or another step | triage shows the error lines. The full log is `results/explorer/<job>/<step>.log` (for example `01_probe/probe.log`), with NCCL's logs under `<job>/nccl/<step>/`. Paste the triage output. |
+| `shared_gpu_check: check did not fire` | The shared-GPU refusal didn't show, or the run failed some other way (a crash, or its time limit): `shared_gpu_check.log` says which. Paste it either way. |
 
 Don't rerun a failed step before pasting: the first failure's records are the
 most useful ones.

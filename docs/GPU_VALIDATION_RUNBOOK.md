@@ -204,8 +204,10 @@ has every command from a fresh login, what each prints, and what to paste
 back. In short:
 
 ```bash
+PROJECT_DIR=/projects/<your-project>
+mkdir -p "$PROJECT_DIR/$USER" && cd "$PROJECT_DIR/$USER"   # the project space, not home
 git clone https://github.com/DavidCzartoryski/gpubridge && cd gpubridge
-echo 'PROJECT_DIR=/projects/<your-project>' > scripts/gpu/explorer/local.env   # once
+echo "PROJECT_DIR=$PROJECT_DIR" > scripts/gpu/explorer/local.env   # once
 scripts/gpu/explorer/submit.sh 00               # GPU types per partition (sinfo, seconds)
 scripts/gpu/explorer/submit.sh --dry-run free   # see what will be submitted
 scripts/gpu/explorer/submit.sh setup            # a short CPU job, once (~10 min)
@@ -251,7 +253,7 @@ nothing. It writes to `results/explorer/00_partitions/`:
 Job logs go to `$WORK_DIR/logs/`, and results to `results/explorer/<step>/`.
 Keep the raw results on the cluster: the step logs, stack dumps and NCCL logs
 aren't redacted (see [Reading results](#reading-results)). For review, paste
-the output of `"$WORK_DIR/venv/bin/python" scripts/gpu/triage.py results/explorer`
+the output of `"$PROJECT_DIR/$USER/gpubridge-gpu/venv/bin/python" scripts/gpu/triage.py results/explorer`
 (the venv's Python: a login node's `python3` may be older than 3.10). What
 gets published is the validation tables, not the results.
 
