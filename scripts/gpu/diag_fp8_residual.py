@@ -16,14 +16,17 @@ rounding instead of two).
 
 Then, for the same inputs:
 
-- the kernel compiled with ``enable_fp_fusion=False`` (no multiply-add
-  contraction), against the reference;
+- the same kernel compiled with multiply-add contraction on
+  (``enable_fp_fusion=True``; gpubridge launches it with it off,
+  ``_compression_kernels.LAUNCH_OPTIONS``), against the reference;
 - a probe kernel built from the kernel's own helpers, which stores v and
-  ``decoded * scale`` as the device computes them;
-- what the kernel's compiled code contains: fused multiply-adds, flush-to-zero
+  ``decoded * scale`` as the device computes them. v of a NaN input is NaN on
+  both, but its payload bits may differ (a GPU's arithmetic returns its own
+  canonical NaN): those are counted apart, since a NaN is never sent;
+- what each compiled kernel contains: fused multiply-adds, flush-to-zero
   instructions and the target.
 
-The kernel itself is unchanged. One device, well under a minute::
+It changes no kernel. One device, well under a minute::
 
     python scripts/gpu/diag_fp8_residual.py [--dtype float32 float64] [--n 255] [--limit 10]
 
@@ -67,7 +70,8 @@ def awkward(n: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
     scale = 2.0 ** torch.randint(-40, 40, (n,), generator=g)
     x = torch.randn(n, generator=g, dtype=torch.float64) * scale
     specials = [0.0, -0.0, float("nan"), float("inf"), -float("inf"), 1e-35, -1e-31,
-                2.0**-100, 3.4e38, -3.0e38, 448.0, 2.0**-6, 2.0**-9]
+                2.0**-100, 3.4e38, -3.0e38, 448.0, 2.0**-6, 2.0**-9,
+                3.4028234663852886e38, 448 * 2.0**119 + 2.0**104]
     for i, value in enumerate(specials[:n]):
         x[(i * 37) % n] = value
     return x.to(dtype)
@@ -92,12 +96,13 @@ def _probe(x_ptr, res_ptr, scale_ptr, code_ptr, v_ptr, sent_ptr, n, BLOCK_SIZE: 
 
 
 def launch(x: torch.Tensor, residual: torch.Tensor, payload: torch.Tensor, **options):
-    """K.quantize's fp8 branch, with Triton launch options; returns the compiled kernel
-    (None under the interpreter)."""
+    """K.quantize's fp8 branch: its launch options, updated with ``options``. Returns the
+    compiled kernel (None under the interpreter)."""
     n = x.numel()
     nb = triton.cdiv(n, C.BLOCK)
     scales = payload[:4 * nb].view(torch.float32)
     codes = payload[4 * nb:4 * nb + n]
+    options = {**getattr(K, "LAUNCH_OPTIONS", {}), **options}
     compiled = K._quantize_fp8[(nb,)](x.reshape(-1), residual, scales, codes, n,
                                       BLOCK_SIZE=C.BLOCK, EF=True, **options)
     payload[4 * nb + n:].zero_()
@@ -157,6 +162,14 @@ def show_input(value: torch.Tensor) -> str:
             f" ({str(value.dtype)[6:]})")
 
 
+def pow2_text(scale: torch.Tensor) -> str:
+    """A float32 scale as 2^k when it is a power of two, else its value and bits."""
+    bits = int(scale.view(torch.int32)) & 0xFFFFFFFF
+    if bits & 0x7FFFFF == 0 and 0 < bits >> 23 < 0xFF:
+        return f"2^{(bits >> 23) - 127}"
+    return show32(scale).replace("  ", " ").strip()
+
+
 def kind32(value: float) -> str:
     """Where a value falls in float32: zero, subnormal, normal, inf, nan or beyond."""
     if value != value:
@@ -207,18 +220,18 @@ def diagnose(dtype: torch.dtype, n: int, limit: int, device: str) -> bool:
     dev_p, dev_r = dev_p.cpu(), dev_r.cpu()
     dev_scales, dev_codes = split(dev_p, n)
 
-    # The kernel without multiply-add contraction (a launch option, the same source).
-    nofuse_p = torch.zeros_like(ref_p, device=device)
-    nofuse_r = on(prior)
+    # The same kernel with multiply-add contraction on (a launch option, the same source).
+    fuse_p = torch.zeros_like(ref_p, device=device)
+    fuse_r = on(prior)
     try:
-        nofuse = launch(on(x), nofuse_r, nofuse_p, enable_fp_fusion=False)
-        nofuse_r = nofuse_r.cpu()
+        fused_kernel = launch(on(x), fuse_r, fuse_p, enable_fp_fusion=True)
+        fuse_r = fuse_r.cpu()
     except Exception as exc:  # an older Triton without the option
-        print(f"enable_fp_fusion=False: launch failed: {type(exc).__name__}: {exc}")
-        nofuse = nofuse_r = None
+        print(f"enable_fp_fusion=True: launch failed: {type(exc).__name__}: {exc}")
+        fused_kernel = fuse_r = None
 
-    # The compiled kernel's code, from a default launch (cached: the same binary). This
-    # and the probe are extras: if one fails, the table below is still printed.
+    # The compiled kernel's code, from a launch as gpubridge's (cached: the same binary).
+    # This and the probe are extras: if one fails, the table below is still printed.
     compiled = again_r = dev_v = dev_sent = None
     try:
         again_r = on(prior)
@@ -244,29 +257,43 @@ def diagnose(dtype: torch.dtype, n: int, limit: int, device: str) -> bool:
     same_payload = torch.equal(ref_p, dev_p)
     r_diff = (bits32(ref_r) != bits32(dev_r)).nonzero().flatten()
     dev_scale = blocks_of(dev_scales, n)
-    # Shown below: every value whose residual, code or scale differs.
-    diff = ((bits32(ref_r) != bits32(dev_r)) | (ref_codes != dev_codes)
-            | (bits32(scale) != bits32(dev_scale))).nonzero().flatten()
+    # Shown below: every value whose residual or code differs (a differing scale is
+    # summarized per block instead).
+    diff = ((bits32(ref_r) != bits32(dev_r)) | (ref_codes != dev_codes)).nonzero().flatten()
     codes = "identical" if same_codes else f"differ at {int((ref_codes != dev_codes).sum())}"
     print(f"payload: {'identical' if same_payload else 'DIFFERS'} (codes {codes},"
           f" scales {'identical' if same_scales else 'differ'}, {nb} block(s))")
+    if not same_scales:
+        blocks = (bits32(ref_scales) != bits32(dev_scales)).nonzero().flatten()
+        print(f"scales differ in {len(blocks)} block(s): " + "; ".join(
+            f"block {b}: reference {pow2_text(ref_scales[b])}, device {pow2_text(dev_scales[b])}"
+            for b in blocks[:limit].tolist()))
     print(f"residual: {len(r_diff)} of {n} differ in their bits"
           + (f"; indices {r_diff[:limit].tolist()}" if len(r_diff) else ""))
     if again_r is not None and not torch.equal(bits32(again_r), bits32(dev_r)):
         print("note: a second default launch gave a different residual from the first")
-    if nofuse_r is not None:
-        nd = int((bits32(ref_r) != bits32(nofuse_r)).sum())
-        print(f"enable_fp_fusion=False: {nd} of {n} residuals differ from the reference")
+    if fuse_r is not None:
+        nd = int((bits32(ref_r) != bits32(fuse_r)).sum())
+        print(f"enable_fp_fusion=True (not gpubridge's): {nd} of {n} residuals differ from"
+              " the reference")
     if dev_v is not None and dev_sent is not None:
-        vd = (bits32(v) != bits32(dev_v)).nonzero().flatten()
+        both_nan = v.isnan() & dev_v.isnan()
+        vd = ((bits32(v) != bits32(dev_v)) & ~both_nan).nonzero().flatten()
+        nan_bits = ((bits32(v) != bits32(dev_v)) & both_nan).nonzero().flatten()
         print(f"probe, v on the device: {len(vd)} of {n} differ from the reference's v"
               + (f" (indices {vd[:limit].tolist()})" if len(vd) else ""))
+        if len(nan_bits):
+            i = int(nan_bits[0])
+            print(f"probe, v on the device: {len(nan_bits)} more NaN on both with other payload"
+                  f" bits (indices {nan_bits[:limit].tolist()}; index {i}: input"
+                  f" {float(x[i])}, reference {hex32(v[i])}, device {hex32(dev_v[i])}): a NaN"
+                  " input, sent as code 0x7f with residual 0, so it can't change either")
         sd = (bits32(sent) != bits32(dev_sent)) & ~(sent.isnan() & dev_sent.isnan())
         print(f"probe, decoded * scale on the device: {int(sd.sum())} of {n} differ from the"
               " reference's sent")
-    print(f"compiled kernel: {code_facts(compiled)}")
-    if nofuse_r is not None:
-        print(f"compiled kernel, enable_fp_fusion=False: {code_facts(nofuse)}")
+    print(f"compiled kernel, as gpubridge launches it: {code_facts(compiled)}")
+    if fuse_r is not None:
+        print(f"compiled kernel, enable_fp_fusion=True: {code_facts(fused_kernel)}")
     if len(r_diff):
         as_fused = int((bits32(dev_r[r_diff]) == bits32(fused[r_diff])).sum())
         print(f"of the {len(r_diff)} differing residuals, the device's equals the fused value"
@@ -300,8 +327,8 @@ def diagnose(dtype: torch.dtype, n: int, limit: int, device: str) -> bool:
             ("residual, reference", show32(ref_r[i]), float(ref_r[i])),
             ("residual, device", show32(dev_r[i]), float(dev_r[i])),
         ]
-        if nofuse_r is not None:
-            rows.append(("residual, device, no fusion", show32(nofuse_r[i]), float(nofuse_r[i])))
+        if fuse_r is not None:
+            rows.append(("residual, device, fusion on", show32(fuse_r[i]), float(fuse_r[i])))
         print(f"    {'':<30} {'value':<16} {'bits':<10}  in float32")
         for label, text, value in rows:
             print(f"    {label:<30} {text}" + ("" if value is None else f"  {kind32(value)}"))

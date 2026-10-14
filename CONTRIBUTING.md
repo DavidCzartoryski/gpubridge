@@ -1,7 +1,8 @@
 # Contributing to gpubridge
 
 Thanks for helping. gpubridge is an alpha: everything is tested on CPU, and
-nothing has run on a GPU yet. So the most useful contributions are often
+there has been one GPU run so far (the [CHANGELOG](CHANGELOG.md)'s header says
+what it showed). So the most useful contributions are often
 results from real hardware (see [GPU validation](#gpu-validation) below).
 
 ## Running the CPU test suite

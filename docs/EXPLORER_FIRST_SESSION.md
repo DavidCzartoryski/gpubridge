@@ -6,9 +6,9 @@ ladder ([GPU_VALIDATION_RUNBOOK.md](GPU_VALIDATION_RUNBOOK.md), "The ladder"):
 one NVIDIA GPU, then the split test on one GPU. More GPUs follow if the
 multigpu partition is open to you.
 
-Nothing in this repository has run on GPUs yet: this session is the first
-attempt, and any step may fail. That's what the session is for: the kit
-records what happened, and `triage.py` summarizes it.
+This session has run once so far (the [CHANGELOG](../CHANGELOG.md)'s header
+says what it showed), and any step may still fail. That's what the session is
+for: the kit records what happened, and `triage.py` summarizes it.
 
 `$PROJECT_DIR` below stands for your group's project space,
 `/projects/<your-project>`: the directory your group was given under
@@ -205,8 +205,8 @@ Paste back:
    pasting (for example `job 123 on <host>: results in $PROJECT_DIR/...`).
 
 Read the triage output before pasting all the same: its error lines come from
-the step logs. The raw results stay on the cluster. Don't commit `results/explorer/` to the
-public repository: step logs, stack dumps and NCCL logs are not redacted.
+the step logs. The raw results stay on the cluster: `results/explorer/` is
+gitignored, because step logs, stack dumps and NCCL logs are not redacted.
 `validation_tables.py` makes the publishable tables later.
 
 ## If something fails

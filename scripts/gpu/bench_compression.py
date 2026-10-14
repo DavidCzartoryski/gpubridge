@@ -26,6 +26,11 @@ PyTorch reference on CPU instead. Writes OUT/compression.json,
 OUT/compression.csv and OUT/summary.md:
 
     python scripts/gpu/bench_compression.py --out results/bench_compression
+
+gpubridge compiles the Triton kernels without multiply-add contraction
+(``_compression_kernels.LAUNCH_OPTIONS``). ``--fp-fusion`` launches them with
+it, to time what that costs: run it once each way, into two OUT directories.
+The bits are the same either way, since every product the kernels add is exact.
 """
 
 from __future__ import annotations
@@ -160,11 +165,24 @@ def main() -> int:
     parser.add_argument("--trials", type=int, default=10)
     parser.add_argument("--max-seconds", type=float, default=10.0,
                         help="stop timing a size after this long (at least 3 trials)")
+    parser.add_argument("--fp-fusion", action="store_true",
+                        help="launch the Triton kernels with multiply-add contraction on "
+                             "(gpubridge's default is off), to time the difference")
     args = parser.parse_args()
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     probe = torch.empty(1, device=device)
-    impl = "triton" if C._triton_kernels(probe) is not None else "torch"
+    triton_kernels = C._triton_kernels(probe)
+    impl = "triton" if triton_kernels is not None else "torch"
+    fp_fusion = None  # only Triton's kernels have the option
+    if triton_kernels is not None:
+        if args.fp_fusion:
+            triton_kernels.LAUNCH_OPTIONS["enable_fp_fusion"] = True
+        fp_fusion = bool(triton_kernels.LAUNCH_OPTIONS.get("enable_fp_fusion", True))
+        impl += f", fp fusion {'on' if fp_fusion else 'off'}"
+    elif args.fp_fusion:
+        print("--fp-fusion: these are the PyTorch kernels, which have no such option; "
+              "ignored", file=sys.stderr)
     if device.type == "cpu":
         impl += " (CPU)"
     lo = min(args.min_bytes, args.max_bytes)
@@ -230,7 +248,7 @@ def main() -> int:
         "kit_version": KIT_VERSION, "script": "scripts/gpu/bench_compression.py",
         "argv": sys.argv, "environment": environment(), "device": str(device), "impl": impl,
         "copy_GBps": round(copy, 2), "peak_GBps": round(peak, 2) if peak else None,
-        "checks": checks, "rows": rows,
+        "fp_fusion": fp_fusion, "checks": checks, "rows": rows,
     })
     lines = [f"# {args.out.name}: bridge compression kernels\n",
              f"Device {device}, kernels {impl}. Memory bandwidth: copy {copy:.1f} GB/s"
