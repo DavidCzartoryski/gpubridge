@@ -146,6 +146,11 @@ runs to the comparison matrix, in the same job as the Gloo bridge's:
 MULTITCP_BRIDGE=1 scripts/gpu/explorer/submit.sh 08
 ```
 
+The venvs must import this branch's gpubridge. The kit's setup installs gpubridge in
+editable mode from the clone that ran it, so from any other clone add
+`PYTHONPATH=$PWD/src` to that command; otherwise the jobs run that clone's scripts
+against the other clone's library.
+
 **The gate, fixed before any run:** the metric is the whole float32
 all_reduce's median time, `median_us` in each run's `bench.json` (gpubridge's op,
 default policy), at each of step 08's sizes from 64 MB to 1 GB. Stage 1 stays only
