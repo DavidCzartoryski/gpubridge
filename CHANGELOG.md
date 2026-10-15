@@ -160,6 +160,24 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   659 ms of it exposed communication), against 25.3 on the V100 alone;
   ResNet-50 327.7 samples/s (a 195 ms step), against 315.8. Adding the MI50
   lowered GPT-2 small's throughput and left ResNet-50's about where it was.
+- **Training on a V100 and an MI50 with fp8 on the bridge, commit 4e7f04e**:
+  the same job and versions as the entry above, with
+  `GPUBRIDGE_BRIDGE_COMPRESSION=fp8` and `GPUBRIDGE_COMPRESSION_KERNELS=torch`
+  on both ranks (`venv-rocm63`'s Triton can't compile the compression kernels
+  for gfx906, so fp8's saving is understated); the bridge's link measured 1164
+  to 1174 MB/s each way. Jobs 11089348, 11090051, 11090726 and 11091146, and
+  the V100 alone at the same per-rank batches in 11090049, 11090725 and
+  11091145. `train_bench.py`, float32, GPT-2 small at 4, 8, 16 and 32 per
+  rank: 12.495, 19.686, 26.274 and 28.311 samples/s, against 25.3, 27.669,
+  28.395 and 29.247 on the V100 alone (0.49x to 0.97x); ResNet-50 at 32,
+  366.849 against 315.8 (1.16x). From batch 16 on, the V100 waits longer for
+  the MI50 each step (409 and 728 ms) than the exposed communication (258
+  and 445 ms). Communication alone was 472 to 485 ms up to batch 16 and 605
+  ms at 32, not yet explained. In the same jobs `train_ddp`'s parameters
+  diverged across ranks once (11090726), FSDP2's bit-for-bit check differed
+  from its uncompressed single-process replay in all four, and HSDP hung
+  until its step timeout in all four. Details in
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#fp8-on-the-bridge-and-larger-batches).
 - **RDMA between the node types, commit 1ac6fa9** (the network check with
   `rdma_report.sh`; its other steps as at 934f87c), one V100 node and one MI50
   node: **no RDMA path between them.** The V100 node's only RDMA device is

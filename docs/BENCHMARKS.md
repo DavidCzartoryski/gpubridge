@@ -19,7 +19,7 @@ intended use (see [Waiting on Research Computing](#waiting-on-research-computing
 | C, C-amd | two V100s (two MI50s) through gpubridge's bridge, one island each: gpubridge's own cost without vendor mixing | waiting on Research Computing |
 | D | a V100 and an MI50 through gpubridge: every policy | ran |
 | E | the same two ranks as one flat Gloo group | ran |
-| Training | DDP with `gpubridge.ddp_comm_hook` on GPT-2 small and ResNet-50: each GPU alone, then both | ran: the V100 alone, the MI50 alone (torch 2.9.1+rocm6.3) and both together |
+| Training | DDP with `gpubridge.ddp_comm_hook` on GPT-2 small and ResNet-50: each GPU alone, then both | ran: the V100 alone, the MI50 alone (torch 2.9.1+rocm6.3) and both together, uncompressed and with fp8 on the bridge (GPT-2 small at batches 4 to 32) |
 
 ## Setup
 
@@ -464,7 +464,75 @@ pageable staging) over TCP on `internal.2137`; their preflight measured
 
 These runs used the default policy, which the matrix above measured at about
 0.65 GB/s; pinned staging, pipelining and fp8 compression were 1.4x to 2.8x
-faster at 1 GB there. Training with them hasn't been measured.
+faster at 1 GB there. fp8 is measured in training below; pinned staging and
+pipelining aren't.
+
+### fp8 on the bridge, and larger batches
+
+The same mixed job and the same `train_bench.py`, at commit 4e7f04e (clean on
+both ranks), with the bridge compressing to fp8
+(`GPUBRIDGE_BRIDGE_COMPRESSION=fp8`). The MI50's Triton in `venv-rocm63`
+can't compile gpubridge's compression kernels for gfx906, so both ranks ran
+the PyTorch versions instead (`GPUBRIDGE_COMPRESSION_KERNELS=torch`): the same
+bits, but slower, so these runs understate what fp8 saves. Both settings are
+in every rank's record. Everything else as above: float32, the default policy
+and pageable staging over TCP, 25 MB buckets (13 for GPT-2 small at every
+batch), 3 warm-up and 10 timed steps, one run per row. Each run's preflight
+measured 1172 to 1174 MB/s from the V100 to the MI50 and 1164 to 1174 MB/s
+back. The MI50 was the same node in every run; the V100 was one of two nodes.
+
+Batch is per rank, so a mixed run processes twice the V100-alone run's
+samples per step.
+
+| Model | Batch | V100 alone | V100 + MI50, fp8 | Mixed / alone | Step (ms) | MI50 compute | V100 compute | V100 waits | Exposed comm | Comm alone |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| GPT-2 small | 4 | 25.3 | 12.495 | 0.49x | 640.3 | 243.1 | 152.0 | 91.1 | 397.2 | 482.5 |
+| GPT-2 small | 8 | 27.669 | 19.686 | 0.71x | 812.8 | 441.8 | 282.6 | 159.1 | 371.0 | 472.4 |
+| GPT-2 small | 16 | 28.395 | 26.274 | 0.93x | 1217.9 | 960.5 | 551.2 | 409.2 | 257.5 | 484.9 |
+| GPT-2 small | 32 | 29.247 | 28.311 | 0.97x | 2260.6 | 1815.4 | 1087.0 | 728.4 | 445.2 | 605.3 |
+| ResNet-50 | 32 | 315.8 | 366.849 | 1.16x | 174.5 | 128.4 | 98.4 | 30.0 | 46.0 | 102.2 |
+
+Samples/s, then milliseconds per step (medians of the 10 timed steps). The
+V100-alone runs are `submit.sh train-nvidia` at the same per-rank batch; the
+batch-4 GPT-2 and ResNet-50 ones are the 934f87c runs above. Without fp8
+(above), GPT-2 small at batch 4 reached 8.9 samples/s (0.35x) and ResNet-50
+327.7 (1.04x).
+
+- **ResNet-50 with fp8: the pair is 1.16x the V100 alone** (366.8 against
+  315.8 samples/s), 65% of the two GPUs' throughputs alone added together
+  (315.8 + 247.3).
+- **GPT-2 small: below the V100 alone at every batch measured**, closing from
+  0.49x at batch 4 to 0.97x at batch 32.
+- **Communication stayed between 472 and 485 ms a step from batch 4 to 16**,
+  so a growing share of it hid behind the backward pass (exposed: 397, 371,
+  then 258 ms). At batch 32 it rose to 605 ms alone and 445 ms exposed. That
+  isn't explained yet. The bucket count didn't change, so the buckets aren't
+  the cause. That run's step times also spread more (2130 to 2419 ms, against
+  1216 to 1270 at batch 16).
+- **From batch 16 on, the wait for the slower GPU costs more than the bridge**:
+  the V100 waits 409 ms a step at batch 16 and 728 at batch 32, against 258 and
+  445 ms of exposed communication. Per sample, the V100 computed in 34 to 35 ms
+  and the MI50 in 55 to 60 ms (compute over batch, batches 8 to 32).
+- `train_bench.py` found every rank's parameters identical after each run.
+
+Job IDs: mixed 11089348 (batch 4 and ResNet-50), 11090051 (8), 11090726
+(16), 11091146 (32); V100 alone 11090049 (8), 11090725 (16), 11091145 (32).
+The batch-16 V100-alone record was overwritten by the batch-32 run's; its
+numbers come from that job's log.
+
+**The other training steps of these four jobs** (each job runs them all):
+
+- `train_ddp` (`examples/train_synthetic.py`, DDP with the comm hook):
+  **parameters diverged across ranks in the batch-16 job** (11090726); they
+  stayed in sync in the other three. Not yet investigated.
+- `verify_fsdp2_backend`: parameters differed from the single-process replay
+  in all four, against a bit-for-bit match without compression (above). fp8
+  is lossy, so this check may not apply with compression on; whether it does
+  is open.
+- `train_hsdp_backend` printed nothing until its 20-minute step timeout in
+  all four, before any NCCL or RCCL communicator was created, as in the
+  uncompressed run; each job then hit its time limit during
+  `verify_hsdp_backend`.
 
 ## Which ROCm wheels can train on an MI50 (gfx906)
 
@@ -535,6 +603,11 @@ scripts/gpu/explorer/submit.sh 08
 scripts/gpu/explorer/submit.sh train-nvidia
 VENV_ROCM=$WORK_DIR/venv-rocm63 scripts/gpu/explorer/submit.sh train-amd
 VENV_ROCM=$WORK_DIR/venv-rocm63 STEPS_07=training TIME_07=00:40:00 scripts/gpu/explorer/submit.sh 07
+# fp8 on the bridge, GPT-2 small at a larger batch (N = 8, 16, 32), each GPU alone then both:
+TRAIN_BENCH_MODELS=gpt2-small TRAIN_BENCH_ARGS="--batch-size N" scripts/gpu/explorer/submit.sh train-nvidia
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 GPUBRIDGE_COMPRESSION_KERNELS=torch \
+    TRAIN_BENCH_MODELS=gpt2-small TRAIN_BENCH_ARGS="--batch-size N" \
+    VENV_ROCM=$WORK_DIR/venv-rocm63 STEPS_07=training scripts/gpu/explorer/submit.sh 07
 python scripts/gpu/bench_matrix.py results/explorer/08_matrix_nvidia-amd \
     results/explorer/net_check_nvidia results/explorer/net_check_amd
 ```
