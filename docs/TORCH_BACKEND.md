@@ -177,7 +177,7 @@ anything else, so no rank is left waiting in `new_group`.
   the backend:
   - reductions other than SUM, AVG, MAX and MIN (PRODUCT, PREMUL_SUM, bitwise),
     on the CPU path too;
-  - point-to-point `send` and `recv`, `alltoall` and `reduce`;
+  - any-source `recv`, `alltoall` and `reduce`;
   - gather and scatter of GPU tensors;
   - list-form collectives with tensors of different sizes.
 
@@ -327,6 +327,106 @@ fully_shard(model, mesh=mesh)
    ranks would hang there until the group's timeout. Call `dist.barrier()`
    on the world group first.
 
+## Point-to-point (CPU only)
+
+`dist.send`, `recv(src=...)`, `isend`, `irecv` and `batch_isend_irecv` use
+the group's `send` and `recv` methods. They accept one contiguous dense
+tensor on CPU or on the rank's configured GPU. Finish setup with a world
+`dist.barrier()` first; a subgroup also needs its own first collective.
+P2P refuses before setup, because setup needs every member, even members
+that will not participate in the subsequent exchange.
+
+Within an island, the call goes straight to the native process group
+(NCCL/RCCL on GPU, Gloo in simulation). CPU tensors in a GPU job use Gloo.
+Between islands, `BridgeTransport.create_p2p` supplies an all-member link;
+Gloo reuses the existing discovery group and transfers host-staged raw bytes.
+This is separate from the leader-only collective link and does not create
+another process group. Collective-only custom transports need to implement
+the optional hook before carrying cross-island P2P.
+
+With `GPUBRIDGE_BRIDGE=ucx`, each matched directional `(src, dst, tag)` lane
+lazily connects its own two-endpoint UCX worker, including non-leaders. This
+keeps the existing collective worker separate (it is not thread-safe) and
+lets unrelated pairs/tags progress concurrently. Address exchange uses the
+same scoped Store; it does not rendezvous with uninvolved ranks or create
+another ProcessGroup. Payloads are host-staged, including pinned/chunked
+options; there is no device-direct UCX P2P path. Separate workers cost a UCX
+context and endpoints per used directional tag for the group's lifetime.
+Use a bounded set of tags. The adapter is CPU tested over UCX TCP; RDMA and
+GPU behavior are unvalidated. Closing schedules worker cleanup after any
+native wait has completed or failed, without blocking the main thread.
+
+`GPUBRIDGE_PINNED_STAGING=1` uses pinned host buffers on GPUs. Setting
+`GPUBRIDGE_P2P_CHUNK_BYTES=4M` instead enables two-slot chunked staging, also
+pinned on GPU: copying the next chunk can overlap the current transfer, and
+copying received chunks back can overlap the following receive. This setting
+must be the same at both endpoints and is checked in the message handshake.
+Unset means one whole message; it does not inherit the collective policy's
+chunk size. CPU tests use the same schedule without pinning. P2P is always
+bit-exact and does not apply collective gradient compression. No GPU overlap
+or speedup has been measured.
+
+- **Matching.** Across islands, a message matches by group, source,
+  destination and tag (integer `0` through `2**31 - 1`). Same-tag sends and
+  receives match in posting order within each direction of a pair. Different
+  tags and pairs run independently, including a full-duplex batched exchange.
+  Sizes and dtypes must agree; shape may differ with the same element count.
+  A group-scoped Store handshake validates byte count and dtype before posting
+  payloads, so mismatches raise instead of triggering Gloo's fatal truncation.
+  Metadata keys are removed after being read. Within an island, matching is
+  the native backend's: NCCL/RCCL ignore tags; Gloo respects them.
+- **Streams and lifetime.** Submission records an event on the caller's
+  stream. A lane's own worker stream waits for it, and the tensor is kept
+  alive and marked with `record_stream` until the operation has completed.
+  `wait()` orders the caller's current stream after the final copy. The
+  future is device-aware; `is_completed()` includes GPU completion. Do not
+  modify or read an in-flight tensor before waiting. P2P has no ordering
+  guarantee relative to collectives or other pairs.
+- **Timeout and failure.** Each cross-island operation has the process group's
+  timeout from submission, including time spent queued. A mismatch, deadline
+  or transport error fails pending P2P handles locally and publishes a group
+  failure. Ranks with an active engine observe this within the health polling
+  interval (50 ms plus Store latency); all other members refuse their next
+  backend operation. An idle dead peer is detected when an operation waiting
+  for it reaches its deadline. There is no recovery: destroy the process group
+  and restart the job. `Work.wait(timeout=...)` has a separate host timeout;
+  it does not cancel the transfer. Same-island errors retain native behavior.
+- **Callbacks.** `wait()` and `is_completed()` see completion before the
+  future's callbacks run, so a callback may wait on its own Work or on any
+  other P2P Work, including a batch's (`batch_isend_irecv` returns Works that
+  wait on their members, not on futures) and a later message with the same
+  tag. Futures are resolved one at a time, in completion order, on one
+  completion thread per process group, never on a lane thread or under an
+  internal lock: a slow callback delays later futures of that group, not
+  transfers, `wait()`, collectives or teardown. So a callback must not block on
+  another P2P future of the same group (`get_future().wait()`): only this
+  thread can resolve it, and it is busy running the callback.
+- **Threads and memory.** A lane's thread exits once its queue is empty, so
+  resident lane threads match the `(peer, tag, direction)` keys with queued or
+  running operations, not every tag used. Per-key message sequence numbers
+  outlive the thread. Completed payloads and Work are not retained once the
+  caller drops them.
+- **Teardown.** Pending handles fail and the engine joins lane threads for at
+  most 200 ms total; it never waits for a future callback. In-flight native
+  requests and their buffers stay owned by daemon lane threads until the
+  transport errors, its timeout passes or torch destroys the group. Teardown
+  never waits for a missing peer to post a receive.
+- **Native GPU batches.** On torch 2.14, `dist.batch_isend_irecv` coalesces
+  gpubridge's native NCCL/RCCL operations and combines their batch Work with
+  the cross-island Works. torch 2.8 excludes Python ProcessGroup subclasses
+  from its coalescing path. On that release, use
+  `gpubridge.batch_isend_irecv(ops)` for a batch containing same-island GPU
+  peers: it supplies the batch boundary without modifying torch's global
+  functions. The explicit helper also works on 2.14 and delegates unchanged
+  for other backends. Plain `dist.batch_isend_irecv` with only cross-island
+  peers works on either release. Native GPU batch behavior remains designed,
+  not GPU validated; the helper and batching paths are tested on CPU.
+
+Tests cover 1+1, 2+2, uneven and three-island simulation layouts, every pair
+(including non-leaders), zero/small/large payloads and dense dtypes, reverse
+tag order, simultaneous pairs, full-duplex same-tag batches, subgroup ranks,
+a slow receiver, missing peers and size/dtype mismatch propagation.
+
 ## What isn't supported, and why
 
 - **Subgroups:** see "Subgroups and HSDP" above for what works. Tensor
@@ -334,7 +434,7 @@ fully_shard(model, mesh=mesh)
 - **`torch.compile`:** not tested. Functional collectives
   (`torch.ops._c10d_functional`) do reach the Python group: FSDP2's
   `full_tensor()` uses them, and it is tested.
-- **Point-to-point, all-to-all, and gather and scatter of GPU tensors:**
+- **Any-source receive, all-to-all, and gather and scatter of GPU tensors:**
   gpubridge has no cross-vendor implementation of them yet.
 - **Overhead:** each collective goes through Python and gpubridge's worker
   thread, as `gpubridge.all_reduce(async_op=True)` does today. CPU

@@ -141,7 +141,7 @@ would fail everything above it, for the same reason.
 | 4 | 2 | Explorer, 4 GPUs | `submit.sh 04` | two 2-GPU NCCL islands and the bridge, both layouts; native vs bridged benchmark | **3, 6, 7**, 9 (data), **11**, 13 | ~10 min | free* |
 | 5 | 2 | Explorer, 2 nodes | `submit.sh 05` | the network preflight between the nodes (interfaces, raw bandwidth); NCCL across nodes; the bridge crossing the network between nodes | **8**, 11 and 13 across nodes | ~10 min | free* |
 | 6 | 2 | Explorer, 4 GPUs | `submit.sh 06` | training throughput and scaling 1 to 4 GPUs (table for the multigpu request) | - | ~10 min | free* |
-| 7 | 3 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11, 12, 13 | 20-30 min | ~0.5 h of the hourly rate |
+| 7 | 3 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11, 12, 13 | 20-30 min plus training | ~0.5 h plus training at the hourly rate |
 | 7 alt | 3 | Explorer `sharing`, 1 AMD GPU | `submit.sh setup-rocm`, then `submit.sh amd` | rung 3 inside Explorer, **if** step 0a finds AMD GPUs in `sharing`: `amd/run_all.sh` on the node, without setup or tarball. Dry-run only until then | **4, 5** on AMD, 6, 7, 10 on ROCm, 12 | ~15 min + ~15 min ROCm setup | free |
 | 8 | 4 | NVIDIA + AMD cloud | `mixed/node.sh` on both | the real mixed-vendor job | **1, 2** on GPUs, **8** across networks | 30-45 min | ~0.75 h of each machine's rate |
 | 8 alt | 4 | Explorer `gpu` + `sharing`, one heterogeneous job | `submit.sh setup-rocm`, then `submit.sh 07` | the real mixed-vendor job inside Explorer, **if** step 0a finds AMD GPUs in `sharing`. Dry-run only until then | **1, 2** on GPUs, 3 with real RCCL ranks, 8 between nodes, 11 against per-island baselines, 13 | ~15 min + ~15 min ROCm setup | free |
@@ -236,7 +236,8 @@ as of 2026-10-06; **verify each one**:
 | `PARTITION_PAIR_NVIDIA`, `PARTITION_PAIR_AMD` | `gpu`, `sharing` | where those pairs' two components go |
 | `PIPELINE_CHUNKS` | `1M 4M 16M 64M` | step 08's pipelined runs, one per `GPUBRIDGE_CHUNK_BYTES` |
 | `TRAIN_BENCH_MODELS`, `TRAIN_BENCH_ARGS` | `gpt2-small resnet50`, empty | `train_bench.py`'s models and extra flags, in step 07 and `train-nvidia`/`train-amd` |
-| `STEPS_07` | `all` | `training`: step 07 runs only the probe, the preflight and its training steps |
+| `STEPS_07` | `all` | `training`: step 07 runs only the probe, the preflight and its training steps; `bench`: only the probe, the preflight and the `train_bench_<model>` steps (no `train_ddp`, FSDP2 or HSDP) |
+| `TRAIN_BENCH_BUCKETS` | empty | DDP bucket sizes in MB, e.g. `10 25 50 100`: step 07 runs each `train_bench_<model>` step once per size (`--bucket-mb`), named `train_bench_<model>_bucket<MB>` (step and JSON). Empty: once, at `train_bench.py`'s default (25) |
 
 Also check:
 
@@ -269,6 +270,8 @@ squeue -u "$USER"                               # wait for them
 cat results/explorer/02_split_shared_gpu/check/summary.md
 # after multigpu access:
 scripts/gpu/explorer/submit.sh multi            # steps 03 to 06
+scripts/gpu/explorer/submit.sh train-multi      # training throughput: 1 GPU, 4 as one island, 2 + 2
+scripts/gpu/explorer/submit.sh 07-multi         # step 07 with 4 NVIDIA GPUs + the AMD side
 ```
 
 **Your settings.** Every step except 00 needs `PROJECT_DIR`, your group's
@@ -362,7 +365,8 @@ runs each phase as one heterogeneous job step (`srun --het-group=0 ... :
 **Per-island baselines need 2+ GPUs per island.** With one GPU, an island's
 all_reduce has nothing to exchange, so its row only times the call itself.
 `gpu` allows one GPU per job. For real baselines, set `GPUS_MIXED_AMD=2`, and,
-with multigpu access, `PARTITION_MIXED_NVIDIA=multigpu GPUS_MIXED_NVIDIA=2`.
+with multigpu access, use `submit.sh 07-multi`: the NVIDIA side on `multigpu`
+with `GPUS_MIXED_NVIDIA_MULTI` GPUs (4 by default, of `GPU_TYPE_MULTI`).
 
 Also check with RC before the first real run:
 
@@ -451,6 +455,26 @@ VENV_ROCM=$WORK_DIR/venv-rocm63 STEPS_07=training scripts/gpu/explorer/submit.sh
 The probe's `blas` stage (`blas_available` in `probe.json`) says whether a venv's
 matmuls run on the GPU.
 
+**Compression kernels while training on an MI50.** The default venv's Triton
+(triton-rocm 3.8.0) compiles them for gfx906. `scripts/gpu/rocm_triton_overlay.sh`
+makes a third, env-only venv: `bin/python`, `python3` and `torchrun` that run
+`venv-rocm63`'s, with the default venv's Triton linked in front on the path.
+Nothing in either venv changes, nothing is copied, and no Python runs, so it is
+fine on a login node:
+
+```bash
+scripts/gpu/rocm_triton_overlay.sh $WORK_DIR/venv-rocm63 $WORK_DIR/venv-rocm \
+    $WORK_DIR/venv-rocm63-triton38
+VENV_ROCM=$WORK_DIR/venv-rocm63-triton38 GPUBRIDGE_BRIDGE_COMPRESSION=fp8 \
+    GPUBRIDGE_COMPRESSION_KERNELS=triton STEPS_07=training scripts/gpu/explorer/submit.sh 07
+```
+
+The GPU tests and fp8 training passed with a manually constructed overlay of
+the same Triton files; this script's generated wrappers have CPU tests but
+have not yet run on the MI50
+([BENCHMARKS.md](BENCHMARKS.md#fp8-with-triton-kernels-on-the-mi50)). Rebuilding
+the default venv changes the Triton the overlay links to.
+
 **`(null): No such file or directory`, once per GPU per process.** The
 `libdrm_amdgpu` that the ROCm wheels bundle looks for its GPU-name table,
 `amdgpu.ids`, in `/opt/amdgpu/share/libdrm` and then by walking the directory
@@ -521,7 +545,7 @@ GPU memory would need there, into `rdma/<side>/`: dma-buf and peer-to-peer
 options in the kernel, `nvidia_peermem` or `nv_peer_mem`, rdma-core and
 `ibv_reg_dmabuf_mr`, `rdma link`, the HSA runtime's dma-buf export and UCX. For
 `ucx_info`, set `RDMA_MODULES` to a module that provides it (on Explorer,
-`OpenMPI/4.1.6`); it is loaded just before that step, the job's last.
+`OpenMPI/4.1.6`); it is loaded inside that step only.
 
 **Same-partition pairs wait for Research Computing.** A1, A2, B1, B2 and C need
 two GPUs of one type, which `08-nvidia-pair` and `08-amd-pair` ask for as two
@@ -537,13 +561,50 @@ step's time splits into compute (the same steps before DDP wraps the model),
 waiting for the slower GPU and exposed communication; `comm_alone_ms` is the
 gradient buckets all_reduced with no compute. Step 07 runs it on both sides
 (`train_bench_<model>`, with the other training steps; `STEPS_07=training`
-runs only the probe, the preflight and those), and `submit.sh train-nvidia` or
+runs only the probe, the preflight and those, `STEPS_07=bench` only the probe,
+the preflight and `train_bench_<model>`, and `TRAIN_BENCH_BUCKETS` repeats each
+at several DDP bucket sizes), and `submit.sh train-nvidia` or
 `train-amd` on one GPU alone, the baseline: adding a GPU through gpubridge
 pays off only if the pair's `samples_per_s` beats the faster GPU's alone.
 `TRAIN_BENCH_MODELS` and `TRAIN_BENCH_ARGS` choose the models and flags. Both
-models need BLAS on every GPU (the probe's `blas_available`): with a ROCm build
-whose rocBLAS lacks the GPU's kernels, its rank aborts at the first matmul, as
-the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
+sides take the same batch per rank unless told otherwise: `--batch-sizes a,b`
+sets one per rank, `--global-batch N` splits N samples evenly, and
+`--global-batch N --balance` times each rank alone for a few steps first and
+splits N in proportion to its speed, at least one sample each, so the faster
+GPU stops waiting for the slower one. With either, each rank's loss is weighted
+by its share of the samples, and the update is still the gradient of the mean
+loss over all N (bit for bit on CPU with integer data,
+[tests/test_train_bench.py](../tests/test_train_bench.py); CPU only so far).
+One rank alone with `--global-batch N` takes all N, so the baseline for a
+mixed run at global batch N is `TRAIN_BENCH_ARGS="--global-batch N"` on
+`train-nvidia`. The JSON has `global_batch`, `batch_sizes`, `batch_split`, each
+rank's `batch_size`, `compute_ms_per_sample` and `waiting_ms`, and with
+`--balance` the calibration's per-sample times. Models with BatchNorm
+(ResNet-50) normalize over each rank's own batch, so their result depends on
+the split, as it does in any DDP run without SyncBatchNorm.
+`--accumulate K` cuts each rank's batch (its samples per optimizer step) into K
+micro-batches and syncs the gradients once per step, in the last backward
+(`no_sync()` for the others): a global batch too big for a GPU's memory runs as
+K smaller forward and backward passes with one exchange. It combines with the
+flags above (with `--balance` the calibration runs at the micro-batch size and
+each rank gets at least K samples), and the update is exact the same way (CPU
+only so far), BatchNorm aside: it normalizes over each micro-batch. The JSON
+adds `accumulate`, `micro_batch_sizes`, `samples_per_step` and the
+`exchanges_per_step` the hook counted. On GPUs each rank's `memory` has, for the
+compute, ddp and comm-alone phases, the caching allocator's peaks
+(`max_allocated_mib`, `max_reserved_mib`) and the allocations it retried after
+freeing its cache (`alloc_retries`, a sign it ran short), and the GPU's
+`total_mib`.
+With multigpu access, `submit.sh train-multi` runs each model on one GPU, on
+`GPUS_TRAIN_MULTI` GPUs (4 by default) as one NCCL island, then on the same GPUs
+split into two islands joined by the bridge (`train_bench_<model>_split`, a
+split test): what several GPUs per island cost through the bridge, against the
+same GPUs on NCCL alone. `submit.sh 07-multi` does the same across vendors
+(several NVIDIA GPUs, one island, and the AMD side). Pipeline-parallel training
+isn't in the kit yet.
+Both models need BLAS on every GPU (the probe's `blas_available`):
+with a ROCm build whose rocBLAS lacks the GPU's kernels, its rank aborts at the
+first matmul, as the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
 
 ## Kaggle (free): two NVIDIA T4s
 
@@ -570,7 +631,7 @@ image that already has a ROCm build of PyTorch saves the 6+ GB download, with
 ```bash
 git clone https://github.com/DavidCzartoryski/gpubridge && cd gpubridge
 bash scripts/gpu/amd/run_all.sh --dry-run       # 1 second, no cost surprises
-bash scripts/gpu/amd/run_all.sh                 # everything; ~20-30 min
+bash scripts/gpu/amd/run_all.sh                 # ~20-30 min plus training
 ```
 
 The script runs:
@@ -591,12 +652,41 @@ With 2+ GPUs it continues with:
 9. the native vs bridged benchmark
 10. training scaling
 
-With 1 GPU it runs a shared-GPU split test instead.
+With 1 GPU it runs a shared-GPU split test instead. Then, either way, training
+throughput (`train_bench.py`, `TRAIN_BENCH_MODELS`, default GPT-2 small and
+ResNet-50; `TRAIN_BENCH_ARGS` for extra flags): each model on one GPU alone and,
+with 2+ GPUs, on all of them as one RCCL island and split into two islands
+through the bridge.
 
 A failing step is logged and skipped, so one problem doesn't waste the
 session. At the end the script prints the exact `scp` command for the results
 tarball. **Download it before stopping the machine.** To rerun after fixing
 something, `SKIP_SETUP=1` skips the install.
+
+### An MI300X on AMD Developer Cloud
+
+AMD Developer Cloud runs on DigitalOcean's GPU Droplets, whose MI300X
+Droplets have 1 or 8 GPUs. gfx942 is in the default ROCm wheel's build, with
+rocBLAS and hipBLASLt files for it
+([BENCHMARKS.md](BENCHMARKS.md#which-rocm-wheels-can-train-on-an-mi50-gfx906)),
+so no second venv is needed. Nothing here has run on one yet.
+
+1. Create an MI300X GPU Droplet from an image with ROCm (one with a ROCm
+   PyTorch lets you set `TORCH_FLAVOR=system` and skip a 6+ GB download), and
+   add your SSH key.
+2. `ssh` in, then:
+
+   ```bash
+   git clone https://github.com/DavidCzartoryski/gpubridge && cd gpubridge
+   bash scripts/gpu/amd/run_all.sh --dry-run    # checks the plan, costs nothing
+   bash scripts/gpu/amd/run_all.sh              # 8 GPUs: about 20-30 min plus training
+   ```
+
+   With one GPU it runs the single-GPU steps and the shared-GPU split test.
+3. Copy the results tarball off with the `scp` command it prints, then run
+   `python scripts/gpu/triage.py <tarball>` locally.
+4. **Destroy the Droplet**: DigitalOcean bills a powered-off Droplet until it
+   is destroyed.
 
 ## Real mixed-vendor job (two cloud machines)
 
@@ -679,8 +769,12 @@ interface (`IFNAME`), which checks:
 5. a real two-machine Gloo handshake succeeds
 
 The preflight **stops with a specific message before torchrun starts** if any
-check fails. After that, the script runs the correctness check and a bridged
-benchmark, and packs the results.
+check fails. After that, the script runs the correctness check, the bridged
+benchmarks (uncompressed, then bf16 and fp8), FSDP2 through the backend, and
+training throughput (`train_bench.py` on GPT-2 small and ResNet-50, DDP with
+`gpubridge.ddp_comm_hook`): first each machine's GPUs alone, one island and
+nothing on the bridge, then both machines together. Last it writes
+`triage.txt` (this machine's half) and packs the results.
 
 Ports: torchrun uses `MASTER_PORT` (29500) and the preflight uses
 `PREFLIGHT_PORT` (29501), plus Gloo's random ports. All are covered by an
@@ -690,6 +784,99 @@ Each machine only holds its own ranks' records. For the full verdict, copy
 both `results/mixed-*/check/rank*.json` sets into one directory and run
 `python scripts/gpu/summarize.py <dir>`. That run's `run.kind` must be
 `gpu-mixed`, with `split_test` null.
+
+### Dry run first: two containers
+
+[`mixed/containers.sh`](../scripts/gpu/mixed/containers.sh) runs `node.sh` end to
+end on CPU in two Linux containers on one Docker network, a stand-in for the
+two machines on an overlay: the master pretends to be the NVIDIA machine and the
+worker the AMD one (`GPUBRIDGE_VENDOR`), two ranks each by default (`NPROC`).
+Everything after setup runs as it would on GPUs, over a real network between
+two hosts: the preflight on `eth0`, the check, the benchmarks, FSDP2, training
+throughput on the tiny models, triage and both tarballs. It can't show GPUs,
+NCCL/RCCL, the overlay itself or a wide-area link.
+
+```bash
+scripts/gpu/mixed/containers.sh            # results in results/mixed_containers/
+NPROC=4 CPUS=4 scripts/gpu/mixed/containers.sh   # four ranks a machine
+```
+
+It builds a small image (`mixed/Dockerfile`: torch's CPU build and gpubridge)
+and needs only Docker. With Colima or Docker Desktop, keep the repo under your
+home directory, which the VM shares. Run it after any change to `node.sh` and
+before renting machines.
+
+### An 8+8 run, step by step
+
+One machine with 8 NVIDIA GPUs and one with 8 AMD GPUs. Nothing here has run on
+8-GPU machines yet, so the times below are the limits the kit enforces, not
+measurements.
+
+1. **Pick the pair.** Prefer one provider and region with a private network
+   between the two machines (no overlay needed, and the most bandwidth); else
+   any two machines and Tailscale. Both on Linux with the GPU driver installed
+   and a ROCm release that supports the AMD GPU.
+2. **Network.** Same provider: note each machine's private IP and interface
+   (`ip -br addr`), and open all TCP between the two in the provider's
+   firewall. Otherwise, Tailscale on both, as [above](#network-what-gpubridge-needs).
+   Check both ways: `ping` the other machine's address from each.
+3. **Code, on both, at one commit:**
+
+   ```bash
+   git clone https://github.com/DavidCzartoryski/gpubridge.git && cd gpubridge
+   git checkout <commit>       # the same on both machines
+   ```
+
+4. **Look at the commands first**, on both (`--dry-run` only prints them):
+
+   ```bash
+   ROLE=master MASTER_ADDR=<master IP> IFNAME=<interface> NPROC=8 \
+       bash scripts/gpu/mixed/node.sh --dry-run
+   ```
+
+5. **Run.** Master first, the worker within about 90 seconds (the preflight's
+   timeout). `node.sh` sets up the venv first (PyTorch 2.14.1 for the
+   machine's GPUs: about 7 GB for the CUDA build, more for ROCm's). On a
+   private network of 25 Gb/s or more, `BENCH_MAX_BYTES=1G` also measures the
+   large sizes:
+
+   ```bash
+   # NVIDIA machine:
+   ROLE=master MASTER_ADDR=<master IP> IFNAME=<interface> NPROC=8 BENCH_MAX_BYTES=1G \
+       bash scripts/gpu/mixed/node.sh
+   # AMD machine:
+   ROLE=worker MASTER_ADDR=<master IP> IFNAME=<interface> NPROC=8 BENCH_MAX_BYTES=1G \
+       bash scripts/gpu/mixed/node.sh
+   ```
+
+   Each machine is one island of 8 (NCCL on one, RCCL on the other) and the
+   bridge joins the two leaders. Every launch is stopped after `KIT_TIMEOUT`
+   seconds (1200 by default) and recorded as timed out, so a hung step costs
+   at most 20 minutes; 11 steps follow the preflight.
+6. **Collect.** Each machine prints the `scp` line for its tarball. Copy both,
+   then:
+
+   ```bash
+   python scripts/gpu/triage.py mixed-master-<host>.tgz
+   python scripts/gpu/triage.py mixed-worker-<host>.tgz
+   ```
+
+   The two-machine training records (`train_bench_<model>.json`) are in the
+   tarball of the machine that got rank 0, which writes them, as it writes the
+   benchmarks' and FSDP2's. torchrun numbers the machines by their addresses
+   (`LOCAL_ADDR`), not by role, so it can be either. Each tarball holds its own
+   machine's baseline (`train_bench_alone_<model>.json`). For the check's
+   verdict, see above.
+7. **Stop billing.** Destroy both machines once the tarballs are copied; on
+   some providers a powered-off GPU machine still bills.
+
+What it answers: whether gpubridge's bridge, compression and training paths
+work on 8+8 GPUs of current generations; what the bridge costs at each size on
+that network (the benchmark against the preflight's prediction); and whether
+16 GPUs across vendors train faster than each machine's 8 alone, for GPT-2
+small and ResNet-50 (`samples_per_s`, with the step split into compute, waiting
+for the slower machine and exposed communication). Pipeline-parallel training
+isn't in the kit yet; when it is, it becomes one more step here.
 
 ## Reading results
 

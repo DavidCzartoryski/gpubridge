@@ -491,6 +491,56 @@ def test_mixed_hetjob_skips_hsdp_unless_both_sides_have_as_many_gpus():
     assert "skipping the HSDP steps: they need as many NVIDIA GPUs as AMD (2 vs 1)" in result.stderr
 
 
+def passed_steps(log: str) -> list[str]:
+    """The steps a dry run's last "passed:" line names, in order."""
+    line = [line for line in log.splitlines() if "] passed: " in line][-1]
+    return line.split("] passed: ", 1)[1].split()
+
+
+TRAINING_07 = ["train_fsdp2_backend", "verify_fsdp2_backend", "train_hsdp_backend",
+               "verify_hsdp_backend"]
+
+
+@pytest.mark.parametrize(("env", "expected"), [
+    ({"STEPS_07": "bench"},
+     ["probe", "preflight", "train_bench_gpt2-small", "train_bench_resnet50"]),
+    ({"STEPS_07": "bench", "TRAIN_BENCH_MODELS": "resnet50", "TRAIN_BENCH_BUCKETS": "10 25"},
+     ["probe", "preflight", "train_bench_resnet50_bucket10", "train_bench_resnet50_bucket25"]),
+    ({"STEPS_07": "training", "TRAIN_BENCH_BUCKETS": "12.5"},
+     ["probe", "preflight", "train_ddp", "train_bench_gpt2-small_bucket12.5",
+      "train_bench_resnet50_bucket12.5", *TRAINING_07]),
+])
+def test_mixed_hetjob_step_selection(env, expected):
+    env = {"TRAIN_BENCH_MODELS": "gpt2-small resnet50", "TRAIN_BENCH_ARGS": "--steps 5",
+           "TRAIN_BENCH_BUCKETS": "", **env}
+    result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w", **env)
+    assert result.returncode == 0, result.stderr
+    assert passed_steps(result.stderr) == expected
+    runs = [line for line in result.stdout.splitlines() if "train_bench.py" in line]
+    assert len(runs) == len([name for name in expected if name.startswith("train_bench_")])
+    for name, line in zip([n for n in expected if n.startswith("train_bench_")], runs,
+                          strict=True):
+        # Each run on both sides, under its own JSON name and rendezvous, after the
+        # extra arguments, with its bucket size when it has one.
+        assert line.count(f"/{name}.json --steps 5") == 2, line
+        assert line.count(f"--rdzv-id=local-{name.replace('_', '-')} ") == 2, line
+        mb = name.partition("_bucket")[2]
+        assert line.count("--bucket-mb") == (2 if mb else 0), line
+        assert not mb or line.count(f"--steps 5 --bucket-mb {mb} ") == 2, line
+
+
+@pytest.mark.parametrize(("env", "message"), [
+    ({"STEPS_07": "hsdp"}, "STEPS_07 must be all, training or bench"),
+    ({"TRAIN_BENCH_BUCKETS": "10 big"}, "TRAIN_BENCH_BUCKETS: 'big' is not a size in MB"),
+    ({"TRAIN_BENCH_BUCKETS": "10", "TRAIN_BENCH_ARGS": "--steps 5 --bucket-mb 5"},
+     "in TRAIN_BENCH_BUCKETS or in TRAIN_BENCH_ARGS, not both"),
+])
+def test_mixed_hetjob_refuses_unknown_step_settings(env, message):
+    result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w", **env)
+    assert result.returncode != 0 and message in result.stderr, result.stderr
+    assert "srun" not in result.stdout
+
+
 def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w")
     assert result.returncode == 0, result.stderr
@@ -597,7 +647,9 @@ def test_amd_dry_run_with_several_gpus():
                  "GPUBRIDGE_SPLIT_TEST=half", "bench_all_reduce.py", "train_n4", "tar -czf",
                  "--policy pipelined-reduce-bridge-broadcast", "--policy sharded-bridge",
                  "train_ddp_split.json", "GPUBRIDGE_PINNED_STAGING=1", "bench_pinned",
-                 "--durations=15", "export AMDGPU_ASIC_ID_TABLE_PATHS="]:
+                 "--durations=15", "export AMDGPU_ASIC_ID_TABLE_PATHS=",
+                 "train_bench_gpt2-small_1gpu.json", "train_bench_resnet50_island.json",
+                 "train_bench_gpt2-small_split.json"]:
         assert text in out, text
     assert "train_n5" not in out
 
@@ -606,7 +658,144 @@ def test_amd_dry_run_with_one_gpu_shares_it():
     out = dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="1").stdout
     assert "check_split_shared_gpu" in out and "--nproc-per-node=2" in out
     assert "bench_all_reduce.py" not in out
+    # Training throughput on the one GPU alone; nothing to split it with.
+    assert "train_bench_gpt2-small_1gpu.json" in out and "_split.json" not in out
 
+
+def test_amd_dry_run_passes_train_bench_args_to_every_run():
+    out = dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="2", TRAIN_BENCH_MODELS="gpt2-small",
+                  TRAIN_BENCH_ARGS="--batch-size 16").stdout
+    runs = [line for line in out.splitlines()
+            if line.startswith("+ timeout") and "train_bench.py" in line]
+    assert len(runs) == 3, out
+    assert all("--batch-size 16" in line for line in runs)
+    assert "resnet50" not in out
+
+
+def _overlay_venvs(tmp_path: Path, triton_minor: int | None = None) -> tuple[Path, Path]:
+    """A base venv whose python runs this interpreter with its own site-packages (an old
+    triton) after PYTHONPATH, and a venv holding a newer triton and its dist-info."""
+    minor = f"python3.{sys.version_info.minor}"
+    base, newer = tmp_path / "venv-old", tmp_path / "venv-new"
+    base_site = base / "lib" / minor / "site-packages"
+    (base_site / "triton").mkdir(parents=True)
+    (base_site / "triton" / "__init__.py").write_text('__version__ = "3.5.1"\n')
+    (base / "bin").mkdir()
+    for tool in ("python", "python3", "torchrun"):
+        (base / "bin" / tool).write_text(
+            "#!/usr/bin/env bash\n"
+            f'export PYTHONPATH="${{PYTHONPATH:+$PYTHONPATH:}}{base_site}"\n'
+            f'exec {sys.executable} "$@"\n')
+        (base / "bin" / tool).chmod(0o755)
+    newer_site = newer / "lib" / f"python3.{triton_minor or sys.version_info.minor}" / "site-packages"
+    (newer_site / "triton").mkdir(parents=True)
+    (newer_site / "triton" / "__init__.py").write_text('__version__ = "3.8.0"\n')
+    (newer_site / "triton_rocm-3.8.0.dist-info").mkdir()
+    return base, newer
+
+
+@pytest.mark.parametrize("directory", ["plain", "with spaces"])
+def test_rocm_triton_overlay_puts_the_newer_triton_first(tmp_path, directory):
+    tmp_path = tmp_path / directory
+    base, newer = _overlay_venvs(tmp_path)
+    out = tmp_path / "venv-old-triton38"
+    result = subprocess.run([str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(out)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert "triton_rocm-3.8.0" in result.stdout
+    overlay = out / "overlay"
+    assert sorted(p.name for p in overlay.iterdir()) == ["triton", "triton_rocm-3.8.0.dist-info"]
+    assert all(p.is_symlink() for p in overlay.iterdir())  # links, not a 1 GB copy
+    for tool in ("python", "python3", "torchrun"):
+        run = subprocess.run([str(out / "bin" / tool), "-c",
+                              "import triton; print(triton.__version__)"],
+                             capture_output=True, text=True, timeout=60)
+        assert run.stdout.strip() == "3.8.0", (tool, run.stderr)
+    # Without the overlay the base venv's own triton is the one imported.
+    run = subprocess.run([str(base / "bin" / "python"), "-c",
+                          "import triton; print(triton.__version__)"],
+                         capture_output=True, text=True, timeout=60)
+    assert run.stdout.strip() == "3.5.1"
+    # Rerunning replaces the links instead of failing on them.
+    again = subprocess.run(["bash", str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                            str(out)], capture_output=True, text=True, timeout=60)
+    assert again.returncode == 0, again.stderr
+
+
+@pytest.mark.parametrize("destination", ["base", "triton", "alias", "venv"])
+def test_rocm_triton_overlay_refuses_source_or_existing_venv(tmp_path, destination):
+    base, newer = _overlay_venvs(tmp_path)
+    interpreter = base / "bin" / "python"
+    original = interpreter.read_bytes()
+    if destination == "base":
+        out = base
+    elif destination == "triton":
+        out = newer
+    elif destination == "alias":
+        out = tmp_path / "alias"
+        out.symlink_to(base, target_is_directory=True)
+    else:
+        out = tmp_path / "existing-venv"
+        out.mkdir()
+        (out / "pyvenv.cfg").write_text("home = example\n")
+    result = subprocess.run([str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(out)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1, result.stderr
+    assert "OUT_DIR" in result.stderr
+    assert interpreter.read_bytes() == original
+    assert not (out / "overlay").exists()
+
+
+@pytest.mark.parametrize("directory", ["bin", "overlay"])
+def test_rocm_triton_overlay_refuses_linked_output_directories(tmp_path, directory):
+    base, newer = _overlay_venvs(tmp_path)
+    original = (base / "bin" / "python").read_bytes()
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / directory).symlink_to(base / "bin", target_is_directory=True)
+    result = subprocess.run([str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(out)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1 and "symbolic link" in result.stderr
+    assert (base / "bin" / "python").read_bytes() == original
+
+
+@pytest.mark.parametrize("link_type", ["symlink", "hardlink"])
+def test_rocm_triton_overlay_replaces_wrapper_links_without_overwriting_target(tmp_path, link_type):
+    base, newer = _overlay_venvs(tmp_path)
+    target = tmp_path / "shared-interpreter"
+    target.write_text("preserve the shared interpreter\n")
+    out = tmp_path / "out"
+    (out / "bin").mkdir(parents=True)
+    for tool in ("python", "python3", "torchrun"):
+        link = out / "bin" / tool
+        if link_type == "symlink":
+            link.symlink_to(target)
+        else:
+            link.hardlink_to(target)
+    result = subprocess.run([str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(out)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert target.read_text() == "preserve the shared interpreter\n"
+    for tool in ("python", "python3", "torchrun"):
+        run = subprocess.run([str(out / "bin" / tool), "-c",
+                              "import triton; print(triton.__version__)"],
+                             capture_output=True, text=True, timeout=60)
+        assert run.returncode == 0 and run.stdout.strip() == "3.8.0", run.stderr
+
+
+def test_rocm_triton_overlay_refuses_another_python_version(tmp_path):
+    base, newer = _overlay_venvs(tmp_path, triton_minor=sys.version_info.minor + 1)
+    result = subprocess.run(["bash", str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(tmp_path / "out")], capture_output=True, text=True, timeout=60)
+    minor = sys.version_info.minor
+    assert result.returncode == 1, result.stderr
+    assert f"{newer} is python3.{minor + 1}, {base} is python3.{minor}" in result.stderr
+
+
+def test_rocm_triton_overlay_needs_three_arguments():
+    result = subprocess.run(["bash", str(KIT / "rocm_triton_overlay.sh")],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2 and "BASE_VENV TRITON_VENV OUT_DIR" in result.stderr
 
 @pytest.mark.parametrize(("role", "is_host"), [("master", "1"), ("worker", "0")])
 def test_mixed_node_dry_run(role, is_host):
@@ -1664,13 +1853,18 @@ def test_amd_script_keeps_going_after_failures_and_packages_results(tmp_path):
     # No GPU here: probe, device_map and rccl_version must fail, everything else must run.
     result = run_script(KIT / "amd" / "run_all.sh", GPUBRIDGE_VENDOR="amd", SKIP_SETUP="1",
                         GPU_COUNT="2", SCALING_MAX_GPUS="2", BENCH_MAX_BYTES="16K",
-                        BENCH_TRIALS="3", RESULTS_ROOT=str(tmp_path), TARGET="sim")
+                        BENCH_TRIALS="3", RESULTS_ROOT=str(tmp_path), TARGET="sim",
+                        TRAIN_BENCH_MODELS="tiny-gpt")
     assert result.returncode == 1  # some steps failed, so the run reports failure
     codes = steps(tmp_path / "sim")
     assert {name for name, code in codes.items() if code} == {"probe", "device_map",
                                                                "rccl_version"}
     assert {"check_1gpu", "check_island", "check_split", "bench", "train_n2",
-            "summarize"} <= {name for name, code in codes.items() if code == 0}
+            "train_bench_tiny-gpt_1gpu", "train_bench_tiny-gpt_island",
+            "train_bench_tiny-gpt_split", "summarize"} <= {
+                name for name, code in codes.items() if code == 0}
+    split = json.loads((tmp_path / "sim" / "train_bench_tiny-gpt_split.json").read_text())
+    assert split["world_size"] == 2 and split["run"]["split_test"] == "half"
     assert (tmp_path / "sim.tgz").exists()
     assert "Download it before stopping this machine" in result.stderr
 
@@ -2001,3 +2195,103 @@ def test_train_bench_runs_ddp_through_gpubridge_on_cpu(tmp_path):
     assert [r["vendor"] for r in record["ranks"]] == ["nvidia", "amd"]
     assert record["samples_per_s"] > 0 and len(record["environments"]) == 2
     assert "SPLIT TEST" in record["warning"]
+
+
+@pytest.mark.parametrize(("args", "split", "want"), [
+    (("--batch-sizes", "1,3"), "explicit", [1, 3]),
+    (("--global-batch", "7"), "even", [4, 3]),
+    (("--global-batch", "6", "--balance", "--calibration-steps", "1"), "balanced", None),
+])
+def test_train_bench_takes_unequal_batches_and_reports_them(args, split, want, tmp_path):
+    out = tmp_path / "train_bench.json"
+    result = torchrun(2, KIT / "train_bench.py", "--model", "tiny-gpt", "--steps", "2",
+                      "--warmup-steps", "1", "--comm-trials", "1", "--json", str(out), *args,
+                      GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode == 0, result.stderr[-3000:]
+    record = json.loads(out.read_text())
+    sizes = record["batch_sizes"]
+    assert record["batch_split"] == split and (want is None or sizes == want)
+    assert record["global_batch"] == sum(sizes) and min(sizes) >= 1
+    assert record["loss_weighting"].startswith("sample-weighted")
+    assert [r["batch_size"] for r in record["ranks"]] == sizes
+    assert all(r["compute_ms_per_sample"] > 0 and r["waiting_ms"] >= 0 for r in record["ranks"])
+    assert record["params_identical"] and record["params_finite"]
+    if split == "balanced":
+        assert record["global_batch"] == 6
+        assert record["calibration"]["batch_size"] == 3
+        assert [r["rank"] for r in record["calibration"]["ranks"]] == [0, 1]
+        assert f"balanced split of 6: {sizes}" in result.stdout
+    else:
+        assert record["calibration"] is None
+
+
+def test_train_bench_alone_runs_the_whole_global_batch_with_the_same_flags(tmp_path):
+    out = tmp_path / "train_bench.json"
+    result = torchrun(1, KIT / "train_bench.py", "--model", "tiny-gpt", "--steps", "1",
+                      "--warmup-steps", "1", "--comm-trials", "1", "--json", str(out),
+                      "--global-batch", "6", "--balance", "--accumulate", "2",
+                      GPUBRIDGE_VENDOR="nvidia")
+    assert result.returncode == 0, result.stderr[-3000:]
+    record = json.loads(out.read_text())
+    assert record["batch_sizes"] == [6] and record["global_batch"] == 6
+    assert record["batch_split"] == "balanced" and record["calibration"] is None
+    assert record["micro_batch_sizes"] == [[3, 3]] and record["exchanges_per_step"] == 1.0
+
+
+def test_train_bench_default_batches_are_unweighted_and_say_so(tmp_path):
+    out = tmp_path / "train_bench.json"
+    result = torchrun(2, KIT / "train_bench.py", "--model", "tiny-gpt", "--steps", "1",
+                      "--warmup-steps", "1", "--comm-trials", "1", "--json", str(out),
+                      "--batch-size", "2", GPUBRIDGE_VENDOR="nvidia",
+                      GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode == 0, result.stderr[-3000:]
+    record = json.loads(out.read_text())
+    assert record["batch_size_per_rank"] == 2 and record["global_batch"] == 4
+    assert record["batch_split"] == "per-rank"
+    assert record["loss_weighting"] == "mean per rank, averaged over ranks"
+    assert record["accumulate"] == 1 and record["micro_batch_sizes"] == [[2], [2]]
+    assert record["exchanges_per_step"] == 1.0
+    assert [r["memory"] for r in record["ranks"]] == [None, None]  # GPU only
+
+
+@pytest.mark.parametrize(("args", "micro"), [
+    (("--batch-size", "4", "--accumulate", "2"), [[2, 2], [2, 2]]),
+    (("--batch-sizes", "2,5", "--accumulate", "2"), [[1, 1], [3, 2]]),
+    (("--global-batch", "8", "--balance", "--accumulate", "2", "--calibration-steps", "1"),
+     None),
+])
+def test_train_bench_accumulates_micro_batches_with_one_exchange_per_step(args, micro,
+                                                                          tmp_path):
+    out = tmp_path / "train_bench.json"
+    result = torchrun(2, KIT / "train_bench.py", "--model", "tiny-gpt", "--steps", "2",
+                      "--warmup-steps", "1", "--comm-trials", "1", "--json", str(out), *args,
+                      GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode == 0, result.stderr[-3000:]
+    record = json.loads(out.read_text())
+    assert record["accumulate"] == 2 and record["exchanges_per_step"] == 1.0
+    got = record["micro_batch_sizes"]
+    assert micro is None or got == micro
+    assert [sum(m) for m in got] == record["batch_sizes"]
+    assert all(len(m) == 2 and min(m) >= 1 for m in got)
+    n = record["global_batch"]
+    assert record["samples_per_step"] == n == sum(record["batch_sizes"])
+    assert record["samples_per_exchange"] == n and record["exchanges_per_sample"] == round(1 / n, 6)
+    assert record["loss_weighting"].startswith("sample-weighted")
+    assert record["params_identical"] and record["params_finite"]
+    if micro is None:
+        assert n == 8 and record["calibration"]["batch_size"] == 2
+
+
+@pytest.mark.parametrize(("args", "message"), [
+    (("--accumulate", "3", "--batch-size", "2"), "needs at least 3 samples per rank"),
+    (("--accumulate", "0"), "--accumulate must be at least 1"),
+    (("--balance",), "--balance needs --global-batch"),
+    (("--batch-sizes", "1,2,3"), "--batch-sizes needs 2 sizes"),
+    (("--global-batch", "1"), "can't give each of 2 ranks a sample"),
+    (("--batch-size", "2", "--global-batch", "4"), "not allowed with"),
+])
+def test_train_bench_rejects_batch_settings_it_cant_honour(args, message):
+    result = torchrun(2, KIT / "train_bench.py", "--model", "tiny-gpt", *args,
+                      GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode != 0
+    assert message in result.stderr

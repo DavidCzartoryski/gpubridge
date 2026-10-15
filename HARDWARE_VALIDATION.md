@@ -352,9 +352,10 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     three and four leaders (`tests/test_ucx.py`); the flush's placement is
     tested on CPU against a fake worker whose receives land only when flushed
     (`tests/test_gdr_flush.py`); the device path's GPU tests are written
-    (`tests/test_gpu.py`). Nothing has run on RDMA hardware. Explorer has no
-    RDMA path between its V100 and MI50 nodes, and its UCX has no verbs
-    transport ([docs/BENCHMARKS.md](docs/BENCHMARKS.md#rdma-between-the-node-types)).*
+    (`tests/test_gpu.py`). Nothing has run on RDMA hardware. On Explorer, the
+    V100 and MI50 nodes checked have no RDMA path between them, and no UCX
+    there has a `cuda` or `rocm` transport
+    ([docs/BENCHMARKS.md](docs/BENCHMARKS.md#rdma-between-the-node-types)).*
     *Step:* `ucx_build` and `check_ucx` in Explorer steps 05 and 07, with
     `UCX_BRIDGE=1`. See [docs/RDMA_TRANSPORT.md](docs/RDMA_TRANSPORT.md) for
     the questions to settle first (InfiniBand on the GPU nodes, GPUDirect
@@ -539,11 +540,25 @@ Where the FAILs come from:
   bit for bit against a single-process replay.
 - **`train_hsdp_backend`, `verify_hsdp_backend` (item 31)**: failed in step
   07's second run (the same rocBLAS abort). With the MI50 on torch
-  2.9.1+rocm6.3, `train_hsdp_backend` printed nothing for 20 minutes and the
-  kit's step timeout stopped it (exit 124); the job was then cancelled, so
-  `verify_hsdp_backend` didn't run. Why it hung is not known: nothing dumped
-  the stacks. That job mixed torch 2.14.1 (V100) and 2.9.1 (MI50); whether
-  that matters is not known either.
+  2.9.1+rocm6.3, `train_hsdp_backend` printed nothing until the kit's step
+  timeout stopped it (exit 124) or the job was cancelled, in this job and
+  the later mixed jobs recorded here.
+  **Where it stops**, from a CPU reproduction (gpubridge's simulation mode,
+  two ranks on one node, `examples/fsdp2_torch_backend.py --hsdp 2`): with
+  both ranks on torch 2.14.1, or both on 2.9.1, it completes; with rank 0 on
+  2.14.1 and rank 1 on 2.9.1 it hangs the same way. Python stacks taken at
+  the hang (faulthandler) show both ranks in gpubridge's one-time world setup,
+  inside `dist.new_group` (`torch_backend._world_topology` -> `setup`),
+  reached from FSDP's first gradient collective: an `all_reduce` on rank 0
+  and a `reduce_scatter` on rank 1. The two torch releases' `DeviceMesh`
+  creates a different number of groups for the (2, 1) mesh (2.14.1 reuses the
+  default group for the replicate dimension; 2.9.1 calls `new_group`), and
+  the world setup's groups take torch's default names, which count the groups
+  each process has made, so the ranks likely wait on different store keys.
+  A setup-naming fix in `src/` completed this mixed-version CPU example and
+  its bit-for-bit replay check. It has not yet been validated on the GPU
+  pair, whose original hang had no captured stacks. Plain `init_device_mesh`
+  and a barrier with the same mixed versions, without gpubridge, don't hang.
 
 ### Network
 

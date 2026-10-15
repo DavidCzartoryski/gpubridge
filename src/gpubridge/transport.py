@@ -109,6 +109,17 @@ class BridgeTransport(abc.ABC):
     def close(self) -> None:  # noqa: B027 - optional hook, deliberately not abstract
         """Release resources. Called by :func:`gpubridge.destroy`; the default does nothing."""
 
+    @classmethod
+    def create_p2p(cls, group: ProcessGroup, *, store=None, timeout=None):
+        """An optional all-member point-to-point link for the torch backend.
+
+        Unlike :meth:`create`, this hook runs locally after topology setup. It
+        must not create a process group or wait for another rank. The supplied
+        Gloo group contains every member, including non-leaders. The default
+        refuses P2P without changing existing collective-only transports.
+        """
+        raise NotImplementedError(f"bridge transport {cls.name!r} has no point-to-point link")
+
 
 class GlooTransport(BridgeTransport):
     """The default bridge: a Gloo process group of the island leaders."""
@@ -131,6 +142,12 @@ class GlooTransport(BridgeTransport):
 
     def broadcast(self, tensor: torch.Tensor, src: int) -> None:
         dist.broadcast(tensor, src=src, group=self.group)
+
+    @classmethod
+    def create_p2p(cls, group: ProcessGroup, *, store=None, timeout=None):
+        from gpubridge.p2p import GlooLink
+
+        return GlooLink(group)
 
 
 DEFAULT_TRANSPORT = GlooTransport.name

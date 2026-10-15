@@ -13,13 +13,13 @@ intended use (see [Waiting on Research Computing](#waiting-on-research-computing
 | Run | What it measures | Status |
 | --- | --- | --- |
 | Network check | InfiniBand/RoCE on each node type; the transport NCCL and RCCL choose | ran, one V100 node and one MI50 node |
-| RDMA check | what RDMA from GPU memory would need on each node type: peer-memory modules, dma-buf, UCX | ran, one V100 node and one MI50 node: no RDMA path between them |
+| RDMA check | what RDMA from GPU memory would need on each node type: peer-memory modules, dma-buf, UCX | ran, one V100 node and one MI50 node: no RDMA path between the nodes checked |
 | A1, A2 | two V100s, native NCCL: as NCCL chooses, then TCP on the bridge's interface | waiting on Research Computing |
 | B1, B2 | two MI50s, native RCCL: the same two | waiting on Research Computing |
 | C, C-amd | two V100s (two MI50s) through gpubridge's bridge, one island each: gpubridge's own cost without vendor mixing | waiting on Research Computing |
 | D | a V100 and an MI50 through gpubridge: every policy | ran |
 | E | the same two ranks as one flat Gloo group | ran |
-| Training | DDP with `gpubridge.ddp_comm_hook` on GPT-2 small and ResNet-50: each GPU alone, then both | ran: the V100 alone, the MI50 alone (torch 2.9.1+rocm6.3) and both together |
+| Training | DDP with `gpubridge.ddp_comm_hook` on GPT-2 small and ResNet-50: each GPU alone, then both | ran: the V100 alone, the MI50 alone (torch 2.9.1+rocm6.3) and both together, uncompressed and with fp8 on the bridge (GPT-2 small at batches 4 to 32) |
 
 ## Setup
 
@@ -71,7 +71,7 @@ What this means for the comparison:
   interface.
 - In the D runs each island has one rank, so NCCL and RCCL never cross the
   network; their lines above say what they would choose, not a transport in use.
-- **There is no RDMA path between the two node types**; see
+- **No RDMA path between the V100 and MI50 nodes checked**; see
   [RDMA between the node types](#rdma-between-the-node-types).
 
 ### RDMA between the node types
@@ -83,7 +83,9 @@ dma-buf and peer-to-peer options, the RDMA and GPU kernel modules, rdma-core,
 `rdma link`, the HSA runtime's dma-buf export, and UCX, with the cluster's
 OpenMPI 4.1.6 module loaded for its `ucx_info` (`RDMA_MODULES`). One node of
 each type: a different V100 node from the first network check's, and the same
-MI50 node. The V100 node's ports matched the first one's.
+MI50 node. The V100 node's ports matched the first one's. Step 00's records list
+two MI50 nodes in `sharing`, one of them drained; every MI50 job so far ran on
+the other.
 
 | | V100 node (`gpu`) | MI50 node (`sharing`) |
 | --- | --- | --- |
@@ -93,27 +95,37 @@ MI50 node. The V100 node's ports matched the first one's.
 | dma-buf and peer-to-peer in the kernel | `DMABUF_MOVE_NOTIFY`, `PCI_P2PDMA` | the same, and `HSA_AMD_P2P` |
 | rdma-core | 46.0; libibverbs has `ibv_reg_dmabuf_mr` | 57.0; the same |
 | GPU memory for the NIC | `nvidia_peermem` (545.23.08) installed for this kernel, not loaded; the NVIDIA kernel module is the proprietary one (license `NVIDIA`) | no `amdp2p` module; torch's HSA runtime (2.14.1+rocm7.2) has `hsa_amd_portable_export_dmabuf` |
-| UCX | 1.16.0, the only build found (in the OpenMPI 4.1.6 module): transports `self`, `tcp`, `sysv`, `posix`, `cma`; memory type host only | the same build, the same transports; host only |
+| UCX | 1.16.0, in the OpenMPI 4.1.6 module: `ucx_info -d` found `self`, `tcp`, `sysv`, `posix`, `cma`, all host memory only | the same build, the same transports; host only |
 
 What this means:
 
-- **No RDMA path between a V100 node and an MI50 node.** The V100 node's only
-  RDMA device is on InfiniBand; the MI50 node's only active one is on Ethernet,
-  and its InfiniBand port is disabled. An InfiniBand port can't reach a RoCE
-  port, and RoCE needs an RDMA device at both ends: the V100 node reaches the
-  MI50 node's Ethernet network through `internal`, which has none. So the UCX
-  transport's RDMA and GPUDirect paths (items 26 and 27 in
-  [HARDWARE_VALIDATION.md](../HARDWARE_VALIDATION.md)) can't be validated
-  between these two node types; the bridge stays on TCP.
-- **The cluster's UCX can't do RDMA or GPU memory even within one node type.**
-  It was built without verbs and without CUDA or ROCm, so it offers TCP and
-  shared memory only. RDMA through gpubridge's UCX transport on Explorer would
-  need another UCX build; none was tried.
+- **No RDMA path between the V100 and MI50 nodes checked** (two V100 nodes,
+  counting the first network check's, and the MI50 node in service). The V100
+  nodes' only RDMA device is on InfiniBand; the MI50 node's only active one is
+  on Ethernet, and its InfiniBand port is disabled. An InfiniBand port can't
+  reach a RoCE port, and RoCE needs an RDMA device at both ends: the V100 node
+  reaches the MI50 node's Ethernet network through `internal`, which has none.
+  So on these nodes the UCX transport's RDMA and GPUDirect paths (items 26 and
+  27 in [HARDWARE_VALIDATION.md](../HARDWARE_VALIDATION.md)) can't be
+  validated; the bridge stays on TCP. Other nodes, or a change to their ports,
+  could differ.
+- **The OpenMPI module's UCX can't do RDMA or GPU memory, even between nodes
+  of one type.** At run time it offered only TCP and shared-memory transports,
+  host memory only, and its install has one transport module, `cma`: no `ib`,
+  `rdmacm`, `cuda` or `rocm` (`lib/ucx` in the module, listed from the login
+  node). It is the only UCX module in `module avail`, and the system has no
+  UCX package. Some application modules bundle their own UCX: AMBER's has only
+  `cma` too, while LAMMPS's and OpenFOAM's have `ib` and `rdmacm`, still with
+  no `cuda` or `rocm`. A UCX like those could carry host-staged RDMA between
+  nodes on one fabric (two V100 nodes), never GPU memory; none was tried, and
+  their versions weren't checked. GPU memory over RDMA on Explorer would need
+  a UCX built with CUDA or ROCm.
 - **GPU side, for other hardware.** On the V100 nodes GPUDirect RDMA would
   need `nvidia_peermem` loaded, which it isn't; NVIDIA's dma-buf path needs the
-  open kernel modules, which these nodes don't run. The MI50 node has what
-  dma-buf RDMA from AMD GPU memory needs (the kernel option, the runtime's
-  export call, `ibv_reg_dmabuf_mr`), but nothing was tried.
+  open kernel modules, which these nodes don't run. The MI50 node has the
+  pieces dma-buf RDMA from AMD GPU memory would use (the kernel option, the
+  runtime's export call, `ibv_reg_dmabuf_mr`); neither exporting a GPU buffer
+  nor registering one with the NIC was tried.
 - Not recorded: `ulimit -l` in jobs and `perftest`. Neither changes the
   answer above.
 
@@ -464,7 +476,124 @@ pageable staging) over TCP on `internal.2137`; their preflight measured
 
 These runs used the default policy, which the matrix above measured at about
 0.65 GB/s; pinned staging, pipelining and fp8 compression were 1.4x to 2.8x
-faster at 1 GB there. Training with them hasn't been measured.
+faster at 1 GB there. fp8 is measured in training below; pinned staging and
+pipelining aren't.
+
+### fp8 on the bridge, and larger batches
+
+The same mixed job and the same `train_bench.py`, at commit 4e7f04e (clean on
+both ranks), with the bridge compressing to fp8
+(`GPUBRIDGE_BRIDGE_COMPRESSION=fp8`). The MI50's Triton in `venv-rocm63`
+can't compile gpubridge's compression kernels for gfx906, so both ranks ran
+the PyTorch versions instead (`GPUBRIDGE_COMPRESSION_KERNELS=torch`): the same
+bits, but slower, so these runs understate what fp8 saves. Both settings are
+in every rank's record. Everything else as above: float32, the default policy
+and pageable staging over TCP, 25 MB buckets (13 for GPT-2 small at every
+batch), 3 warm-up and 10 timed steps, one run per row. Each run's preflight
+measured 1172 to 1174 MB/s from the V100 to the MI50 and 1164 to 1174 MB/s
+back. The MI50 was the same node in every run; the V100 was one of two nodes.
+
+Batch is per rank, so a mixed run processes twice the V100-alone run's
+samples per step.
+
+| Model | Batch | V100 alone | V100 + MI50, fp8 | Mixed / alone | Step (ms) | MI50 compute | V100 compute | V100 waits | Exposed comm | Comm alone |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| GPT-2 small | 4 | 25.3 | 12.495 | 0.49x | 640.3 | 243.1 | 152.0 | 91.1 | 397.2 | 482.5 |
+| GPT-2 small | 8 | 27.669 | 19.686 | 0.71x | 812.8 | 441.8 | 282.6 | 159.1 | 371.0 | 472.4 |
+| GPT-2 small | 16 | 28.395 | 26.274 | 0.93x | 1217.9 | 960.5 | 551.2 | 409.2 | 257.5 | 484.9 |
+| GPT-2 small | 32 | 29.247 | 28.311 | 0.97x | 2260.6 | 1815.4 | 1087.0 | 728.4 | 445.2 | 605.3 |
+| ResNet-50 | 32 | 315.8 | 366.849 | 1.16x | 174.5 | 128.4 | 98.4 | 30.0 | 46.0 | 102.2 |
+
+Samples/s, then milliseconds per step (medians of the 10 timed steps). The
+V100-alone runs are `submit.sh train-nvidia` at the same per-rank batch; the
+batch-4 GPT-2 and ResNet-50 ones are the 934f87c runs above. Without fp8
+(above), GPT-2 small at batch 4 reached 8.9 samples/s (0.35x) and ResNet-50
+327.7 (1.04x).
+
+- **ResNet-50 with fp8: the pair is 1.16x the V100 alone** (366.8 against
+  315.8 samples/s), 65% of the two GPUs' throughputs alone added together
+  (315.8 + 247.3).
+- **GPT-2 small: below the V100 alone at every batch measured**, closing from
+  0.49x at batch 4 to 0.97x at batch 32.
+- **Communication stayed between 472 and 485 ms a step from batch 4 to 16**,
+  so a growing share of it hid behind the backward pass (exposed: 397, 371,
+  then 258 ms). At batch 32 it rose to 605 ms alone and 445 ms exposed. That
+  isn't explained yet. The bucket count didn't change, so the buckets aren't
+  the cause. That run's step times also spread more (2130 to 2419 ms, against
+  1216 to 1270 at batch 16).
+- **From batch 16 on, the wait for the slower GPU costs more than the bridge**:
+  the V100 waits 409 ms a step at batch 16 and 728 at batch 32, against 258 and
+  445 ms of exposed communication. Per sample, the V100 computed in 34 to 35 ms
+  and the MI50 in 55 to 60 ms (compute over batch, batches 8 to 32).
+- `train_bench.py` found every rank's parameters identical after each run.
+
+Job IDs: mixed 11089348 (batch 4 and ResNet-50), 11090051 (8), 11090726
+(16), 11091146 (32); V100 alone 11090049 (8), 11090725 (16), 11091145 (32).
+The batch-16 V100-alone record was overwritten by the batch-32 run's; its
+numbers come from that job's log.
+
+**The other training steps of these four jobs** (each job runs them all):
+
+- `train_ddp` (`examples/train_synthetic.py`, DDP with the comm hook):
+  **parameters diverged across ranks in the batch-16 job** (11090726); they
+  stayed in sync in the other three. Not yet investigated.
+- `verify_fsdp2_backend`: parameters differed from the single-process replay
+  in all four, against a bit-for-bit match without compression (above). fp8
+  is lossy, so this check may not apply with compression on; whether it does
+  is open.
+- `train_hsdp_backend` printed nothing until its 20-minute step timeout in
+  all four, before any NCCL or RCCL communicator was created, as in the
+  uncompressed run; each job then hit its time limit during
+  `verify_hsdp_backend`. Where it stops, from a CPU reproduction with the
+  same two torch releases: [HARDWARE_VALIDATION.md](../HARDWARE_VALIDATION.md#items),
+  item 31's note.
+
+### fp8 with Triton kernels on the MI50
+
+`venv-rocm63`'s Triton (pytorch-triton-rocm 3.5.1) can't compile gpubridge's
+compression kernels for gfx906, so the runs above used the PyTorch versions.
+The default ROCm venv's Triton (triton-rocm 3.8.0) can. A venv of
+`venv-rocm63`'s torch 2.9.1 with that Triton in front of its own
+(`scripts/gpu/rocm_triton_overlay.sh`; the runbook's "Choosing the ROCm
+build") gives the MI50 both: rocBLAS kernels for gfx906 and compression
+kernels. The 2026-10-15 runs used a manual copy of the same Triton files where
+the script now makes links; the script itself has not yet run on the MI50.
+
+- **The kit's GPU tests on one MI50**, as the `amd` step runs them
+  (`tests/test_gpu.py`, `test_compression_kernels.py`, `test_torch_backend.py`),
+  with torch 2.9.1+rocm6.3 and Triton 3.8.0: 26 passed, 8 skipped, the same as
+  the default venv; with `venv-rocm63`'s own Triton 3.5.1, 20 failed. This held
+  both with Triton's bundled HIP runtime and with `TRITON_LIBHIP_PATH` at
+  torch's HIP 6.3 (job 11091760, commit 4e7f04e).
+- **GPT-2 small through the bridge with fp8**, as in the table above but
+  `GPUBRIDGE_COMPRESSION_KERNELS=triton` (in every rank's record), at commit
+  4e7f04e:
+
+| Batch | V100 alone | Mixed, PyTorch kernels | Mixed, Triton kernels | Triton / alone | Step (ms) | MI50 compute | V100 compute | V100 waits | Exposed comm | Comm alone |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 28.395 | 26.274 | 29.631 | 1.04x | 1079.9 | 985.9 | 556.6 | 429.4 | 94.0 | 346.0 |
+| 32 | 29.247 | 28.311 | 32.726 | 1.12x | 1955.6 | 1827.5 | 1077.8 | 749.7 | 128.1 | 361.8 |
+
+Samples/s, then milliseconds per step (medians of the 10 timed steps); the
+first two columns are the runs above. Jobs 11091811 (16) and 11093097 (32);
+preflight 1170 to 1174 MB/s each way, a 0.05 ms round trip, on
+`internal.2137` on the V100 and `internal` on the MI50.
+
+- **The first GPT-2 runs where the pair beats the V100 alone**: 1.04x at
+  batch 16, 1.12x at 32. One run each, and the steps spread (1067 to 1400 ms
+  at 16, 1913 to 2289 ms at 32), so the 1.04x is within that spread.
+- **Communication alone fell from 485 to 346 ms at batch 16 and from 605 to
+  362 ms at 32**; exposed communication from 258 to 94 and 445 to 128 ms. With
+  the Triton kernels, batch 32 needs about what batch 16 does, so the rise at
+  batch 32 above went away with Triton kernels in these runs. The cause of
+  the difference has not been isolated.
+- **What's left is mostly the wait for the MI50**: 429 ms a step at batch 16
+  and 750 at 32, against 94 and 128 ms of exposed communication. The MI50's
+  compute was within 3% of the PyTorch-kernel runs'.
+- In the same jobs, `train_ddp`'s parameters stayed in sync, FSDP2's
+  bit-for-bit check differed from its uncompressed replay as in every fp8 run,
+  and `train_hsdp_backend` hung (batch 16: until its timeout; batch 32: the job
+  was cancelled during it).
 
 ## Which ROCm wheels can train on an MI50 (gfx906)
 
@@ -487,8 +616,18 @@ HTTP range requests, not whole downloads) and counted
 
 Not read: 2.13.0+rocm7.2 (the server sent the whole file instead of the range;
 the scan now refuses such replies) and two AMD development builds of 2.8.0 (no
-end-of-directory record in the last 128 KB). The scan counted rocBLAS only, not
-hipBLASLt or MIOpen.
+end-of-directory record in the last 128 KB).
+
+**hipBLASLt and MIOpen**, from the same zip directories: none of the 38 wheels
+read has hipBLASLt files for gfx906, and training ran on the MI50 with 2.9.1+rocm6.3 anyway
+(below). MIOpen's tuning databases for gfx906
+(`torch/share/miopen/db/gfx906_60.db.txt` and its find-dbs, 5 files) are in
+every wheel that ships MIOpen files except the rocm7.14 and AMD's `.lw`
+builds; no wheel read has precompiled MIOpen kernel archives for gfx906, and the
+MI50's conv2d and ResNet-50 runs worked without them. Not read for MIOpen: the PyTorch index's 2.10 to 2.13
+rocm7.1 builds and 2.11 to 2.14.0 rocm7.2 builds, whose server ignored the
+range requests this time. The default wheel (2.14.1+rocm7.2) lists gfx942
+(MI300X) in its build and ships rocBLAS and hipBLASLt files for it.
 
 **torch 2.9.1+rocm6.3 on one MI50**, in a second venv (`venv-rocm63`; the
 kit's default ROCm venv is unchanged), with HIP 6.3.42134 and RCCL 2.21.5:
@@ -506,8 +645,9 @@ kit's default ROCm venv is unchanged), with HIP 6.3.42134 and RCCL 2.21.5:
   gpubridge's compression kernels for gfx906 (`PassManager::run failed` in
   `ConvertTritonAMDGPUToLLVM`). The default venv's Triton (3.8.0) compiles
   them.
-- So on an MI50, bridge compression needs the default venv and training needs
-  `venv-rocm63`; the runbook's "Choosing the ROCm build" has the commands.
+- So on an MI50, training needs torch 2.9.1+rocm6.3, and bridge compression
+  on the GPU a newer Triton in front of it ([above](#fp8-with-triton-kernels-on-the-mi50));
+  the runbook's "Choosing the ROCm build" has the commands.
 
 ## Waiting on Research Computing
 
@@ -535,6 +675,11 @@ scripts/gpu/explorer/submit.sh 08
 scripts/gpu/explorer/submit.sh train-nvidia
 VENV_ROCM=$WORK_DIR/venv-rocm63 scripts/gpu/explorer/submit.sh train-amd
 VENV_ROCM=$WORK_DIR/venv-rocm63 STEPS_07=training TIME_07=00:40:00 scripts/gpu/explorer/submit.sh 07
+# fp8 on the bridge, GPT-2 small at a larger batch (N = 8, 16, 32), each GPU alone then both:
+TRAIN_BENCH_MODELS=gpt2-small TRAIN_BENCH_ARGS="--batch-size N" scripts/gpu/explorer/submit.sh train-nvidia
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 GPUBRIDGE_COMPRESSION_KERNELS=torch \
+    TRAIN_BENCH_MODELS=gpt2-small TRAIN_BENCH_ARGS="--batch-size N" \
+    VENV_ROCM=$WORK_DIR/venv-rocm63 STEPS_07=training scripts/gpu/explorer/submit.sh 07
 python scripts/gpu/bench_matrix.py results/explorer/08_matrix_nvidia-amd \
     results/explorer/net_check_nvidia results/explorer/net_check_amd
 ```

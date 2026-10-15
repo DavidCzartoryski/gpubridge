@@ -16,3 +16,4 @@ results/explorer/
 # The multitcp crate's build output (python -m gpubridge.multitcp build uses a temporary
 # target directory; cargo run in the crate itself writes here).
 src/gpubridge/multitcp/crate/target/
+results/mixed_containers/

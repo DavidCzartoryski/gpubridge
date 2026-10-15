@@ -18,7 +18,7 @@ vendor islands. Design and limits: docs/TORCH_BACKEND.md.
   those of ``async_op=True`` (:mod:`gpubridge.work`). CPU tensors on a GPU job,
   and gather and scatter of CPU tensors on any job (object collectives,
   checkpointing), go to a Gloo group of the backend's own.
-- Unsupported calls (other reductions, point-to-point, all-to-all, reduce,
+- Unsupported calls (other reductions, any-source receive, all-to-all, reduce,
   GPU-tensor gather and scatter) fail before any communication, saying what
   isn't supported.
 """
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import warnings
 from collections.abc import Callable, Sequence
 from datetime import timedelta
@@ -38,6 +39,7 @@ from torch._C._distributed_c10d import _create_work_from_future
 
 from gpubridge import collectives as _collectives
 from gpubridge import observe as _observe
+from gpubridge import p2p as _p2p
 from gpubridge import topology as _topology
 from gpubridge import work as _work
 from gpubridge.config import BRIDGE_ENV, CPU_BACKEND, POLICY_ENV
@@ -74,6 +76,7 @@ class _NoBackend:
     ``init_process_group(device_id=...)`` only asks whether it can split eagerly."""
 
     supports_splitting = False
+    supports_coalescing = True
 
 
 class GpubridgeProcessGroup(dist.ProcessGroup):
@@ -81,7 +84,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
     (``new_group``, a ``DeviceMesh`` dimension) with ``members``, its global ranks."""
 
     def __init__(self, rank: int, size: int, name: str, timeout: timedelta | None,
-                 members: Sequence[int] = ()) -> None:
+                 members: Sequence[int] = (), store=None) -> None:
         super().__init__(rank, size)
         self._name = name
         self._timeout = timeout
@@ -91,6 +94,10 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         self._building = False
         self._coalesced: list[_work.Work] | None = None
         self._coalesced_torch: list[dist.Work] = []
+        self._native_p2p_coalescing = None
+        self._p2p: _p2p.Engine | None = None
+        self._p2p_lock = threading.Lock()
+        self._p2p_store = dist.PrefixStore("gpubridge-p2p", store) if store is not None else None
 
     # ---- identity -------------------------------------------------------------------------
 
@@ -125,6 +132,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         The world's is always built and owned by the default group, with its timeout,
         whichever group's collective comes first: destroying a subgroup must not
         release gpubridge for the whole job."""
+        self._check_p2p()
         world = _default_group(self)._world_topology()
         if not self._members:
             return world
@@ -179,6 +187,8 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         (it goes in reverse order of group name, the world group last): release gpubridge's
         state without running anything still queued, and never raise. A subgroup closes
         its own topology's policy and bridge; torch destroys its groups."""
+        if self._p2p is not None:
+            self._p2p.close()
         if self._members:
             _close_subgroup(self)
             return
@@ -358,26 +368,98 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         self._coalesced, self._coalesced_torch = [], []
 
     def _end_coalescing(self, device: torch.device) -> dist.Work:
+        if self._native_p2p_coalescing is not None:
+            native, self._native_p2p_coalescing = self._native_p2p_coalescing, None
+            self._coalesced_torch.append(native._end_coalescing(device))
         works, self._coalesced = self._coalesced or [], None
         torch_works, self._coalesced_torch = self._coalesced_torch, []
-        futures = [_future_of(w) for w in torch_works]
+        futures, members = [], list(works)
+        for work in torch_works:
+            try:
+                futures.append(work.get_future())
+                members.append(work)
+            except RuntimeError as exc:
+                if "not implemented" not in str(exc):
+                    raise
+                # Gloo's P2P Works have no future: _future_of waits for it now. Not a
+                # member: a second wait() on a finished Gloo send or recv waits for a
+                # transfer that never comes, until the group's timeout.
+                futures.append(_future_of(work))
         if works:  # the worker runs gpubridge's in order: the last one ends after the others
             futures.append(works[-1].get_future())
         if not futures:
             return _completed([])
-        return _create_work_from_future(torch.futures.collect_all(futures).then(
+        return _BatchWork(members, torch.futures.collect_all(futures).then(
             lambda f: ([g.value() for g in f.value()], [])[1]))
 
-    # ---- refused --------------------------------------------------------------------------
+    # ---- point-to-point -------------------------------------------------------------------
 
-    def send(self, *args, **kwargs):  # noqa: D102
-        raise _unsupported("send", "gpubridge has no point-to-point operations yet")
+    def _check_p2p(self) -> None:
+        if self._p2p is not None:
+            self._p2p.check()
+        elif self._p2p_store is not None and self._p2p_store.check(["failure"]):
+            raise RuntimeError(self._p2p_store.get("failure").decode())
 
-    def recv(self, *args, **kwargs):  # noqa: D102
-        raise _unsupported("recv", "gpubridge has no point-to-point operations yet")
+    def _point_to_point(self, tensors, peer: int, tag: int, sending: bool):
+        if len(tensors) != 1:
+            raise ValueError("gpubridge point-to-point takes exactly one tensor")
+        tensor = tensors[0]
+        if tensor.layout != torch.strided or not tensor.is_contiguous():
+            raise ValueError("gpubridge point-to-point takes contiguous dense tensors")
+        if not 0 <= peer < self.size():
+            raise ValueError(f"point-to-point peer {peer} is outside this group")
+        if not isinstance(tag, int) or not 0 <= tag < 2**31:
+            raise ValueError("point-to-point tag must be an integer in [0, 2**31)")
+        # Setup is collective, whereas P2P may involve only two members. Refuse
+        # locally rather than rendezvous with ranks that never entered this call.
+        if _owner is None or (self._members and self._sub is None):
+            raise RuntimeError("gpubridge point-to-point needs topology setup first; "
+                               "call dist.barrier() on the world and this group first")
+        topology = self._topology()
+        if tensor.device.type != "cpu" and tensor.device != topology.device:
+            raise ValueError(f"point-to-point tensor is on {tensor.device}, expected "
+                             f"{topology.device} or cpu")
+        global_peer = self._global(peer)
+        if global_peer in topology.island.ranks:
+            group = (self._cpu() if tensor.device.type == "cpu" and
+                     topology.device.type != "cpu" else topology.island_group)
+            fn = dist.isend if sending else dist.irecv
+            native_batch = self._coalesced is not None and tensor.device.type == "cuda"
+            if native_batch and self._native_p2p_coalescing is None:
+                group._start_coalescing(tensor.device)
+                self._native_p2p_coalescing = group
+            work = fn(tensor, group=group, tag=tag,
+                       **{"dst" if sending else "src": global_peer})
+            if self._coalesced is not None and not native_batch:
+                self._coalesced_torch.append(work)
+            return work
+        with self._p2p_lock:
+            if self._p2p is None:
+                assert topology.transport is not None and topology.world_group is not None
+                assert self._p2p_store is not None
+                link = topology.transport.create_p2p(topology.world_group,
+                                                       store=self._p2p_store,
+                                                       timeout=self._timeout)
+                self._p2p = _p2p.Engine(link,
+                                        topology.device, topology.rank, self._p2p_store,
+                                        self._timeout, pinned=topology.pinned_staging,
+                                        chunk_bytes=_p2p.chunk_bytes_setting())
+        work = self._p2p.submit(tensor, global_peer, tag, sending)
+        torch_work = _p2p.TorchWork(work, peer if not sending else self.rank())
+        if self._coalesced is not None:
+            self._coalesced_torch.append(torch_work)
+        return torch_work
+
+    def send(self, tensors, dst: int, tag: int):  # noqa: D102
+        return self._point_to_point(tensors, dst, tag, True)
+
+    def recv(self, tensors, src: int, tag: int):  # noqa: D102
+        return self._point_to_point(tensors, src, tag, False)
 
     def recv_anysource(self, *args, **kwargs):  # noqa: D102
-        raise _unsupported("recv", "gpubridge has no point-to-point operations yet")
+        raise _unsupported("any-source recv", "specify src so the island route is known")
+
+    # ---- refused --------------------------------------------------------------------------
 
     def alltoall(self, *args, **kwargs):  # noqa: D102
         raise _unsupported("all_to_all")
@@ -466,6 +548,45 @@ def _future_of(work: dist.Work) -> torch.futures.Future:
     future: torch.futures.Future = torch.futures.Future()
     future.set_result(None)
     return future
+
+
+class _BatchWork(dist.Work):
+    """A coalesced batch's Work (``batch_isend_irecv``, ``_coalescing_manager``).
+
+    ``wait()`` waits on each member itself, so a batch completes on the host when its
+    members do. A Work made from the members' futures would wait for those futures, which
+    one completion thread per group resolves, behind user callbacks: a slow callback on
+    another tag would delay the batch, and a callback waiting on the batch would wait
+    forever. A finite ``wait(timeout)`` also works, as for the members. The future is
+    every member's."""
+
+    def __init__(self, works: Sequence[dist.Work], future: torch.futures.Future) -> None:
+        super().__init__()
+        self._works, self._future = list(works), future
+
+    def wait(self, timeout: timedelta | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout.total_seconds()
+        for work in self._works:
+            if deadline is None:
+                work.wait()
+            else:
+                work.wait(timedelta(seconds=max(0.0, deadline - time.monotonic())))
+        return True
+
+    def is_completed(self) -> bool:
+        return all(work.is_completed() for work in self._works)
+
+    def is_success(self) -> bool:
+        return self.is_completed() and self.exception() is None
+
+    def exception(self) -> BaseException | None:
+        return next((e for e in (w.exception() for w in self._works) if e is not None), None)
+
+    def get_future(self) -> torch.futures.Future:
+        return self._future
+
+    def synchronize(self) -> None:
+        self.wait()
 
 
 def _all_of(works: Sequence[dist.Work], result: Any) -> dist.Work:
@@ -578,7 +699,7 @@ def create(options, backend_options=None) -> GpubridgeProcessGroup:
     if members:
         _topology.check_subgroup_naming()  # here, not at its first collective mid-training
     return GpubridgeProcessGroup(options.group_rank, options.group_size, options.group_id,
-                                 options.timeout, members)
+                                 options.timeout, members, options.store)
 
 
 def register() -> None:
@@ -586,3 +707,23 @@ def register() -> None:
     already (from an earlier call, or gpubridge's entry point)."""
     if dist.is_available() and NAME not in dist.Backend.backend_list:
         dist.Backend.register_backend(NAME, create, extended_api=True, devices=["cpu", "cuda"])
+
+
+def batch_isend_irecv(operations):
+    """A coalesced P2P batch on every supported torch release.
+
+    torch 2.8's batch helper excludes Python ProcessGroup subclasses from its
+    coalescing path. This explicit helper supplies the batch boundary without
+    changing torch's global API; other backends use torch's helper unchanged.
+    torch 2.14 automatically coalesces the gpubridge backend's native GPU ops.
+    """
+    dist.distributed_c10d._check_p2p_op_list(operations)
+    group = operations[0].group or dist.distributed_c10d._get_default_group()
+    if not isinstance(group, GpubridgeProcessGroup):
+        return dist.batch_isend_irecv(operations)
+    device = operations[0].tensor.device
+    with dist.distributed_c10d._coalescing_manager(group, device, async_ops=True) as cm:
+        for op in operations:
+            op.op(op.tensor, group=op.group, tag=op.tag,
+                  **{"group_dst" if op.op is dist.isend else "group_src": op.group_peer})
+    return cm.works
