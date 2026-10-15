@@ -549,7 +549,8 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     # Every launch runs under coreutils timeout (STEP_TIMEOUT, common.sh).
     assert all(line.startswith("+ timeout --kill-after=30 1200 srun ") for line in launches)
     sruns = [line[line.index("srun "):] for line in launches]
-    # probe, preflight, check, check_p2p, bench, a check per opt-in policy, the candidates bench,
+    # probe, preflight, check, check_p2p, bench_p2p, bench, a check per opt-in policy,
+    # the candidates bench,
     # DDP training, then FSDP2 on the torch.distributed backend (trained, then verified),
     # then HSDP the same way (one GPU per side by default: as many on each side)
     # then train_bench.py on each of its models
@@ -570,8 +571,8 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     assert "probe_nvidia" in sruns[0] and "probe_amd" in sruns[0]
     assert out.index("preflight.py") < out.index("torchrun")
     assert "check.py" in sruns[2] and "--p2p-only" in sruns[3]  # check_p2p
-    assert "bench_all_reduce.py" in sruns[4]
-    nvidia_bench, amd_bench = sruns[4].replace("\\", "").split(" : ")  # undo printf %q
+    assert "bench_p2p.py" in sruns[4] and "bench_all_reduce.py" in sruns[5]
+    nvidia_bench, amd_bench = sruns[5].replace("\\", "").split(" : ")  # undo printf %q
     assert "--ops island,gpubridge" in nvidia_bench and "--ops island,gpubridge" in amd_bench
     assert "srun --het-group=1 --ntasks=1 rocm-smi" in out
 
@@ -1904,6 +1905,34 @@ def test_check_and_bench_take_a_policy(tmp_path):
     rows = json.loads((tmp_path / "bench" / "bench.json").read_text())["rows"]
     assert {r["policy"] for r in rows if r["op"] == "gpubridge"} == {"flat-gloo"}
 
+
+
+@pytest.mark.parametrize(("ranks", "routes"), [(2, {"bridge"}), (4, {"bridge", "native"})])
+def test_bench_p2p_times_each_route_and_checks_the_payload(ranks, routes, tmp_path):
+    out = tmp_path / "p2p"
+    result = torchrun(ranks, KIT / "bench_p2p.py", "--out", str(out), "--max-bytes", "4K",
+                      "--trials", "2", "--warmup", "1", GPUBRIDGE_VENDOR="nvidia",
+                      GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode == 0, result.stderr[-3000:]
+    record = json.loads((out / "bench_p2p.json").read_text())
+    assert set(record["routes"]) == routes
+    assert {(r["route"], r["bytes"]) for r in record["rows"]} == {
+        (route, n) for route in routes for n in (1024, 4096)}
+    assert all(r["payload_ok"] and r["trials"] == 2 and r["bandwidth_GBps"] > 0
+               for r in record["rows"])
+    assert record["staging"] == {"pinned_staging": False, "p2p_chunk_bytes": 0,
+                                 "transport": "gloo"}
+    assert "| bridge |" in (out / "summary.md").read_text()
+
+
+def test_bench_p2p_records_the_staging_it_ran_with(tmp_path):
+    out = tmp_path / "p2p"
+    result = torchrun(2, KIT / "bench_p2p.py", "--out", str(out), "--max-bytes", "1K",
+                      "--trials", "1", "--warmup", "0", GPUBRIDGE_VENDOR="nvidia",
+                      GPUBRIDGE_SPLIT_TEST="half", GPUBRIDGE_P2P_CHUNK_BYTES="512")
+    assert result.returncode == 0, result.stderr[-3000:]
+    staging = json.loads((out / "bench_p2p.json").read_text())["staging"]
+    assert staging["p2p_chunk_bytes"] == 512
 
 def test_ucx_steps_are_off_unless_asked_for():
     out = dry_run(KIT / "explorer" / "05_multinode.sbatch").stdout
