@@ -55,6 +55,7 @@ END_TO_END = {
     "validation_tables.py": "test_step_05, test_gpu_kit.py",
     "triage.py": "test_triage.py: Explorer, Kaggle and CPU-simulation results trees, and tarballs",
     "setup_env.sh": "test_setup_job_creates_the_cuda_venv",
+    "bench_p2p.py": "test_gpu_kit.py: test_bench_p2p_*, test_step_02 and 07",
     "rocm_triton_overlay.sh": "test_gpu_kit.py: test_rocm_triton_overlay_*",
     "explorer/submit.sh": "every test_step_*, and test_gpu_kit.py for 00",
     "explorer/job_env.sh": "sourced by every Explorer job",
@@ -252,6 +253,7 @@ def test_step_02_split_on_one_gpu(tmp_path):
     out = tmp_path / "results" / "02_split_shared_gpu"
     assert code == 0 and failed(out) == set(), job_output(tmp_path)
     assert summary(out / "check")["split_test"] == "half"
+    assert summary(out / "check_p2p")["ok"]
 
 
 def test_step_03_single_island(tmp_path):
@@ -391,6 +393,7 @@ def test_step_07_mixed_hetjob(tmp_path):
     assert code == 1
     check = summary(out / "check")
     assert check["ok"] and check["split_test"] is None
+    assert summary(out / "check_p2p")["ok"]
     assert (out / "train_ddp.json").exists() and (out / "thresholds.json").exists()
     bench = json.loads((out / "train_bench_tiny-gpt.json").read_text())
     assert bench["world_size"] == 2 and [r["vendor"] for r in bench["ranks"]] == ["nvidia", "amd"]

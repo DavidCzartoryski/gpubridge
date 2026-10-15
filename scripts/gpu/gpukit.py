@@ -370,6 +370,82 @@ def sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def p2p_checks(topology: gpubridge.Topology, *, numels=(0, 1, 31, 4099, 1_000_003),
+               busy_seconds: float = 0.02) -> list[dict[str, Any]]:
+    """Backend P2P bit-exact checks, including producer/consumer streams on GPU.
+
+    Used by check.py --p2p-only and test_gpu.py. CPU smoke tests run this same
+    code; only real GPU records can validate the stream and allocator behavior.
+    """
+    rank, world, device = topology.rank, topology.world_size, topology.device
+    if world < 2:
+        raise ValueError("P2P checks need at least two ranks")
+    src, dst = (rank - 1) % world, (rank + 1) % world
+    producer = torch.cuda.Stream(device) if device.type == "cuda" else None
+    consumer = torch.cuda.Stream(device) if device.type == "cuda" else None
+    if producer is not None:
+        producer.wait_stream(torch.cuda.current_stream(device))
+    cases = []
+
+    def context(stream):
+        return torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+
+    def values(peer, numel, dtype):
+        return ((torch.arange(numel) * 7 + peer * 3) % 17 - 8).to(dtype)
+
+    for dtype in (torch.int8, torch.int64, torch.float16, torch.bfloat16,
+                  torch.float32, torch.float64):
+        for numel in numels:
+            with context(producer):
+                incoming = torch.full((numel,), -99, device=device, dtype=dtype)
+                outgoing = torch.full_like(incoming, -99)
+                source_device = torch.empty_like(incoming)
+                source_device.copy_(values(rank, numel, dtype))
+                # Upload pageable host input before the delay: an H2D copy after
+                # it would synchronize the producer, hiding a missing stream wait.
+                sync(device)
+                if producer is not None:
+                    queue_gpu_delay(device, busy_seconds)
+                outgoing.copy_(source_device)
+                works = gpubridge.batch_isend_irecv([
+                    dist.P2POp(dist.irecv, incoming, src, tag=42),
+                    dist.P2POp(dist.isend, outgoing, dst, tag=42)])
+                del outgoing  # the Work/native allocator must keep in-flight storage alive
+                # Reuse is stream-local. Allocating on the producer while the
+                # send is pending can overwrite an unprotected outgoing block.
+                scribble = torch.full_like(incoming, 77)
+            with context(consumer):
+                for work in works:
+                    work.wait()
+                observed = incoming.clone().cpu()  # read is queued directly after wait
+            del scribble  # keep allocator pressure alive until both Works completed
+            ok = torch.equal(observed, values(src, numel, dtype))
+            cases.append({"dtype": str(dtype), "numel": numel, "ok": ok})
+            if not ok:
+                raise AssertionError(f"P2P stream/lifetime check: rank {rank}, {dtype}, n={numel}")
+    # Different tags must not block each other. Only cross-island pairs take
+    # this test, because native NCCL/RCCL ignore tags.
+    for source in range(world):
+        for dest in range(source + 1, world):
+            if topology.layout.island_of(source) == topology.layout.island_of(dest):
+                continue
+            if rank == source:
+                a = torch.full((31,), 11.0, device=device)
+                b = torch.full((31,), 22.0, device=device)
+                works = [dist.isend(a, dest, tag=101), dist.isend(b, dest, tag=102)]
+                for work in works:
+                    work.wait()
+            elif rank == dest:
+                b = torch.empty(31, device=device)  # float32, as sent
+                a = torch.empty_like(b)
+                dist.recv(b, source, tag=102)
+                dist.recv(a, source, tag=101)
+                if not bool((a == 11).all() and (b == 22).all()):
+                    raise AssertionError("P2P reverse-tag matching failed")
+    dist.barrier()
+    return cases
+
+
 # ---- GPU work without BLAS --------------------------------------------------------
 #
 # Stream-ordering checks queue GPU work and write their input after it, so that a

@@ -225,6 +225,27 @@ hardware.
 
 ### Added
 
+- `scripts/gpu/bench_p2p.py`: point-to-point latency and bandwidth through
+  `backend="gpubridge"`, ping-pong from 1 KB to 1 GB on each route rank 0 has (across
+  islands through the bridge, and within its island), with a payload check per size and
+  the staging (pinned, chunk size, transport) in each record. A dedicated untimed
+  exchange verifies both directions before warmups and trials, including with zero
+  warmups. CLI bounds fail before rendezvous; chunked integer residues preserve exact
+  payload patterns beyond float32's consecutive-integer range. Explorer steps 02 and 07 run
+  it (`bench_p2p`; step 07 also `bench_p2p_pinned`). CPU only so far: in simulation on one
+  Mac, a cross-island message took about 3 ms one way at 1 KB to 1 MB, a native one 80 to
+  320 us.
+- GPU checks for point-to-point through `backend="gpubridge"`: `check.py --p2p-only`
+  (step `check_p2p` in Explorer steps 02 and 07) and a GPU test in `tests/test_gpu.py`,
+  both from `gpukit.p2p_checks`: six dtypes and odd sizes bit for bit across islands, the
+  send's input written on a busy producer stream and dropped before the send completes, the
+  received tensor read on another stream right after `wait()`, and two tags matched out of
+  order. Uploads finish before the producer delay; its write is device to device,
+  and a same-stream allocation pressures the dropped send's storage before wait.
+  CPU scheduling-model tests reject missing stream waits and storage retention;
+  item 32 counts only explicit `check_p2p` steps, excluding historical `gpu_tests`.
+  CPU only so far (1+1 and 2+2 ranks in simulation).
+
 - `scripts/gpu/rocm_triton_overlay.sh`: an env-only venv of one ROCm venv's
   torch with another's Triton linked in front, for an MI50 that trains on
   torch 2.9.1+rocm6.3 (gfx906 rocBLAS kernels) and needs Triton 3.8.0 for the

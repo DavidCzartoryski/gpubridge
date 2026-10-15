@@ -50,7 +50,9 @@ from datetime import timedelta
 from pathlib import Path
 
 import torch
-from gpukit import Record, default_timeout, queue_gpu_delay, rank_from_env, run_info, sync
+import torch.distributed as dist
+from gpukit import (Record, default_timeout, p2p_checks, queue_gpu_delay, rank_from_env,
+                    run_info, sync)
 
 import gpubridge
 from gpubridge.collectives import SUPPORTED_DTYPES
@@ -110,6 +112,8 @@ def main() -> int:
     parser.add_argument("--policy", default="auto", help="collective policy for gpubridge.init")
     parser.add_argument("--bridge", default="gloo",
                         help="bridge transport for gpubridge.init: gloo, or ucx")
+    parser.add_argument("--p2p-only", action="store_true",
+                        help="initialize the torch backend and run the P2P stream/lifetime stage")
     parser.add_argument("--large-numel", type=int, default=None,
                         help="elements in the busy-GPU tensor (default: 64M on GPU, 1M on CPU)")
     parser.add_argument("--busy-seconds", type=float, default=0.05,
@@ -128,6 +132,8 @@ def main() -> int:
                  hang_dump_seconds=args.timeout * 0.8)
     if args.expect_init_error:
         return expect_init_error(rec, args)
+    if args.p2p_only:
+        return check_point_to_point(rec, args)
     try:
         with rec.stage("init"):
             topology = gpubridge.init(timeout=timedelta(seconds=args.timeout),
@@ -270,6 +276,29 @@ def main() -> int:
     except BaseException:
         traceback.print_exc()
         rec.failed = True
+    return rec.finish()
+
+
+def check_point_to_point(rec: Record, args: argparse.Namespace) -> int:
+    os.environ["GPUBRIDGE_BRIDGE"] = args.bridge
+    os.environ["GPUBRIDGE_POLICY"] = args.policy
+    try:
+        with rec.stage("init"):
+            dist.init_process_group("gpubridge", timeout=timedelta(seconds=args.timeout))
+            dist.barrier()
+        topology = gpubridge.get_topology()
+        rec.data["run"] = run_info(topology)
+        with rec.stage("p2p") as entry:
+            entry["cases"] = p2p_checks(topology, busy_seconds=args.busy_seconds)
+            entry["ok"] = all(case["ok"] for case in entry["cases"])
+        with rec.stage("destroy"):
+            dist.destroy_process_group()
+    except BaseException:
+        traceback.print_exc()
+        rec.failed = True
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
     return rec.finish()
 
 
