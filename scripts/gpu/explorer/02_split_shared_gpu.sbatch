@@ -23,8 +23,8 @@ export GPUBRIDGE_SPLIT_TEST=half
 step check local_torchrun --nproc-per-node="$PROCS" "$KIT_DIR/check.py" \
     --out "$RESULTS/check" --large-numel $((16 * 1024 * 1024))
 step summarize python "$KIT_DIR/summarize.py" "$RESULTS/check"
-# Point-to-point across the two islands through backend="gpubridge" (item 32): every
-# dtype and odd sizes bit for bit, stream order and in-flight storage, tags out of order.
+# Point-to-point across the two islands through backend="gpubridge" (item 32): six
+# dtypes and odd sizes bit for bit, stream order and in-flight storage, tags out of order.
 step check_p2p local_torchrun --nproc-per-node="$PROCS" "$KIT_DIR/check.py" \
     --out "$RESULTS/check_p2p" --p2p-only
 step summarize_p2p python "$KIT_DIR/summarize.py" "$RESULTS/check_p2p"

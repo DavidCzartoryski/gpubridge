@@ -247,6 +247,7 @@ def test_step_02_split_on_one_gpu(tmp_path):
     out = tmp_path / "results" / "02_split_shared_gpu"
     assert code == 0 and failed(out) == set(), job_output(tmp_path)
     assert summary(out / "check")["split_test"] == "half"
+    assert summary(out / "check_p2p")["ok"]
 
 
 def test_step_03_single_island(tmp_path):
@@ -386,6 +387,7 @@ def test_step_07_mixed_hetjob(tmp_path):
     assert code == 1
     check = summary(out / "check")
     assert check["ok"] and check["split_test"] is None
+    assert summary(out / "check_p2p")["ok"]
     assert (out / "train_ddp.json").exists() and (out / "thresholds.json").exists()
     bench = json.loads((out / "train_bench_tiny-gpt.json").read_text())
     assert bench["world_size"] == 2 and [r["vendor"] for r in bench["ranks"]] == ["nvidia", "amd"]

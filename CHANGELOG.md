@@ -211,10 +211,14 @@ hardware.
   320 us.
 - GPU checks for point-to-point through `backend="gpubridge"`: `check.py --p2p-only`
   (step `check_p2p` in Explorer steps 02 and 07) and a GPU test in `tests/test_gpu.py`,
-  both from `gpukit.p2p_checks`: every dtype and odd sizes bit for bit across islands, the
+  both from `gpukit.p2p_checks`: six dtypes and odd sizes bit for bit across islands, the
   send's input written on a busy producer stream and dropped before the send completes, the
   received tensor read on another stream right after `wait()`, and two tags matched out of
-  order. HARDWARE_VALIDATION item 32. CPU only so far (1+1 and 2+2 ranks in simulation).
+  order. Uploads finish before the producer delay; its write is device to device,
+  and a same-stream allocation pressures the dropped send's storage before wait.
+  CPU scheduling-model tests reject missing stream waits and storage retention;
+  item 32 counts only explicit `check_p2p` steps, excluding historical `gpu_tests`.
+  CPU only so far (1+1 and 2+2 ranks in simulation).
 - Step 07: `STEPS_07=bench` runs only the probe, the preflight and the
   `train_bench_<model>` steps: no `train_ddp`, FSDP2 or HSDP (HSDP hung until
   its step limit in each of the four fp8 jobs above).

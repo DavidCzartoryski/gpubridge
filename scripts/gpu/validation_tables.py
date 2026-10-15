@@ -119,7 +119,7 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
     31: ("HSDP through the backend: shard within islands, replicate across vendors",
          [Step("verify_hsdp_backend"), Step("train_hsdp_backend")]),
     32: ("Point-to-point across islands through the backend on GPUs",
-         [Step("check_p2p"), Step("gpu_tests")]),
+         [Step("check_p2p")]),
 }
 
 

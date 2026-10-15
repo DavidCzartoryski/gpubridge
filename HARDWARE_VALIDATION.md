@@ -432,15 +432,17 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
 32. **Point-to-point across islands through the backend on GPUs.** `send`,
     `recv`, `isend`, `irecv` and `batch_isend_irecv` on `backend="gpubridge"`
     go native within an island and through the bridge across islands. On GPUs,
-    check that every dtype and odd size arrives bit for bit, that a send whose
-    input was written on a busy producer stream and dropped before it completes
-    still sends what was written, that the received tensor read on another
+    check that six dtypes and odd sizes arrive bit for bit, that a send whose
+    input was copied device to device on a busy producer stream and dropped before
+    it completes still sends what was written despite a same-stream allocation
+    filled with other data, that the received tensor read on another
     stream right after `wait()` holds the data, and that two tags between a
     pair match out of order. *Status: works on CPU in simulation mode (1+1 and
     2+2 ranks, `tests/test_gpu.py`'s simulation test and check.py `--p2p-only`);
     not run on GPUs.* *Step:* `check_p2p` in Explorer steps 02 and 07, and
     `test_point_to_point_across_islands_keeps_stream_order_and_storage` in
-    `gpu_tests`.
+    `gpu_tests`. The results table counts `check_p2p` only; historical `gpu_tests`
+    records cannot show whether this test existed in the run.
 
 ## GPU results
 
