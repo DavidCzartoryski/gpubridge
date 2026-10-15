@@ -446,6 +446,23 @@ local_torchrun() {
     limited torchrun --nnodes=1 --master-addr=127.0.0.1 --master-port="$(free_port)" "$@"
 }
 
+# dp_run_options RUN: what a data-parallel run's name (step 07's and the mixed runner's
+# DP_RUNS) means for train_dp.py, in DP_MODE, DP_COMPRESSION (for
+# GPUBRIDGE_BRIDGE_COMPRESSION) and DP_RUN_ARGS: ddp and fsdp2; ddp-bf16 and ddp-fp8 (the
+# bridge compressed); ddp-speed (batch shares by each GPU's speed); ddp-bucket-<MB>
+# (DDP's bucket size).
+# shellcheck disable=SC2034  # the caller reads them
+dp_run_options() {
+    DP_MODE=${1%%-*} DP_COMPRESSION='' DP_RUN_ARGS=()
+    case $1 in
+    ddp | fsdp2) ;;
+    ddp-bf16 | ddp-fp8) DP_COMPRESSION=${1#ddp-} ;;
+    ddp-speed) DP_RUN_ARGS=(--shares speed) ;;
+    ddp-bucket-*) DP_RUN_ARGS=(--bucket-mb "${1#ddp-bucket-}") ;;
+    *) die "DP_RUNS: unknown run '$1'" ;;
+    esac
+}
+
 # env_local_torchrun NAME=VALUE... ARGS: local_torchrun with extra environment variables.
 env_local_torchrun() {
     local assignments=()
