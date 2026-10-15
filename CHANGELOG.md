@@ -207,7 +207,7 @@ hardware.
   island, and on the same GPUs as two islands of half each through the bridge
   (a split test); and step 07 with `GPUS_MIXED_NVIDIA_MULTI` NVIDIA GPUs (4) on
   `multigpu` next to the AMD side. Both run end to end on the fake cluster
-  (#PRNUM).
+  (#64).
 - Step 07: `STEPS_07=bench` runs only the probe, the preflight and the
   `train_bench_<model>` steps: no `train_ddp`, FSDP2 or HSDP (HSDP hung until
   its step limit in each of the four fp8 jobs above).
@@ -375,7 +375,7 @@ hardware.
   unless that is a power of two, so on 3 or 5 ranks (2 NVIDIA GPUs and an AMD
   one, say) the check failed with nothing wrong. Each rank's loss is now scaled
   by the world size and the replay sums the ranks' losses; on CPU it matches bit
-  for bit on 2 to 6 ranks, and with `--hsdp 2` on 4 and 6 (#PRNUM).
+  for bit on 2 to 6 ranks, and with `--hsdp 2` on 4 and 6 (#64).
 - The stream-ordering checks (`check.py`'s `busy_gpu` and `async` stages,
   `tests/test_gpu.py`) queued matmuls as busy work, and failed or aborted
   where rocBLAS has no kernels for the GPU (gfx906 on the ROCm 7.2 wheel).
