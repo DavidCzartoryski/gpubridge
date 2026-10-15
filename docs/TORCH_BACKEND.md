@@ -177,7 +177,7 @@ anything else, so no rank is left waiting in `new_group`.
   the backend:
   - reductions other than SUM, AVG, MAX and MIN (PRODUCT, PREMUL_SUM, bitwise),
     on the CPU path too;
-  - point-to-point `send` and `recv`, `alltoall` and `reduce`;
+  - any-source `recv`, `alltoall` and `reduce`;
   - gather and scatter of GPU tensors;
   - list-form collectives with tensors of different sizes.
 
@@ -327,6 +327,64 @@ fully_shard(model, mesh=mesh)
    ranks would hang there until the group's timeout. Call `dist.barrier()`
    on the world group first.
 
+## Point-to-point (CPU only)
+
+`dist.send`, `recv(src=...)`, `isend`, `irecv` and `batch_isend_irecv` use
+the group's `send` and `recv` methods. They accept one contiguous dense
+tensor on CPU or on the rank's configured GPU. Finish setup with a world
+`dist.barrier()` first; a subgroup also needs its own first collective.
+P2P refuses before setup, because setup needs every member, even members
+that will not participate in the subsequent exchange.
+
+Within an island, the call goes straight to the native process group
+(NCCL/RCCL on GPU, Gloo in simulation). CPU tensors in a GPU job use Gloo.
+Between islands, `BridgeTransport.create_p2p` supplies an all-member link;
+Gloo reuses the existing discovery group and transfers host-staged raw bytes.
+This is separate from the leader-only collective link and does not create
+another process group. Collective-only custom transports need to implement
+the optional hook before carrying cross-island P2P. UCX P2P is not implemented
+in this change.
+
+- **Matching.** Across islands, a message matches by group, source,
+  destination and tag (integer `0` through `2**31 - 1`). Same-tag sends and
+  receives match in posting order within each direction of a pair. Different
+  tags and pairs run independently, including a full-duplex batched exchange.
+  Sizes and dtypes must agree; shape may differ with the same element count.
+  A group-scoped Store handshake validates byte count and dtype before posting
+  payloads, so mismatches raise instead of triggering Gloo's fatal truncation.
+  Metadata keys are removed after being read. Within an island, matching is
+  the native backend's: NCCL/RCCL ignore tags; Gloo respects them.
+- **Streams and lifetime.** Submission records an event on the caller's
+  stream. A lane's own worker stream waits for it, and the tensor is kept
+  alive and marked with `record_stream` until the operation has completed.
+  `wait()` orders the caller's current stream after the final copy. The
+  future is device-aware; `is_completed()` includes GPU completion. Do not
+  modify or read an in-flight tensor before waiting. P2P has no ordering
+  guarantee relative to collectives or other pairs.
+- **Timeout and failure.** Each cross-island operation has the process group's
+  timeout from submission, including time spent queued. A mismatch, deadline
+  or transport error fails pending P2P handles locally and publishes a group
+  failure. Ranks with an active engine observe this within the health polling
+  interval (50 ms plus Store latency); all other members refuse their next
+  backend operation. An idle dead peer is detected when an operation waiting
+  for it reaches its deadline. There is no recovery: destroy the process group
+  and restart the job. `Work.wait(timeout=...)` has a separate host timeout;
+  it does not cancel the transfer. Same-island errors retain native behavior.
+- **Teardown.** Pending handles fail and the engine joins lane threads for at
+  most 200 ms total. In-flight native requests and their buffers stay owned by
+  daemon lane threads until the transport errors, its timeout passes or torch
+  destroys the group. Teardown never waits for a missing peer to post a receive.
+- **Native GPU batch limit.** torch 2.8's `batch_isend_irecv` does not coalesce
+  Python ProcessGroup subclasses; unbatched native NCCL/RCCL posting can block
+  in an exchange that requires opposite-direction operations to be posted
+  together. Cross-island batches do not have this restriction. Native GPU P2P
+  and all GPU stream guarantees remain unvalidated; this change is CPU only.
+
+Tests cover 1+1, 2+2, uneven and three-island simulation layouts, every pair
+(including non-leaders), zero/small/large payloads and dense dtypes, reverse
+tag order, simultaneous pairs, full-duplex same-tag batches, subgroup ranks,
+a slow receiver, missing peers and size/dtype mismatch propagation.
+
 ## What isn't supported, and why
 
 - **Subgroups:** see "Subgroups and HSDP" above for what works. Tensor
@@ -334,7 +392,7 @@ fully_shard(model, mesh=mesh)
 - **`torch.compile`:** not tested. Functional collectives
   (`torch.ops._c10d_functional`) do reach the Python group: FSDP2's
   `full_tensor()` uses them, and it is tested.
-- **Point-to-point, all-to-all, and gather and scatter of GPU tensors:**
+- **Any-source receive, all-to-all, and gather and scatter of GPU tensors:**
   gpubridge has no cross-vendor implementation of them yet.
 - **Overhead:** each collective goes through Python and gpubridge's worker
   thread, as `gpubridge.all_reduce(async_op=True)` does today. CPU

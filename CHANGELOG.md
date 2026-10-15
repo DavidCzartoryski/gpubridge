@@ -182,6 +182,11 @@ hardware.
 
 ### Added
 
+- Torch backend point-to-point operations: native calls within an island and
+  independent host-staged Gloo lanes across islands, including asynchronous
+  and batched calls, tag matching, size/dtype checks and bounded teardown.
+  CPU only; GPU stream behavior and native GPU batches are not validated.
+
 - `scripts/gpu/rdma_report.sh`, a step of the network check (`net-nvidia`,
   `net-amd`): what RDMA from GPU memory would need on the node, one file each
   in `rdma/<side>/`: the kernel's dma-buf and peer-to-peer options, the RDMA

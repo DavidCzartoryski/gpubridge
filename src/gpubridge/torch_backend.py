@@ -18,7 +18,7 @@ vendor islands. Design and limits: docs/TORCH_BACKEND.md.
   those of ``async_op=True`` (:mod:`gpubridge.work`). CPU tensors on a GPU job,
   and gather and scatter of CPU tensors on any job (object collectives,
   checkpointing), go to a Gloo group of the backend's own.
-- Unsupported calls (other reductions, point-to-point, all-to-all, reduce,
+- Unsupported calls (other reductions, any-source receive, all-to-all, reduce,
   GPU-tensor gather and scatter) fail before any communication, saying what
   isn't supported.
 """
@@ -38,6 +38,7 @@ from torch._C._distributed_c10d import _create_work_from_future
 
 from gpubridge import collectives as _collectives
 from gpubridge import observe as _observe
+from gpubridge import p2p as _p2p
 from gpubridge import topology as _topology
 from gpubridge import work as _work
 from gpubridge.config import BRIDGE_ENV, CPU_BACKEND, POLICY_ENV
@@ -81,7 +82,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
     (``new_group``, a ``DeviceMesh`` dimension) with ``members``, its global ranks."""
 
     def __init__(self, rank: int, size: int, name: str, timeout: timedelta | None,
-                 members: Sequence[int] = ()) -> None:
+                 members: Sequence[int] = (), store=None) -> None:
         super().__init__(rank, size)
         self._name = name
         self._timeout = timeout
@@ -91,6 +92,9 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         self._building = False
         self._coalesced: list[_work.Work] | None = None
         self._coalesced_torch: list[dist.Work] = []
+        self._p2p: _p2p.Engine | None = None
+        self._p2p_lock = threading.Lock()
+        self._p2p_store = dist.PrefixStore("gpubridge-p2p", store) if store is not None else None
 
     # ---- identity -------------------------------------------------------------------------
 
@@ -125,6 +129,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         The world's is always built and owned by the default group, with its timeout,
         whichever group's collective comes first: destroying a subgroup must not
         release gpubridge for the whole job."""
+        self._check_p2p()
         world = _default_group(self)._world_topology()
         if not self._members:
             return world
@@ -179,6 +184,8 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         (it goes in reverse order of group name, the world group last): release gpubridge's
         state without running anything still queued, and never raise. A subgroup closes
         its own topology's policy and bridge; torch destroys its groups."""
+        if self._p2p is not None:
+            self._p2p.close()
         if self._members:
             _close_subgroup(self)
             return
@@ -368,16 +375,60 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         return _create_work_from_future(torch.futures.collect_all(futures).then(
             lambda f: ([g.value() for g in f.value()], [])[1]))
 
-    # ---- refused --------------------------------------------------------------------------
+    # ---- point-to-point -------------------------------------------------------------------
 
-    def send(self, *args, **kwargs):  # noqa: D102
-        raise _unsupported("send", "gpubridge has no point-to-point operations yet")
+    def _check_p2p(self) -> None:
+        if self._p2p is not None:
+            self._p2p.check()
+        elif self._p2p_store is not None and self._p2p_store.check(["failure"]):
+            raise RuntimeError(self._p2p_store.get("failure").decode())
 
-    def recv(self, *args, **kwargs):  # noqa: D102
-        raise _unsupported("recv", "gpubridge has no point-to-point operations yet")
+    def _point_to_point(self, tensors, peer: int, tag: int, sending: bool):
+        if len(tensors) != 1:
+            raise ValueError("gpubridge point-to-point takes exactly one tensor")
+        tensor = tensors[0]
+        if tensor.layout != torch.strided or not tensor.is_contiguous():
+            raise ValueError("gpubridge point-to-point takes contiguous dense tensors")
+        if not 0 <= peer < self.size():
+            raise ValueError(f"point-to-point peer {peer} is outside this group")
+        if not isinstance(tag, int) or not 0 <= tag < 2**31:
+            raise ValueError("point-to-point tag must be an integer in [0, 2**31)")
+        # Setup is collective, whereas P2P may involve only two members. Refuse
+        # locally rather than rendezvous with ranks that never entered this call.
+        if _owner is None or (self._members and self._sub is None):
+            raise RuntimeError("gpubridge point-to-point needs topology setup first; "
+                               "call dist.barrier() on the world and this group first")
+        topology = self._topology()
+        if tensor.device.type != "cpu" and tensor.device != topology.device:
+            raise ValueError(f"point-to-point tensor is on {tensor.device}, expected "
+                             f"{topology.device} or cpu")
+        global_peer = self._global(peer)
+        if global_peer in topology.island.ranks:
+            group = (self._cpu() if tensor.device.type == "cpu" and
+                     topology.device.type != "cpu" else topology.island_group)
+            fn = dist.isend if sending else dist.irecv
+            return fn(tensor, group=group, tag=tag,
+                      **{"dst" if sending else "src": global_peer})
+        with self._p2p_lock:
+            if self._p2p is None:
+                assert topology.transport is not None and topology.world_group is not None
+                assert self._p2p_store is not None
+                self._p2p = _p2p.Engine(topology.transport.create_p2p(topology.world_group),
+                                        topology.device, topology.rank, self._p2p_store,
+                                        self._timeout)
+        work = self._p2p.submit(tensor, global_peer, tag, sending)
+        return _p2p.TorchWork(work, peer if not sending else self.rank())
+
+    def send(self, tensors, dst: int, tag: int):  # noqa: D102
+        return self._point_to_point(tensors, dst, tag, True)
+
+    def recv(self, tensors, src: int, tag: int):  # noqa: D102
+        return self._point_to_point(tensors, src, tag, False)
 
     def recv_anysource(self, *args, **kwargs):  # noqa: D102
-        raise _unsupported("recv", "gpubridge has no point-to-point operations yet")
+        raise _unsupported("any-source recv", "specify src so the island route is known")
+
+    # ---- refused --------------------------------------------------------------------------
 
     def alltoall(self, *args, **kwargs):  # noqa: D102
         raise _unsupported("all_to_all")
@@ -578,7 +629,7 @@ def create(options, backend_options=None) -> GpubridgeProcessGroup:
     if members:
         _topology.check_subgroup_naming()  # here, not at its first collective mid-training
     return GpubridgeProcessGroup(options.group_rank, options.group_size, options.group_id,
-                                 options.timeout, members)
+                                 options.timeout, members, options.store)
 
 
 def register() -> None:

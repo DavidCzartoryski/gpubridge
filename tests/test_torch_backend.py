@@ -350,9 +350,7 @@ def _refused(rank, world):
     expect(lambda: dist.all_to_all_single(torch.empty(world), torch.ones(world)),
            "the gpubridge torch.distributed backend doesn't support all_to_all")
     expect(lambda: dist.reduce(torch.ones(2), dst=0), "doesn't support reduce")
-    peer = rank ^ 1
-    expect(lambda: dist.send(torch.ones(2), dst=peer) if rank % 2 == 0
-           else dist.recv(torch.empty(2), src=peer), "doesn't support (send|recv)")
+    expect(lambda: dist.irecv(torch.empty(2)), "doesn't support any-source recv")
     expect(lambda: dist.all_gather([torch.empty(2) for _ in range(world)], torch.ones(3)),
            "allgather with tensors of different sizes")
     expect(lambda: dist.reduce_scatter_tensor(torch.empty(2), torch.ones(5)),
@@ -789,7 +787,7 @@ def test_subgroups_are_refused_if_torch_changed_its_private_group_naming(change,
 
     def options(ranks, size):
         return SimpleNamespace(global_ranks_in_group=ranks, group_size=size, group_rank=0,
-                               group_id="1", timeout=TIMEOUT)
+                               group_id="1", timeout=TIMEOUT, store=dist.HashStore())
 
     world = dist.get_world_size() if dist.is_initialized() else 4
     with pytest.raises(RuntimeError, match=refused):
