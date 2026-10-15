@@ -544,7 +544,31 @@ at several DDP bucket sizes), and `submit.sh train-nvidia` or
 `train-amd` on one GPU alone, the baseline: adding a GPU through gpubridge
 pays off only if the pair's `samples_per_s` beats the faster GPU's alone.
 `TRAIN_BENCH_MODELS` and `TRAIN_BENCH_ARGS` choose the models and flags. Both
-models need BLAS on every GPU (the probe's `blas_available`): with a ROCm build
+sides take the same batch per rank unless told otherwise: `--batch-sizes a,b`
+sets one per rank, `--global-batch N` splits N samples evenly, and
+`--global-batch N --balance` times each rank alone for a few steps first and
+splits N in proportion to its speed, at least one sample each, so the faster
+GPU stops waiting for the slower one. With either, each rank's loss is weighted
+by its share of the samples, and the update is still the gradient of the mean
+loss over all N (bit for bit on CPU with integer data,
+[tests/test_train_bench.py](../tests/test_train_bench.py); CPU only so far).
+One rank alone with `--global-batch N` takes all N, so the baseline for a
+mixed run at global batch N is `TRAIN_BENCH_ARGS="--global-batch N"` on
+`train-nvidia`. The JSON has `global_batch`, `batch_sizes`, `batch_split`, each
+rank's `batch_size`, `compute_ms_per_sample` and `waiting_ms`, and with
+`--balance` the calibration's per-sample times. Models with BatchNorm
+(ResNet-50) normalize over each rank's own batch, so their result depends on
+the split, as it does in any DDP run without SyncBatchNorm.
+`--accumulate K` cuts each rank's batch (its samples per optimizer step) into K
+micro-batches and syncs the gradients once per step, in the last backward
+(`no_sync()` for the others): a global batch too big for a GPU's memory runs as
+K smaller forward and backward passes with one exchange. It combines with the
+flags above (with `--balance` the calibration runs at the micro-batch size and
+each rank gets at least K samples), and the update is exact the same way (CPU
+only so far), BatchNorm aside: it normalizes over each micro-batch. The JSON
+adds `accumulate`, `micro_batch_sizes`, `samples_per_step` and the
+`exchanges_per_step` the hook counted. Both models need BLAS on every GPU (the
+probe's `blas_available`): with a ROCm build
 whose rocBLAS lacks the GPU's kernels, its rank aborts at the first matmul, as
 the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
 
@@ -774,8 +798,10 @@ measurements.
    python scripts/gpu/triage.py mixed-worker-<host>.tgz
    ```
 
-   The master's tarball holds the two-machine training records
-   (`train_bench_<model>.json`: rank 0 writes them); each holds its own
+   The two-machine training records (`train_bench_<model>.json`) are in the
+   tarball of the machine that got rank 0, which writes them, as it writes the
+   benchmarks' and FSDP2's. torchrun numbers the machines by their addresses
+   (`LOCAL_ADDR`), not by role, so it can be either. Each tarball holds its own
    machine's baseline (`train_bench_alone_<model>.json`). For the check's
    verdict, see above.
 7. **Stop billing.** Destroy both machines once the tarballs are copied; on

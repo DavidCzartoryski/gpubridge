@@ -612,8 +612,13 @@ def test_mixed_node_script_on_two_pretend_machines(tmp_path):
         assert "verdict: every step that ran passed" in (out / "triage.txt").read_text()
         alone = json.loads((out / "train_bench_alone_tiny-gpt.json").read_text())
         assert alone["world_size"] == 1
-    # The two machines together: rank 0, on the master, writes the record.
-    both = json.loads((tmp_path / "results" / "master" / "train_bench_tiny-gpt.json").read_text())
+    # The two machines together: rank 0 writes the record. torchrun numbers the
+    # machines by address, then process id, not by role: here (one address) rank 0
+    # is on whichever machine started its torchrun first.
+    records = [tmp_path / "results" / role / "train_bench_tiny-gpt.json" for role in procs]
+    written = [path for path in records if path.exists()]
+    assert len(written) == 1, records
+    both = json.loads(written[0].read_text())
     assert both["world_size"] == 2 and both["params_identical"]
 
 

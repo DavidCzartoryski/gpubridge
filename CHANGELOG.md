@@ -295,6 +295,24 @@ hardware.
   for the slower GPU and exposed communication. Step 07 runs it across both
   vendors (`STEPS_07=training` runs only its training steps), and
   `submit.sh train-nvidia` or `train-amd` on one GPU alone.
+- `train_bench.py` per-rank batches (CPU only): `--batch-sizes a,b`,
+  `--global-batch N` (split evenly; one rank alone takes all N) and
+  `--global-batch N --balance` (a short calibration times each rank, then N is
+  split by speed, at least one sample per rank). Each rank's summed loss is
+  scaled by world size / N, so the hook's average is the gradient of the mean
+  loss over all N samples: bit-identical to one process over the concatenated
+  batch on CPU with integer data (2 and 3 ranks), within 1e-5 relative on float
+  data. The JSON records the global batch, the split and each rank's batch,
+  compute per sample and waiting. No `src/` change (#74).
+- `train_bench.py --accumulate K` (CPU only): each rank's batch runs as K
+  micro-batches with `ddp.no_sync()` for the first K-1, one gradient exchange
+  per optimizer step; combines with `--batch-sizes`, `--global-batch` and
+  `--balance` (calibration at the micro-batch size, at least K samples per
+  rank). Bit-identical on CPU to one process over the same samples with
+  integer data (2 and 3 ranks, K = 2 and 3), within 1e-5 relative on float
+  data; BatchNorm normalizes over each micro-batch. The JSON records K, each
+  rank's micro-batch sizes, samples per step and the exchanges per step the
+  hook counted. No `src/` change (#75).
 
 ### Changed
 
@@ -335,6 +353,11 @@ hardware.
 
 ### Fixed
 
+- The runbook's 8+8 steps said the master's tarball holds the two-machine
+  training records. Rank 0 writes them, and torchrun numbers the machines by
+  address, not by role, so they can be on either machine. The two-machine
+  test assumed the master too, and failed when the worker's torchrun started
+  first; it now expects the record on exactly one of the two (#74).
 - The stream-ordering checks (`check.py`'s `busy_gpu` and `async` stages,
   `tests/test_gpu.py`) queued matmuls as busy work, and failed or aborted
   where rocBLAS has no kernels for the GPU (gfx906 on the ROCm 7.2 wheel).
