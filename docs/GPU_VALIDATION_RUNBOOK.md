@@ -619,6 +619,49 @@ Both models need BLAS on every GPU (the probe's `blas_available`):
 with a ROCm build whose rocBLAS lacks the GPU's kernels, its rank aborts at the
 first matmul, as the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
 
+### Data-parallel training across vendors
+
+[`train_dp.py`](../scripts/gpu/train_dp.py) trains [`llama.py`](../scripts/gpu/llama.py)'s
+LLaMA-style decoder (RMSNorm, rotary embeddings, SwiGLU; 134M parameters as
+`llama-125m`, up to 1.03B) on synthetic tokens with a learnable rule, the same
+global batch at every step whatever the world size, and records every step's loss
+over that whole batch. `STEPS_07=dp` makes step 07 run only the probe, the preflight
+and one such run per name in `DP_RUNS`, into `07_mixed_hetjob_dp/`:
+
+| Run | What |
+| --- | --- |
+| `ddp`, `ddp-bf16`, `ddp-fp8` | DDP with `gpubridge.ddp_comm_hook`, the bridge uncompressed, then compressed with error feedback |
+| `fsdp2` | FSDP2 through `backend="gpubridge"`: parameters sharded over both GPUs |
+| `ddp-speed` | each GPU's share of the batch in proportion to its measured speed, with sample-weighted averaging, so the update stays the whole batch's mean gradient |
+| `ddp-bucket-<MB>` | DDP's bucket size (25 MB in the others) |
+
+`submit.sh dp-baseline` runs the same model, global batch, sequence length, steps and
+seed on one V100 alone (`--mode single`), the curve the others are set against;
+`dp-baseline-amd` does the same on the MI50. On the MI50, train with the
+`venv-rocm63` venv (torch 2.9.1+rocm6.3, the build whose rocBLAS has gfx906
+kernels); its Triton can't compile the compression kernels for gfx906, so the AMD
+side uses gpubridge's PyTorch codec (`DP_KERNELS_ON_AMD=torch`, the default here; the
+same bits, slower). The sharing partition allows an hour per job, so split the runs:
+
+```bash
+export VENV_ROCM=$WORK_DIR/venv-rocm63 STEPS_07=dp TIME_07=00:55:00
+RESULTS_ROOT=$PWD/results/explorer/dp-a DP_RUNS="ddp ddp-bf16 ddp-fp8" \
+    scripts/gpu/explorer/submit.sh 07
+RESULTS_ROOT=$PWD/results/explorer/dp-b DP_RUNS="fsdp2 ddp-speed ddp-bucket-5 ddp-bucket-100" \
+    scripts/gpu/explorer/submit.sh 07
+RESULTS_ROOT=$PWD/results/explorer/dp-base scripts/gpu/explorer/submit.sh dp-baseline
+python scripts/gpu/dp_report.py results/explorer/dp-a results/explorer/dp-b \
+    results/explorer/dp-base --out results/explorer/dp-report
+```
+
+[`dp_report.py`](../scripts/gpu/dp_report.py) puts them side by side (`dp.md`): tokens/s,
+DDP's exposed communication and the share of it backward hid (estimates, from the step less each GPU's compute alone), the last loss, the
+largest gap from the baseline's curve and the mean gap over the last 100 steps, and
+whether the ranks' parameters stayed identical (checked every 50 steps); it also
+writes the curves as `dp_losses.csv` and `dp_losses.svg`. `DP_MODEL`, `DP_STEPS`,
+`DP_GLOBAL_BATCH` and `DP_SEQ` change the run (llama-125m, 500 steps, 8 sequences of
+512 tokens by default).
+
 ## Kaggle (free): two NVIDIA T4s
 
 A free Kaggle notebook with **GPU T4 x2** and internet on runs the

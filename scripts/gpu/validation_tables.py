@@ -120,6 +120,8 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
          [Step("verify_hsdp_backend"), Step("train_hsdp_backend")]),
     32: ("Point-to-point across islands through the backend on GPUs",
          [Step("check_p2p")]),
+    33: ("Data-parallel training across vendors tracks one GPU, compressed or not",
+         [Step(r"dp_(ddp|fsdp2)(-.+)?"), Step("dp_single")]),
 }
 
 

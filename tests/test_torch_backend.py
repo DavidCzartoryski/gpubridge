@@ -769,6 +769,82 @@ NAMING_CHANGES = {
 }
 
 
+def _different_group_counts_before_setup(rank, world):
+    # torch 2.9.1's DeviceMesh creates a group for a (2, 1) mesh's replicate dimension
+    # where 2.14.1's reuses the default group, so the two ranks reach gpubridge's first
+    # collective having created different numbers of groups. gpubridge's world setup
+    # must still meet: its groups can't take names from torch's counter of each
+    # process's groups (they did, and HSDP hung across those two releases).
+    if rank == world - 1:
+        dist.new_group(list(range(world)))
+    x = torch.ones(3)
+    dist.all_reduce(x)
+    assert torch.equal(x, torch.full((3,), float(world)))
+
+
+def test_the_world_setup_meets_after_ranks_created_different_numbers_of_groups(tmp_path):
+    run_backend(["nvidia", "amd"], _different_group_counts_before_setup, tmp_path)
+
+
+def _repeated_world_setup_inside_gloo(rank, world):
+    for _ in range(2):
+        group = dist.new_group(backend="gpubridge")
+        x = torch.ones(3)
+        dist.all_reduce(x, group=group)
+        assert torch.equal(x, torch.full((3,), float(world)))
+        dist.destroy_process_group(group)
+        assert not gpubridge.is_initialized()
+
+
+def test_world_setup_names_are_fresh_after_its_group_is_destroyed(tmp_path):
+    # Destroying a Python backend inside a Gloo world keeps its internal Gloo
+    # groups registered. The next setup must not reuse their names or link keys.
+    run_backend(["nvidia", "amd"], _repeated_world_setup_inside_gloo, tmp_path, backend="gloo")
+
+
+def test_world_setups_use_fresh_transport_store_names():
+    from gpubridge.transport import scoped_name
+
+    names = []
+    for _ in range(2):
+        with torch_backend._world_group_names():
+            names.append(scoped_name([0, 1]))
+    assert all(names) and names[0] != names[1]
+    assert scoped_name([0, 1]) is None
+
+
+def test_transport_names_do_not_depend_on_members_only_torch_group_counts():
+    from gpubridge.transport import scoped_name
+
+    names = []
+    for member in (True, False):
+        with topology._members_only("gpubridge:test"):
+            if member:  # torch never names a locally synchronized group on non-members
+                dist.distributed_c10d._process_group_name([0, 1], True)
+            names.append([scoped_name([0, 1]), scoped_name([0, 1])])
+    assert names[0] == names[1]
+    assert names[0][0] != names[0][1]
+
+
+def _world_setup_with_changed_naming(rank, world):
+    c10d = dist.distributed_c10d
+    plain = c10d._process_group_name
+    c10d._process_group_name = _changed_naming(plain)
+    try:
+        x = torch.ones(3)
+        with pytest.warns(RuntimeWarning, match="every rank must have created the same number"):
+            dist.all_reduce(x)
+        assert torch.equal(x, torch.full((3,), float(world)))
+        # The fallback must restore the caller's naming function too.
+        assert c10d._process_group_name is not plain
+    finally:
+        c10d._process_group_name = plain
+
+
+def test_world_setup_warns_and_uses_torch_naming_when_its_private_api_changes(tmp_path):
+    run_backend(["nvidia", "amd"], _world_setup_with_changed_naming, tmp_path)
+
+
 def test_this_torch_has_the_private_group_naming_subgroups_patch():
     assert topology._subgroup_naming_problem() is None, torch.__version__
 

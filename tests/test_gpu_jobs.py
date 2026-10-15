@@ -36,6 +36,9 @@ END_TO_END = {
     "bench_compression.py": "test_step_04, 07, the node pair, test_amd_node_job",
     "bench_matrix.py": "test_step_08_*, test_net_check_job, test_gpu_kit.py",
     "train_bench.py": "test_step_07_*, test_train_bench_job, test_gpu_kit.py",
+    "train_dp.py": "test_step_07_data_parallel, test_dp_baseline_job, test_gpu_kit.py",
+    "llama.py": "imported by train_dp.py: the same tests",
+    "dp_report.py": "test_step_07_data_parallel, test_gpu_kit.py",
     "net_report.sh": "test_step_08_*, test_net_check_job",
     "rdma_report.sh": "test_net_check_job, test_rdma_report_keeps_paths_out_and_reads_all_of_nm",
     "stream_mutations.py": "test_gpu_kit.py: its plan, each mutation, and its refusal without a "
@@ -65,10 +68,11 @@ END_TO_END = {
     "explorer/05_multinode.sbatch": "test_step_05_two_nodes",
     "explorer/06_scaling.sbatch": "test_step_06_scaling",
     "explorer/07_mixed_hetjob.sbatch": "test_step_07_mixed_hetjob, test_step_07_training_only, "
-                                       "test_step_07_multi",
+                                       "test_step_07_multi, test_step_07_data_parallel",
     "explorer/08_bench_matrix.sbatch": "test_step_08_*",
     "explorer/net_check.sbatch": "test_net_check_job",
     "explorer/train_bench.sbatch": "test_train_bench_job, test_train_multi_job",
+    "explorer/dp_baseline.sbatch": "test_dp_baseline_job",
     "explorer/amd_node.sbatch": "test_amd_node_job",
     "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines, mixed/containers.sh",
     "mixed/containers.sh": "test_mixed_containers_dry_run (the containers need Docker: run it "
@@ -448,6 +452,41 @@ def test_step_07_multi(tmp_path):
     log = (tmp_path / "slurm.log").read_text()
     assert "--partition=multigpu" in log and "--gres=gpu:v100-sxm2:2" in log
     assert "--gres=gpu:mi50:1" in log
+
+
+#: A short data-parallel run of the tiny model, for the fake cluster.
+SMALL_DP = {"DP_MODEL": "llama-tiny", "DP_STEPS": "4", "DP_GLOBAL_BATCH": "4", "DP_SEQ": "16",
+            "DP_ARGS": "--check-every 2 --probe-steps 1 --comm-trials 1"}
+
+
+def test_step_07_data_parallel(tmp_path):
+    code = sbatch(tmp_path, "--job-name=gpubridge-07_mixed_hetjob", "--nodes=1",
+                  "--gres=gpu:1", ":", "--nodes=1", "--gres=gpu:mi100:1",
+                  str(EXPLORER / "07_mixed_hetjob.sbatch"),
+                  FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
+                  FAKE_SLURM_HET_ENV_1="GPUBRIDGE_VENDOR=amd", STEPS_07="dp",
+                  DP_RUNS="ddp ddp-fp8 fsdp2 ddp-speed ddp-bucket-5", **SMALL_DP)
+    out = tmp_path / "results" / "07_mixed_hetjob_dp"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    assert list(steps(out)) == ["probe", "preflight", "dp_ddp", "dp_ddp-fp8", "dp_fsdp2",
+                                "dp_ddp-speed", "dp_ddp-bucket-5"]
+    runs = {p.stem: json.loads(p.read_text()) for p in out.glob("dp_*.json")}
+    assert runs["dp_ddp-fp8"]["compression"] == "fp8" and runs["dp_ddp"]["compression"] == "none"
+    assert [r["compression_kernels"] for r in runs["dp_ddp-fp8"]["ranks"]] == ["auto", "torch"]
+    assert runs["dp_fsdp2"]["mode"] == "fsdp2" and runs["dp_ddp-bucket-5"]["bucket_mb"] == 5.0
+    assert runs["dp_ddp-speed"]["shares_rule"] == "speed"
+    assert {r["world_size"] for r in runs.values()} == {2}
+
+
+def test_dp_baseline_job(tmp_path):
+    code = submit(tmp_path, "dp-baseline", DP_MICRO="2", **SMALL_DP)
+    out = tmp_path / "results" / "dp_baseline_nvidia"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    record = json.loads((out / "dp_single.json").read_text())
+    assert record["mode"] == "single" and record["micro_batches"] == 2
+    assert len(record["losses"]) == 4
+    log = (tmp_path / "slurm.log").read_text()
+    assert "--partition=gpu" in log and "--time=00:30:00" in log
 
 
 def test_step_08_matrix_on_the_mixed_pair(tmp_path):
