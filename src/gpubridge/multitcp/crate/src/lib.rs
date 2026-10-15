@@ -14,8 +14,9 @@
 //! posts a collective's receives before waiting on any of them.
 //!
 //! A wait that fails (a timeout, a broken connection, a frame of the wrong size) first
-//! stops the worker: every connection is shut down and every thread joined, so once the
-//! error reaches the caller no thread can read or write the caller's memory again, and
+//! stops the worker: every connection is shut down and every sending and receiving thread
+//! joined, so once the error reaches the caller no thread can read or write the caller's
+//! memory again, and
 //! the buffers of the failed collective can be freed. `gb_tcp_abort` does the same when
 //! the caller fails on its own between posting and waiting.
 //!
@@ -114,7 +115,11 @@ pub struct Worker {
     shared: Arc<Shared>,
     accepted: Accepted,
     sockets: Vec<TcpStream>,
+    /// Every connection's sending and receiving thread: the ones that touch the caller's
+    /// memory, so stop() always joins them.
     threads: Vec<JoinHandle<()>>,
+    /// The accepting thread, which never touches the caller's memory.
+    acceptor: Option<JoinHandle<()>>,
     last_error: CString,
 }
 
@@ -173,10 +178,11 @@ impl Worker {
             accepted,
             sockets: Vec::new(),
             threads: Vec::new(),
+            acceptor: None,
             last_error: CString::default(),
         };
         let (shared, accepted) = (worker.shared.clone(), worker.accepted.clone());
-        worker.threads.push(thread::spawn(move || {
+        worker.acceptor = Some(thread::spawn(move || {
             accept_loop(listener, index, streams, shared, accepted)
         }));
         Ok(worker)
@@ -264,6 +270,7 @@ impl Worker {
             let queue = member * self.streams + stream;
             let reader = socket.try_clone().map_err(|e| e.to_string())?;
             let writer = socket.try_clone().map_err(|e| e.to_string())?;
+            self.sockets.push(socket); // first, so stop() can always shut it down
             let shared = self.shared.clone();
             self.threads.push(thread::spawn(move || {
                 send_loop(writer, queue, member, shared)
@@ -271,7 +278,6 @@ impl Worker {
             let shared = self.shared.clone();
             self.threads
                 .push(thread::spawn(move || recv_loop(reader, member, shared)));
-            self.sockets.push(socket);
         }
         self.shared.lock().connected[member] = true;
         Ok(())
@@ -384,14 +390,17 @@ impl Worker {
         self.last_error = CString::new(error.replace('\0', " ")).unwrap_or_default();
     }
 
-    /// Stop every thread and close every connection. Returns false if a thread outlived
-    /// `timeout` (it is left to end with the process).
+    /// stop(), then free the worker. False if the accepting thread outlived `timeout`.
     pub fn close(mut self, timeout: Duration) -> bool {
         self.stop(timeout)
     }
 
-    /// Shut every connection down and join every thread: afterwards nothing touches the
-    /// caller's memory. False if a thread outlived `timeout`. Calling it again is harmless.
+    /// Shut every connection down and join every thread that touches the caller's memory:
+    /// afterwards nothing does. Those threads are joined without a time limit: shutting
+    /// a socket down wakes one blocked reading or writing it, and the condition variable
+    /// wakes the others, so none can stay blocked. Only the accepting thread, which never
+    /// touches the caller's memory, may be left after `timeout` (false then; it ends at
+    /// its next poll, or with the process). Calling it again is harmless.
     pub fn stop(&mut self, timeout: Duration) -> bool {
         {
             let mut state = self.shared.lock();
@@ -402,19 +411,24 @@ impl Worker {
         for socket in &self.sockets {
             let _ = socket.shutdown(Shutdown::Both);
         }
-        let deadline = Instant::now() + timeout;
-        let mut clean = true;
         for handle in self.threads.drain(..) {
-            while !handle.is_finished() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(1));
-            }
-            if handle.is_finished() {
-                let _ = handle.join();
-            } else {
-                clean = false;
-            }
+            let _ = handle.join();
         }
-        clean
+        let deadline = Instant::now() + timeout;
+        match self.acceptor.take() {
+            Some(handle) => {
+                while !handle.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if handle.is_finished() {
+                    let _ = handle.join();
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
     }
 }
 
@@ -437,7 +451,7 @@ fn accept_loop(
             Ok((mut socket, _)) => {
                 let hello = socket
                     .set_nonblocking(false)
-                    .and_then(|_| socket.set_read_timeout(Some(Duration::from_secs(30))))
+                    .and_then(|_| socket.set_read_timeout(Some(Duration::from_secs(5))))
                     .and_then(|_| read_words::<3>(&mut socket))
                     .and_then(|words| socket.set_read_timeout(None).map(|_| words));
                 let [first, member, stream] = match hello {
@@ -748,8 +762,8 @@ pub unsafe extern "C" fn gb_tcp_last_error(handle: *mut c_void) -> *const c_char
     guard(std::ptr::null(), || worker(handle).last_error.as_ptr())
 }
 
-/// Stop the worker without freeing it (see the module docs): 0, or 1 if a thread didn't
-/// stop within `timeout`.
+/// Stop the worker without freeing it (see the module docs): 0, or 1 if the accepting
+/// thread (which holds none of the caller's memory) didn't stop within `timeout`.
 ///
 /// # Safety
 /// `handle` from gb_tcp_create.
@@ -764,7 +778,8 @@ pub unsafe extern "C" fn gb_tcp_abort(handle: *mut c_void, timeout: f64) -> c_in
     })
 }
 
-/// Close the worker and free it: 0, or 1 if a thread didn't stop within `timeout`.
+/// Close the worker and free it: 0, or 1 if the accepting thread didn't stop within
+/// `timeout` (see gb_tcp_abort).
 ///
 /// # Safety
 /// `handle` from gb_tcp_create; not used again afterwards.
@@ -869,6 +884,24 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("closed its bridge connection"));
+    }
+
+    #[test]
+    fn nothing_touches_the_buffer_once_stop_returns_mid_transfer() {
+        let (mut a, mut b) = pair(4);
+        let size = 64 << 20;
+        let data = vec![7u8; size];
+        let mut out = vec![0u8; size];
+        let got = b.recv(0, out.as_mut_ptr() as usize, size, 3).unwrap();
+        let _sent = a.send(1, data.as_ptr() as usize, size, 3).unwrap();
+        thread::sleep(Duration::from_millis(2)); // let the transfer start
+        assert!(b.stop(Duration::from_secs(5)));
+        let snapshot = out.clone(); // whatever had arrived; nothing may change it now
+        thread::sleep(Duration::from_millis(200));
+        assert!(out == snapshot);
+        assert_eq!(b.wait(&[got], Duration::from_secs(1)), PEER_FAILED);
+        drop(out); // the buffer can go: no thread holds it
+        a.stop(Duration::from_secs(5));
     }
 
     #[test]

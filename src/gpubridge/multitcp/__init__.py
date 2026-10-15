@@ -230,12 +230,12 @@ class Worker:
             if self.failed is None:
                 self.failed = "aborted"
             if self._lib.gb_tcp_abort(self._handle, timeout) != 0:
-                log.warning("gpubridge: the multitcp bridge's threads didn't stop within %g s; "
-                            "its buffers may still be in use", timeout)
+                log.warning("gpubridge: the multitcp bridge's accepting thread didn't stop "
+                            "within %g s (it holds no tensor memory)", timeout)
 
     def close(self, timeout: float = 10.0) -> None:
         if self._handle is not None:
             handle, self._handle = self._handle, None
             if self._lib.gb_tcp_close(handle, timeout) != 0:
-                log.warning("gpubridge: the multitcp bridge's threads didn't stop within %g s",
-                            timeout)
+                log.warning("gpubridge: the multitcp bridge's accepting thread didn't stop "
+                            "within %g s (it holds no tensor memory)", timeout)

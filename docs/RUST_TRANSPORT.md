@@ -92,8 +92,11 @@ part of a collective and closed must not fail another still receiving from the
 rest. A frame of the wrong size fails the worker; a wait that runs out of time,
 or any wait after a failure, raises, and the transport refuses every later call.
 **Before a failed wait returns, the worker stops**: every connection is shut
-down and every thread joined, so no thread can still read or write a
-collective's tensors once Python sees the error and frees them. If Python's own
+down and every sending and receiving thread joined, without a time limit (shutting
+a socket down wakes a thread blocked on it), so no thread can still read or write
+a collective's tensors once Python sees the error and frees them. Only the
+accepting thread, which never touches tensor memory, may outlive the stop's time
+limit. If Python's own
 code raises in the middle of a collective, the transport stops the worker the
 same way (`gb_tcp_abort`) before the error propagates. An empty message never
 touches its pointer (an empty tensor's is null). The accepting thread files
