@@ -1,6 +1,6 @@
-"""train_bench.py's unequal per-rank batches: DDP through gpubridge.ddp_comm_hook still
-takes the gradient of the mean loss over every rank's samples, as one process would
-over the concatenated batch."""
+"""train_bench.py's unequal per-rank batches, whole or in micro-batches: DDP through
+gpubridge.ddp_comm_hook still takes the gradient of the mean loss over every rank's
+samples, as one process would over the concatenated batch."""
 
 import sys
 from functools import partial
@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import torch
 from _harness import run_ranks
-from test_ops import gather
+from test_ops import Keep, gather
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -127,6 +127,109 @@ def _check_float(topology, shares):
 def test_sample_weighted_losses_match_on_float_data_within_tolerance(layout, tmp_path):
     vendors, shares = LAYOUTS[layout]
     run_ranks(vendors, partial(_check_float, shares=shares), tmp_path)
+
+
+#: Gradient accumulation: unequal per-rank batches, each cut into K micro-batches.
+ACCUMULATE = {
+    "2-ranks-2+6-k2": (["nvidia", "amd"], [2, 6], 2),
+    "3-ranks-3+3+10-k3": (["nvidia", "amd", "amd"], [3, 3, 10], 3),
+}
+
+
+def integer_loss(model, x, w, scale):
+    return per_sample_loss(model, x, w).sum() * scale
+
+
+def _check_accumulation(topology, shares, k):
+    rank, world, n = topology.rank, topology.world_size, sum(shares)
+    reference = make_model()
+    model = DDP(make_model(), bucket_cap_mb=1e-6)
+    exchanges = [0]
+    model.register_comm_hook(None, train_bench.recording_hook([], exchanges))
+    keep = Keep()
+    gpubridge.add_observer(keep)
+    micro = train_bench.even_split(shares[rank], k)
+    scale = train_bench.loss_scale(world, n)
+    for step in range(STEPS):
+        x, w = full_batch(n, step)
+        reference.zero_grad()
+        per_sample_loss(reference, x, w).mean().backward()
+        model.zero_grad()
+        [chunks] = train_bench.micro_batches([tuple(mine(shares, rank, x, w))], micro)
+        assert len(chunks) == k
+        train_bench.backward(model, chunks, scale, loss=integer_loss)
+        for i, (param, twin) in enumerate(zip(model.parameters(), reference.parameters(),
+                                              strict=True)):
+            assert torch.equal(param.grad, twin.grad), (step, i)
+        with torch.no_grad():
+            for param, twin in zip(model.parameters(), reference.parameters(), strict=True):
+                twin -= twin.grad.sign()
+                param.copy_(twin)
+    # One exchange per optimizer step, not one per micro-batch, every bucket of it
+    # through gpubridge.
+    assert exchanges[0] == STEPS
+    assert STEPS <= len(keep.records) <= STEPS * len(list(model.parameters()))
+    assert {(r.op, r.reduce_op) for r in keep.records} == {("all_reduce", "avg")}
+    # Without no_sync every micro-batch's backward exchanges: the count tells.
+    x, w = full_batch(n, STEPS)
+    for xs, ws in train_bench.micro_batches([tuple(mine(shares, rank, x, w))], micro)[0]:
+        integer_loss(model, xs, ws, scale).backward()
+    assert exchanges[0] == STEPS + k
+
+
+@pytest.mark.parametrize("layout", ACCUMULATE)
+def test_accumulated_micro_batches_give_the_concatenated_batchs_gradient_bit_for_bit(
+        layout, tmp_path):
+    vendors, shares, k = ACCUMULATE[layout]
+    run_ranks(vendors, partial(_check_accumulation, shares=shares, k=k), tmp_path)
+
+
+def _check_accumulation_float(topology, shares, k):
+    rank, world, n = topology.rank, topology.world_size, sum(shares)
+    seq = train_bench.DEFAULT_SEQ["tiny-gpt"]
+    torch.manual_seed(0)
+    reference = train_bench.build("tiny-gpt")
+    torch.manual_seed(0)
+    model = DDP(train_bench.build("tiny-gpt"), bucket_cap_mb=0.01)
+    model.register_comm_hook(None, gpubridge.ddp_comm_hook)
+    g = torch.Generator().manual_seed(7)
+    tokens = torch.randint(train_bench.MODELS["tiny-gpt"].vocab, (n, seq + 1), generator=g)
+    x, y = tokens[:, :-1], tokens[:, 1:]
+    train_bench.loss_of(reference, x, y).backward()
+    [chunks] = train_bench.micro_batches([tuple(mine(shares, rank, x, y))],
+                                         train_bench.even_split(shares[rank], k))
+    train_bench.backward(model, chunks, train_bench.loss_scale(world, n, seq))
+    for param, twin in zip(model.parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(param.grad, twin.grad, rtol=FLOAT_RTOL, atol=FLOAT_ATOL)
+
+
+@pytest.mark.parametrize("layout", ACCUMULATE)
+def test_accumulated_micro_batches_match_on_float_data_within_tolerance(layout, tmp_path):
+    vendors, shares, k = ACCUMULATE[layout]
+    run_ranks(vendors, partial(_check_accumulation_float, shares=shares, k=k), tmp_path)
+
+
+def test_split_batch_gives_each_rank_at_least_the_minimum():
+    got = train_bench.split_batch(8, [1.0, 10.0], minimum=2)
+    assert got == [6, 2] and sum(got) == 8
+    with pytest.raises(ValueError, match="2 samples"):
+        train_bench.split_batch(3, [1.0, 1.0], minimum=2)
+
+
+def test_memory_peaks_per_phase_on_a_gpu_and_none_on_cpu(monkeypatch):
+    cpu = torch.device("cpu")
+    assert train_bench.memory_mark(cpu) == 0 and train_bench.memory_peaks(cpu, 0) is None
+    # A GPU's allocator, faked: the calls train_bench makes and what it does with them.
+    gpu, stats, resets = torch.device("cuda", 1), {"num_alloc_retries": 3}, []
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", resets.append)
+    monkeypatch.setattr(torch.cuda, "memory_stats", lambda device: dict(stats))
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 3 * 2**30)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device: 5 * 2**29 + 2**19)
+    before = train_bench.memory_mark(gpu)
+    assert resets == [gpu] and before == 3
+    stats["num_alloc_retries"] = 5
+    assert train_bench.memory_peaks(gpu, before) == {
+        "max_allocated_mib": 3072.0, "max_reserved_mib": 2560.5, "alloc_retries": 2}
 
 
 def test_loss_scale_undoes_the_average_and_takes_the_mean():

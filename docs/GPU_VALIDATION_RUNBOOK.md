@@ -236,7 +236,8 @@ as of 2026-10-06; **verify each one**:
 | `PARTITION_PAIR_NVIDIA`, `PARTITION_PAIR_AMD` | `gpu`, `sharing` | where those pairs' two components go |
 | `PIPELINE_CHUNKS` | `1M 4M 16M 64M` | step 08's pipelined runs, one per `GPUBRIDGE_CHUNK_BYTES` |
 | `TRAIN_BENCH_MODELS`, `TRAIN_BENCH_ARGS` | `gpt2-small resnet50`, empty | `train_bench.py`'s models and extra flags, in step 07 and `train-nvidia`/`train-amd` |
-| `STEPS_07` | `all` | `training`: step 07 runs only the probe, the preflight and its training steps |
+| `STEPS_07` | `all` | `training`: step 07 runs only the probe, the preflight and its training steps; `bench`: only the probe, the preflight and the `train_bench_<model>` steps (no `train_ddp`, FSDP2 or HSDP) |
+| `TRAIN_BENCH_BUCKETS` | empty | DDP bucket sizes in MB, e.g. `10 25 50 100`: step 07 runs each `train_bench_<model>` step once per size (`--bucket-mb`), named `train_bench_<model>_bucket<MB>` (step and JSON). Empty: once, at `train_bench.py`'s default (25) |
 
 Also check:
 
@@ -269,6 +270,8 @@ squeue -u "$USER"                               # wait for them
 cat results/explorer/02_split_shared_gpu/check/summary.md
 # after multigpu access:
 scripts/gpu/explorer/submit.sh multi            # steps 03 to 06
+scripts/gpu/explorer/submit.sh train-multi      # training throughput: 1 GPU, 4 as one island, 2 + 2
+scripts/gpu/explorer/submit.sh 07-multi         # step 07 with 4 NVIDIA GPUs + the AMD side
 ```
 
 **Your settings.** Every step except 00 needs `PROJECT_DIR`, your group's
@@ -362,7 +365,8 @@ runs each phase as one heterogeneous job step (`srun --het-group=0 ... :
 **Per-island baselines need 2+ GPUs per island.** With one GPU, an island's
 all_reduce has nothing to exchange, so its row only times the call itself.
 `gpu` allows one GPU per job. For real baselines, set `GPUS_MIXED_AMD=2`, and,
-with multigpu access, `PARTITION_MIXED_NVIDIA=multigpu GPUS_MIXED_NVIDIA=2`.
+with multigpu access, use `submit.sh 07-multi`: the NVIDIA side on `multigpu`
+with `GPUS_MIXED_NVIDIA_MULTI` GPUs (4 by default, of `GPU_TYPE_MULTI`).
 
 Also check with RC before the first real run:
 
@@ -537,7 +541,9 @@ step's time splits into compute (the same steps before DDP wraps the model),
 waiting for the slower GPU and exposed communication; `comm_alone_ms` is the
 gradient buckets all_reduced with no compute. Step 07 runs it on both sides
 (`train_bench_<model>`, with the other training steps; `STEPS_07=training`
-runs only the probe, the preflight and those), and `submit.sh train-nvidia` or
+runs only the probe, the preflight and those, `STEPS_07=bench` only the probe,
+the preflight and `train_bench_<model>`, and `TRAIN_BENCH_BUCKETS` repeats each
+at several DDP bucket sizes), and `submit.sh train-nvidia` or
 `train-amd` on one GPU alone, the baseline: adding a GPU through gpubridge
 pays off only if the pair's `samples_per_s` beats the faster GPU's alone.
 `TRAIN_BENCH_MODELS` and `TRAIN_BENCH_ARGS` choose the models and flags. Both
@@ -555,10 +561,30 @@ mixed run at global batch N is `TRAIN_BENCH_ARGS="--global-batch N"` on
 rank's `batch_size`, `compute_ms_per_sample` and `waiting_ms`, and with
 `--balance` the calibration's per-sample times. Models with BatchNorm
 (ResNet-50) normalize over each rank's own batch, so their result depends on
-the split, as it does in any DDP run without SyncBatchNorm. Both
-models need BLAS on every GPU (the probe's `blas_available`): with a ROCm build
-whose rocBLAS lacks the GPU's kernels, its rank aborts at the first matmul, as
-the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
+the split, as it does in any DDP run without SyncBatchNorm.
+`--accumulate K` cuts each rank's batch (its samples per optimizer step) into K
+micro-batches and syncs the gradients once per step, in the last backward
+(`no_sync()` for the others): a global batch too big for a GPU's memory runs as
+K smaller forward and backward passes with one exchange. It combines with the
+flags above (with `--balance` the calibration runs at the micro-batch size and
+each rank gets at least K samples), and the update is exact the same way (CPU
+only so far), BatchNorm aside: it normalizes over each micro-batch. The JSON
+adds `accumulate`, `micro_batch_sizes`, `samples_per_step` and the
+`exchanges_per_step` the hook counted. On GPUs each rank's `memory` has, for the
+compute, ddp and comm-alone phases, the caching allocator's peaks
+(`max_allocated_mib`, `max_reserved_mib`) and the allocations it retried after
+freeing its cache (`alloc_retries`, a sign it ran short), and the GPU's
+`total_mib`.
+With multigpu access, `submit.sh train-multi` runs each model on one GPU, on
+`GPUS_TRAIN_MULTI` GPUs (4 by default) as one NCCL island, then on the same GPUs
+split into two islands joined by the bridge (`train_bench_<model>_split`, a
+split test): what several GPUs per island cost through the bridge, against the
+same GPUs on NCCL alone. `submit.sh 07-multi` does the same across vendors
+(several NVIDIA GPUs, one island, and the AMD side). Pipeline-parallel training
+isn't in the kit yet.
+Both models need BLAS on every GPU (the probe's `blas_available`):
+with a ROCm build whose rocBLAS lacks the GPU's kernels, its rank aborts at the
+first matmul, as the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
 
 ## Kaggle (free): two NVIDIA T4s
 

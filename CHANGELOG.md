@@ -202,6 +202,19 @@ hardware.
 
 ### Added
 
+- `submit.sh train-multi` and `07-multi`, for the day multigpu access arrives:
+  `train_bench.py` on one GPU, on `GPUS_TRAIN_MULTI` GPUs (4) as one NCCL
+  island, and on the same GPUs as two islands of half each through the bridge
+  (a split test); and step 07 with `GPUS_MIXED_NVIDIA_MULTI` NVIDIA GPUs (4) on
+  `multigpu` next to the AMD side. Both run end to end on the fake cluster
+  (#64).
+- Step 07: `STEPS_07=bench` runs only the probe, the preflight and the
+  `train_bench_<model>` steps: no `train_ddp`, FSDP2 or HSDP (HSDP hung until
+  its step limit in each of the four fp8 jobs above).
+  `TRAIN_BENCH_BUCKETS="10 25 50 100"` runs each `train_bench_<model>` step
+  once per DDP bucket size (`--bucket-mb`), as `train_bench_<model>_bucket<MB>`
+  (step and JSON), for a bucket-size sweep in one job. Tested on the fake
+  cluster, CPU only (#77).
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
   CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA
@@ -297,6 +310,21 @@ hardware.
   batch on CPU with integer data (2 and 3 ranks), within 1e-5 relative on float
   data. The JSON records the global batch, the split and each rank's batch,
   compute per sample and waiting. No `src/` change (#74).
+- `train_bench.py --accumulate K` (CPU only): each rank's batch runs as K
+  micro-batches with `ddp.no_sync()` for the first K-1, one gradient exchange
+  per optimizer step; combines with `--batch-sizes`, `--global-batch` and
+  `--balance` (calibration at the micro-batch size, at least K samples per
+  rank). Bit-identical on CPU to one process over the same samples with
+  integer data (2 and 3 ranks, K = 2 and 3), within 1e-5 relative on float
+  data; BatchNorm normalizes over each micro-batch. The JSON records K, each
+  rank's micro-batch sizes, samples per step and the exchanges per step the
+  hook counted. No `src/` change (#75).
+- `train_bench.py` on GPUs: each rank's `memory` in the JSON, for the compute,
+  ddp and comm-alone phases: the caching allocator's peak allocated and
+  reserved MiB (`torch.cuda.max_memory_allocated`, `max_memory_reserved`) and
+  its allocation retries (`num_alloc_retries`), and the GPU's total. Null on
+  CPU; the GPU path is tested only against a faked allocator (CPU only)
+  (#78).
 
 ### Changed
 
@@ -347,11 +375,26 @@ hardware.
   a fresh generation, so destroying and recreating a backend group inside a Gloo
   world cannot reuse its old names or store keys. On a torch
   whose private naming function has changed, torch's names are kept, with a warning.
+- Point-to-point lifecycle: future callbacks no longer run under the engine
+  lock or on lane threads, so a callback waiting on another (or its own) P2P
+  Work completes and teardown does not wait for it; idle lanes release
+  completed payloads and their threads exit, keeping per-tag sequence order;
+  a CPU request on a lane that earlier carried a CUDA tensor uses no stream.
+  A batch's Work (`batch_isend_irecv`, `_coalescing_manager`) waits on its
+  members rather than on futures behind user callbacks, so a slow callback
+  doesn't delay it, a callback can wait on it, and `wait(timeout)` works.
+  CPU tests only; the GPU stream paths are unvalidated.
 - The runbook's 8+8 steps said the master's tarball holds the two-machine
   training records. Rank 0 writes them, and torchrun numbers the machines by
   address, not by role, so they can be on either machine. The two-machine
   test assumed the master too, and failed when the worker's torchrun started
   first; it now expects the record on exactly one of the two (#74).
+- `examples/fsdp2_torch_backend.py --verify` is exact at any world size. It
+  averaged each rank's unscaled loss, which divides by the world size, inexact
+  unless that is a power of two, so on 3 or 5 ranks (2 NVIDIA GPUs and an AMD
+  one, say) the check failed with nothing wrong. Each rank's loss is now scaled
+  by the world size and the replay sums the ranks' losses; on CPU it matches bit
+  for bit on 2 to 6 ranks, and with `--hsdp 2` on 4 and 6 (#64).
 - The stream-ordering checks (`check.py`'s `busy_gpu` and `async` stages,
   `tests/test_gpu.py`) queued matmuls as busy work, and failed or aborted
   where rocBLAS has no kernels for the GPU (gfx906 on the ROCm 7.2 wheel).
