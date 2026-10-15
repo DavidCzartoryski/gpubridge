@@ -373,6 +373,13 @@ extension can be added next to this library then.
 6. Is `perftest` (`ib_write_bw` with `--use_cuda` / `--use_rocm`) installed,
    to measure the hardware ceiling before running gpubridge?
 
+The network check answered 1 to 4 from the nodes themselves, for one V100
+node and one MI50 node (2026-10-14,
+[BENCHMARKS.md](BENCHMARKS.md#rdma-between-the-node-types)): the V100 node's
+RDMA is InfiniBand and the MI50 node's is RoCE, so the two aren't on one
+fabric; `nvidia_peermem` is installed but not loaded; the MI50 node has what
+dma-buf export needs; the only UCX is 1.16.0 without verbs, CUDA or ROCm.
+
 ## 10. Results so far
 
 - Host-memory path over TCP: every bridge policy on two, three and four
@@ -390,6 +397,10 @@ extension can be added next to this library then.
 - GPUDirect RDMA write visibility (2026-10-12): UCX doesn't flush the NIC's
   writes into GPU memory before reporting a receive complete, for CUDA or ROCm
   memory, so the transport does (section 4).
+- Explorer (2026-10-14): **no RDMA path between a V100 node and an MI50
+  node** (InfiniBand on one, RoCE on the other), and the cluster's UCX has no
+  verbs transport. So the RDMA paths can't be validated there; see
+  [BENCHMARKS.md](BENCHMARKS.md#rdma-between-the-node-types).
 - Nothing has run on RDMA hardware or a GPU.
 
 ## Plan

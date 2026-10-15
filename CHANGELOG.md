@@ -160,6 +160,19 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   659 ms of it exposed communication), against 25.3 on the V100 alone;
   ResNet-50 327.7 samples/s (a 195 ms step), against 315.8. Adding the MI50
   lowered GPT-2 small's throughput and left ResNet-50's about where it was.
+- **RDMA between the node types, commit 1ac6fa9** (the network check with
+  `rdma_report.sh`; its other steps as at 934f87c), one V100 node and one MI50
+  node: **no RDMA path between them.** The V100 node's only RDMA device is
+  `mlx5_0`, InfiniBand; the interface the bridge uses there has none. The MI50
+  node's only active one is `mlx5_0`, RoCE on that interface at 10 Gb/s; its
+  InfiniBand port is disabled. On the GPU side, `nvidia_peermem` (545.23.08) is
+  installed for the V100 node's kernel but not loaded; the MI50 node's kernel
+  has `CONFIG_HSA_AMD_P2P` and torch 2.14.1+rocm7.2's HSA runtime exports
+  dma-bufs; both kernels have `CONFIG_DMABUF_MOVE_NOTIFY`, and both nodes'
+  libibverbs (rdma-core 46.0 and 57.0) have `ibv_reg_dmabuf_mr`. The cluster's
+  only UCX (1.16.0, in the OpenMPI 4.1.6 module) has TCP and shared-memory
+  transports and host memory only. Details in
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#rdma-between-the-node-types).
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
@@ -169,6 +182,13 @@ hardware.
 
 ### Added
 
+- `scripts/gpu/rdma_report.sh`, a step of the network check (`net-nvidia`,
+  `net-amd`): what RDMA from GPU memory would need on the node, one file each
+  in `rdma/<side>/`: the kernel's dma-buf and peer-to-peer options, the RDMA
+  and GPU kernel modules (and whether `nvidia_peermem` or `nv_peer_mem` exist),
+  rdma-core and `ibv_reg_dmabuf_mr`, `rdma link`, UCX (`ucx_info -v` and `-d`)
+  and the HSA runtime's dma-buf export. It runs last, after loading
+  `RDMA_MODULES`, so the steps before it are unchanged (#PRNUM).
 - A Kaggle runner for the GPU validation kit, for a free notebook with two
   T4s (`scripts/gpu/kaggle/`): a notebook and the same steps as one script,
   each step under a hard time limit. It checks what compute capability 7.5

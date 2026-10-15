@@ -516,7 +516,12 @@ no A1 and A2 the multiples stay empty. The job refuses to run if both
 components land on one node. `net_check.sbatch` (`net-nvidia`, `net-amd`)
 records one node's network the same way and has NCCL or RCCL initialize on one
 rank, as chosen and with `NCCL_IB_DISABLE=1`, so its log names the network the
-library would use between nodes.
+library would use between nodes. Last, `rdma_report.sh` records what RDMA from
+GPU memory would need there, into `rdma/<side>/`: dma-buf and peer-to-peer
+options in the kernel, `nvidia_peermem` or `nv_peer_mem`, rdma-core and
+`ibv_reg_dmabuf_mr`, `rdma link`, the HSA runtime's dma-buf export and UCX. For
+`ucx_info`, set `RDMA_MODULES` to a module that provides it (on Explorer,
+`OpenMPI/4.1.6`); it is loaded just before that step, the job's last.
 
 **Same-partition pairs wait for Research Computing.** A1, A2, B1, B2 and C need
 two GPUs of one type, which `08-nvidia-pair` and `08-amd-pair` ask for as two
