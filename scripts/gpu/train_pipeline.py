@@ -199,8 +199,8 @@ def main() -> int:
     example = tokens if first else hidden
     x0, y0 = llama.global_batch(args.model, -1, micro, args.seq_len, args.seed)
     if first:
-        example = x0.to(device)
-    compute = stage_compute(stage, example, y0.to(device) if last else None,
+        example = x0.contiguous().to(device)
+    compute = stage_compute(stage, example, y0.contiguous().to(device) if last else None,
                             device, args.probe_trials)
     hops = hop_time(me, order, hidden.clone(), device, args.probe_trials)
 
@@ -221,6 +221,7 @@ def main() -> int:
     step_s, last_losses = [], []
     for step in range(args.steps):
         x, y = llama.global_batch(args.model, step, args.global_batch, args.seq_len, args.seed)
+        x, y = x.contiguous(), y.contiguous()  # torch 2.8's stages check strides too
         sync(device)
         begin = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
