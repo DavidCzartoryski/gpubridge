@@ -17,6 +17,12 @@ stream ordering is untouched.
   order and then copied.
 - broadcast: the source leader sends to each of the others, in chunks.
 
+The reductions run on one torch thread (the thread count is set for the collective and
+restored after). On a node with few CPUs, torch's intra-op threads would otherwise
+compete with this transport's network threads: on Explorer's 4-CPU jobs that made each
+chunk's reduction 10 to 25 times slower than on one thread. Gloo's own bridge reduces
+on one thread too.
+
 The leaders connect on the address of ``GPUBRIDGE_MULTITCP_IFNAME``, else of
 ``GLOO_SOCKET_IFNAME``, else the one this machine reaches ``MASTER_ADDR`` from.
 Every wait has the deadline ``init()`` gave its groups; a timeout or a failed
@@ -241,13 +247,18 @@ class MultiTcpTransport(BridgeTransport):
                 for i, (start, length) in enumerate(_pieces(view.numel(), chunk))]
 
     def _guarded(self, run) -> None:
-        """``run()``; if anything raises, stop the library's threads before it propagates,
-        so no posted operation outlives the tensors it points into."""
+        """``run()`` on one torch thread (see the module docstring); if anything raises,
+        stop the library's threads before it propagates, so no posted operation outlives
+        the tensors it points into."""
+        threads = torch.get_num_threads()
+        torch.set_num_threads(1)
         try:
             run()
         except BaseException:
             self.worker.abort()
             raise
+        finally:
+            torch.set_num_threads(threads)
 
     def all_reduce(self, tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
         if len(self.members) == 1:

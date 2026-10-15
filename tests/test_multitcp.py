@@ -230,6 +230,22 @@ def test_large_tensors_in_many_chunks(layout, tmp_path):
               init_kwargs={"bridge": "multitcp"})
 
 
+def _check_thread_count_restored(topology):
+    torch.set_num_threads(3)
+    tensor = rank_tensor((257,), torch.float32, topology.rank)
+    gpubridge.all_reduce(tensor)
+    assert torch.get_num_threads() == 3  # one thread during the collective, then back
+    assert torch.equal(tensor, expected_reduce((257,), torch.float32, topology.world_size,
+                                               ReduceOp.SUM))
+
+
+@needs_library
+def test_the_reductions_leave_torchs_thread_count_as_it_was(tmp_path):
+    run_ranks(LAYOUTS["2+2"][0], _check_thread_count_restored, tmp_path,
+              before_init=partial(_label_islands, None, LOCAL),
+              init_kwargs={"bridge": "multitcp"})
+
+
 def _check_empty_and_bad_tensors(topology):
     bridge = topology.bridge
     if bridge is not None:
