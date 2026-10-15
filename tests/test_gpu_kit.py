@@ -2035,11 +2035,13 @@ def test_train_bench_alone_runs_the_whole_global_batch_with_the_same_flags(tmp_p
     out = tmp_path / "train_bench.json"
     result = torchrun(1, KIT / "train_bench.py", "--model", "tiny-gpt", "--steps", "1",
                       "--warmup-steps", "1", "--comm-trials", "1", "--json", str(out),
-                      "--global-batch", "6", "--balance", GPUBRIDGE_VENDOR="nvidia")
+                      "--global-batch", "6", "--balance", "--accumulate", "2",
+                      GPUBRIDGE_VENDOR="nvidia")
     assert result.returncode == 0, result.stderr[-3000:]
     record = json.loads(out.read_text())
     assert record["batch_sizes"] == [6] and record["global_batch"] == 6
     assert record["batch_split"] == "balanced" and record["calibration"] is None
+    assert record["micro_batch_sizes"] == [[3, 3]] and record["exchanges_per_step"] == 1.0
 
 
 def test_train_bench_default_batches_are_unweighted_and_say_so(tmp_path):
@@ -2053,9 +2055,41 @@ def test_train_bench_default_batches_are_unweighted_and_say_so(tmp_path):
     assert record["batch_size_per_rank"] == 2 and record["global_batch"] == 4
     assert record["batch_split"] == "per-rank"
     assert record["loss_weighting"] == "mean per rank, averaged over ranks"
+    assert record["accumulate"] == 1 and record["micro_batch_sizes"] == [[2], [2]]
+    assert record["exchanges_per_step"] == 1.0
+
+
+@pytest.mark.parametrize(("args", "micro"), [
+    (("--batch-size", "4", "--accumulate", "2"), [[2, 2], [2, 2]]),
+    (("--batch-sizes", "2,5", "--accumulate", "2"), [[1, 1], [3, 2]]),
+    (("--global-batch", "8", "--balance", "--accumulate", "2", "--calibration-steps", "1"),
+     None),
+])
+def test_train_bench_accumulates_micro_batches_with_one_exchange_per_step(args, micro,
+                                                                          tmp_path):
+    out = tmp_path / "train_bench.json"
+    result = torchrun(2, KIT / "train_bench.py", "--model", "tiny-gpt", "--steps", "2",
+                      "--warmup-steps", "1", "--comm-trials", "1", "--json", str(out), *args,
+                      GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode == 0, result.stderr[-3000:]
+    record = json.loads(out.read_text())
+    assert record["accumulate"] == 2 and record["exchanges_per_step"] == 1.0
+    got = record["micro_batch_sizes"]
+    assert micro is None or got == micro
+    assert [sum(m) for m in got] == record["batch_sizes"]
+    assert all(len(m) == 2 and min(m) >= 1 for m in got)
+    n = record["global_batch"]
+    assert record["samples_per_step"] == n == sum(record["batch_sizes"])
+    assert record["samples_per_exchange"] == n and record["exchanges_per_sample"] == round(1 / n, 6)
+    assert record["loss_weighting"].startswith("sample-weighted")
+    assert record["params_identical"] and record["params_finite"]
+    if micro is None:
+        assert n == 8 and record["calibration"]["batch_size"] == 2
 
 
 @pytest.mark.parametrize(("args", "message"), [
+    (("--accumulate", "3", "--batch-size", "2"), "needs at least 3 samples per rank"),
+    (("--accumulate", "0"), "--accumulate must be at least 1"),
     (("--balance",), "--balance needs --global-batch"),
     (("--batch-sizes", "1,2,3"), "--batch-sizes needs 2 sizes"),
     (("--global-batch", "1"), "can't give each of 2 ranks a sample"),

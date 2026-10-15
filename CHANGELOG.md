@@ -297,6 +297,15 @@ hardware.
   batch on CPU with integer data (2 and 3 ranks), within 1e-5 relative on float
   data. The JSON records the global batch, the split and each rank's batch,
   compute per sample and waiting. No `src/` change (#74).
+- `train_bench.py --accumulate K` (CPU only): each rank's batch runs as K
+  micro-batches with `ddp.no_sync()` for the first K-1, one gradient exchange
+  per optimizer step; combines with `--batch-sizes`, `--global-batch` and
+  `--balance` (calibration at the micro-batch size, at least K samples per
+  rank). Bit-identical on CPU to one process over the same samples with
+  integer data (2 and 3 ranks, K = 2 and 3), within 1e-5 relative on float
+  data; BatchNorm normalizes over each micro-batch. The JSON records K, each
+  rank's micro-batch sizes, samples per step and the exchanges per step the
+  hook counted. No `src/` change.
 
 ### Changed
 
