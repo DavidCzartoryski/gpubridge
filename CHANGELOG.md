@@ -225,6 +225,12 @@ hardware.
 
 ### Added
 
+- `examples/train_synthetic.py` (the kit's `train_ddp`) compares every rank's
+  gradients after the all_reduce and parameters after the optimizer step, bit for
+  bit, between steps, and records the first step each differed, in which tensors,
+  and by how much (`first_grad_mismatch`, `first_param_mismatch`). The parameter
+  verdict now comes from the bits; the earlier float64 checksum comparison stays
+  as `params_checksums_equal`.
 - `bridge="multitcp"`, an opt-in bridge transport over several TCP connections
   per pair of leaders (`GPUBRIDGE_MULTITCP_STREAMS`, 4), from a small Rust
   library (`src/gpubridge/multitcp/crate`, standard library only, a C interface
