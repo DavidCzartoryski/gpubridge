@@ -276,7 +276,15 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     `examples/train_synthetic.py`, which exits non-zero if parameters diverge:
     `train_ddp` in Explorer steps 04 (split test) and 07 (mixed NVIDIA +
     AMD), `train_ddp_split` in `amd/run_all.sh`, and the single-island
-    scaling runs in step 06.
+    scaling runs in step 06. *On GPUs (V100 on torch 2.14.1+cu126, MI50 on
+    2.9.1+rocm6.3): intermittent. Of the 8 mixed runs on record, 2 ended with
+    the ranks' parameters unequal: job 11090726 (commit 4e7f04e, fp8 with the
+    PyTorch kernels) and job 11112713 (commit 1c7d107, uncompressed). The
+    same fp8 configuration matched in 3 other runs, one of them on the same
+    two nodes (job 11090051), with the same seeded inputs. Cause not known.
+    The check compares sums of each rank's parameters taken on its own GPU,
+    which can also differ in the last bits for identical parameters; a check
+    of gradients and parameters bit for bit, step by step, comes next.*
 23. **What `gpubridge.in_flight()` shows on GPUs.** It reflects the host: a
     thread is listed while it is inside a gpubridge call. NCCL and RCCL calls
     return once their work is queued, so on GPUs a non-leader whose island
@@ -426,8 +434,12 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     2.14.1 and in CI on torch 2.8.0 and 2.14.1: bit for bit like one process,
     every all-gather and reduce-scatter native-only with no bridge phase
     (`tests/test_torch_backend.py`), and the example's `--hsdp 2` and
-    `--verify --hsdp 2` on 4 simulated ranks.* *Step:* `train_hsdp_backend`
-    and `verify_hsdp_backend` in Explorer steps 04 and 07.
+    `--verify --hsdp 2` on 4 simulated ranks. On GPUs: passes since #80. Job
+    11112713, commit 1c7d107, V100 on torch 2.14.1+cu126 and MI50 on
+    2.9.1+rocm6.3 (`venv-rocm63`): `train_hsdp_backend` and
+    `verify_hsdp_backend` passed. With one GPU per vendor the shard groups are
+    single ranks, so only the replicate all_reduce crossed the bridge.* *Step:*
+    `train_hsdp_backend` and `verify_hsdp_backend` in Explorer steps 04 and 07.
 33. **Data-parallel training across vendors tracks one GPU, compressed or
     not.** `train_dp.py` on `llama.py`'s model, 500 steps, the same global
     batch and seed as one V100 alone: DDP through `gpubridge.ddp_comm_hook`
@@ -466,8 +478,11 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     filled with other data, that the received tensor read on another
     stream right after `wait()` holds the data, and that two tags between a
     pair match out of order. *Status: works on CPU in simulation mode (1+1 and
-    2+2 ranks, `tests/test_gpu.py`'s simulation test and check.py `--p2p-only`);
-    not run on GPUs.* *Step:* `check_p2p` in Explorer steps 02 and 07, and
+    2+2 ranks, `tests/test_gpu.py`'s simulation test and check.py `--p2p-only`).
+    On GPUs: passes, commit 1c7d107. `check_p2p` on the split test (one V100,
+    torch 2.14.1+cu126, job 11112711) and across vendors (V100 on 2.14.1+cu126,
+    MI50 on 2.9.1+rocm6.3 in `venv-rocm63`, job 11112713); the stream-order test
+    in `gpu_tests` on the V100 (job 11112711) and the MI50 (job 11113623).* *Step:* `check_p2p` in Explorer steps 02 and 07, and
     `test_point_to_point_across_islands_keeps_stream_order_and_storage` in
     `gpu_tests`. The results table counts `check_p2p` only; historical `gpu_tests`
     records cannot show whether this test existed in the run.
@@ -585,10 +600,37 @@ Where the FAILs come from:
   default group for the replicate dimension; 2.9.1 calls `new_group`), and
   the world setup's groups take torch's default names, which count the groups
   each process has made, so the ranks likely wait on different store keys.
-  A setup-naming fix in `src/` completed this mixed-version CPU example and
-  its bit-for-bit replay check. It has not yet been validated on the GPU
-  pair, whose original hang had no captured stacks. Plain `init_device_mesh`
+  A setup-naming fix in `src/` (#80) completed this mixed-version CPU example
+  and its bit-for-bit replay check, and on 2026-10-15 both steps passed on
+  the GPU pair with it (job 11112713, below). Plain `init_device_mesh`
   and a barrier with the same mixed versions, without gpubridge, don't hang.
+
+### 2026-10-15, commit 1c7d107
+
+Not yet in the tables above: their folders now mix these jobs' attempts with
+the 2026-10-14 ones (a folder's `steps.jsonl` doesn't say which job ran a
+step), so they are left as generated until the next clean run. From each job's
+log, every job from the same checkout, with gpubridge imported from it:
+
+| Job | What | Torch (V100 / MI50) | MI50 venv | Passed | Failed |
+| --- | --- | --- | --- | --- | --- |
+| 11112710 | 01 probe | 2.14.1+cu126 | - | every step | - |
+| 11112711 | 02 split test, one V100 | 2.14.1+cu126 | - | 8 of 8, incl. `check_p2p`, `bench_p2p`, `gpu_tests` (27 passed, 8 skipped) | - |
+| 11112713 | 07 V100 + MI50 | 2.14.1+cu126 / 2.9.1+rocm6.3 | `venv-rocm63` | 24 of 27, incl. `check_p2p`, `bench_p2p`, FSDP2, HSDP | `bench_compression_kernels`, `bench_compressed`, `train_ddp` |
+| 11112712 | AMD node | 2.14.1+rocm7.2 | `venv-rocm` | 9 of 11 | both `train_bench` runs (rocBLAS has no gfx906 kernels) |
+| 11112824 | AMD node | 2.9.1+rocm6.3 | `venv-rocm63` | 9 of 11 | `gpu_tests`, `bench_compression_kernels` (Triton 3.5.1 can't compile for gfx906) |
+| 11113623 | AMD node | 2.9.1+rocm6.3, Triton 3.8.0 overlay | `venv-rocm63` + overlay | 11 of 11, `gpu_tests` 27 passed, 8 skipped | - |
+
+- **Items 31 and 32** pass on GPUs (their entries above).
+- **Item 22**: `train_ddp` failed its parameter check in job 11112713; see
+  its entry.
+- **Item 28 on the MI50** is an environment limit: `venv-rocm63`'s Triton
+  (pytorch-triton-rocm 3.5.1) can't compile the compression kernels for
+  gfx906, and the default ROCm venv's rocBLAS can't train on it. With Triton
+  3.8.0 in front of `venv-rocm63` (`scripts/gpu/rocm_triton_overlay.sh`), every
+  step passed (job 11113623). The overlay's Triton version isn't in the
+  records; it is inferred from the kernels compiling where 3.5.1 had failed
+  half an hour earlier on the same node (job 11112824).
 
 ### Network
 

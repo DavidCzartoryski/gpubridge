@@ -216,6 +216,19 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   PyTorch kernels. Communication alone fell to 346 and 362 ms from 485 and
   605. HSDP hung again in both. Details in
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md#fp8-with-triton-kernels-on-the-mi50).
+- **Point-to-point, HSDP and the kit on a V100 + MI50, commit 1c7d107** (V100:
+  torch 2.14.1+cu126, NCCL 2.29.3; MI50: torch 2.9.1+rocm6.3, RCCL 2.21.5, in
+  `venv-rocm63`). Point-to-point through `backend="gpubridge"` passed on GPUs:
+  `check_p2p` on the split test (one V100, job 11112711) and across vendors (job
+  11112713), and the GPU stream-order test in `gpu_tests` on the V100 and the
+  MI50. Across vendors, a message took about 2.8 to 3.4 ms one way from 1 KB to 1
+  MB, and moved 0.8 GB/s at 64 MB and up (1.0 GB/s with pinned staging), payload
+  intact at every size. HSDP through the backend passed with mixed torch releases
+  (`train_hsdp_backend`, `verify_hsdp_backend`; it hung before #80). `train_ddp`
+  ended with the ranks' parameters unequal, as in 1 of 7 earlier mixed runs (item
+  22). The MI50's compression-kernel steps failed on `venv-rocm63`'s Triton 3.5.1,
+  which can't compile for gfx906, and passed with the Triton 3.8.0 overlay (job
+  11113623: every step of the AMD node job, GPU tests 27 passed, 8 skipped).
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
