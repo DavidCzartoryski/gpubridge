@@ -296,7 +296,7 @@ hardware.
   loss over all N samples: bit-identical to one process over the concatenated
   batch on CPU with integer data (2 and 3 ranks), within 1e-5 relative on float
   data. The JSON records the global batch, the split and each rank's batch,
-  compute per sample and waiting. No `src/` change.
+  compute per sample and waiting. No `src/` change (#74).
 
 ### Changed
 
@@ -337,6 +337,11 @@ hardware.
 
 ### Fixed
 
+- The runbook's 8+8 steps said the master's tarball holds the two-machine
+  training records. Rank 0 writes them, and torchrun numbers the machines by
+  address, not by role, so they can be on either machine. The two-machine
+  test assumed the master too, and failed when the worker's torchrun started
+  first; it now expects the record on exactly one of the two (#74).
 - The stream-ordering checks (`check.py`'s `busy_gpu` and `async` stages,
   `tests/test_gpu.py`) queued matmuls as busy work, and failed or aborted
   where rocBLAS has no kernels for the GPU (gfx906 on the ROCm 7.2 wheel).

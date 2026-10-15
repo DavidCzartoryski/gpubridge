@@ -786,8 +786,10 @@ measurements.
    python scripts/gpu/triage.py mixed-worker-<host>.tgz
    ```
 
-   The master's tarball holds the two-machine training records
-   (`train_bench_<model>.json`: rank 0 writes them); each holds its own
+   The two-machine training records (`train_bench_<model>.json`) are in the
+   tarball of the machine that got rank 0, which writes them, as it writes the
+   benchmarks' and FSDP2's. torchrun numbers the machines by their addresses
+   (`LOCAL_ADDR`), not by role, so it can be either. Each tarball holds its own
    machine's baseline (`train_bench_alone_<model>.json`). For the check's
    verdict, see above.
 7. **Stop billing.** Destroy both machines once the tarballs are copied; on
