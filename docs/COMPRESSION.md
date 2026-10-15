@@ -5,8 +5,9 @@ V100, two of the kernel tests failed: the fp8 error-feedback residual
 differed from the reference, from a codec overflow and a fused multiply-add,
 both fixed in #50. Since then the kernels have matched the CPU reference on
 NVIDIA V100, T4, A100, L40S and H200 GPUs and an AMD MI50 (the
-[CHANGELOG](../CHANGELOG.md)'s runs). Compressed collectives in whole jobs
-have run on CPU only, in simulation mode.
+[CHANGELOG](../CHANGELOG.md)'s runs). Compressed training has run on a V100
+and an MI50: throughput in [BENCHMARKS.md](BENCHMARKS.md), loss curves in
+[Training with compression](#training-with-compression).
 [HARDWARE_VALIDATION.md](../HARDWARE_VALIDATION.md) items 28 and 29 list what
 a GPU run must show.
 
@@ -396,6 +397,53 @@ would help more.
   two-machine `mixed/node.sh`). The first GPU run shows where compression
   starts paying off.
 
+## Training with compression
+
+DDP through `gpubridge.ddp_comm_hook` on a V100 and an MI50, uncompressed,
+`bf16` and `fp8` on the bridge (Triton kernels on both GPUs), against one V100
+alone: `train_dp.py` on `llama-125m`, a global batch of 8 sequences x 512
+tokens (4 per GPU), AdamW 3e-4, seed 0, 1,000 steps. The setup and the
+throughput are in [BENCHMARKS.md](BENCHMARKS.md#data-parallel-training-on-a-llama-style-model).
+The V100 baselines put the same batch through in 1, 2, 4 or 8 micro-batches:
+the same mean gradient, summed in another order. Explorer jobs 11111481 (DDP)
+and 11109239, 11109665, 11109872 and 11110316 (the V100).
+
+| Run | Loss at step 1,000 | Mean of the last 100 steps | Mean gap to the four V100 runs, last 100 steps | Loss first below 9 at step |
+| --- | ---: | ---: | ---: | ---: |
+| V100 alone, 1, 2, 4 and 8 micro-batches | 1.800 to 1.809 | 1.807 to 1.812 | 0.0041 to 0.0056 between them | 179 to 210 |
+| V100 + MI50, uncompressed | 1.802 | 1.806 | 0.0037 to 0.0067 | 188 |
+| V100 + MI50, `bf16` | 1.830 | 1.838 | 0.0263 to 0.0312 | 337 |
+| V100 + MI50, `fp8` | 1.831 | 1.834 | 0.0217 to 0.0266 | 302 |
+
+![Loss over 1,000 steps: DDP uncompressed, bf16 and fp8 on a V100 + MI50, and the four one-V100 runs](img/dp-loss-v100-mi50.svg)
+
+**Why not compare the curves step by step.** Every run sits on a plateau near
+ln(32000) = 10.37, the loss of a uniform guess over the vocabulary, then falls
+to about 2 over the next 200 or so steps. When the drop starts depends on float rounding. Two
+runs of the same one-V100 job match for 4 steps, then differ by 1e-7 at step
+5, 1e-3 by step 24 and 0.1 by step 157 (jobs 11107533 and 11109239). One of
+them was still at 8.24 at step 500, the other at 2.10. So after 500 steps
+the curves of identical runs can be far apart, and only once every run has
+dropped do they come back together. Hence 1,000 steps and the last 100.
+
+**The tolerance.** Runs that differ only in rounding and drop at about the
+same time end 0.004 to 0.007 apart: the four V100 runs, uncompressed DDP, and
+an uncompressed 1F1B pipeline on the same two GPUs (gpubridge #81: 0.0036 to
+0.0052). An uncompressed GPipe pipeline that dropped 130 to 160 steps later
+(step 341) ends 0.020 to 0.025 above them. Both compressed runs dropped later
+too and end 0.022 to 0.031 above: about the gap rounding alone leaves after a
+late drop. So, after 1,000 steps, compressed DDP is within about 0.03 of one
+V100 on this model, and nothing in these runs separates compression's error from
+the timing of the drop. The ranks' parameters were bit-identical at every
+check, every 50 steps, compressed or not.
+
+**Open: does compression delay the drop?** In all four compressed runs so far
+the drop came later than in the uncompressed DDP run of the same job: bf16 at
+steps 228 and 337, fp8 at 302 and 457, against 190 and 188 (job 11105619, 500
+steps with the PyTorch kernels on the MI50, and job 11111481).
+Fourteen uncompressed runs, on one GPU or two, dropped between steps 172 and
+444. Several seeds per setting would tell a delay from chance.
+
 ## Not done
 
 - The `fp8` kernels are compute-bound on the MI50 and the H200 ([Kernel
@@ -403,6 +451,6 @@ would help more.
 - Where compression pays off in a real job, the cost of compiling without
   fused multiply-adds, and a mixed job's digests across vendors are open
   (items 28 and 29).
-- No training-accuracy study: loss curves with and without compression over
-  many steps (`examples/train_synthetic.py` would do).
+- Whether compression delays the drop off the loss plateau ([Training with
+  compression](#training-with-compression)): several seeds per setting.
 - Compressed broadcast, all_gather, or a compressed island step.

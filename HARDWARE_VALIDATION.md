@@ -440,8 +440,17 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     record tokens/s, the step split and the share of communication backward
     hides. *Status: works on CPU in simulation mode: DDP, uneven shares and
     FSDP2 within 1e-4 of one process over 12 steps, fp8 within 0.05
-    (`tests/test_gpu_kit.py`). Not run on GPUs.* *Step:* `dp_*` in Explorer
-    step 07 with `STEPS_07=dp`, and `dp_single` in `submit.sh dp-baseline`.
+    (`tests/test_gpu_kit.py`). On a V100 and an MI50 (Explorer, 1,000 steps):
+    parameters bit-identical at every check, compressed or not; over the last
+    100 steps uncompressed DDP is 0.0037 to 0.0067 from four one-V100 runs,
+    which are 0.0041 to 0.0056 apart, and bf16 and fp8 0.022 to 0.031, about
+    what an uncompressed run leaves after a late drop off the loss plateau
+    (docs/COMPRESSION.md, "Training with compression"); FSDP2 ran 500 steps,
+    shares by speed and bucket sizes 100 steps each
+    (docs/BENCHMARKS.md). 500 steps, as
+    planned here, end mid-drop for some runs, so the curves were compared at
+    1,000.* *Step:* `dp_*` in Explorer step 07 with `STEPS_07=dp`, and
+    `dp_single` in `submit.sh dp-baseline`.
 35. **The multitcp bridge against the Gloo bridge.** `bridge="multitcp"`
     (docs/RUST_TRANSPORT.md) carries the bridge over several TCP connections
     per pair and reduces each chunk as it arrives. Between two machines, its

@@ -286,7 +286,16 @@ hardware.
   across ranks; tokens/s and DDP's step split; batch shares by GPU speed with
   sample-weighted averaging), step 07's `STEPS_07=dp`, `submit.sh dp-baseline`
   and `scripts/gpu/dp_report.py` (the runs against the baseline, with the loss
-  curves as CSV and SVG). CPU only so far; HARDWARE_VALIDATION.md item 33
+  curves as CSV and SVG); HARDWARE_VALIDATION.md item 33. On a V100 and an
+  MI50 (Explorer, `llama-125m`, 1,000 steps): 4,549 tokens/s uncompressed,
+  5,753 with bf16 and 9,523 with fp8 on the bridge (Triton kernels on both
+  GPUs), against 14,264 on the V100 alone; FSDP2 1,809. Shares by speed cut
+  the V100's wait from 78 to 9 ms a step without raising tokens/s, as the
+  bridge sets the step; 5, 25 and 100 MB buckets within 3.5%. Uncompressed DDP
+  ends as close to one V100 as V100 runs do to each other; bf16 and fp8 end
+  0.02 to 0.03 above, after a later drop off the loss plateau, which rounding
+  alone also produces. Parameters identical on both GPUs at every check.
+  docs/BENCHMARKS.md, and docs/COMPRESSION.md's "Training with compression"
   (#67).
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
