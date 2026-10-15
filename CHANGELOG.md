@@ -305,7 +305,7 @@ hardware.
   integer data (2 and 3 ranks, K = 2 and 3), within 1e-5 relative on float
   data; BatchNorm normalizes over each micro-batch. The JSON records K, each
   rank's micro-batch sizes, samples per step and the exchanges per step the
-  hook counted. No `src/` change.
+  hook counted. No `src/` change (#75).
 
 ### Changed
 
