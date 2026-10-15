@@ -182,15 +182,24 @@ hardware.
 
 ### Added
 
-- `mixed/node.sh` (a real mixed job on two machines) also measures training
-  throughput, as Explorer's step 07 does: `train_bench.py` on each model in
-  `TRAIN_BENCH_MODELS` (GPT-2 small and ResNet-50 by default), first on each
-  machine's GPUs alone, then on both together; and it writes `triage.txt`
-  before packing the results (#63).
-- `scripts/gpu/mixed/containers.sh`: `node.sh` end to end on CPU in two Linux
-  containers on one Docker network, standing in for the two machines, with
-  `triage.py` over both; and the runbook's exact steps for an 8+8 run on two
-  cloud machines (#63).
+- Host-staged UCX P2P for arbitrary island members, with independent
+  directional lane workers and optional pinned/chunked staging. Tested on
+  CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA
+  validation or device-direct P2P claim.
+
+- Native P2P batch coalescing for the torch backend, plus an explicit
+  `gpubridge.batch_isend_irecv` helper for torch 2.8, whose batch function
+  excludes Python process groups from coalescing. CPU tested; GPU unvalidated.
+
+- Opt-in P2P pinned staging (`GPUBRIDGE_PINNED_STAGING`) and two-slot chunked
+  staging (`GPUBRIDGE_P2P_CHUNK_BYTES`), with lazy-copy ordering mutation tests.
+  CPU only; no GPU overlap or speedup measured.
+
+- Torch backend point-to-point operations: native calls within an island and
+  independent host-staged Gloo lanes across islands, including asynchronous
+  and batched calls, tag matching, size/dtype checks and bounded teardown.
+  CPU only; GPU stream behavior and native GPU batches are not validated.
+
 - `scripts/gpu/rdma_report.sh`, a step of the network check (`net-nvidia`,
   `net-amd`): what RDMA from GPU memory would need on the node, one file each
   in `rdma/<side>/`: the kernel's dma-buf and peer-to-peer options, the RDMA

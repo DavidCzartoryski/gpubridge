@@ -358,6 +358,12 @@ class UcxTransport(BridgeTransport):
             self._staging = None
         self.worker.close(timeout=min(10.0, self.timeout))
 
+    @classmethod
+    def create_p2p(cls, group, *, store=None, timeout=None):
+        from gpubridge.ucx.p2p import UcxLink
+
+        return UcxLink(dist.get_rank(), store, timeout or DEFAULT_TIMEOUT)
+
 
 def _wait_for(store, keys: list[str], deadline: float, what: str,
               failures: Sequence[str] = ()) -> list[str]:

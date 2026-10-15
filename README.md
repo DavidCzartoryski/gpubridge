@@ -479,8 +479,17 @@ dist.init_process_group(backend="gpubridge")   # instead of "nccl"
   collective. Single-vendor members run native-only (one NCCL/RCCL call);
   mixed members are bridged. See [HSDP on a mixed cluster](#hsdp-on-a-mixed-cluster)
   below. Tested in simulation only.
+- **Point-to-point (CPU only).** `send`, `recv` with an explicit source,
+  `isend`, `irecv` and `batch_isend_irecv` route within an island to its native
+  group and across islands through a host-staged Gloo link. Call
+  `dist.barrier()` on the world, and on a subgroup before its first P2P call,
+  to finish collective setup. Cross-island tags match independently; repeated
+  messages with the same tag, source and destination match in order. See
+  [P2P semantics and limits](docs/TORCH_BACKEND.md#point-to-point-cpu-only).
+  For native GPU peers on torch 2.8, use `gpubridge.batch_isend_irecv(ops)`
+  to provide the batch boundary torch does not pass to Python backends.
 - **Not supported**, refused with an error before any communication:
-  - point-to-point, all-to-all, reduce, and gather and scatter of GPU tensors;
+  - any-source receive, all-to-all, reduce, and gather and scatter of GPU tensors;
   - reductions other than SUM, AVG, MAX and MIN.
 
   `torch.compile` isn't tested.
