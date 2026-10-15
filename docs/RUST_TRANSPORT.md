@@ -113,7 +113,8 @@ unwinds into Python.
   after it never reaching the buffer; empty messages with null pointers; a
   frame of the wrong size and a closed peer failing the wait; a member that
   closes failing only the waits on it, with three members, and frames it sent
-  before closing still arriving on its other connections; stray and
+  before closing still arriving on its other connections, and one that closed
+  before the other side finished connecting seen as closed; stray and
   repeated dials not taking a real connection's place; bad arguments refused.
 - `tests/test_multitcp.py`, between processes over loopback TCP: every bridge
   policy at two, three and four leaders, bit for bit against `flat-gloo`, for

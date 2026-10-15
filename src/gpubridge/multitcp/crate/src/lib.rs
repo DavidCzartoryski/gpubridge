@@ -292,6 +292,9 @@ impl Worker {
                 sockets.push(map.remove(&(member, stream)).unwrap());
             }
         }
+        // Before any receiving thread runs: one may see the member already closed and count
+        // itself out at once.
+        self.shared.lock().readers_left[member] = self.streams;
         for (stream, socket) in sockets.into_iter().enumerate() {
             let queue = member * self.streams + stream;
             let reader = socket.try_clone().map_err(|e| e.to_string())?;
@@ -305,9 +308,7 @@ impl Worker {
             self.threads
                 .push(thread::spawn(move || recv_loop(reader, member, shared)));
         }
-        let mut state = self.shared.lock();
-        state.connected[member] = true;
-        state.readers_left[member] = self.streams;
+        self.shared.lock().connected[member] = true;
         Ok(())
     }
 
@@ -1062,6 +1063,24 @@ mod tests {
         // Now every connection of member 0 has ended: a receive from it can't be met.
         thread::sleep(Duration::from_millis(50));
         assert!(b.recv(0, out[0].as_mut_ptr() as usize, 16, 99).is_err());
+    }
+
+    #[test]
+    fn a_member_that_closed_before_the_connect_finished_is_seen_as_closed() {
+        for _ in 0..5 {
+            let mut a = Worker::new(2, 0, 4, "127.0.0.1").unwrap();
+            let mut b = Worker::new(2, 1, 4, "127.0.0.1").unwrap();
+            a.connect(1, b.address(), Duration::from_secs(5)).unwrap(); // dials; b accepts
+            assert!(a.close(Duration::from_secs(5))); // and leaves before b takes them
+            thread::sleep(Duration::from_millis(20));
+            b.connect(0, "unused", Duration::from_secs(5)).unwrap();
+            let mut out = [0u8; 8];
+            // Refused at once, or failed without waiting out the deadline.
+            match b.recv(0, out.as_mut_ptr() as usize, 8, 1) {
+                Err(_) => {}
+                Ok(id) => assert_eq!(b.wait(&[id], Duration::from_secs(5)), PEER_FAILED),
+            }
+        }
     }
 
     #[test]
