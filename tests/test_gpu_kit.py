@@ -2512,7 +2512,7 @@ def _reversed_pipeline(rank: int, port: int, out: str) -> None:
     train_pipeline.stage_order = lambda vendors: [1, 0]  # stage 0 on rank 1
     sys.argv = ["train_pipeline.py", "--model", "llama-tiny", "--steps", "6", "--global-batch",
                 "8", "--seq-len", "16", "--lr", "3e-3", "--microbatches", "4", "--probe-trials",
-                "1", "--backend", "gloo", "--json", out]
+                "1", "--backend", "gloo", "--split", "3,1", "--json", out]
     train_pipeline.main()
 
 
@@ -2523,6 +2523,8 @@ def test_stages_follow_the_stage_order_not_the_ranks(tmp_path):
     mp.spawn(_reversed_pipeline, args=(_free_port(), str(out)), nprocs=2)
     reversed_run = json.loads(out.read_text())
     assert [(r["stage"], r["rank"]) for r in reversed_run["ranks"]] == [(0, 1), (1, 0)]
-    normal = _train_pipeline(tmp_path, "normal", 2, "--steps", "6", "--backend", "gloo")
+    assert [r["blocks"] for r in reversed_run["ranks"]] == [[0, 3], [3, 4]]  # stage order
+    normal = _train_pipeline(tmp_path, "normal", 2, "--steps", "6", "--backend", "gloo",
+                             "--split", "3,1")
     assert reversed_run["losses"] == normal["losses"]  # the same pipeline, bit for bit
 

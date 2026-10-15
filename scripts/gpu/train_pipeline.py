@@ -238,7 +238,7 @@ def main() -> int:
             last_losses.append(float(torch.stack(losses).mean()))
 
     everyone = gather({"step_s": step_s, "losses": last_losses, "compute": compute,
-                       "hops": hops, "vendor": vendor, "blocks": [start, start + split[rank]],
+                       "hops": hops, "vendor": vendor, "blocks": [start, start + split[me]],
                        "parameters": parameters,
                        "device": torch.cuda.get_device_name(device) if device.type == "cuda"
                        else str(device)})
