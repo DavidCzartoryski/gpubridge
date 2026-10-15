@@ -727,3 +727,28 @@ def _batch_wait_with_a_timeout(rank, world):
 
 def test_a_batch_wait_takes_a_finite_timeout(tmp_path):
     run(["nvidia", "amd"], _batch_wait_with_a_timeout, tmp_path)
+
+
+def _batch_with_a_same_island_peer(rank, world):
+    # Ranks 0 and 1 are one island: on Gloo in simulation, whose P2P Works have no future
+    # and can be waited on only once. Rank 2 is the other island, across the bridge.
+    dist.barrier()
+    if rank == 0:
+        start = time.monotonic()
+        works = batch_isend_irecv([dist.P2POp(dist.isend, torch.ones(3), 1, tag=2),
+                                   dist.P2POp(dist.isend, torch.full((3,), 2.0), 2, tag=2)])
+        for work in works:
+            work.wait()
+        assert time.monotonic() - start < 5, "a batch with a same-island peer stalled"
+        assert all(work.is_completed() and work.exception() is None for work in works)
+    elif rank in (1, 2):
+        t = torch.empty(3)
+        dist.recv(t, 0, tag=2)
+        assert torch.equal(t, torch.full((3,), float(rank)))
+    dist.barrier()
+
+
+def test_a_batch_with_a_same_island_peer_completes(tmp_path):
+    # A batch Work once waited a second time on the same-island Gloo send, which then
+    # waited for a transfer that never came, until the group's timeout.
+    run(["nvidia", "nvidia", "amd"], _batch_with_a_same_island_peer, tmp_path, seconds=15)

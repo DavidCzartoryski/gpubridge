@@ -373,12 +373,23 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
             self._coalesced_torch.append(native._end_coalescing(device))
         works, self._coalesced = self._coalesced or [], None
         torch_works, self._coalesced_torch = self._coalesced_torch, []
-        futures = [_future_of(w) for w in torch_works]
+        futures, members = [], list(works)
+        for work in torch_works:
+            try:
+                futures.append(work.get_future())
+                members.append(work)
+            except RuntimeError as exc:
+                if "not implemented" not in str(exc):
+                    raise
+                # Gloo's P2P Works have no future: _future_of waits for it now. Not a
+                # member: a second wait() on a finished Gloo send or recv waits for a
+                # transfer that never comes, until the group's timeout.
+                futures.append(_future_of(work))
         if works:  # the worker runs gpubridge's in order: the last one ends after the others
             futures.append(works[-1].get_future())
         if not futures:
             return _completed([])
-        return _BatchWork([*torch_works, *works], torch.futures.collect_all(futures).then(
+        return _BatchWork(members, torch.futures.collect_all(futures).then(
             lambda f: ([g.value() for g in f.value()], [])[1]))
 
     # ---- point-to-point -------------------------------------------------------------------
