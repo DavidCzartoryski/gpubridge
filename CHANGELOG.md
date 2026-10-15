@@ -234,7 +234,7 @@ hardware.
   `STEPS_07=pipeline`; `dp_report.py` reads its records too;
   docs/PIPELINE.md; HARDWARE_VALIDATION.md item 34. On CPU: bit for bit like
   plain Gloo (2 stages, and 4 over 2 + 2 islands), within 1e-4 of one process.
-  Not run on GPUs (#PRNUM).
+  Not run on GPUs (#81).
 - `bridge="multitcp"`, an opt-in bridge transport over several TCP connections
   per pair of leaders (`GPUBRIDGE_MULTITCP_STREAMS`, 4), from a small Rust
   library (`src/gpubridge/multitcp/crate`, standard library only, a C interface
