@@ -526,7 +526,8 @@ Where the FAILs come from:
 - **`train_hsdp_backend`, `verify_hsdp_backend` (item 31)**: failed in step
   07's second run (the same rocBLAS abort). With the MI50 on torch
   2.9.1+rocm6.3, `train_hsdp_backend` printed nothing until the kit's step
-  timeout stopped it (exit 124), in this job and in every later mixed job.
+  timeout stopped it (exit 124) or the job was cancelled, in this job and
+  the later mixed jobs recorded here.
   **Where it stops**, from a CPU reproduction (gpubridge's simulation mode,
   two ranks on one node, `examples/fsdp2_torch_backend.py --hsdp 2`): with
   both ranks on torch 2.14.1, or both on 2.9.1, it completes; with rank 0 on
@@ -539,10 +540,10 @@ Where the FAILs come from:
   default group for the replicate dimension; 2.9.1 calls `new_group`), and
   the world setup's groups take torch's default names, which count the groups
   each process has made, so the ranks likely wait on different store keys.
-  Not yet confirmed by a fix: the fix would be in `src/` (name the world
-  setup's groups the way subgroups already are, or build the world topology
-  before any `DeviceMesh` groups). Plain `init_device_mesh` and a barrier with
-  the same mixed versions, without gpubridge, don't hang.
+  A setup-naming fix in `src/` completed this mixed-version CPU example and
+  its bit-for-bit replay check. It has not yet been validated on the GPU
+  pair, whose original hang had no captured stacks. Plain `init_device_mesh`
+  and a barrier with the same mixed versions, without gpubridge, don't hang.
 
 ### Network
 

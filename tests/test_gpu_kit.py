@@ -694,10 +694,12 @@ def _overlay_venvs(tmp_path: Path, triton_minor: int | None = None) -> tuple[Pat
     return base, newer
 
 
-def test_rocm_triton_overlay_puts_the_newer_triton_first(tmp_path):
+@pytest.mark.parametrize("directory", ["plain", "with spaces"])
+def test_rocm_triton_overlay_puts_the_newer_triton_first(tmp_path, directory):
+    tmp_path = tmp_path / directory
     base, newer = _overlay_venvs(tmp_path)
     out = tmp_path / "venv-old-triton38"
-    result = subprocess.run(["bash", str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+    result = subprocess.run([str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
                              str(out)], capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     assert "triton_rocm-3.8.0" in result.stdout
@@ -718,6 +720,67 @@ def test_rocm_triton_overlay_puts_the_newer_triton_first(tmp_path):
     again = subprocess.run(["bash", str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
                             str(out)], capture_output=True, text=True, timeout=60)
     assert again.returncode == 0, again.stderr
+
+
+@pytest.mark.parametrize("destination", ["base", "triton", "alias", "venv"])
+def test_rocm_triton_overlay_refuses_source_or_existing_venv(tmp_path, destination):
+    base, newer = _overlay_venvs(tmp_path)
+    interpreter = base / "bin" / "python"
+    original = interpreter.read_bytes()
+    if destination == "base":
+        out = base
+    elif destination == "triton":
+        out = newer
+    elif destination == "alias":
+        out = tmp_path / "alias"
+        out.symlink_to(base, target_is_directory=True)
+    else:
+        out = tmp_path / "existing-venv"
+        out.mkdir()
+        (out / "pyvenv.cfg").write_text("home = example\n")
+    result = subprocess.run([str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(out)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1, result.stderr
+    assert "OUT_DIR" in result.stderr
+    assert interpreter.read_bytes() == original
+    assert not (out / "overlay").exists()
+
+
+@pytest.mark.parametrize("directory", ["bin", "overlay"])
+def test_rocm_triton_overlay_refuses_linked_output_directories(tmp_path, directory):
+    base, newer = _overlay_venvs(tmp_path)
+    original = (base / "bin" / "python").read_bytes()
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / directory).symlink_to(base / "bin", target_is_directory=True)
+    result = subprocess.run([str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(out)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1 and "symbolic link" in result.stderr
+    assert (base / "bin" / "python").read_bytes() == original
+
+
+@pytest.mark.parametrize("link_type", ["symlink", "hardlink"])
+def test_rocm_triton_overlay_replaces_wrapper_links_without_overwriting_target(tmp_path, link_type):
+    base, newer = _overlay_venvs(tmp_path)
+    target = tmp_path / "shared-interpreter"
+    target.write_text("preserve the shared interpreter\n")
+    out = tmp_path / "out"
+    (out / "bin").mkdir(parents=True)
+    for tool in ("python", "python3", "torchrun"):
+        link = out / "bin" / tool
+        if link_type == "symlink":
+            link.symlink_to(target)
+        else:
+            link.hardlink_to(target)
+    result = subprocess.run([str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(out)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert target.read_text() == "preserve the shared interpreter\n"
+    for tool in ("python", "python3", "torchrun"):
+        run = subprocess.run([str(out / "bin" / tool), "-c",
+                              "import triton; print(triton.__version__)"],
+                             capture_output=True, text=True, timeout=60)
+        assert run.returncode == 0 and run.stdout.strip() == "3.8.0", run.stderr
 
 
 def test_rocm_triton_overlay_refuses_another_python_version(tmp_path):

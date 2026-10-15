@@ -556,15 +556,15 @@ The default ROCm venv's Triton (triton-rocm 3.8.0) can. A venv of
 `venv-rocm63`'s torch 2.9.1 with that Triton in front of its own
 (`scripts/gpu/rocm_triton_overlay.sh`; the runbook's "Choosing the ROCm
 build") gives the MI50 both: rocBLAS kernels for gfx906 and compression
-kernels. Tonight's runs used a copy of the same Triton files where the script
-now makes links.
+kernels. The 2026-10-15 runs used a manual copy of the same Triton files where
+the script now makes links; the script itself has not yet run on the MI50.
 
 - **The kit's GPU tests on one MI50**, as the `amd` step runs them
   (`tests/test_gpu.py`, `test_compression_kernels.py`, `test_torch_backend.py`),
   with torch 2.9.1+rocm6.3 and Triton 3.8.0: 26 passed, 8 skipped, the same as
-  the default venv, where Triton 3.5.1 had 20 failures. The same with Triton
-  loading the HIP runtime it bundles and with `TRITON_LIBHIP_PATH` at torch's
-  HIP 6.3 (job 11091760, commit 4e7f04e).
+  the default venv; with `venv-rocm63`'s own Triton 3.5.1, 20 failed. This held
+  both with Triton's bundled HIP runtime and with `TRITON_LIBHIP_PATH` at
+  torch's HIP 6.3 (job 11091760, commit 4e7f04e).
 - **GPT-2 small through the bridge with fp8**, as in the table above but
   `GPUBRIDGE_COMPRESSION_KERNELS=triton` (in every rank's record), at commit
   4e7f04e:
@@ -577,7 +577,7 @@ now makes links.
 Samples/s, then milliseconds per step (medians of the 10 timed steps); the
 first two columns are the runs above. Jobs 11091811 (16) and 11093097 (32);
 preflight 1170 to 1174 MB/s each way, a 0.05 ms round trip, on
-`internal.2137`.
+`internal.2137` on the V100 and `internal` on the MI50.
 
 - **The first GPT-2 runs where the pair beats the V100 alone**: 1.04x at
   batch 16, 1.12x at 32. One run each, and the steps spread (1067 to 1400 ms
@@ -585,8 +585,8 @@ preflight 1170 to 1174 MB/s each way, a 0.05 ms round trip, on
 - **Communication alone fell from 485 to 346 ms at batch 16 and from 605 to
   362 ms at 32**; exposed communication from 258 to 94 and 445 to 128 ms. With
   the Triton kernels, batch 32 needs about what batch 16 does, so the rise at
-  batch 32 above came with the PyTorch kernels, not the bridge; why they cost
-  more at batch 32 isn't measured.
+  batch 32 above went away with Triton kernels in these runs. The cause of
+  the difference has not been isolated.
 - **What's left is mostly the wait for the MI50**: 429 ms a step at batch 16
   and 750 at 32, against 94 and 128 ms of exposed communication. The MI50's
   compute was within 3% of the PyTorch-kernel runs'.
@@ -623,7 +623,7 @@ read has hipBLASLt files for gfx906, and training ran on the MI50 with 2.9.1+roc
 (below). MIOpen's tuning databases for gfx906
 (`torch/share/miopen/db/gfx906_60.db.txt` and its find-dbs, 5 files) are in
 every wheel that ships MIOpen files except the rocm7.14 and AMD's `.lw`
-builds; no wheel has precompiled MIOpen kernel archives for gfx906, and the
+builds; no wheel read has precompiled MIOpen kernel archives for gfx906, and the
 MI50's conv2d and ResNet-50 runs worked without them. Not read for MIOpen: the PyTorch index's 2.10 to 2.13
 rocm7.1 builds and 2.11 to 2.14.0 rocm7.2 builds, whose server ignored the
 range requests this time. The default wheel (2.14.1+rocm7.2) lists gfx942
