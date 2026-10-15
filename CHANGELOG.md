@@ -233,8 +233,14 @@ hardware.
   previous stage, and idle-time and bubble estimates. Step 07's
   `STEPS_07=pipeline`; `dp_report.py` reads its records too;
   docs/PIPELINE.md; HARDWARE_VALIDATION.md item 34. On CPU: bit for bit like
-  plain Gloo (2 stages, and 4 over 2 + 2 islands), within 1e-4 of one process.
-  Not run on GPUs (#81).
+  plain Gloo (2 stages, and 4 over 2 + 2 islands), within 1e-4 of one process,
+  on torch 2.8.0, 2.9.1 and 2.14.1. Every rank needs the same PyTorch release
+  (2.14.1's stage setup doesn't match 2.9.1's), checked up front, and 2.9's
+  int64 handshake goes as a float32, as in 2.14.1. On a V100 and an MI50
+  (Explorer, both on 2.9.1, 1,000 steps): 13,115 tokens/s with GPipe and
+  13,051 with 1F1B, 1.05x and 1.04x the V100 alone with the same 4
+  micro-batches; over the last 100 steps 1F1B is within the spread of four
+  one-V100 runs, GPipe 0.02 above it after a later drop (#81).
 - `bridge="multitcp"`, an opt-in bridge transport over several TCP connections
   per pair of leaders (`GPUBRIDGE_MULTITCP_STREAMS`, 4), from a small Rust
   library (`src/gpubridge/multitcp/crate`, standard library only, a C interface

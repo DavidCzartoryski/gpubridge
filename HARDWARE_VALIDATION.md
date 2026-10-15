@@ -461,7 +461,12 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     time and the time an activation takes to cross the bridge. *Status: works
     on CPU in simulation mode: bit for bit like the same pipeline on a plain
     Gloo group (2 stages, and 4 over 2 + 2 islands), within 1e-4 of one
-    process (`tests/test_gpu_kit.py`). Not run on GPUs.* *Step:* `pp_gpipe`
+    process (`tests/test_gpu_kit.py`). On a V100 and an MI50 (Explorer job
+    11109376, both on torch 2.9.1, 1,000 steps): over the last 100 steps 1F1B
+    is as close to four one-V100 runs (0.0036 to 0.0052) as they are to each
+    other (0.0041 to 0.0056), GPipe 0.02 above them after a later drop off
+    the loss plateau; 1.04x to 1.05x the tokens/s of the V100 alone with the
+    same micro-batches (docs/PIPELINE.md).* *Step:* `pp_gpipe`
     and `pp_1f1b` in Explorer step 07 with `STEPS_07=pipeline`, and
     `dp_single` in `submit.sh dp-baseline` with `DP_MICRO` set to the
     microbatches.
