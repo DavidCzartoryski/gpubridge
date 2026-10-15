@@ -310,7 +310,8 @@ hardware.
   ddp and comm-alone phases: the caching allocator's peak allocated and
   reserved MiB (`torch.cuda.max_memory_allocated`, `max_memory_reserved`) and
   its allocation retries (`num_alloc_retries`), and the GPU's total. Null on
-  CPU; the GPU path is tested only against a faked allocator (CPU only).
+  CPU; the GPU path is tested only against a faked allocator (CPU only)
+  (#78).
 
 ### Changed
 
