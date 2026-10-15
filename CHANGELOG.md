@@ -188,7 +188,7 @@ hardware.
   and GPU kernel modules (and whether `nvidia_peermem` or `nv_peer_mem` exist),
   rdma-core and `ibv_reg_dmabuf_mr`, `rdma link`, UCX (`ucx_info -v` and `-d`)
   and the HSA runtime's dma-buf export. It runs last, after loading
-  `RDMA_MODULES`, so the steps before it are unchanged (#PRNUM).
+  `RDMA_MODULES`, so the steps before it are unchanged (#62).
 - A Kaggle runner for the GPU validation kit, for a free notebook with two
   T4s (`scripts/gpu/kaggle/`): a notebook and the same steps as one script,
   each step under a hard time limit. It checks what compute capability 7.5
