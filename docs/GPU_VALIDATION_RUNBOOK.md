@@ -642,7 +642,7 @@ python scripts/gpu/dp_report.py results/explorer/dp-a results/explorer/dp-b \
 ```
 
 [`dp_report.py`](../scripts/gpu/dp_report.py) puts them side by side (`dp.md`): tokens/s,
-DDP's exposed communication and the share of it backward hid, the last loss, the
+DDP's exposed communication and the share of it backward hid (estimates, from the step less each GPU's compute alone), the last loss, the
 largest gap from the baseline's curve and the mean gap over the last 100 steps, and
 whether the ranks' parameters stayed identical (checked every 50 steps); it also
 writes the curves as `dp_losses.csv` and `dp_losses.svg`. `DP_MODEL`, `DP_STEPS`,

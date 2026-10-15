@@ -33,8 +33,9 @@ Recorded (rank 0 writes ``--json``): every step's loss over the whole global bat
 time; every ``--check-every`` steps, whether every rank holds the same parameter bits
 (``ddp``: replicas; ``hsdp``: the replicate groups; ``fsdp2`` has one copy of each shard,
 so nothing to compare) and the largest gap between ranks' parameter sums; and at the end
-tokens/s from the median step after ``--warmup-steps``. For ``ddp`` also the step split,
-as train_bench.py does it: each rank's compute alone (forward, backward and an AdamW step
+tokens/s from the median step after ``--warmup-steps`` (each step timed up to the end of
+its optimizer step, before the loss is gathered for the record). For ``ddp`` also the
+step split, an estimate from those measurements, as train_bench.py makes it: each rank's compute alone (forward, backward and an AdamW step
 with learning rate 0, so no parameter moves), the gradient buckets all_reduced with
 nothing else running, the communication backward didn't hide, and the share it did.
 
@@ -265,6 +266,11 @@ def main() -> int:
     if distributed and args.shares == "speed":
         speeds = [s / statistics.median(t) for s, t in zip(shares, gather(probe), strict=True)]
         shares = shares_for(speeds, args.global_batch)
+        if args.mode == "ddp":  # the step split needs compute on the shares it trains with
+            x, y = llama.global_batch(args.model, -1, args.global_batch, args.seq_len, args.seed)
+            mine = rows(shares, rank)
+            probe = compute_alone(model, (x[mine].to(device), y[mine].to(device)), device,
+                                  args.probe_steps)
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -298,13 +304,13 @@ def main() -> int:
             loss = llama.loss_of(trained, x[mine].to(device), y[mine].to(device))
             (loss * weight).backward()
         optimizer.step()
+        sync(device)
+        step_s.append(time.perf_counter() - start)  # the step alone, not the record below
         if distributed:
             # The whole batch's loss: each share's mean weighted by its rows, gathered as
             # Python floats so bridge compression never touches the record.
             total = sum(gather(float(loss.detach()) * shares[rank] / args.global_batch))
-        losses.append(float(total))  # waits for the step's GPU work
-        sync(device)
-        step_s.append(time.perf_counter() - start)
+        losses.append(float(total))
         last = step == args.steps - 1
         if distributed and args.mode != "fsdp2" and ((step + 1) % args.check_every == 0 or last):
             if args.mode == "hsdp":
@@ -327,7 +333,9 @@ def main() -> int:
         exposed = max(0.0, step - slowest)
         alone_s = statistics.median(max(t) for t in zip(*(e["alone"] for e in everyone)))
         hidden = max(0.0, alone_s - exposed)
-        split = {"slowest_compute_ms": ms(slowest), "exposed_comm_ms": ms(exposed),
+        split = {"step_split": "estimated: the median step less the slowest rank's compute "
+                               "alone (exposed), against the buckets all_reduced alone",
+                 "slowest_compute_ms": ms(slowest), "exposed_comm_ms": ms(exposed),
                  "comm_alone_ms": ms(alone_s), "hidden_comm_ms": ms(hidden),
                  "hidden_fraction": round(hidden / alone_s, 4) if alone_s else None,
                  "buckets": len(sizes),

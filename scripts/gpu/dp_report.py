@@ -7,7 +7,7 @@ loss curves as CSV and as an SVG plot).
 Every ``dp_*.json`` under the paths is a run; the one with ``"mode": "single"`` is the
 baseline (``--baseline`` picks another). Per run: mode, compression, batch shares,
 tokens/s from the median step, DDP's exposed communication and the share of it backward
-hid, the last loss, and against the baseline the largest gap between the loss curves over
+hid (estimates: see train_dp.py), the last loss, and against the baseline the largest gap between the loss curves over
 every step and the mean gap over the last 100 steps; then whether every parameter check
 found the ranks' parameters identical. Needs only Python 3.10 or later: no torch.
 """
@@ -24,14 +24,24 @@ COLORS = ("#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b", "#e3
 
 
 def load(paths: list[Path]) -> dict[str, dict]:
-    runs = {}
+    """Every train_dp.py record under ``paths``, by run name (the file's ``dp_<name>``);
+    where two share a name, each is named by its path instead (the argument's own name,
+    then the file's path under it), so none is dropped."""
+    found = []
     for path in paths:
         files = [path] if path.is_file() else sorted(path.rglob("dp_*.json"))
         for f in files:
             record = json.loads(f.read_text())
             if record.get("script") == "scripts/gpu/train_dp.py":
-                name = f.stem.removeprefix("dp_")
-                runs[name if name not in runs else f"{f.parent.name}/{name}"] = record
+                where = f.name if path.is_file() else f.relative_to(path).as_posix()
+                found.append((f.stem.removeprefix("dp_"), f"{path.name}/{where}", record))
+    names = [name for name, _, _ in found]
+    runs = {}
+    for name, where, record in found:
+        key = name if names.count(name) == 1 else where.removesuffix(".json")
+        while key in runs:  # the same path given twice
+            key += "'"
+        runs[key] = record
     return runs
 
 
@@ -54,7 +64,7 @@ def describe(record: dict) -> tuple[str, str]:
 def table(runs: dict[str, dict], baseline: str | None) -> str:
     base = runs[baseline]["losses"] if baseline else None
     out = ["| Run | Mode | Compression | GPUs | Shares | Tokens/s | Step (ms) | Exposed comm "
-           "(ms) | Hidden | Last loss | Max gap | Gap, last 100 | Params identical |",
+           "(ms, est.) | Hidden (est.) | Last loss | Max gap | Gap, last 100 | Params identical |",
            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for name, r in runs.items():
         gpus, shares = describe(r)

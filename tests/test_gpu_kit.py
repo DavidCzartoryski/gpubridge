@@ -2392,4 +2392,10 @@ def test_dp_report_compares_curves_with_the_baseline(tmp_path):
     assert dp_report.main([str(tmp_path), "--out", str(tmp_path / "out")]) == 0
     assert (tmp_path / "out" / "dp_losses.svg").read_text().count("<polyline") == 2
     assert (tmp_path / "out" / "dp_losses.csv").read_text().startswith("step,ddp,single\n1,3.0,3.0")
+    for job in ("a", "b", "c"):  # three jobs' runs of one name: none dropped
+        (tmp_path / "jobs" / job / "07_mixed_hetjob_dp").mkdir(parents=True)
+        (tmp_path / "jobs" / job / "07_mixed_hetjob_dp" / "dp_ddp.json").write_text(
+            json.dumps(record("ddp", [3.0])))
+    assert sorted(dp_report.load([tmp_path / "jobs"])) == [
+        f"jobs/{job}/07_mixed_hetjob_dp/dp_ddp" for job in ("a", "b", "c")]
 
