@@ -2001,3 +2001,68 @@ def test_train_bench_runs_ddp_through_gpubridge_on_cpu(tmp_path):
     assert [r["vendor"] for r in record["ranks"]] == ["nvidia", "amd"]
     assert record["samples_per_s"] > 0 and len(record["environments"]) == 2
     assert "SPLIT TEST" in record["warning"]
+
+
+@pytest.mark.parametrize(("args", "split", "want"), [
+    (("--batch-sizes", "1,3"), "explicit", [1, 3]),
+    (("--global-batch", "7"), "even", [4, 3]),
+    (("--global-batch", "6", "--balance", "--calibration-steps", "1"), "balanced", None),
+])
+def test_train_bench_takes_unequal_batches_and_reports_them(args, split, want, tmp_path):
+    out = tmp_path / "train_bench.json"
+    result = torchrun(2, KIT / "train_bench.py", "--model", "tiny-gpt", "--steps", "2",
+                      "--warmup-steps", "1", "--comm-trials", "1", "--json", str(out), *args,
+                      GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode == 0, result.stderr[-3000:]
+    record = json.loads(out.read_text())
+    sizes = record["batch_sizes"]
+    assert record["batch_split"] == split and (want is None or sizes == want)
+    assert record["global_batch"] == sum(sizes) and min(sizes) >= 1
+    assert record["loss_weighting"].startswith("sample-weighted")
+    assert [r["batch_size"] for r in record["ranks"]] == sizes
+    assert all(r["compute_ms_per_sample"] > 0 and r["waiting_ms"] >= 0 for r in record["ranks"])
+    assert record["params_identical"] and record["params_finite"]
+    if split == "balanced":
+        assert record["global_batch"] == 6
+        assert record["calibration"]["batch_size"] == 3
+        assert [r["rank"] for r in record["calibration"]["ranks"]] == [0, 1]
+        assert f"balanced split of 6: {sizes}" in result.stdout
+    else:
+        assert record["calibration"] is None
+
+
+def test_train_bench_alone_runs_the_whole_global_batch_with_the_same_flags(tmp_path):
+    out = tmp_path / "train_bench.json"
+    result = torchrun(1, KIT / "train_bench.py", "--model", "tiny-gpt", "--steps", "1",
+                      "--warmup-steps", "1", "--comm-trials", "1", "--json", str(out),
+                      "--global-batch", "6", "--balance", GPUBRIDGE_VENDOR="nvidia")
+    assert result.returncode == 0, result.stderr[-3000:]
+    record = json.loads(out.read_text())
+    assert record["batch_sizes"] == [6] and record["global_batch"] == 6
+    assert record["batch_split"] == "balanced" and record["calibration"] is None
+
+
+def test_train_bench_default_batches_are_unweighted_and_say_so(tmp_path):
+    out = tmp_path / "train_bench.json"
+    result = torchrun(2, KIT / "train_bench.py", "--model", "tiny-gpt", "--steps", "1",
+                      "--warmup-steps", "1", "--comm-trials", "1", "--json", str(out),
+                      "--batch-size", "2", GPUBRIDGE_VENDOR="nvidia",
+                      GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode == 0, result.stderr[-3000:]
+    record = json.loads(out.read_text())
+    assert record["batch_size_per_rank"] == 2 and record["global_batch"] == 4
+    assert record["batch_split"] == "per-rank"
+    assert record["loss_weighting"] == "mean per rank, averaged over ranks"
+
+
+@pytest.mark.parametrize(("args", "message"), [
+    (("--balance",), "--balance needs --global-batch"),
+    (("--batch-sizes", "1,2,3"), "--batch-sizes needs 2 sizes"),
+    (("--global-batch", "1"), "can't give each of 2 ranks a sample"),
+    (("--batch-size", "2", "--global-batch", "4"), "not allowed with"),
+])
+def test_train_bench_rejects_batch_settings_it_cant_honour(args, message):
+    result = torchrun(2, KIT / "train_bench.py", "--model", "tiny-gpt", *args,
+                      GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode != 0
+    assert message in result.stderr
