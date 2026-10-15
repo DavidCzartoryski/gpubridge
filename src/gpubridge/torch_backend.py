@@ -75,6 +75,7 @@ class _NoBackend:
     ``init_process_group(device_id=...)`` only asks whether it can split eagerly."""
 
     supports_splitting = False
+    supports_coalescing = True
 
 
 class GpubridgeProcessGroup(dist.ProcessGroup):
@@ -92,6 +93,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         self._building = False
         self._coalesced: list[_work.Work] | None = None
         self._coalesced_torch: list[dist.Work] = []
+        self._native_p2p_coalescing = None
         self._p2p: _p2p.Engine | None = None
         self._p2p_lock = threading.Lock()
         self._p2p_store = dist.PrefixStore("gpubridge-p2p", store) if store is not None else None
@@ -365,6 +367,9 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         self._coalesced, self._coalesced_torch = [], []
 
     def _end_coalescing(self, device: torch.device) -> dist.Work:
+        if self._native_p2p_coalescing is not None:
+            native, self._native_p2p_coalescing = self._native_p2p_coalescing, None
+            self._coalesced_torch.append(native._end_coalescing(device))
         works, self._coalesced = self._coalesced or [], None
         torch_works, self._coalesced_torch = self._coalesced_torch, []
         futures = [_future_of(w) for w in torch_works]
@@ -407,8 +412,15 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
             group = (self._cpu() if tensor.device.type == "cpu" and
                      topology.device.type != "cpu" else topology.island_group)
             fn = dist.isend if sending else dist.irecv
-            return fn(tensor, group=group, tag=tag,
-                      **{"dst" if sending else "src": global_peer})
+            native_batch = self._coalesced is not None and tensor.device.type == "cuda"
+            if native_batch and self._native_p2p_coalescing is None:
+                group._start_coalescing(tensor.device)
+                self._native_p2p_coalescing = group
+            work = fn(tensor, group=group, tag=tag,
+                       **{"dst" if sending else "src": global_peer})
+            if self._coalesced is not None and not native_batch:
+                self._coalesced_torch.append(work)
+            return work
         with self._p2p_lock:
             if self._p2p is None:
                 assert topology.transport is not None and topology.world_group is not None
@@ -418,7 +430,10 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
                                         self._timeout, pinned=topology.pinned_staging,
                                         chunk_bytes=_p2p.chunk_bytes_setting())
         work = self._p2p.submit(tensor, global_peer, tag, sending)
-        return _p2p.TorchWork(work, peer if not sending else self.rank())
+        torch_work = _p2p.TorchWork(work, peer if not sending else self.rank())
+        if self._coalesced is not None:
+            self._coalesced_torch.append(torch_work)
+        return torch_work
 
     def send(self, tensors, dst: int, tag: int):  # noqa: D102
         return self._point_to_point(tensors, dst, tag, True)
@@ -638,3 +653,23 @@ def register() -> None:
     already (from an earlier call, or gpubridge's entry point)."""
     if dist.is_available() and NAME not in dist.Backend.backend_list:
         dist.Backend.register_backend(NAME, create, extended_api=True, devices=["cpu", "cuda"])
+
+
+def batch_isend_irecv(operations):
+    """A coalesced P2P batch on every supported torch release.
+
+    torch 2.8's batch helper excludes Python ProcessGroup subclasses from its
+    coalescing path. This explicit helper supplies the batch boundary without
+    changing torch's global API; other backends use torch's helper unchanged.
+    torch 2.14 automatically coalesces the gpubridge backend's native GPU ops.
+    """
+    dist.distributed_c10d._check_p2p_op_list(operations)
+    group = operations[0].group or dist.distributed_c10d._get_default_group()
+    if not isinstance(group, GpubridgeProcessGroup):
+        return dist.batch_isend_irecv(operations)
+    device = operations[0].tensor.device
+    with dist.distributed_c10d._coalescing_manager(group, device, async_ops=True) as cm:
+        for op in operations:
+            op.op(op.tensor, group=op.group, tag=op.tag,
+                  **{"group_dst" if op.op is dist.isend else "group_src": op.group_peer})
+    return cm.works

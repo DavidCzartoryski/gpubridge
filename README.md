@@ -486,6 +486,8 @@ dist.init_process_group(backend="gpubridge")   # instead of "nccl"
   to finish collective setup. Cross-island tags match independently; repeated
   messages with the same tag, source and destination match in order. See
   [P2P semantics and limits](docs/TORCH_BACKEND.md#point-to-point-cpu-only).
+  For native GPU peers on torch 2.8, use `gpubridge.batch_isend_irecv(ops)`
+  to provide the batch boundary torch does not pass to Python backends.
 - **Not supported**, refused with an error before any communication:
   - any-source receive, all-to-all, reduce, and gather and scatter of GPU tensors;
   - reductions other than SUM, AVG, MAX and MIN.

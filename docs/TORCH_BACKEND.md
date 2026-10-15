@@ -384,11 +384,16 @@ or speedup has been measured.
   most 200 ms total. In-flight native requests and their buffers stay owned by
   daemon lane threads until the transport errors, its timeout passes or torch
   destroys the group. Teardown never waits for a missing peer to post a receive.
-- **Native GPU batch limit.** torch 2.8's `batch_isend_irecv` does not coalesce
-  Python ProcessGroup subclasses; unbatched native NCCL/RCCL posting can block
-  in an exchange that requires opposite-direction operations to be posted
-  together. Cross-island batches do not have this restriction. Native GPU P2P
-  and all GPU stream guarantees remain unvalidated; this change is CPU only.
+- **Native GPU batches.** On torch 2.14, `dist.batch_isend_irecv` coalesces
+  gpubridge's native NCCL/RCCL operations and combines their batch Work with
+  the cross-island Works. torch 2.8 excludes Python ProcessGroup subclasses
+  from its coalescing path. On that release, use
+  `gpubridge.batch_isend_irecv(ops)` for a batch containing same-island GPU
+  peers: it supplies the batch boundary without modifying torch's global
+  functions. The explicit helper also works on 2.14 and delegates unchanged
+  for other backends. Plain `dist.batch_isend_irecv` with only cross-island
+  peers works on either release. Native GPU batch behavior remains designed,
+  not GPU validated; the helper and batching paths are tested on CPU.
 
 Tests cover 1+1, 2+2, uneven and three-island simulation layouts, every pair
 (including non-leaders), zero/small/large payloads and dense dtypes, reverse

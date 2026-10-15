@@ -64,10 +64,12 @@ from gpubridge.ucx import transport as _ucx_transport  # noqa: E402,F401 - regis
 from gpubridge import torch_backend as _torch_backend  # noqa: E402
 
 _torch_backend.register()  # backend="gpubridge" for torch.distributed
+batch_isend_irecv = _torch_backend.batch_isend_irecv
 
 __version__ = "0.4.0a0"
 
 __all__ = [
+    "batch_isend_irecv",
     "BridgeTransport",
     "CollectiveObserver",
     "CollectivePolicy",
