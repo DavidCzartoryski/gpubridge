@@ -51,10 +51,19 @@ read -ra dp_args <<<"${DP_ARGS:-}"
 # STEPS_07=pipeline: train_pipeline.py on the same model, steps, global batch and sequence
 # length (DP_*), stage 0 on the NVIDIA GPU and stage 1 on the AMD one, one run per
 # schedule in PP_RUNS (gpipe, 1f1b), PP_MICROBATCHES microbatches a step; PP_ARGS go to
-# every run (e.g. --split 7,5). Set against dp-baseline with DP_MICRO=PP_MICROBATCHES.
+# every run. Set against dp-baseline with DP_MICRO=PP_MICROBATCHES. PP_SPLITS="even 8,4 auto"
+# runs each schedule once per split (blocks per stage in stage order, even, or auto:
+# balanced on the measured blocks and links), as pp_<schedule>_<split> (step and JSON).
 PP_RUNS="${PP_RUNS:-gpipe 1f1b}"
 PP_MICROBATCHES="${PP_MICROBATCHES:-4}"
 read -ra pp_args <<<"${PP_ARGS:-}"
+PP_SPLITS="${PP_SPLITS:-}"  # empty: one run per schedule, as pp_<schedule>
+for split in $PP_SPLITS; do
+    [[ $split =~ ^(even|auto|[0-9]+(,[0-9]+)+)$ ]] || die "PP_SPLITS: '$split' is not a split"
+done
+if [ -n "$PP_SPLITS" ] && [[ " ${pp_args[*]-} " == *" --split"* ]]; then
+    die "set the split in PP_SPLITS or in PP_ARGS, not both"
+fi
 TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS:-gpt2-small resnet50}"
 read -ra train_args <<<"${TRAIN_BENCH_ARGS:-}"
 TRAIN_BENCH_BUCKETS="${TRAIN_BENCH_BUCKETS:-}"  # DDP bucket sizes (MB); empty: train_bench.py's
@@ -221,10 +230,16 @@ fi
 if [ "$STEPS_07" = pipeline ]; then
     for schedule in $PP_RUNS; do
         case $schedule in gpipe | 1f1b) ;; *) die "PP_RUNS: unknown schedule '$schedule'" ;; esac
-        step "pp_$schedule" mixed_torchrun "pp-$schedule" "$KIT_DIR/train_pipeline.py" \
-            --model "$DP_MODEL" --schedule "$schedule" --microbatches "$PP_MICROBATCHES" \
-            --steps "$DP_STEPS" --global-batch "$DP_GLOBAL_BATCH" --seq-len "$DP_SEQ" \
-            --json "$RESULTS/pp_$schedule.json" "${pp_args[@]+"${pp_args[@]}"}"
+        for split in ${PP_SPLITS:-even}; do
+            name=pp_$schedule split_args=()
+            [ -z "$PP_SPLITS" ] || name=pp_${schedule}_${split//,/-}
+            [ "$split" = even ] || split_args=(--split "$split")
+            step "$name" mixed_torchrun "${name//_/-}" "$KIT_DIR/train_pipeline.py" \
+                --model "$DP_MODEL" --schedule "$schedule" --microbatches "$PP_MICROBATCHES" \
+                --steps "$DP_STEPS" --global-batch "$DP_GLOBAL_BATCH" --seq-len "$DP_SEQ" \
+                --json "$RESULTS/$name.json" "${split_args[@]+"${split_args[@]}"}" \
+                "${pp_args[@]+"${pp_args[@]}"}"
+        done
     done
     finish
     exit

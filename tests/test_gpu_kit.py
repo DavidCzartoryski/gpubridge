@@ -2495,6 +2495,22 @@ def _train_pipeline(tmp_path, name: str, nproc: int, *args: str, **env: str) -> 
     return json.loads(out.read_text())
 
 
+def test_pipeline_auto_split_balances_on_the_measured_blocks_and_links(tmp_path):
+    auto = _train_pipeline(tmp_path, "auto", 2, "--split", "auto", "--schedule", "1f1b")
+    assert auto["split_rule"] == "auto" and sum(auto["split"]) == 4 and min(auto["split"]) >= 1
+    plan = auto["balance"]
+    assert [len(row) for row in plan["layer_ms_by_stage"]] == [4, 4]
+    assert len(plan["link_bytes_per_ms"]) == 1 and plan["link_bytes_per_ms"][0] > 0
+    assert plan["predicted_speedup_over_even"] >= 1 and plan["even_split"] == [2, 2]
+    assert [r["blocks"] for r in auto["ranks"]] == [[0, auto["split"][0]], [auto["split"][0], 4]]
+    # Profiling leaves the weights alone: the same split given by hand trains bit for bit
+    # the same.
+    given = _train_pipeline(tmp_path, "given", 2, "--schedule", "1f1b",
+                            "--split", ",".join(map(str, auto["split"])))
+    assert given["split_rule"] == "given" and given["balance"] is None
+    assert given["losses"] == auto["losses"]
+
+
 @pytest.mark.parametrize("schedule", ["gpipe", "1f1b"])
 def test_pipeline_through_gpubridge_matches_plain_gloo_bit_for_bit(schedule, tmp_path):
     # Two stages, one per island: every hop crosses the bridge's point-to-point.
