@@ -427,6 +427,19 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     (`tests/test_torch_backend.py`), and the example's `--hsdp 2` and
     `--verify --hsdp 2` on 4 simulated ranks.* *Step:* `train_hsdp_backend`
     and `verify_hsdp_backend` in Explorer steps 04 and 07.
+32. **The multitcp bridge against the Gloo bridge.** `bridge="multitcp"`
+    (docs/RUST_TRANSPORT.md) carries the bridge over several TCP connections
+    per pair and reduces each chunk as it arrives. Between two machines, its
+    bridge phase at each size against the Gloo bridge's (default and pinned
+    staging) in the same job, and against the preflight's prediction; one
+    connection against several, for the connections' share. It takes host
+    tensors only, so the GPU side is the policies' usual staging. Stage 1 stays
+    only if, with pinned staging, it takes at least 20% less time than the
+    pinned Gloo bridge at every size from 64 MB up, in two jobs.
+    *Status: works on CPU over loopback TCP, every bridge policy on two, three
+    and four leaders, bit for bit against `flat-gloo` (`tests/test_multitcp.py`).
+    Not run between two machines.* *Step:* `multitcp_build` and the
+    `matrix_D-multitcp*` runs in Explorer step 08, with `MULTITCP_BRIDGE=1`.
 
 ## GPU results
 
@@ -500,6 +513,7 @@ failures count against all six whichever test failed.
 | 29. Where bridge compression pays off | step `bench_compressed` | pass (2) |
 | 30. gpubridge as a torch.distributed backend: DDP and FSDP2 on GPUs | step `verify_fsdp2_backend`; step `train_fsdp2_backend`; step `gpu_tests` | FAIL (9 of 32) |
 | 31. HSDP through the backend: shard within islands, replicate across vendors | step `verify_hsdp_backend`; step `train_hsdp_backend` | FAIL (3 of 3) |
+| 32. The multitcp bridge against the Gloo bridge | step `multitcp_build`; step `matrix_D-multitcp(-pinned\|-1stream)?` | not run |
 
 Where the FAILs come from:
 

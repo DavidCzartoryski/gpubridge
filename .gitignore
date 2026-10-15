@@ -13,3 +13,6 @@ scripts/gpu/explorer/local.env
 # Raw Explorer results: step logs, stack dumps and NCCL logs are not redacted
 # (docs/EXPLORER_FIRST_SESSION.md). triage.py and validation_tables.py make what's shared.
 results/explorer/
+# The multitcp crate's build output (python -m gpubridge.multitcp build uses a temporary
+# target directory; cargo run in the crate itself writes here).
+src/gpubridge/multitcp/crate/target/

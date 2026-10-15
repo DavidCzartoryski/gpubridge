@@ -182,6 +182,17 @@ hardware.
 
 ### Added
 
+- `bridge="multitcp"`, an opt-in bridge transport over several TCP connections
+  per pair of leaders (`GPUBRIDGE_MULTITCP_STREAMS`, 4), from a small Rust
+  library (`src/gpubridge/multitcp/crate`, standard library only, a C interface
+  loaded with ctypes; `python -m gpubridge.multitcp build`). Python runs the
+  collectives and reductions as the UCX transport does; with two leaders each
+  chunk is reduced as soon as it has arrived. Host tensors only. Tested on CPU
+  only: every policy at two to four leaders bit for bit against `flat-gloo`,
+  compression, subgroups, failures and teardown (`tests/test_multitcp.py`,
+  `cargo test`, a CI job). Step 08 measures it against the Gloo bridge with
+  `MULTITCP_BRIDGE=1`; HARDWARE_VALIDATION.md item 32; docs/RUST_TRANSPORT.md
+  (#PRNUM).
 - `scripts/gpu/rdma_report.sh`, a step of the network check (`net-nvidia`,
   `net-amd`): what RDMA from GPU memory would need on the node, one file each
   in `rdma/<side>/`: the kernel's dma-buf and peer-to-peer options, the RDMA

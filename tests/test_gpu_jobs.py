@@ -433,6 +433,22 @@ def test_step_08_matrix_on_the_mixed_pair(tmp_path):
     assert "Without A1 and A2" in md
 
 
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="needs cargo to build multitcp")
+def test_step_08_with_the_multitcp_bridge(tmp_path):
+    code = submit(tmp_path, "08", AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
+                  MULTITCP_BRIDGE="1", GPUBRIDGE_MULTITCP_LIB_DIR=str(tmp_path / "lib"),
+                  FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
+                  FAKE_SLURM_HET_ENV_1="GPUBRIDGE_VENDOR=amd")
+    out = tmp_path / "results" / "08_matrix_nvidia-amd"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    runs = {p.parent.name: json.loads(p.read_text())
+            for p in (out / "matrix").glob("D-multitcp*/bench.json")}
+    assert sorted(runs) == ["D-multitcp", "D-multitcp-1stream", "D-multitcp-pinned"]
+    assert runs["D-multitcp-pinned"]["environment"]["env"]["GPUBRIDGE_PINNED_STAGING"] == "1"
+    assert runs["D-multitcp-1stream"]["environment"]["env"]["GPUBRIDGE_MULTITCP_STREAMS"] == "1"
+    assert "| D-multitcp |" in (out / "matrix.md").read_text()
+
+
 @pytest.mark.parametrize(("target", "vendor", "names"),
                          [("08-nvidia-pair", "nvidia", ["A1", "A2", "C", "E-nvidia"]),
                           ("08-amd-pair", "amd", ["B1", "B2", "C-amd", "E-amd"])])

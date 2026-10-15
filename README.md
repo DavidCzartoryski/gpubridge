@@ -56,6 +56,7 @@ its own vendor. No GPUs? See [Simulation mode](#simulation-mode-no-gpus-needed).
 | `torch.distributed` backend: DDP, FSDP2, HSDP through subgroups | experimental · tested on CPU · DDP and FSDP2 trained on a V100 + MI50 (torch 2.9.1+rocm6.3 on the MI50), FSDP2 bit for bit against a replay; HSDP hung there |
 | Pipelined and sharded bridge policies | opt-in · tested on CPU · correct and benchmarked on a V100 + MI50 (one GPU each, so the sharded bridge had one link) |
 | UCX bridge transport (RDMA where available) | opt-in · tested on CPU over TCP · not yet on GPU or RDMA |
+| Multi-stream TCP bridge transport (Rust) | opt-in · tested on CPU over loopback TCP · not yet between two machines |
 | bf16 / fp8 bridge compression with Triton kernels | opt-in · kernels match the CPU reference on V100, H200 and MI50 (not with torch 2.9.1+rocm6.3's Triton on the MI50); benchmarked on a V100 + MI50 |
 | GPU validation kit: Slurm job scripts, checks, benchmarks | every script runs end to end on CPU against a fake Slurm · run on Explorer: steps 01, 02, `amd`, 07, 08, the network checks and the training benchmarks; not the multi-GPU steps 03 to 06 |
 
@@ -584,6 +585,28 @@ or minor differ. `GPUBRIDGE_UCX_CHUNK_BYTES` (default `4M`) sets the message
 size. On CPU it is tested over UCX's TCP transport with every bridge policy;
 the design, the GPU-memory rules and what's still open are in
 [docs/RDMA_TRANSPORT.md](docs/RDMA_TRANSPORT.md).
+
+#### The multitcp bridge (experimental, **not run between two machines yet**)
+
+`init(bridge="multitcp")` carries the bridge over several TCP connections per
+pair of leaders (`GPUBRIDGE_MULTITCP_STREAMS`, default 4), in chunks of
+`GPUBRIDGE_MULTITCP_CHUNK_BYTES` (default `4M`) spread over them; with two
+leaders each chunk is reduced as soon as it has arrived, while the rest are on
+the wire. It is a small Rust library (the standard library only) with a C
+interface, loaded with ctypes and built on first use with cargo or with:
+
+```bash
+python -m gpubridge.multitcp build   # needs cargo; or set GPUBRIDGE_MULTITCP_LIB to a built library
+python -m gpubridge.multitcp info
+```
+
+It takes host tensors only, so GPU tensors are staged exactly as for the Gloo
+bridge. Leaders connect on `GPUBRIDGE_MULTITCP_IFNAME`'s address, else
+`GLOO_SOCKET_IFNAME`'s. On CPU it is tested with every bridge policy at two to
+four leaders, bit for bit against `flat-gloo`; whether it beats the pinned
+Gloo bridge on a real network is what Explorer's step 08 with
+`MULTITCP_BRIDGE=1` measures. The design and the gate are in
+[docs/RUST_TRANSPORT.md](docs/RUST_TRANSPORT.md).
 
 ### Observing collectives
 

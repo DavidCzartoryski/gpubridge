@@ -1373,7 +1373,7 @@ def test_tables_cover_every_hardware_validation_item():
 
 
 def test_every_step_the_tables_look_for_is_one_a_job_runs():
-    runs = [dry_run(KIT / "explorer" / job, UCX_BRIDGE="1") for job in sorted(
+    runs = [dry_run(KIT / "explorer" / job, UCX_BRIDGE="1", MULTITCP_BRIDGE="1") for job in sorted(
         p.name for p in (KIT / "explorer").glob("0*.sbatch"))]
     runs += [dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="4"),
              dry_run(KIT / "mixed" / "node.sh", ROLE="master", MASTER_ADDR="10.0.0.1",

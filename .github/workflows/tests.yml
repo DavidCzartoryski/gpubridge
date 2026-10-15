@@ -200,13 +200,43 @@ jobs:
       - run: python -m gpubridge.ucx build && python -m gpubridge.ucx info
       - run: pytest tests/test_ucx.py -rs
 
+  multitcp:
+    # The multitcp bridge transport (docs/RUST_TRANSPORT.md): its Rust crate formatted,
+    # linted and unit-tested, then built through Python and tested between processes
+    # over loopback TCP. The pytest jobs above also run tests/test_multitcp.py where
+    # cargo is installed, as it is on GitHub's Ubuntu runners.
+    name: multitcp bridge (3.12)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.12"
+          activate-environment: true
+      - run: rustup component add rustfmt clippy && cargo --version
+      - working-directory: src/gpubridge/multitcp/crate
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+      - run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: uv pip install -e ".[test]"
+      - run: python -m gpubridge.multitcp build && python -m gpubridge.multitcp info
+      - run: pytest tests/test_multitcp.py -rs
+
   ci-ok:
     # The one check for main's ruleset to require: it passes only if every job above
     # succeeded or was skipped, and fails if any failed or was cancelled. `if:
     # always()` makes it report even then. Skipped counts only when changes found a
     # docs-only change: only the heavy jobs skip, and only then.
     name: ci-ok
-    needs: [changes, docs, tests-310, tests-312, pytest-310, pytest-312, ucx]
+    needs: [changes, docs, tests-310, tests-312, pytest-310, pytest-312, ucx, multitcp]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

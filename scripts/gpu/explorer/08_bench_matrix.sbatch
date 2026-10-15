@@ -7,6 +7,7 @@
 # own nodes, so bench_matrix.py lists each job's network next to the ratios:
 #
 #   nvidia-amd     a V100 (gpu) + an MI50 (sharing): D, every policy, and E   submit.sh 08
+#                  (MULTITCP_BRIDGE=1 adds D over bridge="multitcp")
 #   nvidia-nvidia  two V100s: A1, A2, C and E-nvidia               submit.sh 08-nvidia-pair
 #   amd-amd        two MI50s: B1, B2, C-amd and E-amd                 submit.sh 08-amd-pair
 #
@@ -28,6 +29,8 @@ PREFLIGHT_PORT="${PREFLIGHT_PORT:-29501}"
 BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-1G}"
 # D's pipelined runs, one per chunk size (GPUBRIDGE_CHUNK_BYTES; gpubridge's default is 4M).
 PIPELINE_CHUNKS="${PIPELINE_CHUNKS:-1M 4M 16M 64M}"
+# 1: also D-multitcp, D-multitcp-pinned and D-multitcp-1stream, over bridge="multitcp".
+MULTITCP_BRIDGE="${MULTITCP_BRIDGE:-0}"
 case $MATRIX_PAIR in
 nvidia-amd) VENV_0=$VENV VENV_1=$VENV_ROCM SIDE_0=nvidia SIDE_1=amd ;;
 nvidia-nvidia) VENV_0=$VENV VENV_1=$VENV SIDE_0=nvidia-0 SIDE_1=nvidia-1 ;;
@@ -141,6 +144,18 @@ case $MATRIX_PAIR in
 nvidia-amd)
     matrix_run D-default -- --ops gpubridge --phases
     matrix_run D-pinned GPUBRIDGE_PINNED_STAGING=1 -- --ops gpubridge --phases
+    # The multitcp bridge (bridge="multitcp", docs/RUST_TRANSPORT.md), opt-in with
+    # MULTITCP_BRIDGE=1: each side builds the Rust library (cargo on the node), then it
+    # runs with the default and the pinned staging, and over one connection instead of
+    # several, to tell the connections' share from the chunked overlap's.
+    if [ "$MULTITCP_BRIDGE" = 1 ]; then
+        step multitcp_build both @VENV@/bin/python -m gpubridge.multitcp build
+        matrix_run D-multitcp -- --ops gpubridge --phases --bridge multitcp
+        matrix_run D-multitcp-pinned GPUBRIDGE_PINNED_STAGING=1 -- --ops gpubridge --phases \
+            --bridge multitcp
+        matrix_run D-multitcp-1stream GPUBRIDGE_MULTITCP_STREAMS=1 -- --ops gpubridge --phases \
+            --bridge multitcp
+    fi
     for chunk in $PIPELINE_CHUNKS; do
         matrix_run "D-pipelined-$chunk" "GPUBRIDGE_CHUNK_BYTES=$chunk" -- --ops gpubridge \
             --phases --policy pipelined-reduce-bridge-broadcast
