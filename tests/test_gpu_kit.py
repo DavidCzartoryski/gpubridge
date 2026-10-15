@@ -1961,6 +1961,11 @@ def test_matrix_keeps_two_jobs_of_one_name_apart(tmp_path):
     rows = bench_matrix.matrix_rows(runs)
     second = next(r for r in rows if r["run"] == "A2" and r["job"].endswith("(2)"))
     assert second["x_A2_other_job"]  # the first download's A2 is the baseline
+    # The Network rows name the same jobs as the runs.
+    labels = bench_matrix.JobLabels()
+    roots = [tmp_path / "first", tmp_path / "second"]
+    bench_matrix.find_runs(roots, labels)
+    assert {r["job"] for r in bench_matrix.network(roots, labels)} == jobs
 
 
 def test_train_bench_splits_the_step_into_compute_waiting_and_exposed_communication():

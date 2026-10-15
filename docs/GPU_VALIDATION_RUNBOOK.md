@@ -432,6 +432,25 @@ GRES type usually names the model:
 kernels for the GPU. `results/explorer/setup_rocm/probe.json` lists the GPU's
 target and the build's targets.
 
+**The target check is not enough for training: rocBLAS needs the GPU's kernels
+too.** Every ROCm wheel from 2.8 on lists gfx906 (MI50, MI60) as a target, but
+among them only the `rocm6.3` builds of 2.8.0, 2.9.0 and 2.9.1 ship rocBLAS
+kernels for it ([BENCHMARKS.md](BENCHMARKS.md#which-rocm-wheels-can-train-on-an-mi50-gfx906)
+has the scan). With the default wheel the kit's checks pass, but the first
+matmul aborts, so the training steps fail. With 2.9.1+rocm6.3, matmuls run, but
+its Triton (pytorch-triton-rocm 3.5.1) can't compile gpubridge's compression
+kernels for gfx906. So on an MI50, keep the default venv and add a second one
+for training, then point `VENV_ROCM` at it for the steps that train:
+
+```bash
+VENV_ROCM=$WORK_DIR/venv-rocm63 ROCM_TORCH_VERSION=2.9.1 ROCM_INDEX=rocm6.3 \
+    scripts/gpu/explorer/submit.sh setup-rocm
+VENV_ROCM=$WORK_DIR/venv-rocm63 STEPS_07=training scripts/gpu/explorer/submit.sh 07
+```
+
+The probe's `blas` stage (`blas_available` in `probe.json`) says whether a venv's
+matmuls run on the GPU.
+
 **`(null): No such file or directory`, once per GPU per process.** The
 `libdrm_amdgpu` that the ROCm wheels bundle looks for its GPU-name table,
 `amdgpu.ids`, in `/opt/amdgpu/share/libdrm` and then by walking the directory
