@@ -93,9 +93,12 @@ matrix_run() {
 [ "$MATRIX_PAIR" != amd-amd ] || VENV=$VENV_ROCM
 job_setup "08_matrix_$MATRIX_PAIR"
 # Two components of one partition can share a node, and then NCCL never touches the
-# network: not what this job measures. After job_setup, so job.jsonl records why.
-[ "$DRY_RUN" = 1 ] || [ "$HEAD" != "$OTHER" ] ||
-    die "both components are on one node ($HEAD); the matrix needs two"
+# network: not what this job measures. After job_setup, so job.jsonl records why (without
+# the node's name: the job's own log has it).
+if [ "$DRY_RUN" = 0 ] && [ "$HEAD" = "$OTHER" ]; then
+    log "both components are on $HEAD"
+    die "both components are on one node; the matrix needs two"
+fi
 if [ "$MATRIX_PAIR" != nvidia-nvidia ]; then
     rocm_asic_ids "$VENV_ROCM/bin/python"  # the ROCm wheel's GPU-name table (common.sh)
 fi

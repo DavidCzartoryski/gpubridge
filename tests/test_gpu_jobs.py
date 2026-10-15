@@ -462,9 +462,11 @@ def test_step_08_refuses_two_components_on_one_node(tmp_path):
     result = subprocess.run(["bash", str(EXPLORER / "08_bench_matrix.sbatch")], env=env,
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 1
-    assert "both components are on one node (gpunode1); the matrix needs two" in result.stderr
+    assert "both components are on gpunode1" in result.stderr
+    assert "both components are on one node; the matrix needs two" in result.stderr
     out = tmp_path / "results" / "08_matrix_nvidia-nvidia"
     assert [e["event"] for e in events(out)] == ["started", "error", "exit"]
+    assert "gpunode1" not in (out / "job.jsonl").read_text()  # triage pastes it as is
     assert not (out / "matrix").exists()
 
 

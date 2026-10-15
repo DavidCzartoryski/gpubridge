@@ -1900,7 +1900,8 @@ def test_matrix_markdown_has_a_table_per_size_range_and_no_hosts_or_addresses(tm
         assert secret not in md
     data = json.loads((tmp_path / "matrix.json").read_text())
     assert {r["run"] for r in data["runs"]} == {"A1", "A2", "D-default", "D-bf16", "E"}
-    assert (tmp_path / "matrix.csv").read_text().startswith("run,job,what,bytes,median_us")
+    assert (tmp_path / "matrix.csv").read_text().startswith(
+        "run,job,what,bytes,median_us,p90_us,busbw_GBps,x_A2,x_A2_other_job,x_A1,x_A1_other_job")
 
 
 def test_matrix_without_baselines_says_so(tmp_path):
@@ -1929,16 +1930,37 @@ def test_matrix_size_ranges_cover_every_size():
         assert sum(lo <= size < hi for _, lo, hi in bench_matrix.RANGES) == 1, size
 
 
-@pytest.mark.parametrize("mode", ["fp8", "FP8", " bf16 "])
-def test_matrix_predicts_compressed_payloads_whatever_the_case(mode):
+@pytest.mark.parametrize(("mode", "dtype"), [("fp8", "float16"), ("FP8", "float32"),
+                                             (" bf16 ", "float32")])
+def test_matrix_predicts_compressed_payloads_whatever_the_case(mode, dtype):
     from gpubridge.compression import payload_nbytes
 
     run = bench_matrix.Run("D-x", "job", {"environment": {"env": {
         "GPUBRIDGE_BRIDGE_COMPRESSION": mode}}}, None)
-    row = {"bytes": 2**20, "islands": 2, "dtype": "float16"}
-    payload = payload_nbytes(mode.strip().lower(), 2**19)
+    size = {"float16": 2, "float32": 4}[dtype]
+    row = {"bytes": 2**20, "islands": 2, "dtype": dtype}
+    payload = payload_nbytes(mode.strip().lower(), 2**20 // size)
     assert bench_matrix.predicted_ms(run, row, 100.0, 0.5) == pytest.approx(
         0.5 + 2 * payload / 1e8 * 1e3)
+
+
+def test_matrix_predicts_the_ring_where_the_mode_leaves_the_dtype_alone():
+    # bf16 compression doesn't touch float16, so that bridge is the plain all_reduce.
+    run = bench_matrix.Run("D-x", "job", {"environment": {"env": {
+        "GPUBRIDGE_BRIDGE_COMPRESSION": "bf16"}}}, None)
+    row = {"bytes": 10**8, "islands": 2, "dtype": "float16"}
+    assert bench_matrix.predicted_ms(run, row, 100.0, 0.5) == pytest.approx(1000.5)
+
+
+def test_matrix_keeps_two_jobs_of_one_name_apart(tmp_path):
+    for download in ("first", "second"):
+        _matrix_tree(tmp_path / download)
+    runs = bench_matrix.find_runs([tmp_path / "first", tmp_path / "second"])
+    jobs = {r.job for r in runs if r.name == "D-default"}
+    assert jobs == {"08_matrix_nvidia-amd", "08_matrix_nvidia-amd (2)"}
+    rows = bench_matrix.matrix_rows(runs)
+    second = next(r for r in rows if r["run"] == "A2" and r["job"].endswith("(2)"))
+    assert second["x_A2_other_job"]  # the first download's A2 is the baseline
 
 
 def test_train_bench_splits_the_step_into_compute_waiting_and_exposed_communication():

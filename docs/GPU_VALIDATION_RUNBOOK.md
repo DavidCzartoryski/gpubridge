@@ -485,8 +485,8 @@ heterogeneous job of two 1-GPU components (`MATRIX_PAIR`, set by `submit.sh`).
 It records each node's network (`net_report.sh`: `/sys/class/infiniband`,
 `ibstat`, `ibv_devinfo`, `ip -br addr`, into `network/<side>/`), probes both
 GPUs, runs the preflight, then each run into `matrix/<run>/`, and ends with
-`bench_matrix.py`, which writes `matrix.md`: per size range (up to 64 KB,
-256 KB to 16 MB, 64 MB and up) every run's latency and bus bandwidth, its time
+`bench_matrix.py`, which writes `matrix.md`: per size range (under 256 KB,
+256 KB to under 64 MB, 64 MB and up) every run's latency and bus bandwidth, its time
 as a multiple of A2's and A1's, the bridge phase against the preflight's
 prediction (a ring all_reduce of the tensor, both ways at once; with `bf16` or
 `fp8`, each leader's compressed payload broadcast in turn, one way at a time), each

@@ -140,15 +140,21 @@ def _load(path: Path) -> dict[str, Any] | None:
 
 
 def find_runs(roots: list[Path]) -> list[Run]:
-    runs = []
+    """Every run under ``roots``. A run's job is its job directory's name, with
+    " (2)", " (3)" ... where two directories of one name (two downloads of the same
+    step) are different jobs."""
+    runs, labels = [], {}
     for root in roots:
         for path in sorted(root.rglob("matrix/*/bench.json")):
             bench = _load(path)
             if bench is None:
                 continue
             job_dir = path.parent.parent.parent
+            if job_dir.resolve() not in labels:
+                same = sum(1 for d in labels if d.name == job_dir.name)
+                labels[job_dir.resolve()] = job_dir.name + (f" ({same + 1})" if same else "")
             preflight = _load(job_dir / "preflight" / "preflight-master.json")
-            run = Run(path.parent.name, job_dir.name, bench,
+            run = Run(path.parent.name, labels[job_dir.resolve()], bench,
                       preflight if preflight and "bandwidth" in preflight else None,
                       _load(job_dir / "preflight" / "preflight-worker.json"))
             run.nccl = nccl_lines(job_dir / "nccl" / f"matrix_{run.name}")
@@ -330,9 +336,14 @@ def predicted_ms(run: Run, row: dict[str, Any], mbps: float, rtt_ms: float) -> f
     """
     islands = row.get("islands") or 2
     mode = compression(run)
+    if mode:
+        import torch
+        from gpubridge.compression import applies, payload_nbytes  # only when compressed
+
+        if not applies(mode, getattr(torch, row.get("dtype", "float32"), torch.float32)):
+            mode = ""  # a dtype this mode leaves alone: the ring all_reduce
     if not mode:
         return predicted_bridge_ms(row["bytes"], islands, mbps, rtt_ms)
-    from gpubridge.compression import payload_nbytes  # torch, only when compressed
 
     payload = payload_nbytes(mode, row["bytes"] // ELEMENT.get(row.get("dtype", ""), 4))
     return (islands - 1) * rtt_ms + islands * (islands - 1) * payload / (mbps * 1e6) * 1e3
@@ -524,7 +535,7 @@ def main(argv: list[str] | None = None) -> int:
     })
     with open(out / "matrix.csv", "w", newline="") as fh:
         fields = ["run", "job", "what", "bytes", "median_us", "p90_us", "busbw_GBps", "x_A2",
-                  "x_A1", "predicted_bridge_ms", "bridge_ms", "measured_over_predicted",
+                  "x_A2_other_job", "x_A1", "x_A1_other_job", "predicted_bridge_ms", "bridge_ms", "measured_over_predicted",
                   "trials", "timer"]
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
