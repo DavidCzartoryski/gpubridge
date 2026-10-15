@@ -308,6 +308,14 @@ step() {
     printf '{"step": "%s", "exit_code": %d, "seconds": %d, "log": "%s.log", "timed_out": %s%s}\n' \
         "$name" "$code" "$(($(date +%s) - start))" "$name" "$timed_out" \
         "${result:+, \"result\": \"$result\"}" >>"$RESULTS/steps.jsonl"
+    if grep -q -E "gpubridge-kit: (import|triton) check failed" "$RESULTS/$name.log"; then
+        # probe.py on some side of the job found that side's gpubridge isn't this
+        # checkout's (later steps would measure other code), or that its Triton can't
+        # compile the compression kernels for its GPU (later steps would fail on it).
+        FAILED_STEPS+=("$name")
+        die "step $name: $(grep -o -m1 -E "gpubridge-kit: (import|triton) check failed" \
+            "$RESULTS/$name.log"); stopping before any other step. See $RESULTS/$name.log."
+    fi
     if [ "$code" = 0 ]; then
         PASSED_STEPS+=("$name")
     else
@@ -351,9 +359,39 @@ activate_venv() {
         printf '+ source %s/bin/activate\n' "$venv"
         return 0
     fi
+    if [ ! -f "$venv/bin/activate" ] && [ -x "$venv/bin/python" ]; then
+        # A directory of wrappers around another venv's python and torchrun (e.g.
+        # rocm_triton_overlay.sh's): put them first on PATH.
+        log "$venv has no bin/activate; using its bin/ wrappers"
+        export PATH="$venv/bin:$PATH"
+        return 0
+    fi
     [ -f "$venv/bin/activate" ] || die "no venv at $venv; run setup first"
     # shellcheck disable=SC1091
     source "$venv/bin/activate"
+}
+
+# fresh_results DIR: DIR, or DIR_job<id> when DIR already holds another run's
+# records (job.jsonl or steps.jsonl), so a run never writes into, or over,
+# another's folder. The id is SLURM_JOB_ID, else RUN_ID, else this shell's pid.
+fresh_results() {
+    local dir=$1
+    if [ -e "$dir/job.jsonl" ] || [ -e "$dir/steps.jsonl" ]; then
+        dir="${dir}_job${SLURM_JOB_ID:-${RUN_ID:-$$}}"
+        log "$1 already holds another run's records; this run's go to $dir"
+    fi
+    printf '%s\n' "$dir"
+}
+
+# require_kit_import: stop unless the active python imports this checkout's
+# gpubridge (import_check.py). Run after activate_venv.
+require_kit_import() {
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '+ python %s/import_check.py\n' "$KIT_DIR"
+        return 0
+    fi
+    python "$KIT_DIR/import_check.py" >&2 ||
+        die "the venv's gpubridge isn't this checkout's (above); stopping before any step"
 }
 
 # Number of GPUs PyTorch sees. GPU_COUNT overrides (and is required in dry-run mode).

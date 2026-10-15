@@ -1221,16 +1221,20 @@ def test_target_match_rules(target, capability, arch_list, match):
 
 
 def run_probe(monkeypatch, tmp_path, devices: list, *, nccl: bool = True,
-              blas: dict | None = None) -> int:
-    """probe.py's main() on a made-up environment (BLAS available unless ``blas``)."""
+              blas: dict | None = None, triton: dict | None = None) -> int:
+    """probe.py's main() on a made-up environment (BLAS available unless ``blas``; no
+    Triton unless ``triton``; gpubridge imported from this checkout, as it is here)."""
     import gpukit
     import probe
 
     env = {"device_count": len(devices), "devices": devices, "arch_list": CU126,
            "probe": {"nccl_available": nccl, "gloo_available": True}, "torch": "2.14.1+cu126",
-           "torch_cuda": "12.6", "torch_hip": None, "nccl_version": "2.21.5"}
+           "torch_cuda": "12.6", "torch_hip": None, "nccl_version": "2.21.5",
+           "import": gpukit.kit_import()}
     monkeypatch.setattr(gpukit, "environment", lambda: env)
     monkeypatch.setattr(probe, "blas_check", lambda index: blas or {"blas_available": True})
+    monkeypatch.setattr(probe, "triton_check",
+                        lambda index: triton or {"triton": None, "compiles": None})
     monkeypatch.setattr(sys, "argv", ["probe.py", "--out", str(tmp_path)])
     return probe.main()
 
@@ -2444,3 +2448,144 @@ def test_dp_report_compares_curves_with_the_baseline(tmp_path):
     assert sorted(dp_report.load([tmp_path / "jobs"])) == [
         f"jobs/{job}/07_mixed_hetjob_dp/dp_ddp" for job in ("a", "b", "c")]
 
+
+
+# ---- run guards: the import, the results folder, the MI50's Triton ---------------
+
+def _other_checkout(tmp_path: Path) -> Path:
+    """A copy of this checkout's package somewhere else, as another clone would hold it."""
+    other = tmp_path / "other" / "src"
+    shutil.copytree(REPO / "src" / "gpubridge", other / "gpubridge",
+                    ignore=shutil.ignore_patterns("__pycache__", "target"))
+    return other
+
+
+def test_import_check_passes_for_this_checkout_and_names_a_foreign_import(tmp_path):
+    ok = subprocess.run([sys.executable, str(KIT / "import_check.py")],
+                        env=clean_env(PYTHONPATH=str(REPO / "src")), capture_output=True,
+                        text=True, timeout=120)
+    assert ok.returncode == 0, ok.stderr[-2000:]
+    assert "gpubridge from" in ok.stdout
+    other = _other_checkout(tmp_path)
+    bad = subprocess.run([sys.executable, str(KIT / "import_check.py")],
+                         env=clean_env(PYTHONPATH=str(other)), capture_output=True,
+                         text=True, timeout=120)
+    assert bad.returncode == 1
+    assert "gpubridge-kit: import check failed" in bad.stderr
+    assert str(other / "gpubridge") in bad.stderr and "PYTHONPATH is" in bad.stderr
+
+
+def test_probe_records_where_gpubridge_came_from_and_fails_on_a_foreign_import(tmp_path):
+    out = tmp_path / "probe"
+    ok = subprocess.run([sys.executable, str(KIT / "probe.py"), "--out", str(out),
+                         "--allow-no-gpu"], env=clean_env(PYTHONPATH=str(REPO / "src")),
+                        capture_output=True, text=True, timeout=120)
+    assert ok.returncode == 0, ok.stderr[-2000:]
+    record = json.loads((out / "probe.json").read_text())
+    imported = record["environment"]["import"]
+    assert imported["gpubridge_in_kit_checkout"] is True
+    assert imported["gpubridge_file"].endswith("src/gpubridge/__init__.py")
+    assert record["environment"]["env"]["PYTHONPATH"]  # recorded, redacted like any path
+    stages = {s["name"]: s for s in record["stages"]}
+    assert stages["kit_import"]["ok"] and stages["triton_kernels"]["ok"]
+
+    other = _other_checkout(tmp_path)
+    bad = subprocess.run([sys.executable, str(KIT / "probe.py"), "--out", str(tmp_path / "b"),
+                          "--allow-no-gpu"], env=clean_env(PYTHONPATH=str(other)),
+                         capture_output=True, text=True, timeout=120)
+    assert bad.returncode == 1 and "gpubridge-kit: import check failed" in bad.stderr
+
+
+def _bash(script: str, **env: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["bash", "-e", "-c", script], env=clean_env(**env),
+                          capture_output=True, text=True, timeout=60)
+
+
+@pytest.mark.parametrize("marker", ["gpubridge-kit: import check failed: elsewhere",
+                                    "gpubridge-kit: triton check failed: gfx906"])
+def test_a_failed_probe_check_stops_the_job_before_the_next_step(marker, tmp_path):
+    result = _bash(f"""
+source {KIT}/common.sh
+RESULTS={tmp_path}
+step probe sh -c 'echo "{marker}"; exit 1'
+step after echo should-not-run
+""")
+    assert result.returncode != 0
+    assert "stopping before any other step" in result.stderr
+    assert "should-not-run" not in result.stdout + result.stderr
+    assert not (tmp_path / "after.log").exists()
+
+
+def test_require_kit_import_stops_on_a_foreign_import(tmp_path):
+    other = _other_checkout(tmp_path)
+    venv_path = f"{Path(sys.executable).parent}:{os.environ['PATH']}"  # as an active venv
+    good = _bash(f"source {KIT}/common.sh; require_kit_import; echo went-on",
+                 PYTHONPATH=str(REPO / "src"), PATH=venv_path)
+    assert good.returncode == 0 and "went-on" in good.stdout, good.stderr[-2000:]
+    bad = _bash(f"source {KIT}/common.sh; require_kit_import; echo went-on",
+                PYTHONPATH=str(other), PATH=venv_path)
+    assert bad.returncode != 0 and "went-on" not in bad.stdout
+    assert "isn't this checkout's" in bad.stderr
+
+
+def test_a_results_folder_with_records_gets_a_job_folder_of_its_own(tmp_path):
+    fresh = tmp_path / "07_mixed_hetjob"
+    used = tmp_path / "amd_node"
+    used.mkdir()
+    (used / "steps.jsonl").write_text("{}\n")
+    out = _bash(f"source {KIT}/common.sh; fresh_results {fresh}; fresh_results {used}",
+                SLURM_JOB_ID="4242")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == [str(fresh), f"{used}_job4242"]
+    assert "already holds another run's records" in out.stderr
+
+
+def test_job_setup_never_writes_into_another_runs_folder(tmp_path):
+    # job_setup (explorer/job_env.sh), the start of every Explorer job.
+    used = tmp_path / "02_split_shared_gpu"
+    used.mkdir()
+    (used / "job.jsonl").write_text('{"event": "started", "job_id": "1"}\n')
+    out = _bash(f"""
+source {KIT}/common.sh --dry-run
+source {KIT}/explorer/job_env.sh
+VENV={tmp_path}/no-venv
+job_setup 02_split_shared_gpu
+echo "RESULTS=$RESULTS"
+""", SLURM_JOB_ID="77", RESULTS_ROOT=str(tmp_path), PROJECT_DIR=FAKE_PROJECT,
+                GPUBRIDGE_REPO=str(REPO))
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert f"RESULTS={used}_job77" in out.stdout
+    assert (used / "job.jsonl").read_text().count("started") == 1  # untouched
+
+
+def test_a_directory_of_wrappers_is_a_venv_the_kit_can_use(tmp_path):
+    # rocm_triton_overlay.sh writes bin/python, bin/torchrun wrappers and no bin/activate.
+    wrappers = tmp_path / "venv-overlay" / "bin"
+    wrappers.mkdir(parents=True)
+    (wrappers / "python").write_text(f"#!/usr/bin/env bash\nexec {sys.executable} \"$@\"\n")
+    (wrappers / "python").chmod(0o755)
+    out = _bash(f"source {KIT}/common.sh; activate_venv {wrappers.parent}; command -v python")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == str(wrappers / "python")
+    missing = _bash(f"source {KIT}/common.sh; activate_venv {tmp_path}/nothing")
+    assert missing.returncode != 0 and "run setup first" in missing.stderr
+
+
+@pytest.mark.parametrize("compiles,forced,ok", [
+    (True, "auto", True), (None, "auto", True), (False, "auto", False),
+    (False, "triton", False), (False, "torch", True),
+])
+def test_probe_refuses_a_triton_that_cannot_compile_unless_torch_kernels_are_forced(
+        compiles, forced, ok, monkeypatch, tmp_path):
+    mi50 = fake_device(monkeypatch, name="AMD Instinct MI50", capability=(9, 0),
+                       gcn="gfx906:sramecc+:xnack-", hip="6.3.42134", arch_list=["gfx906"])
+    triton = {"triton": "3.5.1", "compiles": compiles,
+              **({"error": "RuntimeError: PassManager::run failed"} if compiles is False else {})}
+    monkeypatch.setenv("GPUBRIDGE_COMPRESSION_KERNELS", forced)
+    assert run_probe(monkeypatch, tmp_path, [mi50], triton=triton) == (0 if ok else 1)
+    stage = next(s for s in json.loads((tmp_path / "probe.json").read_text())["stages"]
+                 if s["name"] == "triton_kernels")
+    assert stage["ok"] is ok and stage["kernels_setting"] == forced
+    if not ok:
+        assert "gpubridge-kit: triton check failed" in stage["error"]
+        assert "gfx906" in stage["error"] and "rocm_triton_overlay.sh" in stage["error"]

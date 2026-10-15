@@ -319,6 +319,24 @@ nothing. It writes to `results/explorer/00_partitions/`:
 - `gpu-types.txt`: every GPU type per partition, labelled `amd`, `nvidia` or `unknown` from its name, and a closing line that says whether `sharing` has AMD GPUs.
 
 Job logs go to `$WORK_DIR/logs/`, and results to `results/explorer/<step>/`.
+A job never writes into another run's folder: if `results/explorer/<step>/`
+already holds a `job.jsonl` or `steps.jsonl`, its results go to
+`results/explorer/<step>_job<id>/` instead, and the log says so. A job also
+stops early when:
+
+- **`import gpubridge` isn't this checkout's `src/`**: every job, before its
+  first step (`import_check.py`), and the probe on each side of a mixed job. The venvs install gpubridge editable from
+  one checkout, so a job run from another checkout, or with `PYTHONPATH` set,
+  would otherwise run that checkout's scripts on other code. Run from the checkout
+  the venv installs, or put this checkout's `src` first on `PYTHONPATH`. The probe
+  records where gpubridge came from, its commit and `PYTHONPATH`.
+- **Triton is installed but can't compile gpubridge's compression kernels for
+  the GPU**: jobs with a probe step (01, 07, 08, the AMD node, train-*,
+  dp-baseline) stop after it (its `triton_kernels` stage), as `venv-rocm63`'s own Triton
+  can't for the MI50's gfx906. Use the overlay venv below, which `activate_venv`
+  accepts like any other, or set `GPUBRIDGE_COMPRESSION_KERNELS=torch` to run
+  without Triton.
+
 Keep the raw results on the cluster: the step logs, stack dumps and NCCL logs
 aren't redacted (see [Reading results](#reading-results)). For review, paste
 the output of `"$PROJECT_DIR/$USER/gpubridge-gpu/venv/bin/python" scripts/gpu/triage.py results/explorer`

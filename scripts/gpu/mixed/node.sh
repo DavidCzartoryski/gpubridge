@@ -45,7 +45,7 @@ if [ -z "$TORCH_FLAVOR" ]; then
     if command -v nvidia-smi >/dev/null 2>&1; then TORCH_FLAVOR=cuda; else TORCH_FLAVOR=rocm; fi
 fi
 TARGET="${TARGET:-mixed-$ROLE-$(hostname -s)}"
-RESULTS="$RESULTS_ROOT/$TARGET"
+RESULTS=$(fresh_results "$RESULTS_ROOT/$TARGET")
 export RESULTS
 VENV="${VENV:-$WORK_DIR/venv}"
 

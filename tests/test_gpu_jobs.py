@@ -31,6 +31,7 @@ SMALL_TRAINING = "--steps 3 --warmup-steps 1 --batch-size 8 --dim 32 --layers 2"
 END_TO_END = {
     "common.sh": "sourced by every shell script below",
     "gpukit.py": "imported by check, bench, probe and device_map",
+    "import_check.py": "every job below (job_setup, run_all.sh), and test_gpu_kit.py",
     "check.py": "every job below, and test_gpu_kit.py",
     "bench_all_reduce.py": "test_step_03, 04, 05, 07, the node pair",
     "bench_compression.py": "test_step_04, 07, the node pair, test_amd_node_job",
@@ -679,6 +680,10 @@ def test_amd_node_job(tmp_path):
     assert code == 1
     assert {"check_1gpu", "gpu_tests", "check_split_shared_gpu", "summarize"} <= set(steps(out))
     assert not (tmp_path / "results" / "amd_node.tgz").exists()
+    # job.jsonl, as every Explorer job writes it: started, finished (3 failed), exit 1.
+    events = [json.loads(line) for line in (out / "job.jsonl").read_text().splitlines()]
+    assert [e["event"] for e in events] == ["started", "finished", "exit"]
+    assert events[1]["failed"] == 3 and events[2]["code"] == 1
 
 
 def loopback() -> str:

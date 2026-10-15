@@ -32,15 +32,18 @@ TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS:-gpt2-small resnet50}"
 read -ra train_args <<<"${TRAIN_BENCH_ARGS:-}"
 # -------------------------------------------------------------------------------
 
-RESULTS="$RESULTS_ROOT/$TARGET"
+RESULTS=$(fresh_results "$RESULTS_ROOT/$TARGET")
 export RESULTS
 VENV="${VENV:-$WORK_DIR/venv}"
 log "results go to $RESULTS"
+run mkdir -p "$RESULTS"
+job_started  # job.jsonl: started, finished and the exit code, as Explorer's jobs record
 
 if [ "$SKIP_SETUP" != 1 ]; then
     step setup "$KIT_DIR/setup_env.sh" --flavor "$TORCH_FLAVOR" --venv "$VENV"
 fi
 activate_venv "$VENV"
+require_kit_import
 rocm_asic_ids python  # the ROCm wheel's GPU-name table (common.sh)
 capture "$RESULTS/rocm-smi.txt" rocm-smi
 capture "$RESULTS/rocm-smi-detail.txt" rocm-smi --showproductname --showdriverversion \

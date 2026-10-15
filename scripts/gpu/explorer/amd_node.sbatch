@@ -18,7 +18,7 @@ source "$KIT_DIR/explorer/job_env.sh"
 
 load_modules "$MODULES"
 export SKIP_SETUP=1 PACKAGE_RESULTS=0 VENV="$VENV_ROCM" RESULTS_ROOT TARGET=amd_node
-log "job ${SLURM_JOB_ID:-local} on $(hostname): results in $RESULTS_ROOT/amd_node"
+log "job ${SLURM_JOB_ID:-local} on $(hostname): results under $RESULTS_ROOT (run_all.sh logs the folder)"
 triton_cache_begin
 code=0
 run bash "$KIT_DIR/amd/run_all.sh" || code=$?

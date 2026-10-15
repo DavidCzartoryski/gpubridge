@@ -51,12 +51,13 @@ load_modules() {
 # (job.jsonl), load modules, activate the venv and record the node's GPUs,
 # interconnect topology and job details.
 job_setup() {
-    RESULTS="$RESULTS_ROOT/$1"
+    RESULTS=$(fresh_results "$RESULTS_ROOT/$1")
     export RESULTS
     run mkdir -p "$RESULTS"
     job_started
     load_modules "$MODULES"
     activate_venv "$VENV"
+    require_kit_import
     triton_cache_begin
     capture "$RESULTS/nvidia-smi.txt" nvidia-smi
     capture "$RESULTS/nvidia-smi-topo.txt" nvidia-smi topo -m
