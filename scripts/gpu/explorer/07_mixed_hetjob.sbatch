@@ -18,7 +18,8 @@
 # size (MB), each under its own name: train_bench_<model>_bucket<MB>.
 # STEPS_07=dp only the probe, the preflight and the data-parallel runs (DP_RUNS, below),
 # into 07_mixed_hetjob_dp/; STEPS_07=pipeline the pipeline runs (PP_RUNS), into
-# 07_mixed_hetjob_pp/.
+# 07_mixed_hetjob_pp/; STEPS_07=megatron Megatron-Core's pipeline (megatron_pp.py; needs
+# MEGATRON_PATH), into 07_mixed_hetjob_megatron/.
 set -euo pipefail
 REPO="${GPUBRIDGE_REPO:?submit with scripts/gpu/explorer/submit.sh}"
 # shellcheck source=../common.sh
@@ -31,18 +32,28 @@ GPUS_AMD="${GPUS_MIXED_AMD:-1}"
 RDZV_PORT="${RDZV_PORT:-29500}"
 PREFLIGHT_PORT="${PREFLIGHT_PORT:-29501}"
 BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-1G}"
-STEPS_07="${STEPS_07:-all}"  # all, training, ddp, bench, dp or pipeline
+STEPS_07="${STEPS_07:-all}"  # all, training, ddp, bench, dp, pipeline or megatron
 case $STEPS_07 in
-all | training | ddp | bench | dp | pipeline) ;;
-*) die "STEPS_07 must be all, training, ddp, bench, dp or pipeline" ;;
+all | training | ddp | bench | dp | pipeline | megatron) ;;
+*) die "STEPS_07 must be all, training, ddp, bench, dp, pipeline or megatron" ;;
 esac
 TRAIN_DDP_REPEATS="${TRAIN_DDP_REPEATS:-1}"
 [[ $TRAIN_DDP_REPEATS =~ ^[1-9][0-9]{0,2}$ ]] ||
     die "TRAIN_DDP_REPEATS must be a whole number from 1 to 999, not '$TRAIN_DDP_REPEATS'"
-case $STEPS_07 in bench | dp | pipeline)
+case $STEPS_07 in bench | dp | pipeline | megatron)
     [ "$TRAIN_DDP_REPEATS" = 1 ] ||
         log "TRAIN_DDP_REPEATS does nothing with STEPS_07=$STEPS_07: it runs no train_ddp" ;;
 esac
+# STEPS_07=megatron: megatron_pp.py, Megatron-Core's GPT with its own 1F1B schedule through
+# gpubridge, MEGATRON_STEPS steps: on the NVIDIA GPU alone (one stage, the baseline), then in
+# two stages across the vendors. MEGATRON_PATH is a directory with Megatron-Core in it (its
+# wheel unpacked); MEGATRON_ARGS go to both runs.
+MEGATRON_PATH="${MEGATRON_PATH:-}"
+MEGATRON_STEPS="${MEGATRON_STEPS:-200}"
+read -ra megatron_args <<<"${MEGATRON_ARGS:-}"
+if [ "$STEPS_07" = megatron ] && [ -z "$MEGATRON_PATH" ]; then
+    die "STEPS_07=megatron needs MEGATRON_PATH: a directory holding Megatron-Core (megatron/)"
+fi
 # STEPS_07=dp: train_dp.py on llama.py's model, DP_STEPS steps of DP_GLOBAL_BATCH sequences
 # of DP_SEQ tokens, one run per name in DP_RUNS: ddp, ddp-bf16 and ddp-fp8 (DDP through
 # gpubridge.ddp_comm_hook, the bridge uncompressed or compressed), fsdp2 (FSDP2 through
@@ -148,6 +159,8 @@ if [ "$STEPS_07" = dp ]; then   # on the gpu node, with the CUDA venv
     job_setup "${results_name}_dp"
 elif [ "$STEPS_07" = pipeline ]; then
     job_setup "${results_name}_pp"
+elif [ "$STEPS_07" = megatron ]; then
+    job_setup 07_mixed_hetjob_megatron
 else
     job_setup 07_mixed_hetjob
 fi
@@ -261,6 +274,18 @@ if [ "$STEPS_07" = pipeline ]; then
                 "${pp_args[@]+"${pp_args[@]}"}"
         done
     done
+    finish
+    exit
+fi
+if [ "$STEPS_07" = megatron ]; then
+    export PYTHONPATH="$MEGATRON_PATH${PYTHONPATH:+:$PYTHONPATH}"
+    step megatron_pp1 limited srun --het-group=0 --nodes=1 --ntasks=1 "$VENV/bin/torchrun" \
+        --standalone --nproc-per-node=1 "$KIT_DIR/megatron_pp.py" --pipeline 1 \
+        --steps "$MEGATRON_STEPS" --json "$RESULTS/megatron_pp1.json" \
+        "${megatron_args[@]+"${megatron_args[@]}"}"
+    step megatron_pp2 mixed_torchrun megatron-pp2 "$KIT_DIR/megatron_pp.py" --pipeline 2 \
+        --steps "$MEGATRON_STEPS" --json "$RESULTS/megatron_pp2.json" \
+        "${megatron_args[@]+"${megatron_args[@]}"}"
     finish
     exit
 fi

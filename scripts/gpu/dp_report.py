@@ -31,13 +31,13 @@ def load(paths: list[Path]) -> dict[str, dict]:
     found = []
     for path in paths:
         files = [path] if path.is_file() else sorted(
-            [*path.rglob("dp_*.json"), *path.rglob("pp_*.json")])
+            [*path.rglob("dp_*.json"), *path.rglob("pp_*.json"), *path.rglob("megatron_*.json")])
         for f in files:
             record = json.loads(f.read_text())
-            if record.get("script") in ("scripts/gpu/train_dp.py",
-                                        "scripts/gpu/train_pipeline.py"):
+            if record.get("script") in ("scripts/gpu/train_dp.py", "scripts/gpu/train_pipeline.py",
+                                        "scripts/gpu/megatron_pp.py"):
                 where = f.name if path.is_file() else f.relative_to(path).as_posix()
-                name = f.stem.removeprefix("dp_").removeprefix("pp_")
+                name = f.stem.removeprefix("dp_").removeprefix("pp_").removeprefix("megatron_")
                 found.append((name, f"{path.name}/{where}", record))
     names = [name for name, _, _ in found]
     runs = {}

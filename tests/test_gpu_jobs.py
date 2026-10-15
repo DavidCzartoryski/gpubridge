@@ -79,7 +79,8 @@ END_TO_END = {
                                        "test_step_07_pipeline_compares_splits, "
                                        "test_step_07_refuses_bad_pipeline_splits, "
                                        "test_step_07_trains_on_a_same_vendor_pair, "
-                                       "test_step_07_multi_trains_data_parallel_and_pipelined",
+                                       "test_step_07_multi_trains_data_parallel_and_pipelined, "
+                                       "test_step_07_megatron_needs_megatron_path",
     "explorer/08_bench_matrix.sbatch": "test_step_08_*",
     "explorer/net_check.sbatch": "test_net_check_job",
     "explorer/train_bench.sbatch": "test_train_bench_job, test_train_multi_job",
@@ -595,6 +596,13 @@ def test_step_07_multi_trains_data_parallel_and_pipelined(tmp_path, mode, out_di
     out = tmp_path / "results" / out_dir
     assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
     assert json.loads((out / record).read_text())["world_size"] == 3
+
+
+def test_step_07_megatron_needs_megatron_path(tmp_path):
+    code = sbatch(tmp_path, "--job-name=gpubridge-07_mixed_hetjob", "--nodes=1",
+                  "--gres=gpu:1", ":", "--nodes=1", "--gres=gpu:mi100:1",
+                  str(EXPLORER / "07_mixed_hetjob.sbatch"), STEPS_07="megatron")
+    assert code != 0 and "STEPS_07=megatron needs MEGATRON_PATH" in job_output(tmp_path)
 
 
 def test_dp_baseline_job(tmp_path):

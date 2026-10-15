@@ -32,6 +32,7 @@ import summarize  # noqa: E402
 import train_bench  # noqa: E402
 import train_ddp_report  # noqa: E402
 import train_dp  # noqa: E402
+import megatron_pp  # noqa: E402
 import train_pipeline  # noqa: E402
 import validation_tables  # noqa: E402
 
@@ -561,7 +562,7 @@ def test_mixed_hetjob_runs_each_train_ddp_repeat_under_its_own_name(repeats, nam
 
 
 @pytest.mark.parametrize(("env", "message"), [
-    ({"STEPS_07": "hsdp"}, "STEPS_07 must be all, training, ddp, bench, dp or pipeline"),
+    ({"STEPS_07": "hsdp"}, "STEPS_07 must be all, training, ddp, bench, dp, pipeline or megatron"),
     ({"TRAIN_DDP_REPEATS": "0"}, "a whole number from 1 to 999, not '0'"),
     ({"TRAIN_DDP_REPEATS": "2.5"}, "a whole number from 1 to 999, not '2.5'"),
     ({"TRAIN_DDP_REPEATS": "many"}, "a whole number from 1 to 999, not 'many'"),
@@ -1793,6 +1794,8 @@ def test_every_step_the_tables_look_for_is_one_a_job_runs():
              dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="pipeline"),
              dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="pipeline",
                      PP_SPLITS="even 8,4 auto"),
+             dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="megatron",
+                     MEGATRON_PATH="/opt/megatron-core"),
              dry_run(KIT / "explorer" / "dp_baseline.sbatch"),
              dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="4"),
              dry_run(KIT / "mixed" / "node.sh", ROLE="master", MASTER_ADDR="10.0.0.1",
@@ -3059,6 +3062,41 @@ def test_setup_rocm_builds_its_venv_when_no_rocm_venv_exists_yet(tmp_path):
                              capture_output=True, text=True, timeout=60)
     assert refused.returncode == 1 and "wrapper scripts" in refused.stderr
     assert "4242" not in refused.stderr + refused.stdout
+
+
+# ---- Megatron-Core's pipeline: megatron_pp.py ---------------------------------------------
+
+def test_megatron_tokens_follow_the_rule_and_the_seed():
+    x, y = megatron_pp.batch(3, 4, 16, 1024, seed=0)
+    again, _ = megatron_pp.batch(3, 4, 16, 1024, seed=0)
+    assert torch.equal(x, again) and torch.equal(x[:, 1:], y[:, :-1])
+    assert (((y - (x * 7 + 13)) % 1024) < 4).all()
+    assert not torch.equal(x, megatron_pp.batch(4, 4, 16, 1024, seed=0)[0])
+
+
+def test_megatron_stages_take_the_whole_models_weights():
+    full = {"embedding.word_embeddings.weight": torch.zeros(1),
+            **{f"decoder.layers.{i}.mlp.weight": torch.full((1,), float(i)) for i in range(4)},
+            "decoder.final_layernorm.weight": torch.ones(1), "output_layer.weight": torch.ones(2)}
+    last = {"decoder.layers.0.mlp.weight": None, "decoder.layers.1.mlp.weight": None,
+            "decoder.layers.1.mlp._extra_state": "own", "decoder.final_layernorm.weight": None,
+            "output_layer.weight": None}
+    out = megatron_pp.stage_weights(full, last, offset=2)
+    assert out["decoder.layers.0.mlp.weight"] is full["decoder.layers.2.mlp.weight"]
+    assert out["decoder.layers.1.mlp.weight"] is full["decoder.layers.3.mlp.weight"]
+    assert out["output_layer.weight"] is full["output_layer.weight"]
+    assert out["decoder.layers.1.mlp._extra_state"] == "own" and set(out) == set(last)
+
+
+def test_step_07_megatron_runs_one_stage_then_two():
+    result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="megatron",
+                     MEGATRON_PATH="/opt/megatron-core", MEGATRON_STEPS="50")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.index("[megatron_pp1]") < result.stdout.index("[megatron_pp2]")
+    lines = [line for line in result.stdout.splitlines() if "megatron_pp.py" in line]
+    assert len(lines) == 2
+    assert "--het-group=0" in lines[0] and "--pipeline 1" in lines[0] and "--steps 50" in lines[0]
+    assert "--pipeline 2" in lines[1] and "--nnodes=2" in lines[1]
 
 
 # ---- pipeline training: train_pipeline.py ------------------------------------------------
