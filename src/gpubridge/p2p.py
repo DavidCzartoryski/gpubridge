@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import queue
 import threading
 import time
@@ -19,6 +20,21 @@ import torch
 import torch.distributed as dist
 
 from gpubridge.work import Work
+from gpubridge.config import parse_size
+from gpubridge.staging import make_staging
+
+CHUNK_BYTES_ENV = "GPUBRIDGE_P2P_CHUNK_BYTES"
+
+
+def chunk_bytes_setting() -> int:
+    """Zero means one whole message; a positive setting uses two staging slots."""
+    raw = os.environ.get(CHUNK_BYTES_ENV, "").strip()
+    if not raw:
+        return 0
+    size = parse_size(raw)
+    if size < 8 or size % 8:
+        raise ValueError(f"{CHUNK_BYTES_ENV} must be a positive multiple of 8 bytes")
+    return size
 
 
 class TorchWork(dist.Work):
@@ -80,9 +96,11 @@ class Engine:
     """
 
     def __init__(self, link, device: torch.device, rank: int, store,
-                 timeout: timedelta | None) -> None:
+                 timeout: timedelta | None, *, pinned: bool = False,
+                 chunk_bytes: int = 0) -> None:
         self.link, self.device, self.rank, self.store = link, device, rank, store
         self.timeout = (timeout or timedelta(minutes=30)).total_seconds()
+        self.pinned, self.chunk_bytes = pinned, chunk_bytes
         self._lock = threading.RLock()
         self._lanes: dict[tuple[int, int, bool], _Lane] = {}
         self._pending: set[Work] = set()
@@ -154,7 +172,8 @@ class Engine:
         src, dst = (self.rank, peer) if sending else (peer, self.rank)
         prefix = f"{src}/{dst}/{tag}/{seq}"
         mine, theirs = (("send", "recv") if sending else ("recv", "send"))
-        descriptor = json.dumps([tensor.numel() * tensor.element_size(), str(tensor.dtype)])
+        descriptor = json.dumps([tensor.numel() * tensor.element_size(), str(tensor.dtype),
+                                 self.chunk_bytes])
         self.store.set(f"{prefix}/{mine}", descriptor)
         key = f"{prefix}/{theirs}"
         while not self.store.check([key]):
@@ -230,8 +249,54 @@ class _Lane:
         # Byte views cover every dense dtype, including types Gloo cannot carry
         # natively. The GPU copy runs after the caller's readiness event.
         flat = tensor.reshape(-1).view(torch.uint8)
+        if self.engine.pinned or self.engine.chunk_bytes:
+            self._pipeline(flat, deadline)
+            return
         host = flat.cpu() if self.sending else torch.empty(flat.numel(), dtype=torch.uint8)
         request = self.engine.link.post(host, self.peer, self.tag, self.sending)
         request.wait(timedelta(seconds=max(0.001, deadline - time.monotonic())))
         if not self.sending:
             flat.copy_(host)
+
+    def _pipeline(self, flat: torch.Tensor, deadline: float) -> None:
+        """Two slots overlap copies and wire transfers; slots are never reused early."""
+        size = self.engine.chunk_bytes or max(8, flat.numel())
+        chunks = list(flat.split(size)) if flat.numel() else [flat]
+        staging = make_staging(flat.device, size, min(2, len(chunks)))
+        staging.begin(flat)
+        try:
+            if self.sending:
+                prepared = {}
+
+                def prepare(i):
+                    host = staging.slot(i % 2, chunks[i])
+                    prepared[i] = host, staging.to_host(host, chunks[i], None)
+
+                for i in range(min(2, len(chunks))):
+                    prepare(i)
+                for i in range(len(chunks)):
+                    host, ready = prepared.pop(i)
+                    staging.wait_host(ready)  # the network may now read the host slot
+                    request = self.engine.link.post(host, self.peer, self.tag, True)
+                    request.wait(timedelta(seconds=max(0.001, deadline - time.monotonic())))
+                    if i + 2 < len(chunks):
+                        prepare(i + 2)  # the previous send no longer reads this slot
+            else:
+                posted, copied = {}, [None, None]
+
+                def receive(i):
+                    staging.wait_host(copied[i % 2])  # before the network overwrites it
+                    host = staging.slot(i % 2, chunks[i])
+                    posted[i] = host, self.engine.link.post(host, self.peer, self.tag, False)
+
+                for i in range(min(2, len(chunks))):
+                    receive(i)
+                for i, chunk in enumerate(chunks):
+                    host, request = posted.pop(i)
+                    request.wait(timedelta(seconds=max(0.001, deadline - time.monotonic())))
+                    copied[i % 2] = staging.to_device(chunk, host)
+                    if i + 2 < len(chunks):
+                        receive(i + 2)
+                staging.end(copied[(len(chunks) - 1) % 2])
+        finally:
+            staging.close()

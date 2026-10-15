@@ -182,6 +182,10 @@ hardware.
 
 ### Added
 
+- Opt-in P2P pinned staging (`GPUBRIDGE_PINNED_STAGING`) and two-slot chunked
+  staging (`GPUBRIDGE_P2P_CHUNK_BYTES`), with lazy-copy ordering mutation tests.
+  CPU only; no GPU overlap or speedup measured.
+
 - Torch backend point-to-point operations: native calls within an island and
   independent host-staged Gloo lanes across islands, including asynchronous
   and batched calls, tag matching, size/dtype checks and bounded teardown.

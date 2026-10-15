@@ -415,7 +415,8 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
                 assert self._p2p_store is not None
                 self._p2p = _p2p.Engine(topology.transport.create_p2p(topology.world_group),
                                         topology.device, topology.rank, self._p2p_store,
-                                        self._timeout)
+                                        self._timeout, pinned=topology.pinned_staging,
+                                        chunk_bytes=_p2p.chunk_bytes_setting())
         work = self._p2p.submit(tensor, global_peer, tag, sending)
         return _p2p.TorchWork(work, peer if not sending else self.rank())
 

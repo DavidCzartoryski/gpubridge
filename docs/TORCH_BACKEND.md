@@ -345,6 +345,16 @@ another process group. Collective-only custom transports need to implement
 the optional hook before carrying cross-island P2P. UCX P2P is not implemented
 in this change.
 
+`GPUBRIDGE_PINNED_STAGING=1` uses pinned host buffers on GPUs. Setting
+`GPUBRIDGE_P2P_CHUNK_BYTES=4M` instead enables two-slot chunked staging, also
+pinned on GPU: copying the next chunk can overlap the current transfer, and
+copying received chunks back can overlap the following receive. This setting
+must be the same at both endpoints and is checked in the message handshake.
+Unset means one whole message; it does not inherit the collective policy's
+chunk size. CPU tests use the same schedule without pinning. P2P is always
+bit-exact and does not apply collective gradient compression. No GPU overlap
+or speedup has been measured.
+
 - **Matching.** Across islands, a message matches by group, source,
   destination and tag (integer `0` through `2**31 - 1`). Same-tag sends and
   receives match in posting order within each direction of a pair. Different
