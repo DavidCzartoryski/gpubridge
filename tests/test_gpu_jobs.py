@@ -70,13 +70,15 @@ END_TO_END = {
     "explorer/06_scaling.sbatch": "test_step_06_scaling",
     "explorer/07_mixed_hetjob.sbatch": "test_step_07_mixed_hetjob, test_step_07_training_only, "
                                        "test_step_07_multi, test_step_07_data_parallel, "
-                                       "test_step_07_pipeline",
+                                       "test_step_07_pipeline, "
+                                       "test_step_07_multi_trains_data_parallel_and_pipelined",
     "explorer/08_bench_matrix.sbatch": "test_step_08_*",
     "explorer/net_check.sbatch": "test_net_check_job",
     "explorer/train_bench.sbatch": "test_train_bench_job, test_train_multi_job",
     "explorer/dp_baseline.sbatch": "test_dp_baseline_job",
     "explorer/amd_node.sbatch": "test_amd_node_job",
-    "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines, mixed/containers.sh",
+    "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines, "
+                     "test_mixed_node_script_leaves_out_what_is_set_empty, mixed/containers.sh",
     "mixed/containers.sh": "test_mixed_containers_dry_run (the containers need Docker: run it "
                            "by hand, see the runbook)",
     "amd/run_all.sh": "test_gpu_kit.py: test_amd_script_keeps_going_*",
@@ -496,6 +498,22 @@ def test_step_07_pipeline(tmp_path):
     assert runs["pp_gpipe"]["microbatches"] == 2 and len(runs["pp_gpipe"]["losses"]) == 4
 
 
+@pytest.mark.parametrize("mode, out_dir, record", [("dp", "07_mixed_hetjob_dp", "dp_ddp.json"),
+                                                   ("pipeline", "07_mixed_hetjob_pp",
+                                                    "pp_1f1b.json")])
+def test_step_07_multi_trains_data_parallel_and_pipelined(tmp_path, mode, out_dir, record):
+    # With multigpu access: train_dp.py and train_pipeline.py with an NVIDIA island of two
+    # GPUs and the AMD side, three ranks (the pipeline in three stages).
+    code = submit(tmp_path, "07-multi", AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
+                  GPU_TYPE_MULTI="v100-sxm2", GPUS_MIXED_NVIDIA_MULTI="2", STEPS_07=mode,
+                  DP_RUNS="ddp", PP_RUNS="1f1b", PP_MICROBATCHES="4", PP_ARGS="--probe-trials 1",
+                  FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
+                  FAKE_SLURM_HET_ENV_1="GPUBRIDGE_VENDOR=amd", **SMALL_DP)
+    out = tmp_path / "results" / out_dir
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    assert json.loads((out / record).read_text())["world_size"] == 3
+
+
 def test_dp_baseline_job(tmp_path):
     code = submit(tmp_path, "dp-baseline", DP_MICRO="2", **SMALL_DP)
     out = tmp_path / "results" / "dp_baseline_nvidia"
@@ -711,7 +729,9 @@ def test_mixed_node_script_on_two_pretend_machines(tmp_path):
               "TORCH_FLAVOR": "system", "RUN_ID": f"test-{os.getpid()}",
               "BENCH_MAX_BYTES": "16K", "RESULTS_ROOT": str(tmp_path / "results"),
               "VENV": sys.prefix, "KIT_TIMEOUT": "120", "TRAIN_BENCH_MODELS": "tiny-gpt",
-              "TRAIN_BENCH_ARGS": "--steps 2 --warmup-steps 1 --comm-trials 1"}
+              "TRAIN_BENCH_ARGS": "--steps 2 --warmup-steps 1 --comm-trials 1",
+              **SMALL_DP, "DP_RUNS": "ddp ddp-fp8", "PP_RUNS": "1f1b", "PP_MICROBATCHES": "2",
+              "PP_ARGS": "--probe-trials 1"}
     procs = {
         role: subprocess.Popen(["bash", str(KIT / "mixed" / "node.sh")],
                                env=clean_env(ROLE=role, TARGET=role, GPUBRIDGE_VENDOR=vendor,
@@ -729,14 +749,40 @@ def test_mixed_node_script_on_two_pretend_machines(tmp_path):
         assert "verdict: every step that ran passed" in (out / "triage.txt").read_text()
         alone = json.loads((out / "train_bench_alone_tiny-gpt.json").read_text())
         assert alone["world_size"] == 1
+        baseline = json.loads((out / "dp_single.json").read_text())
+        assert baseline["mode"] == "single" and len(baseline["losses"]) == 4
     # The two machines together: rank 0 writes the record. torchrun numbers the
     # machines by address, then process id, not by role: here (one address) rank 0
     # is on whichever machine started its torchrun first.
-    records = [tmp_path / "results" / role / "train_bench_tiny-gpt.json" for role in procs]
-    written = [path for path in records if path.exists()]
-    assert len(written) == 1, records
-    both = json.loads(written[0].read_text())
+    def together(name: str) -> dict:
+        records = [tmp_path / "results" / role / name for role in procs]
+        written = [path for path in records if path.exists()]
+        assert len(written) == 1, records
+        return json.loads(written[0].read_text())
+
+    both = together("train_bench_tiny-gpt.json")
     assert both["world_size"] == 2 and both["params_identical"]
+    for run, compression in (("ddp", "none"), ("ddp-fp8", "fp8")):
+        dp = together(f"dp_{run}.json")
+        assert dp["world_size"] == 2 and dp["compression"] == compression
+        assert dp["param_checks"] and all(c["identical"] for c in dp["param_checks"])
+    pp = together("pp_1f1b.json")
+    assert pp["world_size"] == 2 and len(pp["losses"]) == 4
+
+
+def test_mixed_node_script_leaves_out_what_is_set_empty(tmp_path):
+    result = subprocess.run(["bash", str(KIT / "mixed" / "node.sh"), "--dry-run"],
+                            env=clean_env(ROLE="master", MASTER_ADDR="127.0.0.1",
+                                          LOCAL_ADDR="127.0.0.1", IFNAME=loopback(), NPROC="1",
+                                          SKIP_SETUP="1", TORCH_FLAVOR="system",
+                                          VENV=sys.prefix, RESULTS_ROOT=str(tmp_path),
+                                          TRAIN_BENCH_MODELS="", DP_RUNS="", PP_RUNS=""),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    printed = result.stdout + result.stderr
+    assert "bench_all_reduce.py" in printed
+    for script in ("train_bench.py", "train_dp.py", "train_pipeline.py"):
+        assert script not in printed, script
 
 
 def test_mixed_containers_dry_run(tmp_path):
@@ -749,7 +795,8 @@ def test_mixed_containers_dry_run(tmp_path):
     for line, role, vendor, ip in zip(runs, ("master", "worker"), ("nvidia", "amd"),
                                       ("10.9.8.10", "10.9.8.11")):
         for part in (f"--ip {ip}", f"ROLE={role}", f"GPUBRIDGE_VENDOR={vendor}",
-                     "MASTER_ADDR=10.9.8.10", "IFNAME=eth0", "scripts/gpu/mixed/node.sh"):
+                     "MASTER_ADDR=10.9.8.10", "IFNAME=eth0", "-e DP_RUNS", "-e PP_RUNS",
+                     "-e PP_MICROBATCHES", "scripts/gpu/mixed/node.sh"):
             assert part in line, (part, line)
     assert "triage.py /out/master" in result.stderr and "triage.py /out/worker" in result.stderr
 

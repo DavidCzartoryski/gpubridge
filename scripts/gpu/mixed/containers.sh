@@ -12,8 +12,9 @@
 #
 # Settings: NPROC (ranks per machine, default 2), CPUS (per container, default 2),
 # BENCH_MAX_BYTES (default 1M), TRAIN_BENCH_MODELS (default "tiny-gpt tiny-resnet"),
-# TRAIN_BENCH_ARGS, KIT_TIMEOUT (default 600 s a step), IMAGE, SUBNET (a /24 for the
-# network, default 10.231.0.0/24). Writes OUT/{master,worker}/ and their .tgz, each
+# TRAIN_BENCH_ARGS, the data-parallel and pipeline runs' DP_* and PP_* (default: llama-tiny,
+# 4 steps), KIT_TIMEOUT (default 600 s a step), IMAGE, SUBNET (a /24 for the network,
+# default 10.231.0.0/24). Writes OUT/{master,worker}/ and their .tgz, each
 # container's log, and triage.txt (both machines). Exits 1 if either machine failed.
 # With Colima or Docker Desktop, the repo and OUT must be in a directory the VM shares
 # (your home directory, by default); elsewhere the results stay inside the VM.
@@ -29,8 +30,11 @@ MASTER_IP=$prefix.10
 WORKER_IP=$prefix.11
 NET=gpubridge-mixed-$$
 export NPROC=${NPROC:-2} BENCH_MAX_BYTES=${BENCH_MAX_BYTES:-1M}
-export TRAIN_BENCH_MODELS=${TRAIN_BENCH_MODELS:-tiny-gpt tiny-resnet}
+export TRAIN_BENCH_MODELS=${TRAIN_BENCH_MODELS-tiny-gpt tiny-resnet}
 export TRAIN_BENCH_ARGS=${TRAIN_BENCH_ARGS:-} KIT_TIMEOUT=${KIT_TIMEOUT:-600}
+export DP_MODEL=${DP_MODEL:-llama-tiny} DP_STEPS=${DP_STEPS:-4} DP_GLOBAL_BATCH=${DP_GLOBAL_BATCH:-4}
+export DP_SEQ=${DP_SEQ:-16} DP_ARGS=${DP_ARGS:---check-every 2 --probe-steps 1 --comm-trials 1}
+export PP_ARGS=${PP_ARGS:---probe-trials 1}
 CPUS=${CPUS:-2}
 
 run() {
@@ -65,7 +69,9 @@ for role in master worker; do
         -e ROLE="$role" -e MASTER_ADDR="$MASTER_IP" -e IFNAME=eth0 -e SKIP_SETUP=1 \
         -e TORCH_FLAVOR=system -e VENV=/venv -e GPUBRIDGE_VENDOR="$vendor" -e TARGET="$role" \
         -e RESULTS_ROOT=/out -e RUN_ID="containers-$$" -e NPROC -e BENCH_MAX_BYTES \
-        -e TRAIN_BENCH_MODELS -e TRAIN_BENCH_ARGS -e KIT_TIMEOUT \
+        -e TRAIN_BENCH_MODELS -e TRAIN_BENCH_ARGS -e KIT_TIMEOUT -e DP_MODEL -e DP_STEPS \
+        -e DP_GLOBAL_BATCH -e DP_SEQ -e DP_MICRO -e DP_RUNS -e DP_KERNELS_ON_AMD -e DP_ARGS \
+        -e PP_RUNS -e PP_MICROBATCHES -e PP_ARGS \
         "$IMAGE" bash scripts/gpu/mixed/node.sh >/dev/null
 done
 
