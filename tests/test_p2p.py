@@ -17,6 +17,8 @@ from _staging import LazyStaging
 
 from gpubridge import topology
 from gpubridge import p2p
+from gpubridge import torch_backend
+from gpubridge import batch_isend_irecv
 from gpubridge.config import VENDOR_ENV
 from gpubridge.torch_backend import GpubridgeProcessGroup
 
@@ -77,7 +79,7 @@ def test_every_pair_sizes_and_dtypes(vendors, labels, tmp_path):
     run(vendors, _all_pairs, tmp_path, labels=labels)
 
 
-def _tags_and_batches(rank, world):
+def _tags_and_batches(rank, world, helper=False):
     dist.barrier()
     peer = 1 - rank
     # Different tags may be received in the opposite order. A single worker
@@ -98,7 +100,7 @@ def _tags_and_batches(rank, world):
     for seq in range(12):
         ops.extend([dist.P2POp(dist.irecv, receive[seq], peer, tag=99),
                     dist.P2POp(dist.isend, _payload(257, torch.int64, rank, seq), peer, tag=99)])
-    for work in dist.batch_isend_irecv(ops):
+    for work in (batch_isend_irecv if helper else dist.batch_isend_irecv)(ops):
         work.wait()
     for seq, t in enumerate(receive):
         assert torch.equal(t, _payload(257, torch.int64, peer, seq)), seq
@@ -107,6 +109,10 @@ def _tags_and_batches(rank, world):
 
 def test_out_of_order_tags_and_full_duplex_batch_fifo(tmp_path):
     run(["nvidia", "amd"], _tags_and_batches, tmp_path)
+
+
+def test_explicit_batch_helper_on_old_and_new_torch(tmp_path):
+    run(["nvidia", "amd"], partial(_tags_and_batches, helper=True), tmp_path)
 
 
 @pytest.mark.parametrize("settings", [{"GPUBRIDGE_PINNED_STAGING": "1"},
@@ -398,3 +404,47 @@ def test_tag_range_is_checked_without_a_process_group():
     pg = GpubridgeProcessGroup(0, 2, "unit", None)
     with pytest.raises(ValueError, match="tag"):
         pg.send([torch.empty(1)], 1, 2**31)
+
+
+def _check_native_grouping(monkeypatch, mutation):
+    log = []
+
+    class Native:
+        active = False
+
+        def _start_coalescing(self, device):
+            log.append("start")
+            self.active = not mutation
+
+        def _end_coalescing(self, device):
+            log.append("end")
+            self.active = False
+            return torch_backend._completed([])
+
+    native = Native()
+    device = torch.device("cuda:0")
+    tensor = SimpleNamespace(device=device, layout=torch.strided, is_contiguous=lambda: True)
+    pg = GpubridgeProcessGroup(0, 2, "unit-native", None)
+    topo = SimpleNamespace(device=device, island=SimpleNamespace(ranks=(0, 1)),
+                           island_group=native)
+    monkeypatch.setattr(torch_backend, "_owner", pg)
+    monkeypatch.setattr(pg, "_topology", lambda: topo)
+
+    def post(kind, *args, **kwargs):
+        assert native.active, "native P2P was posted outside its NCCL/RCCL batch"
+        log.append(kind)
+        return torch_backend._completed([])
+
+    monkeypatch.setattr(dist, "isend", partial(post, "send"))
+    monkeypatch.setattr(dist, "irecv", partial(post, "recv"))
+    pg._start_coalescing(device)
+    pg.send([tensor], 1, 7)
+    pg.recv([tensor], 1, 7)
+    pg._end_coalescing(device).wait()
+    assert log == ["start", "send", "recv", "end"]
+
+
+def test_native_gpu_posts_are_grouped_and_mutation_is_detected(monkeypatch):
+    _check_native_grouping(monkeypatch, False)
+    with pytest.raises(AssertionError, match="outside its NCCL/RCCL batch"):
+        _check_native_grouping(monkeypatch, True)

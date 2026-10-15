@@ -182,6 +182,10 @@ hardware.
 
 ### Added
 
+- Native P2P batch coalescing for the torch backend, plus an explicit
+  `gpubridge.batch_isend_irecv` helper for torch 2.8, whose batch function
+  excludes Python process groups from coalescing. CPU tested; GPU unvalidated.
+
 - Opt-in P2P pinned staging (`GPUBRIDGE_PINNED_STAGING`) and two-slot chunked
   staging (`GPUBRIDGE_P2P_CHUNK_BYTES`), with lazy-copy ordering mutation tests.
   CPU only; no GPU overlap or speedup measured.
