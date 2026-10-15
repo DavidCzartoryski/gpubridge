@@ -22,6 +22,9 @@
 #   08-nvidia-pair, 08-amd-pair   the matrix's native baselines and same-vendor
 #          bridge, two V100s or two MI50s     refused until SAME_PARTITION_PAIRS_OK=1
 #   train-nvidia, train-amd   training throughput on one GPU alone (train_bench.py)
+#   train-multi   the same on 1 GPU, then GPUS_TRAIN_MULTI GPUs as one island and as two
+#          bridged halves (split test)                        multigpu
+#   07-multi   step 07 with GPUS_MIXED_NVIDIA_MULTI NVIDIA GPUs (multigpu) + the AMD side
 #
 # See docs/GPU_VALIDATION_RUNBOOK.md for what each step proves.
 set -euo pipefail
@@ -52,6 +55,10 @@ GPUS_PER_NODE_MULTINODE="${GPUS_PER_NODE_MULTINODE:-2}"
 PARTITION_MIXED_NVIDIA="${PARTITION_MIXED_NVIDIA:-$PARTITION_1GPU}"
 GPUS_MIXED_NVIDIA="${GPUS_MIXED_NVIDIA:-1}"  # the gpu partition allows 1 GPU per job
 GPUS_MIXED_AMD="${GPUS_MIXED_AMD:-1}"
+# With multigpu access: several GPUs per island. train-multi's node (one island of N, then
+# two of N/2: an even count) and 07-multi's NVIDIA side.
+GPUS_TRAIN_MULTI="${GPUS_TRAIN_MULTI:-4}"
+GPUS_MIXED_NVIDIA_MULTI="${GPUS_MIXED_NVIDIA_MULTI:-4}"
 GPUS_AMD_NODE="${GPUS_AMD_NODE:-1}"        # step amd; 2+ adds an RCCL island and split test
 TIME_SETUP="${TIME_SETUP:-01:00:00}"
 TIME_01="${TIME_01:-00:10:00}"
@@ -65,6 +72,7 @@ TIME_AMD="${TIME_AMD:-00:30:00}"
 TIME_NET="${TIME_NET:-00:10:00}"
 TIME_08="${TIME_08:-00:40:00}"
 TIME_TRAIN="${TIME_TRAIN:-00:30:00}"
+TIME_TRAIN_MULTI="${TIME_TRAIN_MULTI:-01:00:00}"
 # Each job's STEP_TIMEOUT (common.sh: the limit on each launch) is capped at its
 # Slurm limit less STEP_MARGIN seconds, so a stuck launch is stopped and recorded
 # as timed out before Slurm ends the job.
@@ -321,11 +329,26 @@ train-amd)
     export TRAIN_SIDE=amd
     submit train_bench.sbatch "$TIME_TRAIN" 1 1 "$PARTITION_AMD" "$AMD_TYPE"
     ;;
+train-multi)
+    [ $((GPUS_TRAIN_MULTI % 2)) = 0 ] && [ "$GPUS_TRAIN_MULTI" -ge 2 ] ||
+        die "GPUS_TRAIN_MULTI must be even (two halves), not $GPUS_TRAIN_MULTI"
+    export TRAIN_SIDE=nvidia TRAIN_GPUS=$GPUS_TRAIN_MULTI
+    submit train_bench.sbatch "$TIME_TRAIN_MULTI" 1 "$GPUS_TRAIN_MULTI" "$PARTITION_MULTI" \
+        "$GPU_TYPE_MULTI"
+    ;;
+07-multi)
+    amd_gate
+    export GPUS_MIXED_NVIDIA=$GPUS_MIXED_NVIDIA_MULTI
+    gpu_request "$PARTITION_MULTI" "$GPU_TYPE_MULTI" 1 "$GPUS_MIXED_NVIDIA" "$TIME_07"
+    nvidia=("${REQUEST[@]}")
+    gpu_request "$PARTITION_AMD" "$AMD_TYPE" 1 "$GPUS_MIXED_AMD" "$TIME_07"
+    sbatch_job 07_mixed_hetjob 07_mixed_hetjob.sbatch "${nvidia[@]}" : "${REQUEST[@]}"
+    ;;
 free | multi)
     # DRY_RUN is exported, so the recursive calls inherit --dry-run.
     steps=(01 02)
     [ "${ARGS[0]}" = multi ] && steps=(03 04 05 06)
     for s in "${steps[@]}"; do "$0" "$s"; done
     ;;
-*) sed -n '2,26p' "$0" >&2; exit 2 ;;
+*) sed -n '2,29p' "$0" >&2; exit 2 ;;
 esac

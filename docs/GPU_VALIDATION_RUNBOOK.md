@@ -270,6 +270,8 @@ squeue -u "$USER"                               # wait for them
 cat results/explorer/02_split_shared_gpu/check/summary.md
 # after multigpu access:
 scripts/gpu/explorer/submit.sh multi            # steps 03 to 06
+scripts/gpu/explorer/submit.sh train-multi      # training throughput: 1 GPU, 4 as one island, 2 + 2
+scripts/gpu/explorer/submit.sh 07-multi         # step 07 with 4 NVIDIA GPUs + the AMD side
 ```
 
 **Your settings.** Every step except 00 needs `PROJECT_DIR`, your group's
@@ -363,7 +365,8 @@ runs each phase as one heterogeneous job step (`srun --het-group=0 ... :
 **Per-island baselines need 2+ GPUs per island.** With one GPU, an island's
 all_reduce has nothing to exchange, so its row only times the call itself.
 `gpu` allows one GPU per job. For real baselines, set `GPUS_MIXED_AMD=2`, and,
-with multigpu access, `PARTITION_MIXED_NVIDIA=multigpu GPUS_MIXED_NVIDIA=2`.
+with multigpu access, use `submit.sh 07-multi`: the NVIDIA side on `multigpu`
+with `GPUS_MIXED_NVIDIA_MULTI` GPUs (4 by default, of `GPU_TYPE_MULTI`).
 
 Also check with RC before the first real run:
 
@@ -571,7 +574,15 @@ adds `accumulate`, `micro_batch_sizes`, `samples_per_step` and the
 compute, ddp and comm-alone phases, the caching allocator's peaks
 (`max_allocated_mib`, `max_reserved_mib`) and the allocations it retried after
 freeing its cache (`alloc_retries`, a sign it ran short), and the GPU's
-`total_mib`. Both models need BLAS on every GPU (the probe's `blas_available`):
+`total_mib`.
+With multigpu access, `submit.sh train-multi` runs each model on one GPU, on
+`GPUS_TRAIN_MULTI` GPUs (4 by default) as one NCCL island, then on the same GPUs
+split into two islands joined by the bridge (`train_bench_<model>_split`, a
+split test): what several GPUs per island cost through the bridge, against the
+same GPUs on NCCL alone. `submit.sh 07-multi` does the same across vendors
+(several NVIDIA GPUs, one island, and the AMD side). Pipeline-parallel training
+isn't in the kit yet.
+Both models need BLAS on every GPU (the probe's `blas_available`):
 with a ROCm build whose rocBLAS lacks the GPU's kernels, its rank aborts at the
 first matmul, as the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
 
