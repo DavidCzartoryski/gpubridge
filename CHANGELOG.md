@@ -225,6 +225,22 @@ hardware.
 
 ### Added
 
+- Pipeline training across vendors: `scripts/gpu/train_pipeline.py` cuts
+  `llama.py`'s model into contiguous stages, one per rank, and trains it with
+  torch's GPipe or 1F1B through `backend="gpubridge"`'s point-to-point (or on a
+  plain Gloo group, the reference). It records every step's loss and time,
+  each stage's compute alone, the time an activation takes to arrive from the
+  previous stage, and idle-time and bubble estimates. Step 07's
+  `STEPS_07=pipeline`; `dp_report.py` reads its records too;
+  docs/PIPELINE.md; HARDWARE_VALIDATION.md item 34. On CPU: bit for bit like
+  plain Gloo (2 stages, and 4 over 2 + 2 islands), within 1e-4 of one process,
+  on torch 2.8.0, 2.9.1 and 2.14.1. Every rank needs the same PyTorch release
+  (2.14.1's stage setup doesn't match 2.9.1's), checked up front, and 2.9's
+  int64 handshake goes as a float32, as in 2.14.1. On a V100 and an MI50
+  (Explorer, both on 2.9.1, 1,000 steps): 13,115 tokens/s with GPipe and
+  13,051 with 1F1B, 1.05x and 1.04x the V100 alone with the same 4
+  micro-batches; over the last 100 steps 1F1B is within the spread of four
+  one-V100 runs, GPipe 0.02 above it after a later drop (#81).
 - `bridge="multitcp"`, an opt-in bridge transport over several TCP connections
   per pair of leaders (`GPUBRIDGE_MULTITCP_STREAMS`, 4), from a small Rust
   library (`src/gpubridge/multitcp/crate`, standard library only, a C interface
@@ -286,8 +302,20 @@ hardware.
   across ranks; tokens/s and DDP's step split; batch shares by GPU speed with
   sample-weighted averaging), step 07's `STEPS_07=dp`, `submit.sh dp-baseline`
   and `scripts/gpu/dp_report.py` (the runs against the baseline, with the loss
-  curves as CSV and SVG). CPU only so far; HARDWARE_VALIDATION.md item 33
-  (#67).
+  curves as CSV and SVG); HARDWARE_VALIDATION.md item 33. On a V100 and an
+  MI50 (Explorer, `llama-125m`, 1,000 steps): 4,549 tokens/s uncompressed,
+  5,753 with bf16 and 9,523 with fp8 on the bridge (Triton kernels on both
+  GPUs), against 14,264 on the V100 alone; FSDP2 1,809. Shares by speed cut
+  the gap between the GPUs' compute alone from 78 to 9 ms a step without
+  raising tokens/s; the bridge, about 4x the slower GPU's compute, looks like
+  what sets the step. 5, 25 and 100 MB buckets within 3.5%. Uncompressed DDP
+  ends as close to one V100 as V100 runs do to each other; bf16 and fp8 end
+  0.02 to 0.03 above, after a later drop off the loss plateau, about the gap
+  an uncompressed pipeline run left after a similarly late drop; these runs
+  can't separate compression's error from the drop's timing. Parameters
+  identical on both GPUs at every check.
+  docs/BENCHMARKS.md, and docs/COMPRESSION.md's "Training with compression"
+  (#67, #84).
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
   CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA

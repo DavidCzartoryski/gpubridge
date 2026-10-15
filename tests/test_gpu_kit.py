@@ -30,6 +30,7 @@ import preflight  # noqa: E402
 import summarize  # noqa: E402
 import train_bench  # noqa: E402
 import train_dp  # noqa: E402
+import train_pipeline  # noqa: E402
 import validation_tables  # noqa: E402
 
 SHELL_SCRIPTS = sorted(
@@ -533,7 +534,7 @@ def test_mixed_hetjob_step_selection(env, expected):
 
 
 @pytest.mark.parametrize(("env", "message"), [
-    ({"STEPS_07": "hsdp"}, "STEPS_07 must be all, training, bench or dp"),
+    ({"STEPS_07": "hsdp"}, "STEPS_07 must be all, training, bench, dp or pipeline"),
     ({"TRAIN_BENCH_BUCKETS": "10 big"}, "TRAIN_BENCH_BUCKETS: 'big' is not a size in MB"),
     ({"TRAIN_BENCH_BUCKETS": "10", "TRAIN_BENCH_ARGS": "--steps 5 --bucket-mb 5"},
      "in TRAIN_BENCH_BUCKETS or in TRAIN_BENCH_ARGS, not both"),
@@ -1570,6 +1571,7 @@ def test_every_step_the_tables_look_for_is_one_a_job_runs():
     runs = [dry_run(KIT / "explorer" / job, UCX_BRIDGE="1", MULTITCP_BRIDGE="1") for job in sorted(
         p.name for p in (KIT / "explorer").glob("0*.sbatch"))]
     runs += [dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="dp"),
+             dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="pipeline"),
              dry_run(KIT / "explorer" / "dp_baseline.sbatch"),
              dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="4"),
              dry_run(KIT / "mixed" / "node.sh", ROLE="master", MASTER_ADDR="10.0.0.1",
@@ -2352,7 +2354,7 @@ def test_train_bench_rejects_batch_settings_it_cant_honour(args, message):
 def test_llama_models_are_the_stated_sizes():
     assert {n: llama.parameters(n) for n in llama.MODELS} == {
         "llama-125m": 134_105_856, "llama-350m": 373_867_520, "llama-1b": 1_032_931_328,
-        "llama-tiny": 26_784}
+        "llama-tiny": 45_344}
     model = llama.build("llama-tiny")
     assert sum(p.numel() for p in model.parameters()) == llama.parameters("llama-tiny")
 
@@ -2443,4 +2445,108 @@ def test_dp_report_compares_curves_with_the_baseline(tmp_path):
             json.dumps(record("ddp", [3.0])))
     assert sorted(dp_report.load([tmp_path / "jobs"])) == [
         f"jobs/{job}/07_mixed_hetjob_dp/dp_ddp" for job in ("a", "b", "c")]
+
+
+# ---- pipeline training: train_pipeline.py ------------------------------------------------
+
+def test_pipeline_puts_nvidia_stages_first_whatever_the_ranks():
+    assert train_pipeline.stage_order(["nvidia", "amd"]) == [0, 1]
+    assert train_pipeline.stage_order(["amd", "nvidia"]) == [1, 0]
+    assert train_pipeline.stage_order(["amd", "nvidia", "amd", "nvidia"]) == [1, 3, 0, 2]
+    assert train_pipeline.stage_order(["cpu", "cpu"]) == [0, 1]
+
+
+def test_pipeline_needs_one_pytorch_release_on_every_rank():
+    assert train_pipeline.release_mismatch(["2.9.1+cu126", "2.9.1+rocm6.3"]) is None
+    mismatch = train_pipeline.release_mismatch(["2.14.1+cu126", "2.9.1+rocm6.3"])
+    assert "same PyTorch release" in mismatch and "2.14.1+cu126, 2.9.1+rocm6.3" in mismatch
+
+
+def test_pipeline_handshake_sends_float32_as_torch_2_14_does():
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+    sent = SimpleNamespace(op=dist.isend, tensor=torch.tensor(1))  # torch 2.9.1's int64 index
+    received = SimpleNamespace(op=dist.irecv, tensor=torch.zeros(1))
+    stage = SimpleNamespace(_get_init_p2p_neighbors_ops=lambda: [sent, received])
+    train_pipeline.float_handshake(stage)
+    ops = stage._get_init_p2p_neighbors_ops()
+    assert ops[0].tensor.dtype == torch.float32 and ops[0].tensor.tolist() == [1.0]
+    assert ops[1] is received and ops[1].tensor.dtype == torch.float32
+    plain = SimpleNamespace()
+    train_pipeline.float_handshake(plain)  # torch 2.8: no handshake, nothing to change
+    assert not vars(plain)
+
+
+def test_pipeline_splits_blocks_evenly():
+    assert train_pipeline.even_split(12, 2) == [6, 6]
+    assert train_pipeline.even_split(5, 3) == [2, 2, 1]
+    with pytest.raises(ValueError):
+        train_pipeline.even_split(2, 3)
+
+
+def _train_pipeline(tmp_path, name: str, nproc: int, *args: str, **env: str) -> dict:
+    out = tmp_path / f"pp_{name}.json"
+    result = torchrun(nproc, KIT / "train_pipeline.py", "--model", "llama-tiny", "--steps", "8",
+                      "--global-batch", "8", "--seq-len", "16", "--lr", "3e-3",
+                      "--microbatches", "4", "--probe-trials", "1", "--json", str(out), *args,
+                      GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half", **env)
+    assert result.returncode == 0, result.stderr[-3000:]
+    return json.loads(out.read_text())
+
+
+@pytest.mark.parametrize("schedule", ["gpipe", "1f1b"])
+def test_pipeline_through_gpubridge_matches_plain_gloo_bit_for_bit(schedule, tmp_path):
+    # Two stages, one per island: every hop crosses the bridge's point-to-point.
+    bridged = _train_pipeline(tmp_path, f"bridged-{schedule}", 2, "--schedule", schedule)
+    gloo = _train_pipeline(tmp_path, f"gloo-{schedule}", 2, "--schedule", schedule,
+                           "--backend", "gloo")
+    assert bridged["losses"] == gloo["losses"]  # full precision
+    assert bridged["loss_last"] < bridged["loss_first"]
+    assert [r["vendor"] for r in bridged["ranks"]] == ["nvidia", "amd"]
+    assert [r["blocks"] for r in bridged["ranks"]] == [[0, 2], [2, 4]]
+    assert bridged["ranks"][0]["hop_in_ms"] is None and bridged["ranks"][1]["hop_in_ms"] > 0
+    assert bridged["ideal_bubble_fraction"] == round(1 / 5, 4)
+
+
+def test_four_stages_across_two_islands_match_plain_gloo_and_one_process(tmp_path):
+    # 2 + 2: stages 0-1 and 2-3 hop within an island, 1-2 across the bridge.
+    bridged = _train_pipeline(tmp_path, "four", 4, "--split", "1,1,1,1")
+    gloo = _train_pipeline(tmp_path, "four-gloo", 4, "--split", "1,1,1,1", "--backend", "gloo")
+    assert bridged["losses"] == gloo["losses"]
+    assert [r["vendor"] for r in bridged["ranks"]] == ["nvidia", "nvidia", "amd", "amd"]
+    one = tmp_path / "dp_single.json"
+    result = subprocess.run([sys.executable, str(KIT / "train_dp.py"), "--mode", "single",
+                             "--model", "llama-tiny", "--steps", "8", "--global-batch", "8",
+                             "--seq-len", "16", "--lr", "3e-3", "--micro", "4", "--json", str(one)],
+                            env=clean_env(), capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stderr[-3000:]
+    single = json.loads(one.read_text())["losses"]
+    # The same mean gradient over the microbatches, summed in another order.
+    assert max(abs(a - b) for a, b in zip(bridged["losses"], single, strict=True)) < 1e-4
+    report = dp_report.table(dp_report.load([tmp_path]), "single")
+    assert "| four | pipeline-gpipe |" in report
+
+
+def _reversed_pipeline(rank: int, port: int, out: str) -> None:
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank),
+                      WORLD_SIZE="2", LOCAL_RANK=str(rank))
+    train_pipeline.stage_order = lambda vendors: [1, 0]  # stage 0 on rank 1
+    sys.argv = ["train_pipeline.py", "--model", "llama-tiny", "--steps", "6", "--global-batch",
+                "8", "--seq-len", "16", "--lr", "3e-3", "--microbatches", "4", "--probe-trials",
+                "1", "--backend", "gloo", "--split", "3,1", "--json", out]
+    train_pipeline.main()
+
+
+def test_stages_follow_the_stage_order_not_the_ranks(tmp_path):
+    import torch.multiprocessing as mp
+
+    out = tmp_path / "pp_reversed.json"
+    mp.spawn(_reversed_pipeline, args=(_free_port(), str(out)), nprocs=2)
+    reversed_run = json.loads(out.read_text())
+    assert [(r["stage"], r["rank"]) for r in reversed_run["ranks"]] == [(0, 1), (1, 0)]
+    assert [r["blocks"] for r in reversed_run["ranks"]] == [[0, 3], [3, 4]]  # stage order
+    normal = _train_pipeline(tmp_path, "normal", 2, "--steps", "6", "--backend", "gloo",
+                             "--split", "3,1")
+    assert reversed_run["losses"] == normal["losses"]  # the same pipeline, bit for bit
 

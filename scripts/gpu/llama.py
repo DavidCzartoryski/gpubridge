@@ -10,7 +10,7 @@ stages. Sizes (parameters counted by :func:`parameters`):
 - ``llama-125m``: width 768, 12 blocks, 12 heads, MLP 2048, vocabulary 32000: 134M.
 - ``llama-350m``: width 1024, 24 blocks, 16 heads, MLP 2816: 374M.
 - ``llama-1b``: width 2048, 20 blocks, 32 heads with 8 key/value heads, MLP 5632: 1.03B.
-- ``llama-tiny``: width 32, 2 blocks, for CPU tests.
+- ``llama-tiny``: width 32, 4 blocks (enough for a 4-stage pipeline), for CPU tests.
 
 Each fits a 32 GB V100 or MI50 with float32 AdamW states at a few sequences per GPU
 (llama-1b: 16 GB of weights, gradients and optimizer state).
@@ -53,7 +53,7 @@ MODELS: dict[str, LlamaConfig] = {
                               vocab=32000, context=2048),
     "llama-1b": LlamaConfig(width=2048, blocks=20, heads=32, kv_heads=8, mlp=5632,
                             vocab=32000, context=2048),
-    "llama-tiny": LlamaConfig(width=32, blocks=2, heads=4, kv_heads=2, mlp=64, vocab=128,
+    "llama-tiny": LlamaConfig(width=32, blocks=4, heads=4, kv_heads=2, mlp=64, vocab=128,
                               context=64),
 }
 

@@ -440,8 +440,37 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     record tokens/s, the step split and the share of communication backward
     hides. *Status: works on CPU in simulation mode: DDP, uneven shares and
     FSDP2 within 1e-4 of one process over 12 steps, fp8 within 0.05
-    (`tests/test_gpu_kit.py`). Not run on GPUs.* *Step:* `dp_*` in Explorer
-    step 07 with `STEPS_07=dp`, and `dp_single` in `submit.sh dp-baseline`.
+    (`tests/test_gpu_kit.py`). On a V100 and an MI50 (Explorer, 1,000 steps):
+    parameters bit-identical at every check, compressed or not; over the last
+    100 steps uncompressed DDP is 0.0037 to 0.0067 from four one-V100 runs,
+    which are 0.0041 to 0.0056 apart, and bf16 and fp8 0.022 to 0.031, about
+    the gap an uncompressed pipeline run left after a similarly late drop off
+    the loss plateau; compression's error and the drop's timing aren't
+    separated yet (docs/COMPRESSION.md, "Training with compression"); FSDP2
+    ran 500 steps, shares by speed and bucket sizes 100 steps each
+    (docs/BENCHMARKS.md). 500 steps, as
+    planned here, end mid-drop for some runs, so the curves were compared at
+    1,000.* *Step:* `dp_*` in Explorer step 07 with `STEPS_07=dp`, and
+    `dp_single` in `submit.sh dp-baseline`.
+34. **Pipeline training across vendors tracks one GPU.** `train_pipeline.py`
+    (docs/PIPELINE.md): `llama.py`'s model in two stages, the first on the
+    NVIDIA GPU and the second on the AMD one, with torch's GPipe and 1F1B
+    schedules through `backend="gpubridge"`'s point-to-point, 500 steps.
+    Check that the loss curve tracks one V100's with the same global batch,
+    microbatches and seed, and record tokens/s, each stage's compute, its idle
+    time and the time an activation takes to cross the bridge. *Status: works
+    on CPU in simulation mode: bit for bit like the same pipeline on a plain
+    Gloo group (2 stages, and 4 over 2 + 2 islands), within 1e-4 of one
+    process (`tests/test_gpu_kit.py`). On a V100 and an MI50 (Explorer job
+    11109376, both on torch 2.9.1, 1,000 steps): over the last 100 steps 1F1B
+    is as close to four one-V100 runs (0.0036 to 0.0052) as they are to each
+    other (0.0041 to 0.0056), GPipe 0.02 above them after a later drop off
+    the loss plateau; 1.04x to 1.05x the tokens/s of the V100 alone with the
+    same micro-batches (docs/PIPELINE.md).* *Step:* `pp_gpipe`
+    and `pp_1f1b` in Explorer step 07 with `STEPS_07=pipeline`, and
+    `dp_single` in `submit.sh dp-baseline` with `DP_MICRO` set to the
+    microbatches.
+
 35. **The multitcp bridge against the Gloo bridge.** `bridge="multitcp"`
     (docs/RUST_TRANSPORT.md) carries the bridge over several TCP connections
     per pair and reduces each chunk as it arrives. Between two machines, its
@@ -545,6 +574,7 @@ failures count against all six whichever test failed.
 | 30. gpubridge as a torch.distributed backend: DDP and FSDP2 on GPUs | step `verify_fsdp2_backend`; step `train_fsdp2_backend`; step `gpu_tests` | FAIL (9 of 32) |
 | 31. HSDP through the backend: shard within islands, replicate across vendors | step `verify_hsdp_backend`; step `train_hsdp_backend` | FAIL (3 of 3) |
 | 33. Data-parallel training across vendors tracks one GPU, compressed or not | step `dp_(ddp\|fsdp2)(-.+)?`; step `dp_single` | not run |
+| 34. Pipeline training across vendors tracks one GPU | step `pp_(gpipe\|1f1b)`; step `dp_single` | not run |
 | 35. The multitcp bridge against the Gloo bridge | step `multitcp_build`; step `matrix_D-multitcp(-pinned\|-1stream)?` | not run |
 
 Where the FAILs come from:
