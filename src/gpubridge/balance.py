@@ -108,37 +108,45 @@ def profile_layers(layers: Sequence[nn.Module], example: torch.Tensor, device: t
         x = example.to(device)
         costs = []
         for layer in layers:
-            work = copy.deepcopy(layer)  # the layer itself is never moved or run
-            for p in work.parameters():
-                p.grad = None
-            work.to(device)
-            own = {p.untyped_storage().data_ptr() for p in work.parameters()}
-            forward, backward, saved = [], [], []
-            for i in range(warmup + trials):
-                inp = x.detach().requires_grad_(x.is_floating_point())
-                held: dict[int, int] = {}
-
-                def pack(t: torch.Tensor) -> torch.Tensor:
-                    for key, size in _held(t):
-                        if key not in own:
-                            held[key] = size
-                    return t
-
-                with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
-                    out, f_ms = timed(lambda: work(inp))
-                grad = torch.ones_like(out)
-                _, b_ms = timed(lambda: out.backward(grad))
-                if i >= warmup:
-                    forward.append(f_ms)
-                    backward.append(b_ms)
-                    saved.append(sum(held.values()))
-            parameters = sum(p.numel() for p in work.parameters())
-            costs.append(LayerCost(round(statistics.median(forward), 4),
-                                   round(statistics.median(backward), 4),
-                                   out.numel() * out.element_size(),
-                                   parameters * state_bytes_per_parameter, max(saved)))
-            x = out.detach()
+            # Each copy, its graph and its gradients go when _profile_one returns: only the
+            # detached output, the next layer's input, carries on.
+            cost, x = _profile_one(layer, x, device, timed, trials, warmup,
+                                   state_bytes_per_parameter)
+            costs.append(cost)
     return costs
+
+
+def _profile_one(layer: nn.Module, x: torch.Tensor, device: torch.device, timed, trials: int,
+                 warmup: int, state_bytes_per_parameter: int) -> tuple[LayerCost, torch.Tensor]:
+    work = copy.deepcopy(layer)  # the layer itself is never moved or run
+    for p in work.parameters():
+        p.grad = None
+    work.to(device)
+    own = {p.untyped_storage().data_ptr() for p in work.parameters()}
+    forward, backward, saved = [], [], []
+    for i in range(warmup + trials):
+        inp = x.detach().requires_grad_(x.is_floating_point())
+        held: dict[int, int] = {}
+
+        def pack(t: torch.Tensor) -> torch.Tensor:
+            for key, size in _held(t):
+                if key not in own:
+                    held[key] = size
+            return t
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+            out, f_ms = timed(lambda: work(inp))
+        grad = torch.ones_like(out)
+        _, b_ms = timed(lambda: out.backward(grad))
+        if i >= warmup:
+            forward.append(f_ms)
+            backward.append(b_ms)
+            saved.append(sum(held.values()))
+    parameters = sum(p.numel() for p in work.parameters())
+    cost = LayerCost(round(statistics.median(forward), 4), round(statistics.median(backward), 4),
+                     out.numel() * out.element_size(), parameters * state_bytes_per_parameter,
+                     max(saved))
+    return cost, out.detach()
 
 
 def _held(t: torch.Tensor) -> list[tuple[int, int]]:

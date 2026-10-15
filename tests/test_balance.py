@@ -204,6 +204,22 @@ def test_shared_parameters_and_buffers_stay_shared_and_in_place():
 
 def test_a_sparse_inputs_whole_values_storage_counts():
     big = torch.randn(100_000)
-    sparse = torch.sparse_coo_tensor(torch.tensor([[0, 1], [0, 1]]), big[:2], (5, 8))
+    sparse = torch.sparse_coo_tensor(torch.tensor([[0, 1], [0, 1]]), big[:2], (5, 8),
+                                     check_invariants=True)
     costs = balance.profile_layers([nn.Linear(8, 4)], sparse, torch.device("cpu"), trials=1)
     assert costs[0].activation_bytes >= big.untyped_storage().nbytes()
+
+
+def test_each_copy_is_gone_before_the_next_layer_runs():
+    import weakref
+    weights: list = []
+
+    class Seen(nn.Linear):
+        def forward(self, x):
+            alive = [w for w in weights if w() is not None and w() is not self.weight]
+            assert not alive, "an earlier layer's copied weights are still alive"
+            weights.append(weakref.ref(self.weight))
+            return super().forward(x)
+
+    balance.profile_layers([Seen(4, 4), Seen(4, 4), Seen(4, 4)], torch.randn(2, 4),
+                           torch.device("cpu"), warmup=0, trials=1)
