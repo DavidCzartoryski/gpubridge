@@ -118,6 +118,8 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
          [Step("verify_fsdp2_backend"), Step("train_fsdp2_backend"), Step("gpu_tests")]),
     31: ("HSDP through the backend: shard within islands, replicate across vendors",
          [Step("verify_hsdp_backend"), Step("train_hsdp_backend")]),
+    33: ("Data-parallel training across vendors tracks one GPU, compressed or not",
+         [Step(r"dp_(ddp|fsdp2)(-.+)?"), Step("dp_single")]),
 }
 
 

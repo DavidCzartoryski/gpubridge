@@ -428,6 +428,20 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     (`tests/test_torch_backend.py`), and the example's `--hsdp 2` and
     `--verify --hsdp 2` on 4 simulated ranks.* *Step:* `train_hsdp_backend`
     and `verify_hsdp_backend` in Explorer steps 04 and 07.
+33. **Data-parallel training across vendors tracks one GPU, compressed or
+    not.** `train_dp.py` on `llama.py`'s model, 500 steps, the same global
+    batch and seed as one V100 alone: DDP through `gpubridge.ddp_comm_hook`
+    uncompressed, with bf16 and with fp8 (error feedback), FSDP2 through the
+    backend, and DDP with batch shares by GPU speed. Uncompressed and
+    speed-weighted runs should track the single GPU's loss curve closely (the
+    same mean gradient each step, reduced in another order on other hardware);
+    compressed ones within a tolerance to be justified from the measured gaps.
+    Check that the ranks' parameters stay bit-identical (every 50 steps), and
+    record tokens/s, the step split and the share of communication backward
+    hides. *Status: works on CPU in simulation mode: DDP, uneven shares and
+    FSDP2 within 1e-4 of one process over 12 steps, fp8 within 0.05
+    (`tests/test_gpu_kit.py`). Not run on GPUs.* *Step:* `dp_*` in Explorer
+    step 07 with `STEPS_07=dp`, and `dp_single` in `submit.sh dp-baseline`.
 
 ## GPU results
 
@@ -501,6 +515,7 @@ failures count against all six whichever test failed.
 | 29. Where bridge compression pays off | step `bench_compressed` | pass (2) |
 | 30. gpubridge as a torch.distributed backend: DDP and FSDP2 on GPUs | step `verify_fsdp2_backend`; step `train_fsdp2_backend`; step `gpu_tests` | FAIL (9 of 32) |
 | 31. HSDP through the backend: shard within islands, replicate across vendors | step `verify_hsdp_backend`; step `train_hsdp_backend` | FAIL (3 of 3) |
+| 33. Data-parallel training across vendors tracks one GPU, compressed or not | step `dp_(ddp\|fsdp2)(-.+)?`; step `dp_single` | not run |
 
 Where the FAILs come from:
 

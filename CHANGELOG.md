@@ -235,6 +235,17 @@ hardware.
   once per DDP bucket size (`--bucket-mb`), as `train_bench_<model>_bucket<MB>`
   (step and JSON), for a bucket-size sweep in one job. Tested on the fake
   cluster, CPU only (#77).
+- Data-parallel training across vendors on a LLaMA-style model:
+  `scripts/gpu/llama.py` (RMSNorm, rotary embeddings, SwiGLU; 134M to 1.03B
+  parameters; the same weights on every vendor; synthetic tokens with a
+  learnable rule, the same global batch for any world size),
+  `scripts/gpu/train_dp.py` (DDP with the comm hook, FSDP2 or HSDP through the
+  backend, or one GPU; every step's loss over the whole batch; parameter checks
+  across ranks; tokens/s and DDP's step split; batch shares by GPU speed with
+  sample-weighted averaging), step 07's `STEPS_07=dp`, `submit.sh dp-baseline`
+  and `scripts/gpu/dp_report.py` (the runs against the baseline, with the loss
+  curves as CSV and SVG). CPU only so far; HARDWARE_VALIDATION.md item 33
+  (#PRNUM).
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
   CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA
