@@ -30,7 +30,8 @@ It uses the standard library only, so it builds offline on any node with a
 Rust toolchain (Explorer's login node has cargo 1.88 from the OS packages;
 the crate builds and passes its tests with 1.70 and 1.98). `python -m gpubridge.multitcp build` compiles it
 into `~/.cache/gpubridge` (`GPUBRIDGE_MULTITCP_LIB_DIR`), keyed by the source,
-the toolchain, the machine and libc; `load()` builds on first use;
+the toolchain, the machine and libc, always without `RUSTFLAGS` (a cache shared
+by nodes of different CPUs must not hold a `target-cpu=native` build); `load()` builds on first use;
 `GPUBRIDGE_MULTITCP_LIB` takes a library built elsewhere, for nodes without
 cargo.
 
@@ -87,16 +88,24 @@ unchanged: the transport never sees a device pointer or a stream.
 groups (30 minutes without one). A socket error, a closed connection or a
 frame of the wrong size fails the worker; a wait that runs out of time, or
 any wait after a failure, raises, and the transport refuses every later call.
-`close()` shuts every connection down, wakes every thread and joins them
-within a limit. Every C function catches Rust panics, so none unwinds into
-Python.
+**Before a failed wait returns, the worker stops**: every connection is shut
+down and every thread joined, so no thread can still read or write a
+collective's tensors once Python sees the error and frees them. If Python's own
+code raises in the middle of a collective, the transport stops the worker the
+same way (`gb_tcp_abort`) before the error propagates. An empty message never
+touches its pointer (an empty tensor's is null). The accepting thread files
+only the connections lower-index members dial, each number once. `close()`
+stops the worker and frees it. Every C function catches Rust panics, so none
+unwinds into Python.
 
 ## Tests (CPU)
 
 - The crate's own (`cargo test`): messages of 0 bytes to 3 MB over three
   connections, matched by tag in any order; a frame that arrives before its
-  receive is posted; a missing message timing out; a frame of the wrong size
-  and a closed peer failing the wait; bad arguments refused.
+  receive is posted; a missing message timing out, and the frame that comes
+  after it never reaching the buffer; empty messages with null pointers; a
+  frame of the wrong size and a closed peer failing the wait; stray and
+  repeated dials not taking a real connection's place; bad arguments refused.
 - `tests/test_multitcp.py`, between processes over loopback TCP: every bridge
   policy at two, three and four leaders, bit for bit against `flat-gloo`, for
   every dtype and reduction, broadcast, reduce-scatter and an async collective
@@ -106,8 +115,8 @@ Python.
   mismatched settings on one leader failing `init()` on every rank; a leader
   that never joins tripping the deadline, then every later call refused;
   teardown with a receive still posted, and a new bridge after it; a message of
-  the wrong size; the address and setting rules; and the library's build and
-  load errors.
+  the wrong size; empty tensors, and a bad argument leaving the bridge working;
+  the address and setting rules; and the library's build and load errors.
 - CI: `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test`, then
   the Python tests over the built library (job `multitcp bridge`).
 
@@ -126,10 +135,13 @@ runs to the comparison matrix, in the same job as the Gloo bridge's:
 MULTITCP_BRIDGE=1 scripts/gpu/explorer/submit.sh 08
 ```
 
-**The gate, fixed before any run:** stage 1 stays only if `D-multitcp-pinned`
-takes at least 20% less time than `D-pinned` at every size from 64 MB up, in
-two jobs. Otherwise the measurements get written up and the work stops there;
-it doesn't go on to stage 2 on that basis alone. Either way the numbers go in
+**The gate, fixed before any run:** the metric is the whole float32
+all_reduce's median time, `median_us` in each run's `bench.json` (gpubridge's op,
+default policy), at each of step 08's sizes from 64 MB to 1 GB. Stage 1 stays only
+if, in each of two step-08 jobs on its own, `D-multitcp-pinned` takes at most 0.8
+times `D-pinned`'s time at every one of those sizes. Otherwise the measurements
+get written up and the work stops there; it doesn't go on to stage 2 on that
+basis alone. Either way the numbers go in
 [BENCHMARKS.md](BENCHMARKS.md) and the CHANGELOG, measured, not predicted.
 
 ## Not done

@@ -434,8 +434,9 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     staging) in the same job, and against the preflight's prediction; one
     connection against several, for the connections' share. It takes host
     tensors only, so the GPU side is the policies' usual staging. Stage 1 stays
-    only if, with pinned staging, it takes at least 20% less time than the
-    pinned Gloo bridge at every size from 64 MB up, in two jobs.
+    only if, in each of two jobs, the median time of the whole float32
+    all_reduce with pinned staging is at most 0.8 times the pinned Gloo
+    bridge's at every size from 64 MB to 1 GB.
     *Status: works on CPU over loopback TCP, every bridge policy on two, three
     and four leaders, bit for bit against `flat-gloo` (`tests/test_multitcp.py`).
     Not run between two machines.* *Step:* `multitcp_build` and the

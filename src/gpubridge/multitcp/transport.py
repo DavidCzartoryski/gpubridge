@@ -20,7 +20,9 @@ stream ordering is untouched.
 The leaders connect on the address of ``GPUBRIDGE_MULTITCP_IFNAME``, else of
 ``GLOO_SOCKET_IFNAME``, else the one this machine reaches ``MASTER_ADDR`` from.
 Every wait has the deadline ``init()`` gave its groups; a timeout or a failed
-peer raises, and the transport refuses later calls.
+peer raises, and the transport refuses later calls. Before anything raises out of
+a collective, the library's threads are stopped, so none of them can still write
+into (or read from) the collective's tensors once the caller sees the error.
 """
 
 from __future__ import annotations
@@ -216,9 +218,12 @@ class MultiTcpTransport(BridgeTransport):
     def _peers(self) -> list[int]:
         return [i for i in range(len(self.members)) if i != self.index]
 
-    def _start(self, tensor: torch.Tensor) -> tuple[int, float, int]:
+    @staticmethod
+    def _check(tensor: torch.Tensor) -> None:
         if not tensor.is_contiguous() or tensor.device.type != "cpu":
             raise ValueError("the multitcp bridge carries contiguous host tensors")
+
+    def _start(self, tensor: torch.Tensor) -> tuple[int, float, int]:
         self._seq += 1
         chunk = max(1, self.chunk_bytes // tensor.element_size())
         return self._seq, time.monotonic() + self.timeout, chunk
@@ -235,9 +240,22 @@ class MultiTcpTransport(BridgeTransport):
                                  tag(seq, step, peer, i))
                 for i, (start, length) in enumerate(_pieces(view.numel(), chunk))]
 
+    def _guarded(self, run) -> None:
+        """``run()``; if anything raises, stop the library's threads before it propagates,
+        so no posted operation outlives the tensors it points into."""
+        try:
+            run()
+        except BaseException:
+            self.worker.abort()
+            raise
+
     def all_reduce(self, tensor: torch.Tensor, op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:
         if len(self.members) == 1:
             return
+        self._check(tensor)  # a bad argument fails the call, not the bridge
+        self._guarded(lambda: self._all_reduce(tensor, op))
+
+    def _all_reduce(self, tensor: torch.Tensor, op: ReduceOp.RedOpType) -> None:
         seq, deadline, chunk = self._start(tensor)
         size = len(self.members)
         reduce = _REDUCE[op]
@@ -277,6 +295,10 @@ class MultiTcpTransport(BridgeTransport):
     def broadcast(self, tensor: torch.Tensor, src: int) -> None:
         if len(self.members) == 1:
             return
+        self._check(tensor)
+        self._guarded(lambda: self._broadcast(tensor, src))
+
+    def _broadcast(self, tensor: torch.Tensor, src: int) -> None:
         seq, deadline, chunk = self._start(tensor)
         root = self.members.index(src)
         flat = tensor.view(-1)

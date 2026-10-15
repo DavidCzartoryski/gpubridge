@@ -228,6 +228,28 @@ def test_large_tensors_in_many_chunks(layout, tmp_path):
               init_kwargs={"bridge": "multitcp"})
 
 
+def _check_empty_and_bad_tensors(topology):
+    bridge = topology.bridge
+    if bridge is not None:
+        for _ in range(2):  # an empty tensor's data pointer is null: nothing may read it
+            empty = torch.empty(0)
+            bridge.all_reduce(empty)
+            bridge.broadcast(empty, bridge.members[0])
+        with pytest.raises(ValueError, match="contiguous host tensors"):
+            bridge.all_reduce(torch.ones(4, 2).t())
+        tensor = torch.ones(3)
+        bridge.all_reduce(tensor)  # a bad argument leaves the bridge working
+        assert torch.equal(tensor, torch.full((3,), float(len(bridge.members))))
+    dist.barrier()
+
+
+@needs_library
+def test_empty_tensors_and_bad_arguments(tmp_path):
+    run_ranks(LAYOUTS["2+2"][0], _check_empty_and_bad_tensors, tmp_path,
+              before_init=partial(_label_islands, None, LOCAL),
+              init_kwargs={"bridge": "multitcp"})
+
+
 @needs_library
 def test_subgroups_on_the_multitcp_bridge(tmp_path):
     # A subgroup's members build its links on their own: their store keys must not

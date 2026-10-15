@@ -92,6 +92,10 @@ def build(*, force: bool = False) -> Path:
     if path.exists() and not force:
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
+    # The build is the same everywhere: no RUSTFLAGS (say, -C target-cpu=native) from this
+    # shell or cargo's config, since the cache may be shared by nodes of other CPUs.
+    env = {k: v for k, v in os.environ.items() if k != "CARGO_ENCODED_RUSTFLAGS"}
+    env["RUSTFLAGS"] = ""
     with tempfile.TemporaryDirectory(prefix="gpubridge-multitcp-", dir=path.parent) as work:
         # A copy of the crate: cargo writes next to Cargo.toml, and an installed package
         # may be read-only.
@@ -99,7 +103,7 @@ def build(*, force: bool = False) -> Path:
         shutil.copytree(CRATE, crate, ignore=shutil.ignore_patterns("target"))
         command = [cargo, "build", "--release", "--offline", "--quiet", "--manifest-path",
                    str(crate / "Cargo.toml"), "--target-dir", str(Path(work) / "target")]
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True, env=env)
         if result.returncode != 0:
             raise Unavailable("building the multitcp bridge failed:\n" + " ".join(command)
                               + "\n" + result.stderr[-4000:])
@@ -127,7 +131,9 @@ def _declare(lib: ctypes.CDLL) -> ctypes.CDLL:
     lib.gb_tcp_wait.argtypes = [c.c_void_p, c.POINTER(c.c_int64), c.c_int, c.c_double]
     lib.gb_tcp_last_error.argtypes, lib.gb_tcp_last_error.restype = [c.c_void_p], c.c_char_p
     lib.gb_tcp_close.argtypes = [c.c_void_p, c.c_double]
-    for name in ("gb_tcp_address", "gb_tcp_connect", "gb_tcp_wait", "gb_tcp_close"):
+    lib.gb_tcp_abort.argtypes = [c.c_void_p, c.c_double]
+    for name in ("gb_tcp_address", "gb_tcp_connect", "gb_tcp_wait", "gb_tcp_close",
+                 "gb_tcp_abort"):
         getattr(lib, name).restype = c.c_int
     return lib
 
@@ -216,6 +222,16 @@ class Worker:
         array = (ctypes.c_int64 * len(ids))(*ids)
         timeout = max(0.0, deadline - time.monotonic())
         self._check(self._lib.gb_tcp_wait(self._handle, array, len(ids), timeout))
+
+    def abort(self, timeout: float = 10.0) -> None:
+        """Stop the worker's threads and connections now, so none of them touches memory
+        an operation posted (a failed wait does this itself). Every later call raises."""
+        if self._handle is not None:
+            if self.failed is None:
+                self.failed = "aborted"
+            if self._lib.gb_tcp_abort(self._handle, timeout) != 0:
+                log.warning("gpubridge: the multitcp bridge's threads didn't stop within %g s; "
+                            "its buffers may still be in use", timeout)
 
     def close(self, timeout: float = 10.0) -> None:
         if self._handle is not None:

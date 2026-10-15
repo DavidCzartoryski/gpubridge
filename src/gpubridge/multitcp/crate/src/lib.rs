@@ -13,6 +13,12 @@
 //! the others. Python numbers its messages so tags never repeat within a collective, and
 //! posts a collective's receives before waiting on any of them.
 //!
+//! A wait that fails (a timeout, a broken connection, a frame of the wrong size) first
+//! stops the worker: every connection is shut down and every thread joined, so once the
+//! error reaches the caller no thread can read or write the caller's memory again, and
+//! the buffers of the failed collective can be freed. `gb_tcp_abort` does the same when
+//! the caller fails on its own between posting and waiting.
+//!
 //! The C functions below are what gpubridge.multitcp loads with ctypes. Every one catches
 //! panics, so a bug here can't unwind into Python. Not thread-safe across callers: one
 //! Python thread drives a worker, as the bridge does.
@@ -32,6 +38,8 @@ const MAGIC: u32 = 0x6762_7470; // "gbtp"
 pub const FAILED: i64 = -1;
 pub const TIMED_OUT: i64 = -2;
 pub const PEER_FAILED: i64 = -3;
+/// How long a failed wait waits for the worker's threads to stop.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Job {
     id: i64,
@@ -153,10 +161,9 @@ impl Worker {
             threads: Vec::new(),
             last_error: CString::default(),
         };
-        let expected = index * streams; // every lower-index member dials `streams` times
         let (shared, accepted) = (worker.shared.clone(), worker.accepted.clone());
         worker.threads.push(thread::spawn(move || {
-            accept_loop(listener, expected, members, streams, shared, accepted)
+            accept_loop(listener, index, streams, shared, accepted)
         }));
         Ok(worker)
     }
@@ -256,9 +263,15 @@ impl Worker {
         Ok(())
     }
 
-    fn check_peer(&self, state: &State, member: usize) -> Result<(), String> {
+    fn usable(&self, state: &State, member: usize) -> Result<(), String> {
         if member >= self.members || member == self.index || !state.connected[member] {
             return Err(format!("member {member} is not connected"));
+        }
+        if let Some(error) = &state.failed {
+            return Err(error.clone());
+        }
+        if state.closing {
+            return Err("the worker has stopped".to_string());
         }
         Ok(())
     }
@@ -267,10 +280,7 @@ impl Worker {
     /// send finished: written to the socket, so the memory can be reused.
     pub fn send(&self, member: usize, ptr: usize, len: usize, tag: u64) -> Result<i64, String> {
         let mut state = self.shared.lock();
-        self.check_peer(&state, member)?;
-        if let Some(error) = &state.failed {
-            return Err(error.clone());
-        }
+        self.usable(&state, member)?;
         state.next_id += 1;
         let id = state.next_id;
         let stream = state.next_stream[member];
@@ -283,10 +293,7 @@ impl Worker {
     /// Post a receive of exactly `len` bytes into `ptr` for the message `tag` from `member`.
     pub fn recv(&self, member: usize, ptr: usize, len: usize, tag: u64) -> Result<i64, String> {
         let mut state = self.shared.lock();
-        self.check_peer(&state, member)?;
-        if let Some(error) = &state.failed {
-            return Err(error.clone());
-        }
+        self.usable(&state, member)?;
         if state.posted.contains_key(&(member, tag)) {
             return Err(format!(
                 "a receive for tag {tag:#x} from member {member} is already posted"
@@ -299,7 +306,8 @@ impl Worker {
         Ok(id)
     }
 
-    /// Wait until every one of `ids` finished: 0, or TIMED_OUT, or PEER_FAILED.
+    /// Wait until every one of `ids` finished: 0, or TIMED_OUT, or PEER_FAILED. Either
+    /// failure stops the worker first (see the module docs), and so does any later wait.
     pub fn wait(&mut self, ids: &[i64], timeout: Duration) -> i64 {
         let deadline = Instant::now() + timeout;
         let shared = self.shared.clone();
@@ -314,6 +322,12 @@ impl Worker {
             if let Some(error) = state.failed.clone() {
                 drop(state);
                 self.set_error(error);
+                self.stop(STOP_TIMEOUT);
+                return PEER_FAILED;
+            }
+            if state.closing {
+                drop(state);
+                self.set_error("the worker has stopped".to_string());
                 return PEER_FAILED;
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -324,6 +338,7 @@ impl Worker {
                     "{missing} of {} operation(s) unfinished",
                     ids.len()
                 ));
+                self.stop(STOP_TIMEOUT);
                 return TIMED_OUT;
             }
             state = shared
@@ -341,6 +356,12 @@ impl Worker {
     /// Stop every thread and close every connection. Returns false if a thread outlived
     /// `timeout` (it is left to end with the process).
     pub fn close(mut self, timeout: Duration) -> bool {
+        self.stop(timeout)
+    }
+
+    /// Shut every connection down and join every thread: afterwards nothing touches the
+    /// caller's memory. False if a thread outlived `timeout`. Calling it again is harmless.
+    pub fn stop(&mut self, timeout: Duration) -> bool {
         {
             let mut state = self.shared.lock();
             state.closing = true;
@@ -366,16 +387,18 @@ impl Worker {
     }
 }
 
+/// Files the `index * streams` connections the lower-index members dial. A hello naming
+/// this member or a higher one, an unknown connection number, or a connection already
+/// filed is dropped, so a stray or repeated dial can't take a real one's place.
 fn accept_loop(
     listener: TcpListener,
-    expected: usize,
-    members: usize,
+    index: usize,
     streams: usize,
     shared: Arc<Shared>,
     accepted: Accepted,
 ) {
-    let mut count = 0;
-    while count < expected {
+    let mut seen = HashSet::new();
+    while seen.len() < index * streams {
         if shared.lock().closing {
             return;
         }
@@ -391,7 +414,7 @@ fn accept_loop(
                     Err(_) => continue, // not one of ours (a port scan, a dead dialer)
                 };
                 let (member, stream) = (member as usize, stream as usize);
-                if first as u32 != MAGIC || member >= members || stream >= streams {
+                if first as u32 != MAGIC || member >= index || stream >= streams {
                     continue;
                 }
                 if (first >> 32) as u32 != PROTOCOL {
@@ -402,12 +425,14 @@ fn accept_loop(
                     ));
                     return;
                 }
+                if !seen.insert((member, stream)) {
+                    continue; // already filed: keep the first
+                }
                 let _ = socket.set_nodelay(true);
                 let (lock, arrived) = &*accepted;
-                let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
-                if map.insert((member, stream), socket).is_none() {
-                    count += 1;
-                }
+                lock.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((member, stream), socket);
                 arrived.notify_all();
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
@@ -439,7 +464,12 @@ fn send_loop(mut socket: TcpStream, queue: usize, member: usize, shared: Arc<Sha
             }
         };
         // SAFETY: the caller keeps the bytes valid until wait() reports this send finished.
-        let bytes = unsafe { std::slice::from_raw_parts(job.ptr as *const u8, job.len) };
+        // An empty message may come with a null pointer (an empty tensor's): no slice of it.
+        let bytes: &[u8] = if job.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(job.ptr as *const u8, job.len) }
+        };
         let sent = write_header(&mut socket, &[job.tag, job.len as u64])
             .and_then(|_| socket.write_all(bytes));
         if let Err(e) = sent {
@@ -489,7 +519,11 @@ fn recv_loop(mut socket: TcpStream, member: usize, shared: Arc<Shared>) {
             return;
         }
         // SAFETY: the caller keeps the buffer valid until wait() reports this receive done.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(recv.ptr as *mut u8, recv.len) };
+        let bytes: &mut [u8] = if recv.len == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(recv.ptr as *mut u8, recv.len) }
+        };
         if let Err(e) = socket.read_exact(bytes) {
             shared.fail(format!("receiving from member {member}: {e}"));
             return;
@@ -686,6 +720,22 @@ pub unsafe extern "C" fn gb_tcp_last_error(handle: *mut c_void) -> *const c_char
     guard(std::ptr::null(), || worker(handle).last_error.as_ptr())
 }
 
+/// Stop the worker without freeing it (see the module docs): 0, or 1 if a thread didn't
+/// stop within `timeout`.
+///
+/// # Safety
+/// `handle` from gb_tcp_create.
+#[no_mangle]
+pub unsafe extern "C" fn gb_tcp_abort(handle: *mut c_void, timeout: f64) -> c_int {
+    guard(FAILED as c_int, || {
+        if worker(handle).stop(seconds(timeout)) {
+            0
+        } else {
+            1
+        }
+    })
+}
+
 /// Close the worker and free it: 0, or 1 if a thread didn't stop within `timeout`.
 ///
 /// # Safety
@@ -791,6 +841,61 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("closed its bridge connection"));
+    }
+
+    #[test]
+    fn empty_messages_need_no_memory() {
+        let (mut a, mut b) = pair(2);
+        let got = b.recv(0, 0, 0, 5).unwrap(); // null pointers, as an empty tensor's
+        let sent = a.send(1, 0, 0, 5).unwrap();
+        assert_eq!(b.wait(&[got], Duration::from_secs(5)), 0);
+        assert_eq!(a.wait(&[sent], Duration::from_secs(5)), 0);
+    }
+
+    #[test]
+    fn a_timed_out_wait_stops_the_worker_so_late_data_cant_land() {
+        let (mut a, mut b) = pair(2);
+        let mut out = vec![0u8; 64];
+        let id = b.recv(0, out.as_mut_ptr() as usize, out.len(), 6).unwrap();
+        assert_eq!(b.wait(&[id], Duration::from_millis(50)), TIMED_OUT);
+        // The buffer may be freed now: a frame that comes late must not reach it. (The
+        // sender may already see the connection closed: b stopped.)
+        let data = [9u8; 64];
+        if let Ok(late) = a.send(1, data.as_ptr() as usize, data.len(), 6) {
+            a.wait(&[late], Duration::from_secs(2));
+        }
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(out, vec![0u8; 64]);
+        assert!(b.send(0, data.as_ptr() as usize, 1, 7).is_err()); // and it refuses more
+        assert_eq!(b.wait(&[id], Duration::from_secs(1)), PEER_FAILED);
+    }
+
+    #[test]
+    fn stray_or_repeated_dials_dont_take_a_real_connections_place() {
+        let mut b = Worker::new(2, 1, 1, "127.0.0.1").unwrap();
+        let target: SocketAddr = b.address().parse().unwrap();
+        for (member, stream) in [(1u64, 0u64), (5, 0), (0, 9)] {
+            let mut stray = TcpStream::connect(target).unwrap();
+            write_header(
+                &mut stray,
+                &[MAGIC as u64 | (PROTOCOL as u64) << 32, member, stream],
+            )
+            .unwrap();
+        }
+        let mut a = Worker::new(2, 0, 1, "127.0.0.1").unwrap();
+        let address = b.address().to_string();
+        let dialer = thread::spawn(move || {
+            a.connect(1, &address, Duration::from_secs(5)).unwrap();
+            a
+        });
+        b.connect(0, "unused", Duration::from_secs(5)).unwrap();
+        let mut a = dialer.join().unwrap();
+        let (data, mut out) = ([3u8; 4], [0u8; 4]);
+        let got = b.recv(0, out.as_mut_ptr() as usize, 4, 1).unwrap();
+        let sent = a.send(1, data.as_ptr() as usize, 4, 1).unwrap();
+        assert_eq!(b.wait(&[got], Duration::from_secs(5)), 0);
+        assert_eq!(a.wait(&[sent], Duration::from_secs(5)), 0);
+        assert_eq!(out, data);
     }
 
     #[test]
