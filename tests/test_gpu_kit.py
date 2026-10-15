@@ -2057,6 +2057,7 @@ def test_train_bench_default_batches_are_unweighted_and_say_so(tmp_path):
     assert record["loss_weighting"] == "mean per rank, averaged over ranks"
     assert record["accumulate"] == 1 and record["micro_batch_sizes"] == [[2], [2]]
     assert record["exchanges_per_step"] == 1.0
+    assert [r["memory"] for r in record["ranks"]] == [None, None]  # GPU only
 
 
 @pytest.mark.parametrize(("args", "micro"), [

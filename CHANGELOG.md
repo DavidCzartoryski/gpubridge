@@ -306,6 +306,11 @@ hardware.
   data; BatchNorm normalizes over each micro-batch. The JSON records K, each
   rank's micro-batch sizes, samples per step and the exchanges per step the
   hook counted. No `src/` change (#75).
+- `train_bench.py` on GPUs: each rank's `memory` in the JSON, for the compute,
+  ddp and comm-alone phases: the caching allocator's peak allocated and
+  reserved MiB (`torch.cuda.max_memory_allocated`, `max_memory_reserved`) and
+  its allocation retries (`num_alloc_retries`), and the GPU's total. Null on
+  CPU; the GPU path is tested only against a faked allocator (CPU only).
 
 ### Changed
 

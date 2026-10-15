@@ -564,10 +564,13 @@ flags above (with `--balance` the calibration runs at the micro-batch size and
 each rank gets at least K samples), and the update is exact the same way (CPU
 only so far), BatchNorm aside: it normalizes over each micro-batch. The JSON
 adds `accumulate`, `micro_batch_sizes`, `samples_per_step` and the
-`exchanges_per_step` the hook counted. Both models need BLAS on every GPU (the
-probe's `blas_available`): with a ROCm build
-whose rocBLAS lacks the GPU's kernels, its rank aborts at the first matmul, as
-the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
+`exchanges_per_step` the hook counted. On GPUs each rank's `memory` has, for the
+compute, ddp and comm-alone phases, the caching allocator's peaks
+(`max_allocated_mib`, `max_reserved_mib`) and the allocations it retried after
+freeing its cache (`alloc_retries`, a sign it ran short), and the GPU's
+`total_mib`. Both models need BLAS on every GPU (the probe's `blas_available`):
+with a ROCm build whose rocBLAS lacks the GPU's kernels, its rank aborts at the
+first matmul, as the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
 
 ## Kaggle (free): two NVIDIA T4s
 

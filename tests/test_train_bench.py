@@ -216,6 +216,22 @@ def test_split_batch_gives_each_rank_at_least_the_minimum():
         train_bench.split_batch(3, [1.0, 1.0], minimum=2)
 
 
+def test_memory_peaks_per_phase_on_a_gpu_and_none_on_cpu(monkeypatch):
+    cpu = torch.device("cpu")
+    assert train_bench.memory_mark(cpu) == 0 and train_bench.memory_peaks(cpu, 0) is None
+    # A GPU's allocator, faked: the calls train_bench makes and what it does with them.
+    gpu, stats, resets = torch.device("cuda", 1), {"num_alloc_retries": 3}, []
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", resets.append)
+    monkeypatch.setattr(torch.cuda, "memory_stats", lambda device: dict(stats))
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 3 * 2**30)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device: 5 * 2**29 + 2**19)
+    before = train_bench.memory_mark(gpu)
+    assert resets == [gpu] and before == 3
+    stats["num_alloc_retries"] = 5
+    assert train_bench.memory_peaks(gpu, before) == {
+        "max_allocated_mib": 3072.0, "max_reserved_mib": 2560.5, "alloc_retries": 2}
+
+
 def test_loss_scale_undoes_the_average_and_takes_the_mean():
     assert train_bench.loss_scale(2, 4) == 0.5
     assert train_bench.loss_scale(3, 8, 16) == 3 / 128
