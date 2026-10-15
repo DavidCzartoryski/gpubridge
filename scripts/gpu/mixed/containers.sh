@@ -30,7 +30,7 @@ MASTER_IP=$prefix.10
 WORKER_IP=$prefix.11
 NET=gpubridge-mixed-$$
 export NPROC=${NPROC:-2} BENCH_MAX_BYTES=${BENCH_MAX_BYTES:-1M}
-export TRAIN_BENCH_MODELS=${TRAIN_BENCH_MODELS:-tiny-gpt tiny-resnet}
+export TRAIN_BENCH_MODELS=${TRAIN_BENCH_MODELS-tiny-gpt tiny-resnet}
 export TRAIN_BENCH_ARGS=${TRAIN_BENCH_ARGS:-} KIT_TIMEOUT=${KIT_TIMEOUT:-600}
 export DP_MODEL=${DP_MODEL:-llama-tiny} DP_STEPS=${DP_STEPS:-4} DP_GLOBAL_BATCH=${DP_GLOBAL_BATCH:-4}
 export DP_SEQ=${DP_SEQ:-16} DP_ARGS=${DP_ARGS:---check-every 2 --probe-steps 1 --comm-trials 1}
