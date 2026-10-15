@@ -40,7 +40,8 @@ DP_GLOBAL_BATCH="${DP_GLOBAL_BATCH:-8}"
 DP_SEQ="${DP_SEQ:-512}"
 DP_RUNS="${DP_RUNS:-ddp ddp-bf16 ddp-fp8 fsdp2 ddp-speed ddp-bucket-5 ddp-bucket-100}"
 # The AMD side's compression kernels: torch (gpubridge's PyTorch codec, the same bits) where
-# its ROCm build's Triton can't compile them, as on gfx906 with torch 2.9.1+rocm6.3.
+# its ROCm build's Triton can't compile them, as venv-rocm63's own Triton can't for gfx906.
+# auto with a Triton that can: VENV_ROCM=<rocm_triton_overlay.sh's venv> DP_KERNELS_ON_AMD=auto.
 DP_KERNELS_ON_AMD="${DP_KERNELS_ON_AMD:-torch}"
 read -ra dp_args <<<"${DP_ARGS:-}"
 TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS:-gpt2-small resnet50}"
