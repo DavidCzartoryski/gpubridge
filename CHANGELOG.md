@@ -218,7 +218,10 @@ hardware.
 - `scripts/gpu/bench_p2p.py`: point-to-point latency and bandwidth through
   `backend="gpubridge"`, ping-pong from 1 KB to 1 GB on each route rank 0 has (across
   islands through the bridge, and within its island), with a payload check per size and
-  the staging (pinned, chunk size, transport) in each record. Explorer steps 02 and 07 run
+  the staging (pinned, chunk size, transport) in each record. A dedicated untimed
+  exchange verifies both directions before warmups and trials, including with zero
+  warmups. CLI bounds fail before rendezvous; chunked integer residues preserve exact
+  payload patterns beyond float32's consecutive-integer range. Explorer steps 02 and 07 run
   it (`bench_p2p`; step 07 also `bench_p2p_pinned`). CPU only so far: in simulation on one
   Mac, a cross-island message took about 3 ms one way at 1 KB to 1 MB, a native one 80 to
   320 us.

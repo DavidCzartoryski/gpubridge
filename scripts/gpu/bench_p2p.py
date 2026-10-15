@@ -11,11 +11,11 @@ and bandwidth is the size over that. The routes:
 - ``native``: rank 0 and the next rank of its own island, if it has one: the island's
   backend directly (NCCL or RCCL on GPUs, Gloo on CPU), the baseline.
 
-Other ranks wait at a barrier. Each size's first exchange checks the payload, bit for bit,
-both ways. Timing is the host clock, with the device synchronized before and after each
-round trip; each size gets --warmup untimed round trips, then --trials timed ones. To
-compare staging settings, run it once per setting: each row records the staging and the
-transport.
+Other ranks wait at a barrier. Each size starts with a dedicated untimed exchange that
+checks the payload bit for bit both ways. Timing is the host clock, with the device
+synchronized before and after each round trip; each size gets --warmup untimed round
+trips, then --trials timed ones. To compare staging settings, run it once per setting:
+each row records the staging and the transport.
 
 Rank 0 writes OUT/bench_p2p.json, OUT/bench_p2p.csv and OUT/summary.md. Runs on CPU in
 simulation mode too (use a smaller --max-bytes):
@@ -44,6 +44,7 @@ import gpubridge
 from gpubridge.p2p import chunk_bytes_setting
 
 TAG = 7
+PATTERN_CHUNK = 1 << 20
 
 
 def routes(topology: gpubridge.Topology) -> dict[str, int]:
@@ -59,9 +60,19 @@ def routes(topology: gpubridge.Topology) -> dict[str, int]:
     return out
 
 
+def _pattern_chunk(offset: int, numel: int) -> torch.Tensor:
+    """Exact residues even beyond float32's consecutive-integer range."""
+    start = offset % 251
+    return torch.arange(start, start + numel, dtype=torch.int64).remainder_(251).float()
+
+
 def pattern(numel: int, device: torch.device) -> torch.Tensor:
-    """Integer-valued float32s: exact on any device, and different at every index mod 251."""
-    return (torch.arange(numel, dtype=torch.float32) % 251).to(device)
+    """Integer-valued float32s; bounded CPU temporaries, distinct indices mod 251."""
+    result = torch.empty(numel, dtype=torch.float32, device=device)
+    for start in range(0, numel, PATTERN_CHUNK):
+        count = min(PATTERN_CHUNK, numel - start)
+        result[start:start + count].copy_(_pattern_chunk(start, count))
+    return result
 
 
 def ping_pong(peer: int, numel: int, device: torch.device, *, warmup: int,
@@ -69,11 +80,15 @@ def ping_pong(peer: int, numel: int, device: torch.device, *, warmup: int,
     """Rank 0's side: seconds per round trip, and whether the payload came back intact."""
     sent = pattern(numel, device)
     back = torch.empty_like(sent)
+    # Complete both peers' verification before starting any measured exchange,
+    # including --warmup 0. The peer sends this reply only after its own check.
+    back.fill_(-1)
+    dist.send(sent, peer, tag=TAG)
+    dist.recv(back, peer, tag=TAG)
+    sync(device)
+    ok = bool(torch.equal(back, sent))
     times: list[float] = []
-    ok = True
     for i in range(warmup + trials):
-        if i == 0:
-            back.fill_(-1)
         sync(device)
         start = time.perf_counter()
         dist.send(sent, peer, tag=TAG)
@@ -81,25 +96,24 @@ def ping_pong(peer: int, numel: int, device: torch.device, *, warmup: int,
         sync(device)
         if i >= warmup:
             times.append(time.perf_counter() - start)
-        if i == 0:
-            ok = bool(torch.equal(back, sent))
     return times, ok
 
 
 def echo(numel: int, device: torch.device, *, rounds: int) -> bool:
-    """The peer's side: receive and send back, ``rounds`` times; whether the first arrived intact."""
+    """Untimed verification, then ``rounds`` replies without verification work."""
     buf = torch.empty(numel, dtype=torch.float32, device=device)
-    ok = True
-    for i in range(rounds):
+    dist.recv(buf, 0, tag=TAG)
+    ok = bool(torch.equal(buf, pattern(numel, device)))
+    dist.send(buf, 0, tag=TAG)
+    for _ in range(rounds):
         dist.recv(buf, 0, tag=TAG)
-        if i == 0:
-            ok = bool(torch.equal(buf, pattern(numel, device)))
         dist.send(buf, 0, tag=TAG)
     return ok
 
 
 def summary(rows: list[dict[str, Any]], staging: dict[str, Any]) -> str:
     lines = ["Ping-pong between rank 0 and each route's peer; one-way = half the median round trip.",
+             "Payload verification is a separate untimed exchange before warmups and trials.",
              f"Staging: {staging}.", "",
              "| Route | Peer | Size | One-way (us) | Bandwidth (GB/s) | Round trip p90 (us) | Payload |",
              "| --- | ---: | --- | ---: | ---: | ---: | --- |"]
@@ -120,6 +134,14 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=default_timeout(600),
                         help="process-group timeout (s); default KIT_TIMEOUT, else 600")
     args = parser.parse_args()
+    if args.factor <= 1:
+        parser.error("--factor must be greater than 1")
+    if args.min_bytes <= 0 or args.max_bytes < args.min_bytes:
+        parser.error("size bounds require 0 < --min-bytes <= --max-bytes")
+    if args.trials <= 0 or args.warmup < 0:
+        parser.error("--trials must be positive and --warmup nonnegative")
+    if not 0 < args.timeout < float("inf"):
+        parser.error("--timeout must be positive and finite")
     dist.init_process_group("gpubridge", timeout=timedelta(seconds=args.timeout))
     dist.barrier()  # builds gpubridge's topology; point-to-point needs it first
     topology = gpubridge.get_topology()

@@ -172,8 +172,9 @@ Both steps also run `bench_p2p.py` (`bench_p2p`, and in step 07 `bench_p2p_pinne
 with `GPUBRIDGE_PINNED_STAGING=1`): ping-pong between rank 0 and a rank of another island
 (the bridge route) and, where rank 0's island has another rank, that rank (the native
 route), from 1 KB to `BENCH_MAX_BYTES`, with the one-way latency, bandwidth and a payload
-check per size in `bench_p2p/summary.md`. To compare other staging, rerun it with
-`GPUBRIDGE_P2P_CHUNK_BYTES` or `GPUBRIDGE_BRIDGE=ucx`; each record names its staging.
+check per size in `bench_p2p/summary.md`. Verification uses a separate untimed exchange
+before warmups and timed trials, including with `--warmup 0`. To compare other staging,
+rerun it with `GPUBRIDGE_P2P_CHUNK_BYTES` or `GPUBRIDGE_BRIDGE=ucx`; each record names its staging.
 With `UCX_BRIDGE=1`, steps 05 and 07 also run the check and the gpubridge
 benchmark over the UCX bridge (`check_ucx`, `bench_ucx`; items 26 and 27); the
 run records say whether GPU tensors went to UCX directly or through pinned host
