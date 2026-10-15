@@ -525,11 +525,24 @@ Where the FAILs come from:
   bit for bit against a single-process replay.
 - **`train_hsdp_backend`, `verify_hsdp_backend` (item 31)**: failed in step
   07's second run (the same rocBLAS abort). With the MI50 on torch
-  2.9.1+rocm6.3, `train_hsdp_backend` printed nothing for 20 minutes and the
-  kit's step timeout stopped it (exit 124); the job was then cancelled, so
-  `verify_hsdp_backend` didn't run. Why it hung is not known: nothing dumped
-  the stacks. That job mixed torch 2.14.1 (V100) and 2.9.1 (MI50); whether
-  that matters is not known either.
+  2.9.1+rocm6.3, `train_hsdp_backend` printed nothing until the kit's step
+  timeout stopped it (exit 124), in this job and in every later mixed job.
+  **Where it stops**, from a CPU reproduction (gpubridge's simulation mode,
+  two ranks on one node, `examples/fsdp2_torch_backend.py --hsdp 2`): with
+  both ranks on torch 2.14.1, or both on 2.9.1, it completes; with rank 0 on
+  2.14.1 and rank 1 on 2.9.1 it hangs the same way. Python stacks taken at
+  the hang (faulthandler) show both ranks in gpubridge's one-time world setup,
+  inside `dist.new_group` (`torch_backend._world_topology` -> `setup`),
+  reached from FSDP's first gradient collective: an `all_reduce` on rank 0
+  and a `reduce_scatter` on rank 1. The two torch releases' `DeviceMesh`
+  creates a different number of groups for the (2, 1) mesh (2.14.1 reuses the
+  default group for the replicate dimension; 2.9.1 calls `new_group`), and
+  the world setup's groups take torch's default names, which count the groups
+  each process has made, so the ranks likely wait on different store keys.
+  Not yet confirmed by a fix: the fix would be in `src/` (name the world
+  setup's groups the way subgroups already are, or build the world topology
+  before any `DeviceMesh` groups). Plain `init_device_mesh` and a barrier with
+  the same mixed versions, without gpubridge, don't hang.
 
 ### Network
 

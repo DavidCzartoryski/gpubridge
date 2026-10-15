@@ -544,7 +544,56 @@ numbers come from that job's log.
 - `train_hsdp_backend` printed nothing until its 20-minute step timeout in
   all four, before any NCCL or RCCL communicator was created, as in the
   uncompressed run; each job then hit its time limit during
-  `verify_hsdp_backend`.
+  `verify_hsdp_backend`. Where it stops, from a CPU reproduction with the
+  same two torch releases: [HARDWARE_VALIDATION.md](../HARDWARE_VALIDATION.md#items),
+  item 31's note.
+
+### fp8 with Triton kernels on the MI50
+
+`venv-rocm63`'s Triton (pytorch-triton-rocm 3.5.1) can't compile gpubridge's
+compression kernels for gfx906, so the runs above used the PyTorch versions.
+The default ROCm venv's Triton (triton-rocm 3.8.0) can. A venv of
+`venv-rocm63`'s torch 2.9.1 with that Triton in front of its own
+(`scripts/gpu/rocm_triton_overlay.sh`; the runbook's "Choosing the ROCm
+build") gives the MI50 both: rocBLAS kernels for gfx906 and compression
+kernels. Tonight's runs used a copy of the same Triton files where the script
+now makes links.
+
+- **The kit's GPU tests on one MI50**, as the `amd` step runs them
+  (`tests/test_gpu.py`, `test_compression_kernels.py`, `test_torch_backend.py`),
+  with torch 2.9.1+rocm6.3 and Triton 3.8.0: 26 passed, 8 skipped, the same as
+  the default venv, where Triton 3.5.1 had 20 failures. The same with Triton
+  loading the HIP runtime it bundles and with `TRITON_LIBHIP_PATH` at torch's
+  HIP 6.3 (job 11091760, commit 4e7f04e).
+- **GPT-2 small through the bridge with fp8**, as in the table above but
+  `GPUBRIDGE_COMPRESSION_KERNELS=triton` (in every rank's record), at commit
+  4e7f04e:
+
+| Batch | V100 alone | Mixed, PyTorch kernels | Mixed, Triton kernels | Triton / alone | Step (ms) | MI50 compute | V100 compute | V100 waits | Exposed comm | Comm alone |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 28.395 | 26.274 | 29.631 | 1.04x | 1079.9 | 985.9 | 556.6 | 429.4 | 94.0 | 346.0 |
+| 32 | 29.247 | 28.311 | 32.726 | 1.12x | 1955.6 | 1827.5 | 1077.8 | 749.7 | 128.1 | 361.8 |
+
+Samples/s, then milliseconds per step (medians of the 10 timed steps); the
+first two columns are the runs above. Jobs 11091811 (16) and 11093097 (32);
+preflight 1170 to 1174 MB/s each way, a 0.05 ms round trip, on
+`internal.2137`.
+
+- **The first GPT-2 runs where the pair beats the V100 alone**: 1.04x at
+  batch 16, 1.12x at 32. One run each, and the steps spread (1067 to 1400 ms
+  at 16, 1913 to 2289 ms at 32), so the 1.04x is within that spread.
+- **Communication alone fell from 485 to 346 ms at batch 16 and from 605 to
+  362 ms at 32**; exposed communication from 258 to 94 and 445 to 128 ms. With
+  the Triton kernels, batch 32 needs about what batch 16 does, so the rise at
+  batch 32 above came with the PyTorch kernels, not the bridge; why they cost
+  more at batch 32 isn't measured.
+- **What's left is mostly the wait for the MI50**: 429 ms a step at batch 16
+  and 750 at 32, against 94 and 128 ms of exposed communication. The MI50's
+  compute was within 3% of the PyTorch-kernel runs'.
+- In the same jobs, `train_ddp`'s parameters stayed in sync, FSDP2's
+  bit-for-bit check differed from its uncompressed replay as in every fp8 run,
+  and `train_hsdp_backend` hung (batch 16: until its timeout; batch 32: the job
+  was cancelled during it).
 
 ## Which ROCm wheels can train on an MI50 (gfx906)
 
@@ -567,8 +616,18 @@ HTTP range requests, not whole downloads) and counted
 
 Not read: 2.13.0+rocm7.2 (the server sent the whole file instead of the range;
 the scan now refuses such replies) and two AMD development builds of 2.8.0 (no
-end-of-directory record in the last 128 KB). The scan counted rocBLAS only, not
-hipBLASLt or MIOpen.
+end-of-directory record in the last 128 KB).
+
+**hipBLASLt and MIOpen**, from the same zip directories: none of the 38 wheels
+read has hipBLASLt files for gfx906, and training ran on the MI50 with 2.9.1+rocm6.3 anyway
+(below). MIOpen's tuning databases for gfx906
+(`torch/share/miopen/db/gfx906_60.db.txt` and its find-dbs, 5 files) are in
+every wheel that ships MIOpen files except the rocm7.14 and AMD's `.lw`
+builds; no wheel has precompiled MIOpen kernel archives for gfx906, and the
+MI50's conv2d and ResNet-50 runs worked without them. Not read for MIOpen: the PyTorch index's 2.10 to 2.13
+rocm7.1 builds and 2.11 to 2.14.0 rocm7.2 builds, whose server ignored the
+range requests this time. The default wheel (2.14.1+rocm7.2) lists gfx942
+(MI300X) in its build and ships rocBLAS and hipBLASLt files for it.
 
 **torch 2.9.1+rocm6.3 on one MI50**, in a second venv (`venv-rocm63`; the
 kit's default ROCm venv is unchanged), with HIP 6.3.42134 and RCCL 2.21.5:
@@ -586,8 +645,9 @@ kit's default ROCm venv is unchanged), with HIP 6.3.42134 and RCCL 2.21.5:
   gpubridge's compression kernels for gfx906 (`PassManager::run failed` in
   `ConvertTritonAMDGPUToLLVM`). The default venv's Triton (3.8.0) compiles
   them.
-- So on an MI50, bridge compression needs the default venv and training needs
-  `venv-rocm63`; the runbook's "Choosing the ROCm build" has the commands.
+- So on an MI50, training needs torch 2.9.1+rocm6.3, and bridge compression
+  on the GPU a newer Triton in front of it ([above](#fp8-with-triton-kernels-on-the-mi50));
+  the runbook's "Choosing the ROCm build" has the commands.
 
 ## Waiting on Research Computing
 

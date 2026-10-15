@@ -193,6 +193,19 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   module; UCX copies bundled with some application modules have `ib`, none
   `cuda` or `rocm`. Details in
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md#rdma-between-the-node-types).
+- **Triton 3.8.0 with torch 2.9.1+rocm6.3 on the AMD MI50 (gfx906), commit
+  4e7f04e**: Triton from the default ROCm venv in front of `venv-rocm63`'s own
+  (3.5.1), which can't compile the compression kernels for gfx906. The kit's
+  GPU tests (`test_gpu.py`, `test_compression_kernels.py`,
+  `test_torch_backend.py`) gave 26 passed, 8 skipped, with Triton's bundled HIP
+  and with torch's HIP 6.3 (job 11091760); with 3.5.1, 20 failed. Then GPT-2
+  small through the bridge with fp8 and these Triton kernels on both ranks
+  (V100: torch 2.14.1+cu126, NCCL 2.29.3; MI50: RCCL 2.21.5): 29.631 samples/s
+  at batch 16 (job 11091811) and 32.726 at 32 (11093097), against 28.395 and
+  29.247 on the V100 alone (1.04x and 1.12x) and 26.274 and 28.311 with the
+  PyTorch kernels. Communication alone fell to 346 and 362 ms from 485 and
+  605. HSDP hung again in both. Details in
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#fp8-with-triton-kernels-on-the-mi50).
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
@@ -202,6 +215,13 @@ hardware.
 
 ### Added
 
+- `scripts/gpu/rocm_triton_overlay.sh`: an env-only venv of one ROCm venv's
+  torch with another's Triton linked in front, for an MI50 that trains on
+  torch 2.9.1+rocm6.3 (gfx906 rocBLAS kernels) and needs Triton 3.8.0 for the
+  compression kernels. Links, not copies; no Python runs.
+- `scripts/gpu/amd/run_all.sh` measures training throughput (`train_bench.py`):
+  each model on one GPU, and with 2+ GPUs as one RCCL island and split through
+  the bridge. The runbook has the steps for an MI300X on AMD Developer Cloud.
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
   CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA
