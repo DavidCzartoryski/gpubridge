@@ -2,9 +2,11 @@
 rank, trained with torch.distributed.pipelining through backend="gpubridge", against one
 GPU alone with the same global batch and seed (train_dp.py --mode single).
 
-Launched by torchrun, one process per stage. Stage 0 holds the embedding and the first
-blocks, the last stage the last blocks, the final norm and the output layer; the split
-is even by default (``--split 6,6`` gives the blocks per stage). Activations go forward
+Launched by torchrun, one process per stage. Stages go to the NVIDIA ranks first, then
+the AMD ones, each in rank order, whatever ranks the launcher handed out, so stage 0 is
+an NVIDIA GPU in a mixed job. Stage 0 holds the embedding and the first blocks, the last
+stage the last blocks, the final norm and the output layer; the split is even by
+default (``--split 6,6`` gives the blocks per stage, in stage order). Activations go forward
 and their gradients back with the backend's point-to-point sends and receives: native
 within an island, across the bridge between islands. Schedules: GPipe (``--schedule
 gpipe``) and 1F1B (``1f1b``), ``--microbatches`` microbatches of the global batch per
@@ -114,22 +116,29 @@ def stage_compute(stage: Stage, example: torch.Tensor, target: torch.Tensor | No
     return out
 
 
-def hop_time(rank: int, world: int, activation: torch.Tensor, device: torch.device,
+def stage_order(vendors: list[str]) -> list[int]:
+    """The ranks in stage order: NVIDIA ranks first, then the rest, each in rank order."""
+    return sorted(range(len(vendors)), key=lambda r: (vendors[r] != "nvidia", r))
+
+
+def hop_time(stage: int, order: list[int], activation: torch.Tensor, device: torch.device,
              trials: int) -> list[float]:
-    """Seconds to send one microbatch's activations from each stage to the next (on the
-    receiver; empty on stage 0): the point-to-point a forward hop costs."""
+    """Seconds for one microbatch's activations to arrive from the previous stage (on the
+    receiving stage; empty on stage 0). Each pair of neighbours is timed on its own, every
+    rank stepping through the same barriers, so no other hop runs at the same time."""
     out = []
-    for i in range(trials + 1):
-        dist.barrier()
-        sync(device)
-        start = time.perf_counter()
-        if rank + 1 < world:
-            dist.send(activation, dst=rank + 1)
-        if rank > 0:
-            dist.recv(activation, src=rank - 1)
-        sync(device)
-        if i and rank > 0:
-            out.append(time.perf_counter() - start)
+    for sender in range(len(order) - 1):
+        for i in range(trials + 1):
+            dist.barrier()
+            if stage == sender:
+                dist.send(activation, dst=order[sender + 1])
+            elif stage == sender + 1:
+                sync(device)
+                start = time.perf_counter()
+                dist.recv(activation, src=order[sender])
+                sync(device)
+                if i:  # the first is a warmup
+                    out.append(time.perf_counter() - start)
     return out
 
 
@@ -174,9 +183,12 @@ def main() -> int:
     if len(split) != world or sum(split) != config.blocks or min(split) < 1:
         raise SystemExit(f"--split {args.split}: need {world} positive counts adding up to "
                          f"{config.blocks} blocks")
-    start = sum(split[:rank])
+    order = stage_order(gather(vendor))
+    me = order.index(rank)  # this rank's stage
+    first, last = me == 0, me == world - 1
+    start = sum(split[:me])
     model = llama.build(args.model, seed=args.seed)  # every rank the same weights, on CPU
-    stage = Stage(model, start, start + split[rank], rank == 0, rank == world - 1).to(device)
+    stage = Stage(model, start, start + split[me], first, last).to(device)
     del model
     parameters = sum(p.numel() for p in stage.parameters())
 
@@ -184,21 +196,24 @@ def main() -> int:
     tokens = torch.zeros(micro, args.seq_len, dtype=torch.int64, device=device)
     hidden = torch.zeros(micro, args.seq_len, config.width, device=device)
     logits = torch.zeros(micro, args.seq_len, config.vocab, device=device)
-    example = tokens if rank == 0 else hidden
+    example = tokens if first else hidden
     x0, y0 = llama.global_batch(args.model, -1, micro, args.seq_len, args.seed)
-    if rank == 0:
+    if first:
         example = x0.to(device)
-    compute = stage_compute(stage, example, y0.to(device) if rank == world - 1 else None,
+    compute = stage_compute(stage, example, y0.to(device) if last else None,
                             device, args.probe_trials)
-    hops = hop_time(rank, world, hidden.clone(), device, args.probe_trials)
+    hops = hop_time(me, order, hidden.clone(), device, args.probe_trials)
 
     # Static shapes, so nothing is inferred over the network. torch derives each gradient's
     # metadata from these: activations crossing a stage boundary require gradients (a later
     # stage's input, an earlier stage's output), or no gradient is sent back for them.
-    meta_input = example.to("meta").requires_grad_(rank > 0)
-    meta_output = (logits if rank == world - 1 else hidden).to("meta").requires_grad_(True)
-    pipe_stage = PipelineStage(stage, rank, world, device, input_args=(meta_input,),
+    meta_input = example.to("meta").requires_grad_(not first)
+    meta_output = (logits if last else hidden).to("meta").requires_grad_(True)
+    pipe_stage = PipelineStage(stage, me, world, device, input_args=(meta_input,),
                                output_args=(meta_output,))
+    # Stage i's neighbours are the ranks holding stages i - 1 and i + 1 (torch's default
+    # puts stage i on rank i).
+    pipe_stage.stage_index_to_group_rank = dict(enumerate(order))
     schedule = (ScheduleGPipe if args.schedule == "gpipe" else Schedule1F1B)(
         pipe_stage, n_microbatches=args.microbatches, loss_fn=loss_fn)
     optimizer = torch.optim.AdamW(stage.parameters(), lr=args.lr)
@@ -209,9 +224,9 @@ def main() -> int:
         sync(device)
         begin = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
-        if rank == 0:
+        if first:
             schedule.step(x.to(device))
-        elif rank == world - 1:
+        elif last:
             losses: list[torch.Tensor] = []
             schedule.step(target=y.to(device), losses=losses)
         else:
@@ -219,7 +234,7 @@ def main() -> int:
         optimizer.step()
         sync(device)
         step_s.append(time.perf_counter() - begin)
-        if rank == world - 1:
+        if last:
             last_losses.append(float(torch.stack(losses).mean()))
 
     everyone = gather({"step_s": step_s, "losses": last_losses, "compute": compute,
@@ -228,16 +243,17 @@ def main() -> int:
                        "device": torch.cuda.get_device_name(device) if device.type == "cuda"
                        else str(device)})
     environments = gather(environment()) if args.json else []
-    losses_all = everyone[-1]["losses"]
+    losses_all = everyone[order[-1]]["losses"]  # the last stage's
     steps = [max(times) for times in zip(*(e["step_s"] for e in everyone))]
     median_step = statistics.median(steps[args.warmup_steps:] or steps)
     ok = all(math.isfinite(v) for v in losses_all)
     if rank == 0:
-        stages = []
-        for r, e in enumerate(everyone):
+        stages = []  # in stage order
+        for s, r in enumerate(order):
+            e = everyone[r]
             per_micro = statistics.median(e["compute"])
             stages.append({
-                "rank": r, "vendor": e["vendor"], "device": e["device"],
+                "stage": s, "rank": r, "vendor": e["vendor"], "device": e["device"],
                 "blocks": e["blocks"], "parameters": e["parameters"],
                 "compute_ms_per_microbatch": ms(per_micro),
                 "idle_ms_per_step_est": ms(max(0.0, median_step - args.microbatches * per_micro)),

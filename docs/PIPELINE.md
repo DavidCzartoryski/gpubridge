@@ -25,7 +25,11 @@ small real dataset isn't wired in yet.
 
 **Stages.** Stage *i* holds a contiguous range of the blocks; stage 0 also the
 embedding, the last stage the final norm and output layer. The split is even
-(`--split 7,5` sets it by hand); automatic balancing is prompt 4's work.
+(`--split 7,5` sets it by hand, in stage order); automatic balancing is prompt
+4's work. Stages go to the NVIDIA ranks first, then the AMD ones, each in rank
+order, whatever ranks the launcher handed out (torch's c10d rendezvous doesn't
+promise the NVIDIA node rank 0), and the pipeline's neighbours follow that
+order; the record lists each stage's rank, vendor and blocks.
 
 **Communication.** `PipelineStage` sends each microbatch's activations to the
 next stage and receives its gradient back with `dist.isend`/`irecv` on the
@@ -46,7 +50,7 @@ step and the gradients averaged over them.
 on the last stage) and time (the slowest stage's); tokens/s from the median
 step; per stage its blocks, the forward and backward of one microbatch through
 it alone, and the time one microbatch's activations take to arrive from the
-previous stage. From those, two estimates: each stage's idle time per step (the
+previous stage, each pair of neighbouring stages timed on its own. From those, two estimates: each stage's idle time per step (the
 step less its microbatches' compute) and GPipe's ideal bubble share,
 (stages − 1) / (microbatches + stages − 1). The baseline is
 [`train_dp.py`](../scripts/gpu/train_dp.py) `--mode single` on one GPU, with the
@@ -87,6 +91,7 @@ largest gap and the gap over the last 100 steps, and the curves as CSV and SVG.
 | --- | --- | --- |
 | The pipeline through gpubridge gives the same losses as on a plain Gloo group, bit for bit | CPU, 2 stages (one per island), GPipe and 1F1B; 4 stages over 2 + 2 islands (hops within and across islands) | passes (`tests/test_gpu_kit.py`) |
 | It tracks one process with the same global batch and microbatches | CPU, 4 stages, 8 steps: within 1e-4 | passes |
+| Stages follow the stage order, not the ranks | CPU, stage 0 on rank 1: the same losses as stage 0 on rank 0, bit for bit | passes |
 | The step 07 runs and their records | the fake cluster | passes (`tests/test_gpu_jobs.py`) |
 | Loss curves, tokens/s, per-stage compute, idle time and hop time on a V100 + MI50, 500 steps | Explorer, `STEPS_07=pipeline` | not run |
 | A two-stage pipeline on one V100, as a second baseline | - | not built |

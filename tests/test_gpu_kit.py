@@ -2449,6 +2449,13 @@ def test_dp_report_compares_curves_with_the_baseline(tmp_path):
 
 # ---- pipeline training: train_pipeline.py ------------------------------------------------
 
+def test_pipeline_puts_nvidia_stages_first_whatever_the_ranks():
+    assert train_pipeline.stage_order(["nvidia", "amd"]) == [0, 1]
+    assert train_pipeline.stage_order(["amd", "nvidia"]) == [1, 0]
+    assert train_pipeline.stage_order(["amd", "nvidia", "amd", "nvidia"]) == [1, 3, 0, 2]
+    assert train_pipeline.stage_order(["cpu", "cpu"]) == [0, 1]
+
+
 def test_pipeline_splits_blocks_evenly():
     assert train_pipeline.even_split(12, 2) == [6, 6]
     assert train_pipeline.even_split(5, 3) == [2, 2, 1]
@@ -2497,4 +2504,25 @@ def test_four_stages_across_two_islands_match_plain_gloo_and_one_process(tmp_pat
     assert max(abs(a - b) for a, b in zip(bridged["losses"], single, strict=True)) < 1e-4
     report = dp_report.table(dp_report.load([tmp_path]), "single")
     assert "| four | pipeline-gpipe |" in report
+
+
+def _reversed_pipeline(rank: int, port: int, out: str) -> None:
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank),
+                      WORLD_SIZE="2", LOCAL_RANK=str(rank))
+    train_pipeline.stage_order = lambda vendors: [1, 0]  # stage 0 on rank 1
+    sys.argv = ["train_pipeline.py", "--model", "llama-tiny", "--steps", "6", "--global-batch",
+                "8", "--seq-len", "16", "--lr", "3e-3", "--microbatches", "4", "--probe-trials",
+                "1", "--backend", "gloo", "--json", out]
+    train_pipeline.main()
+
+
+def test_stages_follow_the_stage_order_not_the_ranks(tmp_path):
+    import torch.multiprocessing as mp
+
+    out = tmp_path / "pp_reversed.json"
+    mp.spawn(_reversed_pipeline, args=(_free_port(), str(out)), nprocs=2)
+    reversed_run = json.loads(out.read_text())
+    assert [(r["stage"], r["rank"]) for r in reversed_run["ranks"]] == [(0, 1), (1, 0)]
+    normal = _train_pipeline(tmp_path, "normal", 2, "--steps", "6", "--backend", "gloo")
+    assert reversed_run["losses"] == normal["losses"]  # the same pipeline, bit for bit
 
