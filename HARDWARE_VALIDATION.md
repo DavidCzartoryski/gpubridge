@@ -516,6 +516,17 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     *Step:* `pp_<schedule>_<split>` in Explorer step 07 with
     `STEPS_07=pipeline PP_SPLITS="even 7,5 8,4 9,3 auto"`.
 
+37. **Megatron-Core's pipeline across vendors tracks one GPU.**
+    `megatron_pp.py` (docs/MEGATRON.md): Megatron-Core's GPT in two stages, one
+    on the NVIDIA GPU and one on the AMD GPU, with Megatron's own 1F1B schedule
+    through `backend="gpubridge"`, 200 steps. Check that it runs at all, and
+    that its loss curve tracks the same model, weights and data in one stage on
+    the V100; record tokens/s. *Status: Megatron's group setup on
+    `backend="gpubridge"` and a `batch_isend_irecv` across its pipeline group
+    work on CPU (checked by hand); Megatron's pipeline code needs CUDA, so no
+    CPU test. Not run on GPUs.* *Step:* `megatron_pp1` and `megatron_pp2` in
+    Explorer step 07 with `STEPS_07=megatron`.
+
 32. **Point-to-point across islands through the backend on GPUs.** `send`,
     `recv`, `isend`, `irecv` and `batch_isend_irecv` on `backend="gpubridge"`
     go native within an island and through the bridge across islands. On GPUs,
@@ -610,6 +621,7 @@ failures count against all six whichever test failed.
 | 34. Pipeline training across vendors tracks one GPU | step `pp_(gpipe\|1f1b)`; step `dp_single` | not run |
 | 35. The multitcp bridge against the Gloo bridge | step `multitcp_build`; step `matrix_D-multitcp(-pinned\|-1stream)?` | not run |
 | 36. Automatic stage balancing against even and hand-tuned splits | step `pp_(gpipe\|1f1b)_(even\|auto\|[0-9]+(-[0-9]+)+)` | not run |
+| 37. Megatron-Core's pipeline across vendors tracks one GPU | step `megatron_pp2`; step `megatron_pp1` | not run |
 
 Where the FAILs come from:
 
