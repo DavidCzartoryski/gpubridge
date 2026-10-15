@@ -26,6 +26,7 @@ vendor islands. Design and limits: docs/TORCH_BACKEND.md.
 from __future__ import annotations
 
 import contextlib
+import itertools
 import os
 import threading
 import warnings
@@ -55,6 +56,9 @@ _cpu_group: dist.ProcessGroup | None = None
 """A Gloo group of every rank for CPU-tensor collectives, apart from the one
 gpubridge's worker thread uses, so the two threads never interleave on one group."""
 _setting_up = False
+_world_setups = itertools.count()
+"""Every rank enters world setup in lockstep, even when torch's group counts differ.
+Never reset: internal groups and transport store keys can outlive the owning group."""
 _subgroups: list[GpubridgeProcessGroup] = []
 """Subgroups whose topology is built; the world's teardown closes what they hold."""
 
@@ -599,7 +603,7 @@ def _teardown(group: GpubridgeProcessGroup) -> None:
 
 
 def _world_group_names() -> contextlib.AbstractContextManager[None]:
-    """Name the world setup's groups the way a subgroup's are (``gpubridge:world.{ranks}.{k}``,
+    """Name the world setup's groups like a subgroup's (``gpubridge:world{generation}.{ranks}.{k}``,
     :func:`gpubridge.topology._members_only`), not from torch's count of the groups each
     process has created. The ranks can reach their first collective having created
     different numbers of groups: torch 2.9.1's ``DeviceMesh`` creates one for a (2, 1)
@@ -610,11 +614,12 @@ def _world_group_names() -> contextlib.AbstractContextManager[None]:
     torch's names are used as before, with a warning."""
     problem = _topology._subgroup_naming_problem()
     if problem is None:
-        return _topology._members_only("gpubridge:world")
+        return _topology._members_only(f"gpubridge:world{next(_world_setups)}")
     warnings.warn(
         f"gpubridge names its setup groups the way torch {torch.__version__} does ({problem}), "
         "so every rank must have created the same number of groups before the first "
-        f"collective on the {NAME} backend, or setup waits until the timeout", stacklevel=3)
+        f"collective on the {NAME} backend, or setup waits until the timeout",
+        RuntimeWarning, stacklevel=3)
     return contextlib.nullcontext()
 
 

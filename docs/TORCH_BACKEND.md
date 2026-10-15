@@ -137,12 +137,20 @@ other settings. A setting one rank can't read at all (an unknown policy name,
 a malformed `GPUBRIDGE_*` value) also fails every rank. The Gloo groups are
 created first, and every rank's error is exchanged over them before
 anything else, so no rank is left waiting in `new_group`. These groups are
-named like a subgroup's (below), `gpubridge:world.{ranks}.{k}`, not from
+named like a subgroup's (below), `gpubridge:world{generation}.{ranks}.{k}`, not from
 torch's count of the groups each process has created: the ranks can reach the
 first collective having created different numbers of groups (torch 2.9.1's
 `DeviceMesh` creates one for a (2, 1) mesh's replicate dimension where 2.14.1's
 reuses the default group, and this backend's groups are created without an
-exchange), and torch's names would then differ between them.
+exchange), and torch's names would then differ between them. Each world setup
+advances a process-local generation on every rank, including after a backend
+group is destroyed and recreated inside a Gloo job. Its groups and transport
+links therefore cannot reuse names or store keys from an earlier setup. All
+ranks must enter these setups in the same order. Setup synchronizes each new
+group's members only; all ranks visit the groups in the same order, and the
+discovery exchange on the world Gloo group follows their creation. No other
+thread may create process groups during setup. Transport links have their own
+namespace and counter, separate from torch groups.
 
 **Collectives.**
 - Each torch collective maps onto gpubridge's public collective of the same

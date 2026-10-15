@@ -340,9 +340,12 @@ hardware.
 - The `gpubridge` torch.distributed backend's setup hung until its timeout when the
   ranks had created different numbers of groups before their first collective: its
   own groups took torch's names, which count each process's groups, so the ranks
-  waited on different store keys. That is what HSDP across torch 2.14.1 and 2.9.1
-  did (their `DeviceMesh` creates one group more on 2.9.1), on a V100 + MI50 and in
-  a CPU reproduction. The setup's groups are now named like a subgroup's; on a torch
+  waited on different store keys. HSDP across torch 2.14.1 and 2.9.1 reproduced
+  this on CPU (their `DeviceMesh` creates one group more on 2.9.1). The V100 + MI50
+  jobs hung at the same step, likely for the same reason; the fix has not run on
+  those GPUs yet. Each world setup now names its groups and transport links with
+  a fresh generation, so destroying and recreating a backend group inside a Gloo
+  world cannot reuse its old names or store keys. On a torch
   whose private naming function has changed, torch's names are kept, with a warning.
 - The runbook's 8+8 steps said the master's tarball holds the two-machine
   training records. Rank 0 writes them, and torchrun numbers the machines by
