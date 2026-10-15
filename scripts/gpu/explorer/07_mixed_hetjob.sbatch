@@ -9,6 +9,7 @@
 # joined by the Gloo bridge over the cluster network. Items 1 and 2 on GPUs,
 # 3 with real RCCL ranks, 8 between nodes. The benchmark times each island's
 # native all_reduce (NCCL, RCCL) in the same job as the bridged one (item 11).
+# STEPS_07=training runs only the probe, the preflight and the training steps.
 set -euo pipefail
 REPO="${GPUBRIDGE_REPO:?submit with scripts/gpu/explorer/submit.sh}"
 # shellcheck source=../common.sh
@@ -21,6 +22,10 @@ GPUS_AMD="${GPUS_MIXED_AMD:-1}"
 RDZV_PORT="${RDZV_PORT:-29500}"
 PREFLIGHT_PORT="${PREFLIGHT_PORT:-29501}"
 BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-1G}"
+STEPS_07="${STEPS_07:-all}"  # all, or training
+case $STEPS_07 in all | training) ;; *) die "STEPS_07 must be all or training" ;; esac
+TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS:-gpt2-small resnet50}"
+read -ra train_args <<<"${TRAIN_BENCH_ARGS:-}"
 # Interfaces: empty lets NCCL choose, and Gloo on each node use the interface
 # the preflight picks there (names may differ between the two partitions).
 [ -n "${NCCL_SOCKET_IFNAME:-}" ] && export NCCL_SOCKET_IFNAME
@@ -100,47 +105,57 @@ if [ -z "${GLOO_SOCKET_IFNAME:-}" ] && [ "$USE_PREFLIGHT_IFNAME" = 1 ]; then
 fi
 # Both components write into one directory on the shared filesystem, so the
 # summary below covers every rank of the mixed job.
-step check mixed_torchrun check "$KIT_DIR/check.py" --out "$RESULTS/check"
-step summarize python "$KIT_DIR/summarize.py" "$RESULTS/check"
-step bench mixed_torchrun bench "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" \
-    --ops island,gpubridge,flat-gloo --phases --max-bytes "$BENCH_MAX_BYTES"
-# Pinned staging for the default bridge (item 25) on real NVIDIA + AMD leaders.
-export GPUBRIDGE_PINNED_STAGING=1
-step check_pinned mixed_torchrun check-pinned "$KIT_DIR/check.py" --out "$RESULTS/check_pinned"
-step summarize_pinned python "$KIT_DIR/summarize.py" "$RESULTS/check_pinned"
-step bench_pinned mixed_torchrun bench-pinned "$KIT_DIR/bench_all_reduce.py" \
-    --out "$RESULTS/bench_pinned" --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES"
-unset GPUBRIDGE_PINNED_STAGING
-# Bridge compression between real NVIDIA and AMD leaders (items 28 and 29). The kernel
-# benchmark runs on each side's GPU; the digests in the two summaries must match.
-step bench_compression_kernels both @VENV@/bin/python "$KIT_DIR/bench_compression.py" \
-    --out "$RESULTS/bench_compression_@SIDE@" --max-bytes "$BENCH_MAX_BYTES"
-step bench_compressed mixed_torchrun bench-compressed "$KIT_DIR/bench_all_reduce.py" \
-    --out "$RESULTS/bench_compressed" --ops gpubridge --compression none,bf16,fp8 --phases \
-    --max-bytes "$BENCH_MAX_BYTES"
-# The UCX bridge between real NVIDIA and AMD leaders (items 26 and 27), opt-in
-# with UCX_BRIDGE=1. Each side builds it against its own UCX (CUDA- or ROCm-built).
-if [ "$UCX_BRIDGE" = 1 ]; then
-    step ucx_build both @VENV@/bin/python -m gpubridge.ucx build
-    step check_ucx mixed_torchrun check-ucx "$KIT_DIR/check.py" --out "$RESULTS/check_ucx" \
-        --bridge ucx
-    step summarize_ucx python "$KIT_DIR/summarize.py" "$RESULTS/check_ucx"
-    step bench_ucx mixed_torchrun bench-ucx "$KIT_DIR/bench_all_reduce.py" \
-        --out "$RESULTS/bench_ucx" --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES" \
-        --bridge ucx
+if [ "$STEPS_07" = all ]; then
+    step check mixed_torchrun check "$KIT_DIR/check.py" --out "$RESULTS/check"
+    step summarize python "$KIT_DIR/summarize.py" "$RESULTS/check"
+    step bench mixed_torchrun bench "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" \
+        --ops island,gpubridge,flat-gloo --phases --max-bytes "$BENCH_MAX_BYTES"
+    # Pinned staging for the default bridge (item 25) on real NVIDIA + AMD leaders.
+    export GPUBRIDGE_PINNED_STAGING=1
+    step check_pinned mixed_torchrun check-pinned "$KIT_DIR/check.py" --out "$RESULTS/check_pinned"
+    step summarize_pinned python "$KIT_DIR/summarize.py" "$RESULTS/check_pinned"
+    step bench_pinned mixed_torchrun bench-pinned "$KIT_DIR/bench_all_reduce.py" \
+        --out "$RESULTS/bench_pinned" --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES"
+    unset GPUBRIDGE_PINNED_STAGING
+    # Bridge compression between real NVIDIA and AMD leaders (items 28 and 29). The kernel
+    # benchmark runs on each side's GPU; the digests in the two summaries must match.
+    step bench_compression_kernels both @VENV@/bin/python "$KIT_DIR/bench_compression.py" \
+        --out "$RESULTS/bench_compression_@SIDE@" --max-bytes "$BENCH_MAX_BYTES"
+    step bench_compressed mixed_torchrun bench-compressed "$KIT_DIR/bench_all_reduce.py" \
+        --out "$RESULTS/bench_compressed" --ops gpubridge --compression none,bf16,fp8 --phases \
+        --max-bytes "$BENCH_MAX_BYTES"
+    # The UCX bridge between real NVIDIA and AMD leaders (items 26 and 27), opt-in
+    # with UCX_BRIDGE=1. Each side builds it against its own UCX (CUDA- or ROCm-built).
+    if [ "$UCX_BRIDGE" = 1 ]; then
+        step ucx_build both @VENV@/bin/python -m gpubridge.ucx build
+        step check_ucx mixed_torchrun check-ucx "$KIT_DIR/check.py" --out "$RESULTS/check_ucx" \
+            --bridge ucx
+        step summarize_ucx python "$KIT_DIR/summarize.py" "$RESULTS/check_ucx"
+        step bench_ucx mixed_torchrun bench-ucx "$KIT_DIR/bench_all_reduce.py" \
+            --out "$RESULTS/bench_ucx" --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES" \
+            --bridge ucx
+    fi
+    # Opt-in policies on the real mixed job (items 17 to 21).
+    for policy in $OPT_IN_POLICIES; do
+        step "check_$policy" mixed_torchrun "check-$policy" "$KIT_DIR/check.py" \
+            --out "$RESULTS/check_$policy" --policy "$policy"
+        step "summarize_$policy" python "$KIT_DIR/summarize.py" "$RESULTS/check_$policy"
+    done
+    step bench_candidates mixed_torchrun candidates "$KIT_DIR/bench_all_reduce.py" \
+        --out "$RESULTS/bench_candidates" --ops gpubridge --max-bytes "$BENCH_MAX_BYTES" \
+        --write-thresholds "$RESULTS/thresholds.json"
 fi
-# Opt-in policies on the real mixed job (items 17 to 21).
-for policy in $OPT_IN_POLICIES; do
-    step "check_$policy" mixed_torchrun "check-$policy" "$KIT_DIR/check.py" \
-        --out "$RESULTS/check_$policy" --policy "$policy"
-    step "summarize_$policy" python "$KIT_DIR/summarize.py" "$RESULTS/check_$policy"
-done
-step bench_candidates mixed_torchrun candidates "$KIT_DIR/bench_all_reduce.py" \
-    --out "$RESULTS/bench_candidates" --ops gpubridge --max-bytes "$BENCH_MAX_BYTES" \
-    --write-thresholds "$RESULTS/thresholds.json"
 # DDP with gpubridge.ddp_comm_hook on real NVIDIA + AMD ranks (item 22).
 step train_ddp mixed_torchrun train "$REPO_DIR/examples/train_synthetic.py" \
     --json "$RESULTS/train_ddp.json"
+# Training throughput through the same hook on real models (train_bench.py): samples/s,
+# and the step split into compute, waiting for the slower GPU and exposed
+# communication. Set against train_bench.sbatch's runs of each GPU alone.
+for model in $TRAIN_BENCH_MODELS; do
+    step "train_bench_$model" mixed_torchrun "train-bench-$model" "$KIT_DIR/train_bench.py" \
+        --model "$model" --json "$RESULTS/train_bench_$model.json" \
+        "${train_args[@]+"${train_args[@]}"}"
+done
 # gpubridge as the torch.distributed backend (item 30): a plain FSDP2 script apart from
 # backend="gpubridge" and `import gpubridge`. Exits non-zero if ranks disagree.
 step train_fsdp2_backend mixed_torchrun fsdp2 "$REPO_DIR/examples/fsdp2_torch_backend.py" \

@@ -145,6 +145,31 @@ hardware.
 - `scripts/gpu/bench_compression.py --fp-fusion`: launches the compression
   kernels with multiply-add contraction on, so a run each way times what
   gpubridge's default (off) costs (#50).
+- Step 08, a comparison matrix of what gpubridge costs
+  (`scripts/gpu/explorer/08_bench_matrix.sbatch`, `scripts/gpu/bench_matrix.py`):
+  one heterogeneous job of two 1-GPU nodes runs the all_reduce benchmark
+  (1 KB to 1 GB, CUDA events, phases) for native NCCL or RCCL on the
+  transport each picks and over TCP on the bridge's interface (A1, A2, B1,
+  B2), gpubridge between two islands of one vendor (C), gpubridge between a
+  V100 and an MI50 under every policy, chunk size and compression mode (D),
+  and one flat Gloo group (E). `matrix.md` has a table per size range with
+  each run as a multiple of the two native baselines (marked where the
+  baseline ran in another job, on other nodes) and the bridge phase against
+  the preflight's prediction, each job's preflight, each node's InfiniBand
+  ports, and the transport NCCL and RCCL chose. `submit.sh 08` submits the
+  V100 + MI50 job;
+  `08-nvidia-pair` and `08-amd-pair`, two GPUs of one type in one partition,
+  are refused until `SAME_PARTITION_PAIRS_OK=1`.
+- `submit.sh net-nvidia` and `net-amd` (`net_check.sbatch`,
+  `scripts/gpu/net_report.sh`): one node's InfiniBand devices and ports, its
+  interfaces, and the network NCCL or RCCL initializes there, as chosen and
+  with `NCCL_IB_DISABLE=1`.
+- `scripts/gpu/train_bench.py`: training throughput through DDP and
+  `gpubridge.ddp_comm_hook` on GPT-2 small and ResNet-50 (built from
+  `torch.nn`, synthetic data), with each step split into compute, waiting
+  for the slower GPU and exposed communication. Step 07 runs it across both
+  vendors (`STEPS_07=training` runs only its training steps), and
+  `submit.sh train-nvidia` or `train-amd` on one GPU alone.
 
 ### Changed
 

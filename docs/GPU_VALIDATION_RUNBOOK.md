@@ -231,6 +231,12 @@ as of 2026-10-06; **verify each one**:
 | `SHARED_GPU_CHECK_SECONDS` | `60` | step 02's limit for its deliberate failing run, which fails within seconds when the check works |
 | `UCX_BRIDGE` | `0` | `1`: steps 05 and 07 also build the UCX bridge on each node (`python -m gpubridge.ucx build`) and run `check_ucx` and `bench_ucx` over `bridge="ucx"` (items 26 and 27; [RDMA_TRANSPORT.md](RDMA_TRANSPORT.md)). Needs UCX and a C++ compiler on the nodes, e.g. `MODULES=ucx` |
 | `PREFLIGHT_SECONDS` | `2` | seconds of raw TCP data each way per pair of interfaces in the preflight |
+| `TIME_NET`, `TIME_08`, `TIME_TRAIN` | 10, 40, 30 min | walltimes of the network check, the comparison matrix and the one-GPU training benchmark |
+| `SAME_PARTITION_PAIRS_OK` | `0` | `1` lets `08-nvidia-pair` and `08-amd-pair` submit: two GPUs of one type in one partition, once RC confirms that is within intended use |
+| `PARTITION_PAIR_NVIDIA`, `PARTITION_PAIR_AMD` | `gpu`, `sharing` | where those pairs' two components go |
+| `PIPELINE_CHUNKS` | `1M 4M 16M 64M` | step 08's pipelined runs, one per `GPUBRIDGE_CHUNK_BYTES` |
+| `TRAIN_BENCH_MODELS`, `TRAIN_BENCH_ARGS` | `gpt2-small resnet50`, empty | `train_bench.py`'s models and extra flags, in step 07 and `train-nvidia`/`train-amd` |
+| `STEPS_07` | `all` | `training`: step 07 runs only the probe, the preflight and its training steps |
 
 Also check:
 
@@ -440,6 +446,80 @@ The CUDA side stays at 2.14.1. On CPU, mixed releases from 2.9.1 to 2.14.1
 worked (item 2 in HARDWARE_VALIDATION.md). An older ROCm-side release is
 untested, and `gpubridge.init()` warns when releases differ. For identical
 releases, set `TORCH_VERSION` (and `CUDA_INDEX` if needed) for `submit.sh setup` too.
+
+### The comparison matrix and training throughput
+
+What gpubridge costs against native NCCL/RCCL and flat Gloo. Every run is
+2 ranks, one GPU each on two nodes, `bench_all_reduce.py` with float32 from
+1 KB to 1 GB, timed with CUDA events, with `--phases` on every gpubridge run.
+
+| Run | GPUs | What | Job |
+| --- | --- | --- | --- |
+| A1 | V100 + V100 | native NCCL, the transport NCCL picks | `submit.sh 08-nvidia-pair` |
+| A2 | V100 + V100 | native NCCL over TCP: `NCCL_IB_DISABLE=1`, `NCCL_SOCKET_IFNAME` = the bridge's interface | `08-nvidia-pair` |
+| B1, B2 | MI50 + MI50 | the same with RCCL | `submit.sh 08-amd-pair` |
+| C | V100 + V100 | through gpubridge's bridge, each GPU an island (`GPUBRIDGE_SPLIT_TEST=node`) | `08-nvidia-pair` |
+| C-amd | MI50 + MI50 | the same | `08-amd-pair` |
+| D-* | V100 + MI50 | through gpubridge: `default`, `pinned`, `pipelined-<chunk>` (`PIPELINE_CHUNKS`, default `1M 4M 16M 64M`), `sharded`, `bf16`, `fp8`, and `default-repeat` last | `submit.sh 08` |
+| E | V100 + MI50 | one flat Gloo group of both ranks (`flat-gloo`) | `08` |
+| E-nvidia, E-amd | the pairs | the same | the pair jobs |
+
+How to read it: **A1 against A2 is the network** (the transport NCCL picks
+against TCP, for the same NCCL in one job), **A2 against C is gpubridge's own
+cost** (the same job, GPUs and interface), **C against D is the vendor mixing**,
+and D's variants against `D-default` are what each policy buys. Each pair is
+its own job on its own nodes, so C against D, and every multiple of A1 or A2 on
+a D or E row, also compares two node pairs' networks: `matrix.md` lists each
+job's preflight and marks those multiples with †.
+
+```bash
+scripts/gpu/explorer/submit.sh net-nvidia   # one V100 node's network (~1 min)
+scripts/gpu/explorer/submit.sh net-amd      # one MI50 node's
+scripts/gpu/explorer/submit.sh 08           # D and E: one gpu + sharing job (~20 min)
+scripts/gpu/explorer/submit.sh 08-nvidia-pair   # A1, A2, C: refused until
+scripts/gpu/explorer/submit.sh 08-amd-pair      # SAME_PARTITION_PAIRS_OK=1
+```
+
+[`08_bench_matrix.sbatch`](../scripts/gpu/explorer/08_bench_matrix.sbatch) is one
+heterogeneous job of two 1-GPU components (`MATRIX_PAIR`, set by `submit.sh`).
+It records each node's network (`net_report.sh`: `/sys/class/infiniband`,
+`ibstat`, `ibv_devinfo`, `ip -br addr`, into `network/<side>/`), probes both
+GPUs, runs the preflight, then each run into `matrix/<run>/`, and ends with
+`bench_matrix.py`, which writes `matrix.md`: per size range (under 256 KB,
+256 KB to under 64 MB, 64 MB and up) every run's latency and bus bandwidth, its time
+as a multiple of A2's and A1's, the bridge phase against the preflight's
+prediction (a ring all_reduce of the tensor, both ways at once; with `bf16` or
+`fp8`, each leader's compressed payload broadcast in turn, one way at a time), each
+gpubridge run's phases, and what NCCL and RCCL logged about the network in
+each run (`Using network IB` or `Socket`, `via NET/IB` or `NET/Socket`). Point
+`bench_matrix.py` at several jobs' results to put the pairs side by side; with
+no A1 and A2 the multiples stay empty. The job refuses to run if both
+components land on one node. `net_check.sbatch` (`net-nvidia`, `net-amd`)
+records one node's network the same way and has NCCL or RCCL initialize on one
+rank, as chosen and with `NCCL_IB_DISABLE=1`, so its log names the network the
+library would use between nodes.
+
+**Same-partition pairs wait for Research Computing.** A1, A2, B1, B2 and C need
+two GPUs of one type, which `08-nvidia-pair` and `08-amd-pair` ask for as two
+1-GPU components of one heterogeneous job in one partition
+(`PARTITION_PAIR_NVIDIA`, `PARTITION_PAIR_AMD`). Whether that is within the
+partitions' intended use is RC's call, so `submit.sh` refuses them (dry-run
+only) until `SAME_PARTITION_PAIRS_OK=1` is in `explorer/local.env`.
+
+**Training throughput** ([`train_bench.py`](../scripts/gpu/train_bench.py)):
+GPT-2 small (124M parameters) and ResNet-50 (25.6M), built from `torch.nn`
+alone, on synthetic data, trained with DDP and `gpubridge.ddp_comm_hook`. Each
+step's time splits into compute (the same steps before DDP wraps the model),
+waiting for the slower GPU and exposed communication; `comm_alone_ms` is the
+gradient buckets all_reduced with no compute. Step 07 runs it on both sides
+(`train_bench_<model>`, with the other training steps; `STEPS_07=training`
+runs only the probe, the preflight and those), and `submit.sh train-nvidia` or
+`train-amd` on one GPU alone, the baseline: adding a GPU through gpubridge
+pays off only if the pair's `samples_per_s` beats the faster GPU's alone.
+`TRAIN_BENCH_MODELS` and `TRAIN_BENCH_ARGS` choose the models and flags. Both
+models need BLAS on every GPU (the probe's `blas_available`): with a ROCm build
+whose rocBLAS lacks the GPU's kernels, its rank aborts at the first matmul, as
+the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
 
 ## Kaggle (free): two NVIDIA T4s
 
