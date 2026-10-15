@@ -330,8 +330,9 @@ train-amd)
     submit train_bench.sbatch "$TIME_TRAIN" 1 1 "$PARTITION_AMD" "$AMD_TYPE"
     ;;
 train-multi)
-    [ $((GPUS_TRAIN_MULTI % 2)) = 0 ] && [ "$GPUS_TRAIN_MULTI" -ge 2 ] ||
+    if [ $((GPUS_TRAIN_MULTI % 2)) != 0 ] || [ "$GPUS_TRAIN_MULTI" -lt 2 ]; then
         die "GPUS_TRAIN_MULTI must be even (two halves), not $GPUS_TRAIN_MULTI"
+    fi
     export TRAIN_SIDE=nvidia TRAIN_GPUS=$GPUS_TRAIN_MULTI
     submit train_bench.sbatch "$TIME_TRAIN_MULTI" 1 "$GPUS_TRAIN_MULTI" "$PARTITION_MULTI" \
         "$GPU_TYPE_MULTI"
