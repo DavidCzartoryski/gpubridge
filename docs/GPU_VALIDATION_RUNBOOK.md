@@ -521,7 +521,7 @@ GPU memory would need there, into `rdma/<side>/`: dma-buf and peer-to-peer
 options in the kernel, `nvidia_peermem` or `nv_peer_mem`, rdma-core and
 `ibv_reg_dmabuf_mr`, `rdma link`, the HSA runtime's dma-buf export and UCX. For
 `ucx_info`, set `RDMA_MODULES` to a module that provides it (on Explorer,
-`OpenMPI/4.1.6`); it is loaded just before that step, the job's last.
+`OpenMPI/4.1.6`); it is loaded inside that step only.
 
 **Same-partition pairs wait for Research Computing.** A1, A2, B1, B2 and C need
 two GPUs of one type, which `08-nvidia-pair` and `08-amd-pair` ask for as two

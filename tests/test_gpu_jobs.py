@@ -37,7 +37,7 @@ END_TO_END = {
     "bench_matrix.py": "test_step_08_*, test_net_check_job, test_gpu_kit.py",
     "train_bench.py": "test_step_07_*, test_train_bench_job, test_gpu_kit.py",
     "net_report.sh": "test_step_08_*, test_net_check_job",
-    "rdma_report.sh": "test_net_check_job",
+    "rdma_report.sh": "test_net_check_job, test_rdma_report_keeps_paths_out_and_reads_all_of_nm",
     "stream_mutations.py": "test_gpu_kit.py: its plan, each mutation, and its refusal without a "
                            "GPU (the mutated tests themselves need one)",
     "time_triton_cache.py": "test_gpu_kit.py: filesystems and its refusal without a GPU (the "
@@ -497,6 +497,46 @@ def test_net_check_job(tmp_path):
     assert "## Network" in (out / "matrix.md").read_text()
     log = (tmp_path / "slurm.log").read_text()
     assert "--partition=gpu" in log and "--time=00:10:00" in log
+
+
+def test_rdma_report_keeps_paths_out_and_reads_all_of_nm(tmp_path):
+    # Stand-ins: an nm whose symbol comes first in a long listing (grep -q would stop
+    # reading and nm die of SIGPIPE, which pipefail reports as no match), and a ucx_info
+    # and ldconfig that print site paths, which the records must not keep.
+    bin_dir, lib = tmp_path / "bin", tmp_path / "site" / "lib"
+    (lib / "ucx").mkdir(parents=True)
+    bin_dir.mkdir()
+    for name in ("ucx/libuct_cma.so", "ucx/libuct_ib.so", "libibverbs.so.1"):
+        (lib / name).touch()
+    tools = {
+        # Versioned, as newer binutils print rdma-core's symbols; an unversioned near miss.
+        "nm": "echo '0000 T ibv_reg_dmabuf_mr@@IBVERBS_1.12'; echo '0000 T ibv_reg_dmabuf_mr_x'; "
+              "seq 1 200000 | sed 's/^/0000 T sym_/'",
+        "ucx_info": f"""if [ "$1" = -v ]; then echo '# Library path: {lib}/libucs.so.0'
+echo '# Configured with: --prefix={tmp_path}/site'; else echo '# Memory domain: tcp'; fi""",
+        "ldconfig": f"echo '\tlibibverbs.so.1 (libc6,x86-64) => {lib}/libibverbs.so.1'",
+    }
+    for name, body in tools.items():
+        (bin_dir / name).write_text(f"#!/usr/bin/env bash\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+    out = tmp_path / "out"
+    result = subprocess.run(["bash", str(KIT / "rdma_report.sh"), str(out)],
+                            env=clean_env(PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}"),
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert "libibverbs.so.1: has ibv_reg_dmabuf_mr" in (out / "rdma_core.txt").read_text()
+    ucx = (out / "ucx.txt").read_text()
+    assert "# transport modules installed: cma ib" in ucx
+    assert "# Library path: .../libucs.so.0" in ucx
+    assert not [p.name for p in out.iterdir() if str(tmp_path) in p.read_text()]
+
+
+def test_net_check_job_survives_a_module_that_wont_load(tmp_path):
+    code = submit(tmp_path, "net-nvidia", RDMA_MODULES="no-such-module",
+                  FAKE_MODULES_MISSING="no-such-module")
+    out = tmp_path / "results" / "net_check_nvidia"
+    assert code == 1 and failed(out) == {"rdma"}, job_output(tmp_path)
+    assert "finished" in [e["event"] for e in events(out)]  # finish ran: the job's records
 
 
 def test_train_bench_job(tmp_path):

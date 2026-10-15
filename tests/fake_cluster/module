@@ -1,3 +1,10 @@
 #!/usr/bin/env bash
-# Fake Lmod module command: records the call and succeeds.
+# Fake Lmod module command: records the call and succeeds, except for `module load` of a
+# name in FAKE_MODULES_MISSING, which fails as Lmod does for an unknown module.
 echo "module $*" >>"${FAKE_SLURM_LOG:-/dev/null}"
+for missing in ${FAKE_MODULES_MISSING:-}; do
+    if [ "${1:-}" = load ] && [ "${2:-}" = "$missing" ]; then
+        echo "Lmod has detected the following error: The following module(s) are unknown: \"$2\"" >&2
+        exit 1
+    fi
+done
