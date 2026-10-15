@@ -555,8 +555,17 @@ mixed run at global batch N is `TRAIN_BENCH_ARGS="--global-batch N"` on
 rank's `batch_size`, `compute_ms_per_sample` and `waiting_ms`, and with
 `--balance` the calibration's per-sample times. Models with BatchNorm
 (ResNet-50) normalize over each rank's own batch, so their result depends on
-the split, as it does in any DDP run without SyncBatchNorm. Both
-models need BLAS on every GPU (the probe's `blas_available`): with a ROCm build
+the split, as it does in any DDP run without SyncBatchNorm.
+`--accumulate K` cuts each rank's batch (its samples per optimizer step) into K
+micro-batches and syncs the gradients once per step, in the last backward
+(`no_sync()` for the others): a global batch too big for a GPU's memory runs as
+K smaller forward and backward passes with one exchange. It combines with the
+flags above (with `--balance` the calibration runs at the micro-batch size and
+each rank gets at least K samples), and the update is exact the same way (CPU
+only so far), BatchNorm aside: it normalizes over each micro-batch. The JSON
+adds `accumulate`, `micro_batch_sizes`, `samples_per_step` and the
+`exchanges_per_step` the hook counted. Both models need BLAS on every GPU (the
+probe's `blas_available`): with a ROCm build
 whose rocBLAS lacks the GPU's kernels, its rank aborts at the first matmul, as
 the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
 

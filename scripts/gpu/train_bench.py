@@ -52,6 +52,17 @@ scaling, unequal batches would weight a sample on a small rank more. The record
 holds each rank's batch, compute, per-sample compute and waiting, the global
 batch, the split and, with --balance, the calibration's measurements.
 
+``--accumulate K``: each rank's batch (its samples per optimizer step) is cut into
+K micro-batches as evenly as whole samples allow, forward and backward run on
+each in turn, and DDP syncs the gradients once, in the last backward
+(``no_sync()`` for the others): one exchange per optimizer step instead of K.
+The losses are sample-weighted as above, so the update is the same as one
+backward over the rank's whole batch (BatchNorm aside: it normalizes over each
+micro-batch). With --balance the calibration runs at
+the micro-batch size, and each rank gets at least K samples. The record holds
+K, each rank's micro-batch sizes, the samples per step, and the exchanges per
+step the hook counted (and per sample).
+
 So, for "does adding a second GPU raise throughput?", compare a run's
 samples_per_s with a one-rank run's on the faster GPU. The decomposition is a
 model: compute measured alone can differ from compute while gradients sync
@@ -74,6 +85,7 @@ Rank 0 writes --json PATH. On CPU, in simulation mode:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import statistics
 import sys
@@ -232,17 +244,18 @@ def loss_of(model: nn.Module, x: torch.Tensor, y: torch.Tensor,
                            reduction="sum") * scale
 
 
-def split_batch(global_batch: int, per_sample_s: list[float]) -> list[int]:
-    """``global_batch`` whole samples over the ranks, at least one each, in proportion to
-    their speed: each next sample goes to the rank whose predicted compute (samples x
-    seconds per sample) stays lowest, the lower rank on a tie."""
-    if global_batch < len(per_sample_s):
+def split_batch(global_batch: int, per_sample_s: list[float], minimum: int = 1) -> list[int]:
+    """``global_batch`` whole samples over the ranks, at least ``minimum`` each, in
+    proportion to their speed: each next sample goes to the rank whose predicted
+    compute (samples x seconds per sample) stays lowest, the lower rank on a tie."""
+    if global_batch < minimum * len(per_sample_s):
         raise ValueError(f"a global batch of {global_batch} can't give each of "
-                         f"{len(per_sample_s)} ranks a sample")
+                         f"{len(per_sample_s)} ranks "
+                         + ("a sample" if minimum == 1 else f"{minimum} samples"))
     if not all(t > 0 for t in per_sample_s):
         raise ValueError(f"seconds per sample must be positive, got {per_sample_s}")
-    shares = [1] * len(per_sample_s)
-    for _ in range(global_batch - len(shares)):
+    shares = [minimum] * len(per_sample_s)
+    for _ in range(global_batch - sum(shares)):
         rank = min(range(len(shares)), key=lambda r: ((shares[r] + 1) * per_sample_s[r], r))
         shares[rank] += 1
     return shares
@@ -257,35 +270,61 @@ def even_split(global_batch: int, world: int) -> list[int]:
     return [global_batch // world + (r < global_batch % world) for r in range(world)]
 
 
+def micro_batches(data: list[tuple[torch.Tensor, torch.Tensor]],
+                  sizes: list[int]) -> list[list[tuple[torch.Tensor, torch.Tensor]]]:
+    """Each (input, target) batch cut into micro-batches of ``sizes`` samples."""
+    return [list(zip(x.split(sizes), y.split(sizes), strict=True)) for x, y in data]
+
+
+def backward(model: nn.Module, micro: list[tuple[torch.Tensor, torch.Tensor]],
+             scale: float | None, loss=loss_of) -> tuple[torch.Tensor, int]:
+    """Forward and backward over each micro-batch, gradients accumulating. Under DDP
+    the gradients sync once, in the last backward (``no_sync`` for the others). The
+    summed loss and the targets' element count."""
+    total, units = None, 0
+    for j, (x, y) in enumerate(micro):
+        syncs = j == len(micro) - 1 or not isinstance(model, DistributedDataParallel)
+        with contextlib.nullcontext() if syncs else model.no_sync():
+            value = loss(model, x, y, scale)
+            value.backward()
+        total = value.detach() if total is None else total + value.detach()
+        units += y.numel()
+    assert total is not None
+    return total, units
+
+
 def timed_steps(model: nn.Module, optimizer: torch.optim.Optimizer, data, device,
                 warmup: int, steps: int,
                 scale: float | None = None) -> tuple[list[float], list[float]]:
     """Seconds per timed step (synchronized before and after), and every step's loss
-    (this rank's mean, with or without ``scale``)."""
+    (this rank's mean, with or without ``scale``). Each entry of ``data`` is one
+    step's micro-batches (:func:`micro_batches`)."""
     times, losses = [], []
     for i in range(warmup + steps):
-        x, y = data[i % len(data)]
+        micro = data[i % len(data)]
         sync(device)
         start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
-        loss = loss_of(model, x, y, scale)
-        loss.backward()
+        total, units = backward(model, micro, scale)
         optimizer.step()
         sync(device)
         if i >= warmup:
             times.append(time.perf_counter() - start)
-        value = float(loss.detach())
-        losses.append(value if scale is None else value / (scale * y.numel()))
+        value = float(total)
+        losses.append(value if scale is None else value / (scale * units))
     return times, losses
 
 
-def recording_hook(sizes: list[tuple[int, torch.dtype]]):
+def recording_hook(sizes: list[tuple[int, torch.dtype]], exchanges: list[int] | None = None):
     """gpubridge.ddp_comm_hook, noting each bucket's size and dtype in ``sizes`` as DDP
-    hands it over (the last step's buckets: DDP may rebuild them after the first)."""
+    hands it over (the last step's buckets: DDP may rebuild them after the first), and
+    counting gradient exchanges (bucket 0's) in ``exchanges[0]``."""
 
     def hook(state, bucket):
         if bucket.index() == 0:
             sizes.clear()
+            if exchanges is not None:
+                exchanges[0] += 1
         buffer = bucket.buffer()
         sizes.append((buffer.numel(), buffer.dtype))
         return gpubridge.ddp_comm_hook(state, bucket)
@@ -357,8 +396,8 @@ def calibrate(name: str, model: nn.Module, batch: int, seq: int, rank: int,
     """Seconds per step of this rank alone at ``batch`` samples: its speed for
     --balance. The optimizer is thrown away, like the compute phase's."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    times, _ = timed_steps(model, optimizer, batches(name, batch, seq, rank, device),
-                           device, warmup, steps, scale)
+    data = micro_batches(batches(name, batch, seq, rank, device), [batch])
+    times, _ = timed_steps(model, optimizer, data, device, warmup, steps, scale)
     del optimizer
     model.zero_grad(set_to_none=True)
     return times
@@ -397,6 +436,9 @@ def main() -> int:
                         "global batch / world size")
     parser.add_argument("--calibration-steps", type=int, default=3,
                         help="--balance's timed steps per rank, after one warm-up")
+    parser.add_argument("--accumulate", type=int, default=1, metavar="K",
+                        help="micro-batches per optimizer step: each rank's batch is cut "
+                        "into K, its gradients synced once, after the last")
     parser.add_argument("--seq-len", type=int, default=None, help="GPT models only")
     parser.add_argument("--steps", type=int, default=10, help="timed steps per phase")
     parser.add_argument("--warmup-steps", type=int, default=3)
@@ -409,6 +451,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.balance and not args.global_batch:
         raise SystemExit("--balance needs --global-batch")
+    if args.accumulate < 1:
+        raise SystemExit("--accumulate must be at least 1")
+    accumulate = args.accumulate
     config = MODELS[args.model]
     seq = (args.seq_len or DEFAULT_SEQ[args.model]) if isinstance(config, GPTConfig) else 0
     if isinstance(config, GPTConfig) and not 0 < seq <= config.context:
@@ -420,8 +465,12 @@ def main() -> int:
         print("SPLIT TEST: not a mixed-vendor result.", file=sys.stderr, flush=True)
     shares, split = batch_sizes(args, world)
     global_batch = sum(shares)
-    # Unequal batches, or a global batch asked for: sample-weighted losses (loss_scale).
-    scale = (None if split == "per-rank"
+    if min(shares) < accumulate:
+        raise SystemExit(f"--accumulate {accumulate} needs at least {accumulate} samples "
+                         f"per rank, got {shares}")
+    # Unequal batches, a global batch asked for or micro-batches: sample-weighted losses
+    # (loss_scale), so the update is the mean over every sample of the step.
+    scale = (None if split == "per-rank" and accumulate == 1
              else loss_scale(world, global_batch, seq or 1))
     torch.manual_seed(0)  # on CPU, so every rank builds the same model on any device
     model = build(args.model).to(device)
@@ -430,11 +479,12 @@ def main() -> int:
     calibration = None
     if args.balance and world > 1:
         # 0. calibration: each rank alone at one batch size, then the split by speed.
-        cal_batch = args.calibration_batch or max(1, global_batch // world)
+        # With micro-batches, at the micro-batch size: what each forward and backward runs.
+        cal_batch = args.calibration_batch or max(1, global_batch // (world * accumulate))
         times = calibrate(args.model, model, cal_batch, seq, rank, device, 1,
                           args.calibration_steps, args.lr, scale)
         per_sample = [statistics.median(t) / cal_batch for t in gather(times)]
-        shares, split = split_batch(global_batch, per_sample), "balanced"
+        shares, split = split_batch(global_batch, per_sample, accumulate), "balanced"
         calibration = {"batch_size": cal_batch, "steps": args.calibration_steps,
                        "warmup_steps": 1,
                        "ranks": [{"rank": r, "compute_ms_per_sample": ms(t),
@@ -447,7 +497,8 @@ def main() -> int:
     elif args.balance:
         split = "balanced"
     batch = shares[rank]
-    data = batches(args.model, batch, seq, rank, device)
+    micro = [even_split(n, accumulate) for n in shares]
+    data = micro_batches(batches(args.model, batch, seq, rank, device), micro[rank])
 
     # 1. compute: this rank's GPU alone. Its optimizer state is thrown away; DDP below
     # starts again from rank 0's parameters.
@@ -464,10 +515,12 @@ def main() -> int:
                                   else None, bucket_cap_mb=args.bucket_mb,
                                   broadcast_buffers=False)
     sizes: list[tuple[int, torch.dtype]] = []
-    ddp.register_comm_hook(None, recording_hook(sizes))
+    exchanges = [0]
+    ddp.register_comm_hook(None, recording_hook(sizes, exchanges))
     optimizer = torch.optim.AdamW(ddp.parameters(), lr=args.lr)
     ddp_times, losses = timed_steps(ddp, optimizer, data, device, args.warmup_steps, args.steps,
                                     scale)
+    exchanges_per_step = exchanges[0] / (args.warmup_steps + args.steps)
 
     # Every rank's parameters: their bits, their sum, and whether they are finite.
     digest, total, finite = hashlib.sha256(), 0.0, True
@@ -508,7 +561,14 @@ def main() -> int:
             "loss_weighting": ("mean per rank, averaged over ranks" if scale is None else
                                "sample-weighted: each rank's summed loss x world size / "
                                "(global batch x units per sample)"),
-            "calibration": calibration, "seq_len": seq or None,
+            "calibration": calibration,
+            "accumulate": accumulate, "micro_batch_sizes": micro,
+            "samples_per_step": global_batch,
+            "exchanges_per_step": exchanges_per_step,
+            "samples_per_exchange": (round(global_batch / exchanges_per_step, 3)
+                                     if exchanges_per_step else None),
+            "exchanges_per_sample": round(exchanges_per_step / global_batch, 6),
+            "seq_len": seq or None,
             "steps": args.steps, "warmup_steps": args.warmup_steps,
             "comm_trials": args.comm_trials, "bucket_mb": args.bucket_mb,
             "buckets": len(sizes), "optimizer": f"AdamW(lr={args.lr})",
@@ -528,7 +588,9 @@ def main() -> int:
               f"{result['exposed_comm_ms']} (comm alone {result['comm_alone_ms']}); per rank "
               + ", ".join(f"{r['vendor']} batch {r['batch_size']} compute {r['compute_ms']} "
                           f"waits {r['waiting_ms']}" for r in result["ranks"])
-              + f"; global batch {global_batch}", flush=True)
+              + f"; global batch {global_batch}"
+              + (f" in {accumulate} micro-batches {micro}, {exchanges_per_step:g} "
+                 "exchange(s) per step" if accumulate > 1 else ""), flush=True)
         if not record["params_identical"]:
             print(f"note: the ranks' parameters differ (sums up to "
                   f"{record['params_sum_spread']:.3g} apart)", flush=True)
