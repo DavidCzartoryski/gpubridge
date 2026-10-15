@@ -222,6 +222,12 @@ hardware.
 - `scripts/gpu/amd/run_all.sh` measures training throughput (`train_bench.py`):
   each model on one GPU, and with 2+ GPUs as one RCCL island and split through
   the bridge. The runbook has the steps for an MI300X on AMD Developer Cloud.
+- `submit.sh train-multi` and `07-multi`, for the day multigpu access arrives:
+  `train_bench.py` on one GPU, on `GPUS_TRAIN_MULTI` GPUs (4) as one NCCL
+  island, and on the same GPUs as two islands of half each through the bridge
+  (a split test); and step 07 with `GPUS_MIXED_NVIDIA_MULTI` NVIDIA GPUs (4) on
+  `multigpu` next to the AMD side. Both run end to end on the fake cluster
+  (#64).
 - Step 07: `STEPS_07=bench` runs only the probe, the preflight and the
   `train_bench_<model>` steps: no `train_ddp`, FSDP2 or HSDP (HSDP hung until
   its step limit in each of the four fp8 jobs above).
@@ -379,11 +385,26 @@ hardware.
 
 ### Fixed
 
+- Point-to-point lifecycle: future callbacks no longer run under the engine
+  lock or on lane threads, so a callback waiting on another (or its own) P2P
+  Work completes and teardown does not wait for it; idle lanes release
+  completed payloads and their threads exit, keeping per-tag sequence order;
+  a CPU request on a lane that earlier carried a CUDA tensor uses no stream.
+  A batch's Work (`batch_isend_irecv`, `_coalescing_manager`) waits on its
+  members rather than on futures behind user callbacks, so a slow callback
+  doesn't delay it, a callback can wait on it, and `wait(timeout)` works.
+  CPU tests only; the GPU stream paths are unvalidated.
 - The runbook's 8+8 steps said the master's tarball holds the two-machine
   training records. Rank 0 writes them, and torchrun numbers the machines by
   address, not by role, so they can be on either machine. The two-machine
   test assumed the master too, and failed when the worker's torchrun started
   first; it now expects the record on exactly one of the two (#74).
+- `examples/fsdp2_torch_backend.py --verify` is exact at any world size. It
+  averaged each rank's unscaled loss, which divides by the world size, inexact
+  unless that is a power of two, so on 3 or 5 ranks (2 NVIDIA GPUs and an AMD
+  one, say) the check failed with nothing wrong. Each rank's loss is now scaled
+  by the world size and the replay sums the ranks' losses; on CPU it matches bit
+  for bit on 2 to 6 ranks, and with `--hsdp 2` on 4 and 6 (#64).
 - The stream-ordering checks (`check.py`'s `busy_gpu` and `async` stages,
   `tests/test_gpu.py`) queued matmuls as busy work, and failed or aborted
   where rocBLAS has no kernels for the GPU (gfx906 on the ROCm 7.2 wheel).
