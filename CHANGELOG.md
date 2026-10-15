@@ -202,6 +202,13 @@ hardware.
 
 ### Added
 
+- Step 07: `STEPS_07=bench` runs only the probe, the preflight and the
+  `train_bench_<model>` steps: no `train_ddp`, FSDP2 or HSDP (HSDP hung until
+  its step limit in each of the four fp8 jobs above).
+  `TRAIN_BENCH_BUCKETS="10 25 50 100"` runs each `train_bench_<model>` step
+  once per DDP bucket size (`--bucket-mb`), as `train_bench_<model>_bucket<MB>`
+  (step and JSON), for a bucket-size sweep in one job. Tested on the fake
+  cluster (CPU only).
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
   CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA

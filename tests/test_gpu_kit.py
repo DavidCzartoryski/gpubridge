@@ -491,6 +491,56 @@ def test_mixed_hetjob_skips_hsdp_unless_both_sides_have_as_many_gpus():
     assert "skipping the HSDP steps: they need as many NVIDIA GPUs as AMD (2 vs 1)" in result.stderr
 
 
+def passed_steps(log: str) -> list[str]:
+    """The steps a dry run's last "passed:" line names, in order."""
+    line = [line for line in log.splitlines() if "] passed: " in line][-1]
+    return line.split("] passed: ", 1)[1].split()
+
+
+TRAINING_07 = ["train_fsdp2_backend", "verify_fsdp2_backend", "train_hsdp_backend",
+               "verify_hsdp_backend"]
+
+
+@pytest.mark.parametrize(("env", "expected"), [
+    ({"STEPS_07": "bench"},
+     ["probe", "preflight", "train_bench_gpt2-small", "train_bench_resnet50"]),
+    ({"STEPS_07": "bench", "TRAIN_BENCH_MODELS": "resnet50", "TRAIN_BENCH_BUCKETS": "10 25"},
+     ["probe", "preflight", "train_bench_resnet50_bucket10", "train_bench_resnet50_bucket25"]),
+    ({"STEPS_07": "training", "TRAIN_BENCH_BUCKETS": "12.5"},
+     ["probe", "preflight", "train_ddp", "train_bench_gpt2-small_bucket12.5",
+      "train_bench_resnet50_bucket12.5", *TRAINING_07]),
+])
+def test_mixed_hetjob_step_selection(env, expected):
+    env = {"TRAIN_BENCH_MODELS": "gpt2-small resnet50", "TRAIN_BENCH_ARGS": "--steps 5",
+           "TRAIN_BENCH_BUCKETS": "", **env}
+    result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w", **env)
+    assert result.returncode == 0, result.stderr
+    assert passed_steps(result.stderr) == expected
+    runs = [line for line in result.stdout.splitlines() if "train_bench.py" in line]
+    assert len(runs) == len([name for name in expected if name.startswith("train_bench_")])
+    for name, line in zip([n for n in expected if n.startswith("train_bench_")], runs,
+                          strict=True):
+        # Each run on both sides, under its own JSON name and rendezvous, after the
+        # extra arguments, with its bucket size when it has one.
+        assert line.count(f"/{name}.json --steps 5") == 2, line
+        assert line.count(f"--rdzv-id=local-{name.replace('_', '-')} ") == 2, line
+        mb = name.partition("_bucket")[2]
+        assert line.count("--bucket-mb") == (2 if mb else 0), line
+        assert not mb or line.count(f"--steps 5 --bucket-mb {mb} ") == 2, line
+
+
+@pytest.mark.parametrize(("env", "message"), [
+    ({"STEPS_07": "hsdp"}, "STEPS_07 must be all, training or bench"),
+    ({"TRAIN_BENCH_BUCKETS": "10 big"}, "TRAIN_BENCH_BUCKETS: 'big' is not a size in MB"),
+    ({"TRAIN_BENCH_BUCKETS": "10", "TRAIN_BENCH_ARGS": "--steps 5 --bucket-mb 5"},
+     "in TRAIN_BENCH_BUCKETS or in TRAIN_BENCH_ARGS, not both"),
+])
+def test_mixed_hetjob_refuses_unknown_step_settings(env, message):
+    result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w", **env)
+    assert result.returncode != 0 and message in result.stderr, result.stderr
+    assert "srun" not in result.stdout
+
+
 def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w")
     assert result.returncode == 0, result.stderr
