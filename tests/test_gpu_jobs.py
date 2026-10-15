@@ -37,6 +37,7 @@ END_TO_END = {
     "bench_matrix.py": "test_step_08_*, test_net_check_job, test_gpu_kit.py",
     "train_bench.py": "test_step_07_*, test_train_bench_job, test_gpu_kit.py",
     "net_report.sh": "test_step_08_*, test_net_check_job",
+    "rdma_report.sh": "test_net_check_job",
     "stream_mutations.py": "test_gpu_kit.py: its plan, each mutation, and its refusal without a "
                            "GPU (the mutated tests themselves need one)",
     "time_triton_cache.py": "test_gpu_kit.py: filesystems and its refusal without a GPU (the "
@@ -485,10 +486,14 @@ def test_net_check_job(tmp_path):
     code = submit(tmp_path, "net-nvidia")
     out = tmp_path / "results" / "net_check_nvidia"
     assert code == 0 and failed(out) == set(), job_output(tmp_path)
-    assert list(steps(out)) == ["network", "net_default", "net_tcp", "matrix"]
+    assert list(steps(out)) == ["network", "net_default", "net_tcp", "matrix", "rdma"]
     side = out / "network" / "nvidia"
     assert {p.name for p in side.iterdir()} == {"sys_class_infiniband.txt", "ibstat.txt",
                                                 "ibv_devinfo.txt", "ip_addr.txt"}
+    rdma = out / "rdma" / "nvidia"
+    assert {p.name for p in rdma.iterdir()} == {"kernel.txt", "modules.txt", "rdma_core.txt",
+                                                "rdma_link.txt", "ucx.txt", "rocm_dmabuf.txt"}
+    assert str(tmp_path) not in "".join(p.read_text() for p in rdma.iterdir())
     assert "## Network" in (out / "matrix.md").read_text()
     log = (tmp_path / "slurm.log").read_text()
     assert "--partition=gpu" in log and "--time=00:10:00" in log
