@@ -549,7 +549,8 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     # Every launch runs under coreutils timeout (STEP_TIMEOUT, common.sh).
     assert all(line.startswith("+ timeout --kill-after=30 1200 srun ") for line in launches)
     sruns = [line[line.index("srun "):] for line in launches]
-    # probe, preflight, check, check_p2p, bench, a check per opt-in policy, the candidates bench,
+    # probe, preflight, check, check_p2p, bench_p2p, bench, a check per opt-in policy,
+    # the candidates bench,
     # DDP training, then FSDP2 on the torch.distributed backend (trained, then verified),
     # then HSDP the same way (one GPU per side by default: as many on each side)
     # then train_bench.py on each of its models
@@ -570,8 +571,8 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     assert "probe_nvidia" in sruns[0] and "probe_amd" in sruns[0]
     assert out.index("preflight.py") < out.index("torchrun")
     assert "check.py" in sruns[2] and "--p2p-only" in sruns[3]  # check_p2p
-    assert "bench_all_reduce.py" in sruns[4]
-    nvidia_bench, amd_bench = sruns[4].replace("\\", "").split(" : ")  # undo printf %q
+    assert "bench_p2p.py" in sruns[4] and "bench_all_reduce.py" in sruns[5]
+    nvidia_bench, amd_bench = sruns[5].replace("\\", "").split(" : ")  # undo printf %q
     assert "--ops island,gpubridge" in nvidia_bench and "--ops island,gpubridge" in amd_bench
     assert "srun --het-group=1 --ntasks=1 rocm-smi" in out
 
