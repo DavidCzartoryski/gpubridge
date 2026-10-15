@@ -233,7 +233,7 @@ hardware.
   one shell function for both (`dp_run_options`). The runbook's 8+8 steps say
   how to size them for 16 GPUs. Step 07's `07-multi` with `STEPS_07=dp` and
   `pipeline` runs on the fake cluster with an NVIDIA island of two, and the
-  runner on two pretend machines and in two containers (#PRNUM).
+  runner on two pretend machines and in two containers (#85).
 - Pipeline training across vendors: `scripts/gpu/train_pipeline.py` cuts
   `llama.py`'s model into contiguous stages, one per rank, and trains it with
   torch's GPipe or 1F1B through `backend="gpubridge"`'s point-to-point (or on a
