@@ -299,7 +299,7 @@ hardware.
   can't separate compression's error from the drop's timing. Parameters
   identical on both GPUs at every check.
   docs/BENCHMARKS.md, and docs/COMPRESSION.md's "Training with compression"
-  (#67).
+  (#67, #84).
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
   CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA
