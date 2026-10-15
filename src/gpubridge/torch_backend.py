@@ -425,7 +425,10 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
             if self._p2p is None:
                 assert topology.transport is not None and topology.world_group is not None
                 assert self._p2p_store is not None
-                self._p2p = _p2p.Engine(topology.transport.create_p2p(topology.world_group),
+                link = topology.transport.create_p2p(topology.world_group,
+                                                       store=self._p2p_store,
+                                                       timeout=self._timeout)
+                self._p2p = _p2p.Engine(link,
                                         topology.device, topology.rank, self._p2p_store,
                                         self._timeout, pinned=topology.pinned_staging,
                                         chunk_bytes=_p2p.chunk_bytes_setting())
