@@ -139,22 +139,30 @@ def _load(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def find_runs(roots: list[Path]) -> list[Run]:
-    """Every run under ``roots``. A run's job is its job directory's name, with
-    " (2)", " (3)" ... where two directories of one name (two downloads of the same
-    step) are different jobs."""
-    runs, labels = [], {}
+class JobLabels(dict):
+    """Job directory (resolved) -> its label: the directory's name, with " (2)", " (3)"
+    ... where two directories of one name (two downloads of the same step) are
+    different jobs."""
+
+    def __call__(self, job_dir: Path) -> str:
+        key = job_dir.resolve()
+        if key not in self:
+            same = sum(1 for d in self if d.name == job_dir.name)
+            self[key] = job_dir.name + (f" ({same + 1})" if same else "")
+        return self[key]
+
+
+def find_runs(roots: list[Path], labels: JobLabels | None = None) -> list[Run]:
+    """Every run under ``roots``, each labeled with its job (JobLabels)."""
+    runs, labels = [], JobLabels() if labels is None else labels
     for root in roots:
         for path in sorted(root.rglob("matrix/*/bench.json")):
             bench = _load(path)
             if bench is None:
                 continue
             job_dir = path.parent.parent.parent
-            if job_dir.resolve() not in labels:
-                same = sum(1 for d in labels if d.name == job_dir.name)
-                labels[job_dir.resolve()] = job_dir.name + (f" ({same + 1})" if same else "")
             preflight = _load(job_dir / "preflight" / "preflight-master.json")
-            run = Run(path.parent.name, labels[job_dir.resolve()], bench,
+            run = Run(path.parent.name, labels(job_dir), bench,
                       preflight if preflight and "bandwidth" in preflight else None,
                       _load(job_dir / "preflight" / "preflight-worker.json"))
             run.nccl = nccl_lines(job_dir / "nccl" / f"matrix_{run.name}")
@@ -275,8 +283,8 @@ def infiniband(side_dir: Path) -> dict[str, Any]:
     return {"devices": devices, "ports": list(ports.values()), "tools": tools}
 
 
-def network(roots: list[Path]) -> list[dict[str, Any]]:
-    rows = []
+def network(roots: list[Path], labels: JobLabels | None = None) -> list[dict[str, Any]]:
+    rows, labels = [], JobLabels() if labels is None else labels
     for root in roots:
         for side_dir in sorted(root.rglob("network/*")):
             if not side_dir.is_dir():
@@ -286,7 +294,7 @@ def network(roots: list[Path]) -> list[dict[str, Any]]:
             # net_check.sbatch's one-rank initializations, net_default and net_tcp.
             nccl = {step.name: nccl_lines(step)
                     for step in sorted((job_dir / "nccl").glob("net_*")) if step.is_dir()}
-            rows.append({"job": job_dir.name, "side": side_dir.name, **ib,
+            rows.append({"job": labels(job_dir), "side": side_dir.name, **ib,
                          "interfaces": interfaces(side_dir / "ip_addr.txt"), "nccl": nccl})
     return rows
 
@@ -508,8 +516,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pending", action="append", default=[], metavar="RUNS=WHY",
                         help="runs not in the results and why, e.g. A1,A2='waiting on access'")
     args = parser.parse_args(argv)
-    runs = find_runs(args.paths)
-    net = network(args.paths)
+    labels = JobLabels()
+    runs = find_runs(args.paths, labels)
+    net = network(args.paths, labels)
     if not runs and not net:
         print(f"no matrix runs (matrix/<run>/bench.json) or network records under "
               f"{', '.join(map(str, args.paths))}", file=sys.stderr)
@@ -534,9 +543,9 @@ def main(argv: list[str] | None = None) -> int:
         "pending": pending,
     })
     with open(out / "matrix.csv", "w", newline="") as fh:
-        fields = ["run", "job", "what", "bytes", "median_us", "p90_us", "busbw_GBps", "x_A2",
-                  "x_A2_other_job", "x_A1", "x_A1_other_job", "predicted_bridge_ms", "bridge_ms", "measured_over_predicted",
-                  "trials", "timer"]
+        fields = ["run", "job", "what", "bytes", "median_us", "p90_us", "busbw_GBps",
+                  "x_A2", "x_A2_other_job", "x_A1", "x_A1_other_job", "predicted_bridge_ms",
+                  "bridge_ms", "measured_over_predicted", "trials", "timer"]
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)

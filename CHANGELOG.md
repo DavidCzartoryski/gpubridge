@@ -101,6 +101,65 @@ release so far is an alpha. Numbers in parentheses are pull requests.
     differently: the MI50's rank timed out (Gloo, 300 s) in DDP's parameter
     check while the V100's printed nothing, cause unknown. The job reached
     its limit during `train_fsdp2_backend`.
+- **Network checks at 934f87c** (`submit.sh net-nvidia`, `net-amd`), one
+  node of each type. The V100 node (`gpu`) has one RDMA port, `mlx5_0`:
+  InfiniBand, active, 100 Gb/s; NCCL 2.29.3 initialized alone chose NET/IB on
+  it, and with `NCCL_IB_DISABLE=1` NET/Socket on `internal` and
+  `internal.2137`. The MI50 node (`sharing`) has `mlx5_0` (Ethernet, so RoCE;
+  active, 10 Gb/s), `mlx5_1` (Ethernet, down) and `mlx5_2` (InfiniBand, down);
+  RCCL 2.27.7 chose NET/IB over RoCE on `mlx5_0`, and with
+  `NCCL_IB_DISABLE=1` NET/Socket on `ibs8`, an interface `ip` reports as down.
+  The bridge's preflight uses TCP on `internal.2137` on both. Details in
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#network).
+- **ROCm wheel scan** (a CPU job; no GPU): of every torch ROCm wheel from 2.8
+  on for Python 3.12, only the `rocm6.3` builds of 2.8.0, 2.9.0 and 2.9.1 ship
+  rocBLAS kernels for gfx906 (155 Tensile files each); the table is in
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#which-rocm-wheels-can-train-on-an-mi50-gfx906).
+- **AMD MI50 (gfx906) with torch 2.9.1+rocm6.3**, in a second venv
+  (`venv-rocm63`; the default ROCm venv unchanged), HIP 6.3.42134, RCCL 2.21.5,
+  driver 5.14.0-611.5.1.el9_7: `setup-rocm`'s probe found BLAS working. On one
+  MI50, float32 and float16 matmuls (float32 within 1.6e-6 of a float64 CPU
+  result), a conv2d, causal attention and a linear layer's backward ran. The
+  single-node AMD step at dbed5c9 passed 7 of 9 steps; `gpu_tests` (20
+  failed, 6 passed, 8 skipped) and `bench_compression_kernels` failed, every
+  failure the wheel's Triton (pytorch-triton-rocm 3.5.1) failing to compile
+  the compression kernels for gfx906 (`PassManager::run failed`).
+- **The comparison matrix, an NVIDIA V100 (sm_70) and an AMD MI50 (gfx906),
+  commit 934f87c**, step 08: one heterogeneous job, one GPU and one rank
+  each, the V100 as in step 07 (driver 545.23.08, torch 2.14.1+cu126, NCCL
+  2.29.3) and the MI50 on the default venv (torch 2.14.1+rocm7.2, RCCL
+  2.27.7). All 15 steps passed. The preflight measured 1173.7 and 1172.1 MB/s
+  over `internal.2137` and a 0.048 ms round trip. A float32 all_reduce of 1 GB
+  took 1.67 s through the default bridge (1.60 s in a repeat run), 1.64 s in
+  one flat Gloo group, 1.21 s with pinned staging, 1.07 s pipelined in 16 MB
+  chunks, 1.58 s sharded (one link), 1.23 s with bf16 compression and 609 ms
+  with fp8. The native baselines (A1, A2, B1, B2) and the same-vendor bridge
+  (C) wait on Research Computing. Tables in
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+- **Training throughput on one V100 alone, commit 934f87c**
+  (`submit.sh train-nvidia`; driver 545.23.08, torch 2.14.1+cu126, NCCL
+  2.29.3): `train_bench.py`, float32, DDP with `gpubridge.ddp_comm_hook` on one
+  rank: GPT-2 small at batch 4 x 512 tokens, 25.3 samples/s (158 ms a step);
+  ResNet-50 at batch 32, 315.8 samples/s (101 ms).
+- **Training throughput on one MI50 alone, commit 934f87c**, with torch
+  2.9.1+rocm6.3 (`submit.sh train-amd`, `VENV_ROCM` at `venv-rocm63`; HIP
+  6.3.42134, RCCL 2.21.5): GPT-2 small 16.4 samples/s (244 ms a step);
+  ResNet-50 247.3 samples/s (129 ms).
+- **Training on an NVIDIA V100 (sm_70) and an AMD MI50 (gfx906) together,
+  commit 934f87c**: step 07 with `STEPS_07=training`, the V100 on torch
+  2.14.1+cu126 (driver 545.23.08, NCCL 2.29.3) and the MI50 on torch
+  2.9.1+rocm6.3 (`venv-rocm63`; HIP 6.3.42134, RCCL 2.21.5), the default
+  bridge over TCP (1173.8 and 1169.7 MB/s, a 0.046 ms round trip). With
+  gfx906 rocBLAS kernels on the MI50, the training steps that failed this
+  afternoon ran: DDP with `gpubridge.ddp_comm_hook` (`train_ddp`; parameters
+  in sync), and FSDP2 through the `gpubridge` backend, which also matched a
+  single-process replay bit for bit. HSDP through the backend printed
+  nothing for 20 minutes and the step timeout stopped it; the job was then
+  cancelled, before HSDP's bit-for-bit check. `train_bench.py` (float32, the
+  same batches per rank as alone): GPT-2 small 8.9 samples/s (a 899 ms step,
+  659 ms of it exposed communication), against 25.3 on the V100 alone;
+  ResNet-50 327.7 samples/s (a 195 ms step), against 315.8. Adding the MI50
+  lowered GPT-2 small's throughput and left ResNet-50's about where it was.
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real

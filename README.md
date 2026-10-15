@@ -8,8 +8,11 @@ native NCCL or RCCL, and a bridge joins them.**
 [![release](https://img.shields.io/github/v/release/DavidCzartoryski/gpubridge?include_prereleases&sort=semver)](https://github.com/DavidCzartoryski/gpubridge/releases)
 
 **Status:** alpha. Validated on CPU, in simulation and with CUDA and ROCm
-builds of PyTorch joined in one job. One GPU run so far: the
-[CHANGELOG](CHANGELOG.md)'s header says what it showed.
+builds of PyTorch joined in one job. On GPUs since 2026-10-14: single-vendor
+runs on NVIDIA V100, T4, L40S, A100 and H200 and an AMD MI50, and mixed jobs of
+one V100 and one MI50 (one GPU per vendor) over TCP. The
+[CHANGELOG](CHANGELOG.md)'s header lists every GPU run, and
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) what the bridge costs.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/architecture-dark.svg">
@@ -48,13 +51,13 @@ its own vendor. No GPUs? See [Simulation mode](#simulation-mode-no-gpus-needed).
 
 | Feature | Status |
 | --- | --- |
-| Collectives: `all_reduce`, `broadcast`, `all_gather_into_tensor`, `reduce_scatter_tensor`, `barrier` | tested on CPU · not yet on GPU |
-| Async collectives (`async_op=True`) and a DDP comm hook | tested on CPU · not yet on GPU |
-| `torch.distributed` backend: DDP, FSDP2, HSDP through subgroups | experimental · tested on CPU · not yet on GPU |
-| Pipelined and sharded bridge policies | opt-in · tested on CPU · not yet on GPU |
+| Collectives: `all_reduce`, `broadcast`, `all_gather_into_tensor`, `reduce_scatter_tensor`, `barrier` | tested on CPU · passed on a V100 + MI50, one GPU each, and in split tests (two processes on one NVIDIA or AMD GPU, labeled as two vendors) |
+| Async collectives (`async_op=True`) and a DDP comm hook | tested on CPU · passed on a V100 + MI50; DDP with the hook trained there with torch 2.9.1+rocm6.3 on the MI50 |
+| `torch.distributed` backend: DDP, FSDP2, HSDP through subgroups | experimental · tested on CPU · DDP and FSDP2 trained on a V100 + MI50 (torch 2.9.1+rocm6.3 on the MI50), FSDP2 bit for bit against a replay; HSDP hung there |
+| Pipelined and sharded bridge policies | opt-in · tested on CPU · correct and benchmarked on a V100 + MI50 (one GPU each, so the sharded bridge had one link) |
 | UCX bridge transport (RDMA where available) | opt-in · tested on CPU over TCP · not yet on GPU or RDMA |
-| bf16 / fp8 bridge compression with Triton kernels | opt-in · kernels tested in Triton's CPU interpreter · not yet on GPU |
-| GPU validation kit: Slurm job scripts, checks, benchmarks | every script runs end to end on CPU against a fake Slurm · not yet run on GPUs |
+| bf16 / fp8 bridge compression with Triton kernels | opt-in · kernels match the CPU reference on V100, H200 and MI50 (not with torch 2.9.1+rocm6.3's Triton on the MI50); benchmarked on a V100 + MI50 |
+| GPU validation kit: Slurm job scripts, checks, benchmarks | every script runs end to end on CPU against a fake Slurm · run on Explorer: steps 01, 02, `amd`, 07, 08, the network checks and the training benchmarks; not the multi-GPU steps 03 to 06 |
 
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what each one still
 needs from real GPUs.
