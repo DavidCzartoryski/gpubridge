@@ -393,11 +393,14 @@ or speedup has been measured.
   it does not cancel the transfer. Same-island errors retain native behavior.
 - **Callbacks.** `wait()` and `is_completed()` see completion before the
   future's callbacks run, so a callback may wait on its own Work or on any
-  other P2P Work, including a later message with the same tag. Futures are
-  resolved one at a time, in completion order, on one completion thread per
-  process group, never on a lane thread or under an internal lock: a slow
-  callback delays only later futures of that group, not transfers,
-  collectives or teardown.
+  other P2P Work, including a batch's (`batch_isend_irecv` returns Works that
+  wait on their members, not on futures) and a later message with the same
+  tag. Futures are resolved one at a time, in completion order, on one
+  completion thread per process group, never on a lane thread or under an
+  internal lock: a slow callback delays later futures of that group, not
+  transfers, `wait()`, collectives or teardown. So a callback must not block on
+  another P2P future of the same group (`get_future().wait()`): only this
+  thread can resolve it, and it is busy running the callback.
 - **Threads and memory.** A lane's thread exits once its queue is empty, so
   resident lane threads match the `(peer, tag, direction)` keys with queued or
   running operations, not every tag used. Per-key message sequence numbers

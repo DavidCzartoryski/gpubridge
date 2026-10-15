@@ -644,3 +644,86 @@ def test_native_gpu_posts_are_grouped_and_mutation_is_detected(monkeypatch):
     _check_native_grouping(monkeypatch, False)
     with pytest.raises(AssertionError, match="outside its NCCL/RCCL batch"):
         _check_native_grouping(monkeypatch, True)
+
+
+# ---- batches and callbacks (review round 2 of the lifecycle fix) -----------------------------
+
+def _within(fn, seconds: float) -> bool:
+    """Run ``fn`` on a helper thread; whether it returned within ``seconds``."""
+    done = threading.Event()
+    threading.Thread(target=lambda: (fn(), done.set()), daemon=True).start()
+    return done.wait(seconds)
+
+
+def _callback_waits_on_a_batch(rank, world):
+    dist.barrier()
+    store = dist.distributed_c10d._get_default_store()
+    if rank == 0:
+        a = dist.isend(torch.ones(5), 1, tag=0)
+        b = batch_isend_irecv([dist.P2POp(dist.isend, torch.full((5,), 2.0), 1, tag=1)])[0]
+        seen = {}
+
+        def callback(future):
+            store.set("entered", "1")
+            store.wait(["received-b"], timedelta(seconds=10))  # the peer has b's payload
+            seen["b"] = _within(b.wait, 5)
+
+        chained = a.get_future().then(callback)
+        store.set("registered", "1")
+        chained.wait()
+        assert seen["b"], "a callback on a's future couldn't see batch b complete"
+    else:
+        store.wait(["registered"])
+        t = torch.empty(5)
+        dist.recv(t, 0, tag=0)
+        store.wait(["entered"])
+        dist.recv(t, 0, tag=1)
+        assert torch.equal(t, torch.full((5,), 2.0))
+        store.set("received-b", "1")
+    dist.barrier()
+
+
+def test_a_callback_can_wait_on_a_batch_handle(tmp_path):
+    # Before: a batch's Work waited on its members' futures, which the group's one
+    # completion thread resolves, and that thread was running this very callback.
+    run(["nvidia", "amd"], _callback_waits_on_a_batch, tmp_path)
+
+
+def _slow_callback_and_a_batch(rank, world):
+    dist.barrier()
+    if rank == 0:
+        a = dist.isend(torch.ones(3), 1, tag=0)
+        a.get_future().then(lambda _: time.sleep(2))
+        a.wait()
+        start = time.monotonic()
+        for work in batch_isend_irecv([dist.P2POp(dist.isend, torch.ones(3), 1, tag=1)]):
+            work.wait()
+        elapsed = time.monotonic() - start
+        assert elapsed < 1, f"a batch's wait() took {elapsed:.2f} s behind a slow callback"
+    else:
+        dist.recv(torch.empty(3), 0, tag=0)
+        dist.recv(torch.empty(3), 0, tag=1)
+    dist.barrier()
+
+
+def test_a_slow_callback_does_not_delay_a_batch_wait(tmp_path):
+    run(["nvidia", "amd"], _slow_callback_and_a_batch, tmp_path)
+
+
+def _batch_wait_with_a_timeout(rank, world):
+    dist.barrier()
+    if rank == 0:
+        (work,) = batch_isend_irecv([dist.P2POp(dist.irecv, torch.empty(3), 1, tag=5)])
+        with pytest.raises(TimeoutError):  # the peer sends only after this
+            work.wait(timedelta(seconds=0.2))
+        dist.barrier()
+        assert work.wait(timedelta(seconds=10)) and work.is_completed()
+        assert work.exception() is None
+    else:
+        dist.barrier()
+        dist.send(torch.ones(3), 0, tag=5)
+    dist.barrier()
+
+
+def test_a_batch_wait_takes_a_finite_timeout(tmp_path):
+    run(["nvidia", "amd"], _batch_wait_with_a_timeout, tmp_path)

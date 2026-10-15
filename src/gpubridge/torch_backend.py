@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import warnings
 from collections.abc import Callable, Sequence
 from datetime import timedelta
@@ -377,7 +378,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
             futures.append(works[-1].get_future())
         if not futures:
             return _completed([])
-        return _create_work_from_future(torch.futures.collect_all(futures).then(
+        return _BatchWork([*torch_works, *works], torch.futures.collect_all(futures).then(
             lambda f: ([g.value() for g in f.value()], [])[1]))
 
     # ---- point-to-point -------------------------------------------------------------------
@@ -536,6 +537,45 @@ def _future_of(work: dist.Work) -> torch.futures.Future:
     future: torch.futures.Future = torch.futures.Future()
     future.set_result(None)
     return future
+
+
+class _BatchWork(dist.Work):
+    """A coalesced batch's Work (``batch_isend_irecv``, ``_coalescing_manager``).
+
+    ``wait()`` waits on each member itself, so a batch completes on the host when its
+    members do. A Work made from the members' futures would wait for those futures, which
+    one completion thread per group resolves, behind user callbacks: a slow callback on
+    another tag would delay the batch, and a callback waiting on the batch would wait
+    forever. A finite ``wait(timeout)`` also works, as for the members. The future is
+    every member's."""
+
+    def __init__(self, works: Sequence[dist.Work], future: torch.futures.Future) -> None:
+        super().__init__()
+        self._works, self._future = list(works), future
+
+    def wait(self, timeout: timedelta | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout.total_seconds()
+        for work in self._works:
+            if deadline is None:
+                work.wait()
+            else:
+                work.wait(timedelta(seconds=max(0.0, deadline - time.monotonic())))
+        return True
+
+    def is_completed(self) -> bool:
+        return all(work.is_completed() for work in self._works)
+
+    def is_success(self) -> bool:
+        return self.is_completed() and self.exception() is None
+
+    def exception(self) -> BaseException | None:
+        return next((e for e in (w.exception() for w in self._works) if e is not None), None)
+
+    def get_future(self) -> torch.futures.Future:
+        return self._future
+
+    def synchronize(self) -> None:
+        self.wait()
 
 
 def _all_of(works: Sequence[dist.Work], result: Any) -> dist.Work:
