@@ -225,6 +225,19 @@ hardware.
 
 ### Added
 
+- Automatic pipeline stage balancing: `gpubridge.balance`, an opt-in module
+  nothing else imports. `profile_layers` times each layer's forward and
+  backward on a device (CUDA or HIP events), with its output size, state and
+  saved activations. `partition` picks the contiguous split whose slowest
+  stage, transfers across each boundary included, is fastest within each
+  device's memory: exact, by dynamic programming, and checked against brute
+  force with injected speeds, links and memory limits. `train_pipeline.py
+  --split auto` profiles every block on every stage's GPU and the links, and
+  trains bit for bit like the same split given by hand. Step 07's
+  `PP_SPLITS` runs several splits in one job. On a V100 + MI50 (1F1B, 500
+  steps): even 13,062 tokens/s, 8 + 4 15,577, 9 + 3 16,021; the automatic
+  split chose 8 + 4 (15,559, 1.19x even), 3.0% below the best hand-tuned one.
+  docs/PIPELINE.md, HARDWARE_VALIDATION.md item 36 (#PRNUM).
 - Pipeline training across vendors: `scripts/gpu/train_pipeline.py` cuts
   `llama.py`'s model into contiguous stages, one per rank, and trains it with
   torch's GPipe or 1F1B through `backend="gpubridge"`'s point-to-point (or on a

@@ -1572,6 +1572,8 @@ def test_every_step_the_tables_look_for_is_one_a_job_runs():
         p.name for p in (KIT / "explorer").glob("0*.sbatch"))]
     runs += [dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="dp"),
              dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="pipeline"),
+             dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="pipeline",
+                     PP_SPLITS="even 8,4 auto"),
              dry_run(KIT / "explorer" / "dp_baseline.sbatch"),
              dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="4"),
              dry_run(KIT / "mixed" / "node.sh", ROLE="master", MASTER_ADDR="10.0.0.1",

@@ -25,8 +25,8 @@ small real dataset isn't wired in yet.
 
 **Stages.** Stage *i* holds a contiguous range of the blocks; stage 0 also the
 embedding, the last stage the final norm and output layer. The split is even
-(`--split 7,5` sets it by hand, in stage order); automatic balancing is prompt
-4's work. Stages go to the NVIDIA ranks first, then the AMD ones, each in rank
+by default; `--split 7,5` sets it by hand, in stage order, and `--split auto`
+balances it ([Automatic stage balancing](#automatic-stage-balancing)). Stages go to the NVIDIA ranks first, then the AMD ones, each in rank
 order, whatever ranks the launcher handed out (torch's c10d rendezvous doesn't
 promise the NVIDIA node rank 0), and the pipeline's neighbours follow that
 order; the record lists each stage's rank, vendor and blocks.
@@ -141,8 +141,8 @@ Per stage, from the same runs (GPipe; 1F1B's within 1.5 ms of each):
   that is the GPU: both stages have 6 blocks, but stage 1 also runs the output
   layer (768 x 32,000) and the loss. The step is close to what GPipe's schedule predicts from the
   slowest stage, (microbatches + stages - 1) x 61.8 = 309 ms (an estimate, not
-  a measurement). An uneven split (`--split 7,5` or `8,4`, not run) is the
-  obvious next step; balancing is prompt 4's work.
+  a measurement). Uneven splits are faster: 9 + 3 reached 16,021 tokens/s in a
+  later job ([Automatic stage balancing](#measured-a-v100-and-an-mi50)).
 - **1F1B tracks the one-V100 runs as closely as they track each other**: over
   the last 100 steps it's 0.0036 to 0.0052 from each, and they're 0.0041 to
   0.0056 apart.
@@ -160,6 +160,105 @@ Per stage, from the same runs (GPipe; 1F1B's within 1.5 ms of each):
   [Design](#design): first 2.14.1 on the V100 against 2.9.1 on the MI50, then
   2.9.1's int64 handshake.
 
+## Automatic stage balancing
+
+GPUs of different speed want different shares of the layers. `--split auto`
+picks the split from measurements, with [`gpubridge.balance`](../src/gpubridge/balance.py),
+an opt-in module that nothing else imports:
+
+1. **Profile.** Every rank runs each layer (the embedding, each block, the
+   final norm and output layer) forward and backward on its own GPU, one
+   microbatch, timed with CUDA or HIP events after a warmup
+   (`balance.profile_layers`). It also records each layer's output size (what
+   crosses a stage boundary after it), its state (parameters, gradients and
+   AdamW's two moments: 16 bytes a parameter) and the tensors autograd saves
+   for its backward. The embedding's cost goes with the first block, the
+   output layer's with the last, as they always share those blocks' stages.
+2. **Time the links.** Each pair of neighbouring stages sends one microbatch's
+   activations, timed alone, as the record's hop times are.
+3. **Partition** (`balance.partition`): of every split into contiguous ranges,
+   at least one block each, the one whose slowest stage is fastest. A stage's
+   time per microbatch is its blocks' forward and backward on its own GPU,
+   plus `2 x activation bytes / link bandwidth` at each boundary it shares
+   (forward the activation, back its gradient; both sides count it, as the
+   host-staged send and receive keep both waiting). A stage's memory is its
+   blocks' state plus their saved activations times the microbatches it holds
+   at once (all of them with GPipe, `stages - stage` with 1F1B), within 90% of
+   its GPU's memory. Exact, by dynamic programming over the boundaries; the
+   tests check it against brute force on random cases with injected speeds,
+   links and memory limits.
+
+Every rank computes the same split from the gathered measurements. The record
+keeps them: each stage's per-block times, the links, the memory limits, the
+predicted stage times for the chosen split and for the even one, and the
+speedup the cost model predicts.
+
+**When it helps:** stages on GPUs of different speed, or a model whose layers
+cost different amounts (here the output layer, 768 x 32,000, sits on the last
+stage). **When it doesn't:** identical GPUs and identical layers, where the
+even split is already best; and whatever the model leaves out: the pipeline's
+fill and drain (the same for every split with the same stages and
+microbatches), transfers overlapping compute, and the optimizer step. A split
+it predicts faster can still measure slower, which is why step 07 runs it next
+to the even and hand-tuned splits.
+
+**Prior work.** Zettabyte's paper (Hu et al.,
+[arXiv 2602.18007](https://arxiv.org/abs/2602.18007), §3.1.2 and §4.2) split
+the layers by hand: for LLaMA-8B, 15 on the AMD stage and 17 on the NVIDIA one,
+fewer on AMD "due to their lower observed throughput". It doesn't say how it
+chose those counts.
+
+```bash
+# Even, three hand-tuned splits and the automatic one, 1F1B, in one job:
+VENV=$WORK_DIR/venv-cu291 STEPS_07=pipeline PP_RUNS=1f1b PP_SPLITS="even 7,5 8,4 9,3 auto" \
+    TIME_07=00:55:00 scripts/gpu/explorer/submit.sh 07
+```
+
+`PP_SPLITS` runs each schedule once per split, as `pp_<schedule>_<split>`
+(step and record).
+
+### Measured: a V100 and an MI50
+
+Explorer job 11113912, commit 8217a36 (clean on both ranks), both GPUs on torch
+2.9.1: `llama-125m`, 1F1B, 4 microbatches of 2 x 512 tokens, 500 steps, every
+split in the one job (preflight: 1163 to 1174 MB/s each way). Medians of steps
+6 to 500; compute is one microbatch's forward and backward through the stage
+alone.
+
+| Split (V100 + MI50 blocks) | Tokens/s | Against even | Step (ms) | V100 compute | MI50 compute | V100 idle (est.) | MI50 idle (est.) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| even, 6 + 6 | 13,062 | 1.00x | 313.6 | 36.8 | 61.7 | 166.3 | 66.7 |
+| 7 + 5 | 14,216 | 1.09x | 288.1 | 42.7 | 54.5 | 117.2 | 70.2 |
+| 8 + 4 | 15,577 | 1.19x | 263.0 | 47.1 | 46.7 | 74.4 | 76.1 |
+| 9 + 3 | 16,021 | 1.23x | 255.7 | 50.3 | 39.0 | 54.4 | 99.5 |
+| `auto`, which chose 8 + 4 | 15,559 | 1.19x | 263.3 | 43.2 | 46.8 | 90.4 | 75.9 |
+
+- **The automatic split beats the even one by 1.19x, but not the best
+  hand-tuned split.** It chose 8 + 4, which ran within 0.1% of the same split
+  given by hand. 9 + 3 gave 3.0% more tokens/s. The cost model predicted 1.25x
+  over even: 61.1 and 60.5 ms a microbatch for 8 + 4's stages, against 49.7 and
+  76.3 for even's.
+- **What the model misses.** By compute alone 8 + 4 is balanced (47.1 and
+  46.7 ms) and 9 + 3 isn't (50.3 and 39.0), yet 9 + 3 was faster. Moving a block
+  off the MI50 still shortened the step after the V100's compute passed the
+  MI50's. So the MI50's stage seems to cost more per microbatch than its
+  compute, by about the 11 ms gap at 9 + 3 or more, and the profile doesn't see
+  it. Where it goes (host staging on that side, the bridge's receive, the last
+  stage's loss) isn't measured yet. The model also charges each hop to both
+  stages, while gpubridge's sends across islands don't block the sender, so it
+  overstates the transfers. Timing each side's share of a hop would be the
+  next step.
+- **Compute alone varies between runs**: 8 blocks on the V100 took 47.1 ms in
+  one run and 43.2 in the other. Close splits can swap places on that.
+- **These runs compare throughput, not loss.** The even split's loss was
+  still on the plateau at step 500 (9.42); the others had dropped (2.05 to
+  2.08). As [above](#results-a-v100-and-an-mi50), the drop's timing varies from
+  run to run.
+
+Against Zettabyte's hand-chosen splits, then: on this pair, choosing the split
+from measurements got within 3% of the best of three hand-tuned splits on its
+first try, and didn't beat it.
+
 ## What's validated where
 
 | What | Where | Status |
@@ -169,6 +268,9 @@ Per stage, from the same runs (GPipe; 1F1B's within 1.5 ms of each):
 | Stages follow the stage order, not the ranks | CPU, stage 0 on rank 1: the same losses as stage 0 on rank 0, bit for bit | passes |
 | The step 07 runs and their records | the fake cluster | passes (`tests/test_gpu_jobs.py`) |
 | Loss curves, tokens/s, per-stage compute, idle time and hop time on a V100 + MI50 | Explorer, `STEPS_07=pipeline`, 1,000 steps | ran: 1F1B within the one-V100 runs' spread, GPipe 0.02 above it ([results](#results-a-v100-and-an-mi50)) |
+| The automatic split is the best under the cost model | CPU: random cases with injected device speeds, links and memory limits, against brute force | passes (`tests/test_balance.py`) |
+| `--split auto` trains like the same split given by hand | CPU, 2 stages | bit for bit (`tests/test_gpu_kit.py`) |
+| Even, hand-tuned and automatic splits on a V100 + MI50, 500 steps | Explorer, `PP_SPLITS` | ran: automatic 1.19x even, 3.0% below the best hand-tuned ([above](#measured-a-v100-and-an-mi50)) |
 | A two-stage pipeline on one V100, as a second baseline | - | not built |
 
 A number in this file gets written only once it was measured, with where it

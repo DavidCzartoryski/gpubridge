@@ -486,6 +486,24 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     Not run between two machines.* *Step:* `multitcp_build` and the
     `matrix_D-multitcp*` runs in Explorer step 08, with `MULTITCP_BRIDGE=1`.
 
+36. **Automatic stage balancing against even and hand-tuned splits.**
+    `train_pipeline.py --split auto` (docs/PIPELINE.md, "Automatic stage
+    balancing"): `gpubridge.balance` profiles each block on each stage's GPU
+    and the links between stages, then picks the contiguous split whose
+    slowest stage, transfers included, is fastest within each GPU's memory. On
+    a V100 + MI50, 500 steps: tokens/s, per-stage times and idle time for the
+    even split, the best of a few hand-tuned splits and the automatic one, same
+    model and seed. *Status: works on CPU: the partitioner matches brute force
+    on random cases with injected device speeds, links and memory limits
+    (`tests/test_balance.py`), and `--split auto` trains bit for bit like the
+    same split given by hand (`tests/test_gpu_kit.py`). On a V100 + MI50
+    (Explorer job 11113912, 1F1B, 500 steps): even 13,062 tokens/s, 7 + 5
+    14,216, 8 + 4 15,577, 9 + 3 16,021, and the automatic split chose 8 + 4,
+    15,559: 1.19x even, 3.0% below the best hand-tuned split. The cost model
+    misses a per-microbatch cost on the MI50's stage (docs/PIPELINE.md).*
+    *Step:* `pp_<schedule>_<split>` in Explorer step 07 with
+    `STEPS_07=pipeline PP_SPLITS="even 7,5 8,4 9,3 auto"`.
+
 32. **Point-to-point across islands through the backend on GPUs.** `send`,
     `recv`, `isend`, `irecv` and `batch_isend_irecv` on `backend="gpubridge"`
     go native within an island and through the bridge across islands. On GPUs,
@@ -576,6 +594,7 @@ failures count against all six whichever test failed.
 | 33. Data-parallel training across vendors tracks one GPU, compressed or not | step `dp_(ddp\|fsdp2)(-.+)?`; step `dp_single` | not run |
 | 34. Pipeline training across vendors tracks one GPU | step `pp_(gpipe\|1f1b)`; step `dp_single` | not run |
 | 35. The multitcp bridge against the Gloo bridge | step `multitcp_build`; step `matrix_D-multitcp(-pinned\|-1stream)?` | not run |
+| 36. Automatic stage balancing against even and hand-tuned splits | step `pp_(gpipe\|1f1b)_(even\|auto\|[0-9]+(-[0-9]+)+)` | not run |
 
 Where the FAILs come from:
 
