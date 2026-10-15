@@ -202,6 +202,12 @@ hardware.
 
 ### Added
 
+- GPU checks for point-to-point through `backend="gpubridge"`: `check.py --p2p-only`
+  (step `check_p2p` in Explorer steps 02 and 07) and a GPU test in `tests/test_gpu.py`,
+  both from `gpukit.p2p_checks`: every dtype and odd sizes bit for bit across islands, the
+  send's input written on a busy producer stream and dropped before the send completes, the
+  received tensor read on another stream right after `wait()`, and two tags matched out of
+  order. HARDWARE_VALIDATION item 32. CPU only so far (1+1 and 2+2 ranks in simulation).
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
   CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA

@@ -162,6 +162,12 @@ The same steps then rerun the check and the gpubridge benchmark with
 allocation compares the default bridge's pageable copies with pinned staging:
 read `bench_pinned/summary.md` next to the pageable benchmark's gpubridge rows
 and `bridge` phase. `validation_tables.py` shows each benchmark's staging.
+Steps 02 and 07 also run `check.py --p2p-only` (`check_p2p`; item 32): point-to-point
+through `backend="gpubridge"` across the two islands, every dtype and odd sizes bit for
+bit, with the send's input written on a busy stream and dropped before it completes, the
+received tensor read on another stream right after `wait()`, and two tags matched out of
+order. `gpu_tests` runs the same check in
+`test_point_to_point_across_islands_keeps_stream_order_and_storage`.
 With `UCX_BRIDGE=1`, steps 05 and 07 also run the check and the gpubridge
 benchmark over the UCX bridge (`check_ucx`, `bench_ucx`; items 26 and 27); the
 run records say whether GPU tensors went to UCX directly or through pinned host

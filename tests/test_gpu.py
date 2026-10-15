@@ -45,7 +45,7 @@ import torch
 import torch.multiprocessing as mp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "gpu"))
-from gpukit import queue_gpu_delay  # noqa: E402
+from gpukit import p2p_checks, queue_gpu_delay  # noqa: E402
 
 import gpubridge  # noqa: E402
 from gpubridge import ucx
@@ -767,6 +767,31 @@ def test_is_completed_means_the_result_is_ready(tmp_path):
     spawn(partial(completion, numel=LARGE_NUMEL), gpu_ranks(), tmp_path, SPLIT)
 
 
+def point_to_point(rank: int, world: int, tmp_path: Path) -> None:
+    """Send and receive through ``backend="gpubridge"`` across the two islands (and
+    within them with 4 ranks): every dtype and odd sizes bit for bit, the send's input
+    written on a busy producer stream and dropped before the send completes, the
+    received tensor read on another stream right after wait(), and tags matched out of
+    order (gpukit.p2p_checks, which check.py's ``p2p`` stage runs too)."""
+    import torch.distributed as dist
+    dist.init_process_group("gpubridge", init_method=f"file://{tmp_path}/rendezvous-p2p",
+                            rank=rank, world_size=world, timeout=TIMEOUT)
+    try:
+        dist.barrier()
+        topology = gpubridge.get_topology()
+        seconds = 0.02 if topology.device.type == "cuda" else 0.0
+        cases = p2p_checks(topology, busy_seconds=seconds)
+        assert cases and all(case["ok"] for case in cases)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+@requires_gpu
+def test_point_to_point_across_islands_keeps_stream_order_and_storage(tmp_path):
+    spawn(point_to_point, gpu_ranks(), tmp_path, SPLIT)
+
+
 @pytest.mark.parametrize("dtype", DTYPES, ids=str)
 def test_gpu_test_data_is_exact_in_any_order(dtype):
     """The premises of the bit-for-bit checks, on CPU, for every world size they allow."""
@@ -811,6 +836,8 @@ def test_gpu_test_logic_in_simulation(tmp_path):
     each(partial(slot_reuse, seconds=0), 4, "slots")
     each(partial(completion, numel=100_003), 2, "completion")
     each(partial(pinned_reuse, numel=10_007), 4, "pinned")
+    each(point_to_point, 2, "p2p")
+    each(point_to_point, 4, "p2p-4")
     if UCX:
         each(partial(ucx_device_path, numel=10_007), 4, "ucx-path")
         each(partial(ucx_fresh_data, numel=10_007, iters=3), 4, "ucx-fresh")

@@ -108,6 +108,10 @@ fi
 if [ "$STEPS_07" = all ]; then
     step check mixed_torchrun check "$KIT_DIR/check.py" --out "$RESULTS/check"
     step summarize python "$KIT_DIR/summarize.py" "$RESULTS/check"
+    # Point-to-point between the NVIDIA and AMD ranks through backend="gpubridge" (item 32).
+    step check_p2p mixed_torchrun check-p2p "$KIT_DIR/check.py" --out "$RESULTS/check_p2p" \
+        --p2p-only
+    step summarize_p2p python "$KIT_DIR/summarize.py" "$RESULTS/check_p2p"
     step bench mixed_torchrun bench "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" \
         --ops island,gpubridge,flat-gloo --phases --max-bytes "$BENCH_MAX_BYTES"
     # Pinned staging for the default bridge (item 25) on real NVIDIA + AMD leaders.
