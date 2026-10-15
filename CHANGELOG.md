@@ -288,6 +288,15 @@ hardware.
   for the slower GPU and exposed communication. Step 07 runs it across both
   vendors (`STEPS_07=training` runs only its training steps), and
   `submit.sh train-nvidia` or `train-amd` on one GPU alone.
+- `train_bench.py` per-rank batches (CPU only): `--batch-sizes a,b`,
+  `--global-batch N` (split evenly; one rank alone takes all N) and
+  `--global-batch N --balance` (a short calibration times each rank, then N is
+  split by speed, at least one sample per rank). Each rank's summed loss is
+  scaled by world size / N, so the hook's average is the gradient of the mean
+  loss over all N samples: bit-identical to one process over the concatenated
+  batch on CPU with integer data (2 and 3 ranks), within 1e-5 relative on float
+  data. The JSON records the global batch, the split and each rank's batch,
+  compute per sample and waiting. No `src/` change.
 
 ### Changed
 
