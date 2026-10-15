@@ -290,11 +290,14 @@ hardware.
   MI50 (Explorer, `llama-125m`, 1,000 steps): 4,549 tokens/s uncompressed,
   5,753 with bf16 and 9,523 with fp8 on the bridge (Triton kernels on both
   GPUs), against 14,264 on the V100 alone; FSDP2 1,809. Shares by speed cut
-  the V100's wait from 78 to 9 ms a step without raising tokens/s, as the
-  bridge sets the step; 5, 25 and 100 MB buckets within 3.5%. Uncompressed DDP
+  the gap between the GPUs' compute alone from 78 to 9 ms a step without
+  raising tokens/s; the bridge, about 4x the slower GPU's compute, looks like
+  what sets the step. 5, 25 and 100 MB buckets within 3.5%. Uncompressed DDP
   ends as close to one V100 as V100 runs do to each other; bf16 and fp8 end
-  0.02 to 0.03 above, after a later drop off the loss plateau, which rounding
-  alone also produces. Parameters identical on both GPUs at every check.
+  0.02 to 0.03 above, after a later drop off the loss plateau, about the gap
+  an uncompressed pipeline run left after a similarly late drop; these runs
+  can't separate compression's error from the drop's timing. Parameters
+  identical on both GPUs at every check.
   docs/BENCHMARKS.md, and docs/COMPRESSION.md's "Training with compression"
   (#67).
 - Host-staged UCX P2P for arbitrary island members, with independent

@@ -647,10 +647,12 @@ MI50's venv had Triton 3.8.0 in front (`venv-rocm63-triton38`,
 `scripts/gpu/rocm_triton_overlay.sh`), so the compression kernels ran as
 Triton on both GPUs. One V100 alone is `submit.sh dp-baseline`. Medians of
 the steps after the first 5; "exposed" is the median step less the slower
-GPU's compute alone, and "hidden" the share of the bridge's time alone that
-isn't exposed: estimates, as in `train_dp.py`.
+GPU's compute alone, "hidden" the share of the bridge's time alone that isn't
+exposed, and "V100 waits" the slower GPU's compute alone less the V100's:
+estimates from each GPU's compute timed alone, as in `train_dp.py`, not waits
+measured during training.
 
-| Run | Steps | Tokens/s | Against the V100 alone | Step (ms) | MI50 compute | V100 waits | Bridge alone | Exposed (est.) | Hidden (est.) |
+| Run | Steps | Tokens/s | Against the V100 alone | Step (ms) | MI50 compute | V100 waits (est.) | Bridge alone | Exposed (est.) | Hidden (est.) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | V100 alone | 1,000 | 14,264 | 1.00x | 287.1 | - | - | - | - | - |
 | V100 + MI50, DDP | 1,000 | 4,549 | 0.32x | 900.4 | 231.8 | 78.4 | 792.2 | 668.7 | 16% |
@@ -663,7 +665,7 @@ Jobs: 11111481 (the three DDP runs), 11110598 (FSDP2), 11109239 (the V100).
 Shares, bucket sizes and fp8 with the PyTorch kernels on the MI50, side by
 side in one job (11111037), 100 steps each:
 
-| Run | Shares (V100 + MI50) | Buckets | Tokens/s | Step (ms) | V100 compute | MI50 compute | V100 waits | Bridge alone | Exposed (est.) | Hidden (est.) |
+| Run | Shares (V100 + MI50) | Buckets | Tokens/s | Step (ms) | V100 compute | MI50 compute | V100 waits (est.) | Bridge alone | Exposed (est.) | Hidden (est.) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | DDP | 4 + 4 | 14 x 25 MB | 4,391 | 932.8 | 153.5 | 231.3 | 77.8 | 836.6 | 701.5 | 16% |
 | DDP, shares by speed | 5 + 3 | 14 x 25 MB | 4,274 | 958.4 | 183.3 | 192.8 | 9.4 | 860.7 | 765.7 | 11% |
@@ -680,12 +682,13 @@ side in one job (11111037), 100 steps each:
   to 628 and 326 ms, and the share hidden rose to 24% and 39%. With the
   PyTorch kernels on the MI50, fp8 was 1.49x (6,544 against 4,391, another
   job), so Triton on the MI50 matters here as it did for GPT-2 above.
-- **Shares by speed balance the compute but don't raise throughput here.**
-  With 5 + 3 the V100 waits 9 ms a step instead of 78, but tokens/s fell
-  2.7%: the bridge alone took 861 ms against 837 in that run, and the share
-  hidden fell from 16% to 11%. While the bridge takes about 4x the slower
-  GPU's compute, it sets the step; balancing would pay where compute is a
-  larger share (bigger batches, or a faster bridge), which these runs didn't
+- **Shares by speed even out the compute but don't raise throughput here.**
+  With 5 + 3 the two GPUs' compute alone differs by 9 ms a step instead of
+  78, but tokens/s fell 2.7%: in that run the bridge alone took 861 ms
+  against 837, and the share hidden fell from 16% to 11%. The bridge takes
+  about 4x the slower GPU's compute, so it, more than the compute gap, looks
+  like what sets the step here. Balancing may pay where compute is a larger
+  share (bigger batches, or a faster bridge), which these runs didn't
   measure.
 - **Bucket size matters little**: 100 MB, 25 MB and 5 MB buckets ran within
   3.5% of each other (4,429, 4,391 and 4,278 tokens/s), the 50 small buckets

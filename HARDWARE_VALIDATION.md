@@ -444,9 +444,10 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     parameters bit-identical at every check, compressed or not; over the last
     100 steps uncompressed DDP is 0.0037 to 0.0067 from four one-V100 runs,
     which are 0.0041 to 0.0056 apart, and bf16 and fp8 0.022 to 0.031, about
-    what an uncompressed run leaves after a late drop off the loss plateau
-    (docs/COMPRESSION.md, "Training with compression"); FSDP2 ran 500 steps,
-    shares by speed and bucket sizes 100 steps each
+    the gap an uncompressed pipeline run left after a similarly late drop off
+    the loss plateau; compression's error and the drop's timing aren't
+    separated yet (docs/COMPRESSION.md, "Training with compression"); FSDP2
+    ran 500 steps, shares by speed and bucket sizes 100 steps each
     (docs/BENCHMARKS.md). 500 steps, as
     planned here, end mid-drop for some runs, so the curves were compared at
     1,000.* *Step:* `dp_*` in Explorer step 07 with `STEPS_07=dp`, and

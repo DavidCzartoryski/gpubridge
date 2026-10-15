@@ -420,21 +420,25 @@ and 11109239, 11109665, 11109872 and 11110316 (the V100).
 **Why not compare the curves step by step.** Every run sits on a plateau near
 ln(32000) = 10.37, the loss of a uniform guess over the vocabulary, then falls
 to about 2 over the next 200 or so steps. When the drop starts depends on float rounding. Two
-runs of the same one-V100 job match for 4 steps, then differ by 1e-7 at step
-5, 1e-3 by step 24 and 0.1 by step 157 (jobs 11107533 and 11109239). One of
+runs of the same one-V100 job match for 4 steps, then differ by more than
+1e-7 from step 5, 1e-3 from step 25 and 0.1 from step 158 (jobs 11107533 and
+11109239). One of
 them was still at 8.24 at step 500, the other at 2.10. So after 500 steps
 the curves of identical runs can be far apart, and only once every run has
 dropped do they come back together. Hence 1,000 steps and the last 100.
 
-**The tolerance.** Runs that differ only in rounding and drop at about the
-same time end 0.004 to 0.007 apart: the four V100 runs, uncompressed DDP, and
-an uncompressed 1F1B pipeline on the same two GPUs (gpubridge #81: 0.0036 to
-0.0052). An uncompressed GPipe pipeline that dropped 130 to 160 steps later
-(step 341) ends 0.020 to 0.025 above them. Both compressed runs dropped later
-too and end 0.022 to 0.031 above: about the gap rounding alone leaves after a
-late drop. So, after 1,000 steps, compressed DDP is within about 0.03 of one
-V100 on this model, and nothing in these runs separates compression's error from
-the timing of the drop. The ranks' parameters were bit-identical at every
+**The tolerance.** Runs that drop at about the same time end 0.004 to 0.007
+apart: the four V100 runs, which differ only in summation order,
+uncompressed DDP, and an uncompressed 1F1B pipeline on the same two GPUs
+(gpubridge #81: 0.0036 to 0.0052). An uncompressed GPipe pipeline that
+dropped 130 to 160 steps later (step 341) ends 0.020 to 0.025 above them.
+Both compressed runs dropped later too and end 0.022 to 0.031 above, about
+GPipe's gap. One reading is that a late drop leaves a gap of that size
+whatever delayed it, but GPipe isn't a clean control: it also differs in
+schedule and runs torch 2.9.1 on the V100. So after 1,000 steps compressed
+DDP is within about 0.03 of one V100 on this model, an uncompressed run that
+dropped as late is within 0.025, and these runs can't separate compression's
+error from the timing of the drop. The ranks' parameters were bit-identical at every
 check, every 50 steps, compressed or not.
 
 **Open: does compression delay the drop?** In all four compressed runs so far
