@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import threading
 import time
+import weakref
 from datetime import timedelta
 from functools import partial
 from types import SimpleNamespace
@@ -35,7 +37,8 @@ def _main(rank, vendors, labels, fn, rendezvous, seconds):
     try:
         fn(rank, len(vendors))
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():  # some tests time teardown themselves
+            dist.destroy_process_group()
 
 
 def run(vendors, fn, tmp_path, *, labels=None, seconds=15):
@@ -418,6 +421,179 @@ def test_same_tag_fifo_and_mutation(monkeypatch):
     _check_lane_fifo(monkeypatch, False)
     with pytest.raises(AssertionError, match="overtook"):
         _check_lane_fifo(monkeypatch, True)
+
+
+def _callback_dependency(rank, world, tags):
+    dist.barrier()
+    store = dist.distributed_c10d._get_default_store()
+    if rank == 1:
+        a = dist.isend(torch.ones(5), 3, tag=tags[0])
+        b = dist.isend(torch.full((5,), 2.), 3, tag=tags[1])
+
+        def callback(future):
+            store.set("callback-entered", "1")
+            # b completes while this callback runs; it must not need a lock
+            # or a lane thread that the callback is holding.
+            return b.wait(timedelta(seconds=3))
+
+        chained = a.get_future().then(callback)
+        store.set("callback-registered", "1")
+        assert chained.wait() is True
+        b.wait()
+    elif rank == 3:
+        store.wait(["callback-registered"])
+        t = torch.empty(5)
+        dist.recv(t, 1, tag=tags[0])
+        assert torch.equal(t, torch.ones(5))
+        store.wait(["callback-entered"])
+        dist.recv(t, 1, tag=tags[1])
+        assert torch.equal(t, torch.full((5,), 2.))
+    dist.barrier()
+
+
+@pytest.mark.parametrize("tags", [(0, 1), (4, 4)], ids=["another-tag", "same-tag"])
+def test_future_callback_can_wait_for_a_later_message(tags, tmp_path):
+    run(["nvidia", "nvidia", "amd", "amd"], partial(_callback_dependency, tags=tags), tmp_path)
+
+
+def _blocked_callback_teardown(rank, world):
+    dist.barrier()
+    entered, release = threading.Event(), threading.Event()
+    chained = None
+    if rank == 0:
+        work = dist.isend(torch.ones(7), 1, tag=3)
+        chained = work.get_future().then(lambda future: (entered.set(), release.wait(10)))
+        work.wait()
+    else:
+        dist.recv(torch.empty(7), 0, tag=3)
+    # Neither a later collective nor teardown may wait for the callback.
+    start = time.monotonic()
+    dist.barrier()
+    if rank == 0:
+        assert entered.wait(5)
+    dist.destroy_process_group()
+    elapsed = time.monotonic() - start
+    release.set()
+    if chained is not None:
+        # Exiting while a daemon thread is inside torch's Future aborts on Linux.
+        chained.wait()
+        for thread in threading.enumerate():
+            if thread.name == "gpubridge-p2p-completion":
+                thread.join(5)
+    assert elapsed < 3, f"barrier and teardown waited {elapsed:.1f} s for a blocked callback"
+
+
+def test_teardown_does_not_wait_for_a_blocked_callback(tmp_path):
+    run(["nvidia", "amd"], _blocked_callback_teardown, tmp_path)
+
+
+def _released_payloads(rank, world):
+    dist.barrier()
+    references = []
+    peer = 1 - rank
+    for tag in range(8):
+        tensor = (_payload(2**20, torch.float32, rank, tag) if rank == 0
+                  else torch.empty(2**20))
+        references.append(weakref.ref(tensor))
+        work = dist.isend(tensor, peer, tag=tag) if rank == 0 else dist.irecv(tensor, peer, tag=tag)
+        if tag % 2:
+            work.get_future().wait()
+        else:
+            work.wait()
+        if rank == 1:
+            assert torch.equal(tensor, _payload(2**20, torch.float32, 0, tag))
+        del work, tensor
+    dist.barrier()
+    deadline = time.monotonic() + 3
+    while any(ref() is not None for ref in references) and time.monotonic() < deadline:
+        gc.collect()
+        time.sleep(0.01)
+    alive = sum(ref() is not None for ref in references)
+    assert alive == 0, f"{alive}/8 completed payloads retained after the caller dropped them"
+    dist.barrier()
+
+
+def test_completed_send_and_recv_payloads_are_released(tmp_path):
+    run(["nvidia", "amd"], _released_payloads, tmp_path)
+
+
+def _lane_threads():
+    return sum(thread.name == "gpubridge-p2p" for thread in threading.enumerate())
+
+
+def _fresh_tags_and_retired_lanes(rank, world):
+    dist.barrier()
+    peer = 1 - rank
+    most = 0
+    for tag in range(100, 140):
+        t = torch.full((3,), tag) if rank == 0 else torch.empty(3, dtype=torch.int64)
+        (dist.send if rank == 0 else dist.recv)(t, peer, tag=tag)
+        assert torch.equal(t, torch.full((3,), tag))
+        most = max(most, _lane_threads())
+    assert most <= 2, f"{most} lane threads alive during 40 sequential fresh tags"
+    # Same tag after its lane retired: the sender's lane exits between
+    # messages while the receiver's stays busy, so their sequences must agree.
+    if rank == 0:
+        for seq in range(4):
+            dist.send(_payload(9, torch.int64, rank, seq), peer, tag=7)
+            time.sleep(0.05)
+    else:
+        receive = [torch.empty(9, dtype=torch.int64) for _ in range(4)]
+        works = [dist.irecv(t, peer, tag=7) for t in receive]
+        for work in works:
+            work.wait()
+        for seq, t in enumerate(receive):
+            assert torch.equal(t, _payload(9, torch.int64, 0, seq)), seq
+    deadline = time.monotonic() + 2
+    while _lane_threads() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert _lane_threads() == 0
+    dist.barrier()
+
+
+def test_fresh_tags_do_not_accumulate_threads_and_sequences_survive(tmp_path):
+    run(["nvidia", "amd"], _fresh_tags_and_retired_lanes, tmp_path)
+
+
+def _self_wait_callback(rank, world):
+    dist.barrier()
+    peer = 1 - rank
+    t = torch.full((4,), 6.) if rank == 0 else torch.empty(4)
+    work = dist.isend(t, peer, tag=2) if rank == 0 else dist.irecv(t, peer, tag=2)
+    chained = work.get_future().then(
+        lambda future: (work.wait(timedelta(seconds=2)), work.is_completed()))
+    assert chained.wait() == (True, True)
+    assert torch.equal(t, torch.full((4,), 6.))
+    dist.barrier()
+
+
+def test_future_callback_sees_its_own_work_completed(tmp_path):
+    run(["nvidia", "amd"], _self_wait_callback, tmp_path)
+
+
+def test_cpu_request_on_a_lane_that_has_a_stream_uses_no_stream(monkeypatch):
+    engine = p2p.Engine(_BlockedLink(), torch.device("cpu"), 0, dist.HashStore(),
+                        timedelta(seconds=5))
+    entered, release = threading.Event(), threading.Event()
+
+    def match(*args):
+        entered.set()
+        assert release.wait(2)
+
+    monkeypatch.setattr(engine, "match", match)
+    engine.link.release.set()
+    try:
+        first = engine.submit(torch.ones(2), 1, 0, True)
+        assert entered.wait(2)
+        # As if an earlier CUDA request on this (peer, tag, direction) created it.
+        engine._lanes[1, 0, True].stream = object()
+        second = engine.submit(torch.ones(2), 1, 0, True)
+        release.set()
+        assert first.wait(2) and second.wait(2)
+        assert second._event is None and second.is_completed()
+    finally:
+        release.set()
+        engine.close()
 
 
 def test_tag_range_is_checked_without_a_process_group():

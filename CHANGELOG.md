@@ -307,6 +307,13 @@ hardware.
 
 ### Fixed
 
+- Point-to-point lifecycle: future callbacks no longer run under the engine
+  lock or on lane threads, so a callback waiting on another (or its own) P2P
+  Work completes and teardown does not wait for it; idle lanes release
+  completed payloads and their threads exit, keeping per-tag sequence order;
+  a CPU request on a lane that earlier carried a CUDA tensor uses no stream.
+  CPU tests only; the GPU stream paths are unvalidated.
+
 - The stream-ordering checks (`check.py`'s `busy_gpu` and `async` stages,
   `tests/test_gpu.py`) queued matmuls as busy work, and failed or aborted
   where rocBLAS has no kernels for the GPU (gfx906 on the ROCm 7.2 wheel).

@@ -391,10 +391,23 @@ or speedup has been measured.
   for it reaches its deadline. There is no recovery: destroy the process group
   and restart the job. `Work.wait(timeout=...)` has a separate host timeout;
   it does not cancel the transfer. Same-island errors retain native behavior.
+- **Callbacks.** `wait()` and `is_completed()` see completion before the
+  future's callbacks run, so a callback may wait on its own Work or on any
+  other P2P Work, including a later message with the same tag. Futures are
+  resolved one at a time, in completion order, on one completion thread per
+  process group, never on a lane thread or under an internal lock: a slow
+  callback delays only later futures of that group, not transfers,
+  collectives or teardown.
+- **Threads and memory.** A lane's thread exits once its queue is empty, so
+  resident lane threads match the `(peer, tag, direction)` keys with queued or
+  running operations, not every tag used. Per-key message sequence numbers
+  outlive the thread. Completed payloads and Work are not retained once the
+  caller drops them.
 - **Teardown.** Pending handles fail and the engine joins lane threads for at
-  most 200 ms total. In-flight native requests and their buffers stay owned by
-  daemon lane threads until the transport errors, its timeout passes or torch
-  destroys the group. Teardown never waits for a missing peer to post a receive.
+  most 200 ms total; it never waits for a future callback. In-flight native
+  requests and their buffers stay owned by daemon lane threads until the
+  transport errors, its timeout passes or torch destroys the group. Teardown
+  never waits for a missing peer to post a receive.
 - **Native GPU batches.** On torch 2.14, `dist.batch_isend_irecv` coalesces
   gpubridge's native NCCL/RCCL operations and combines their batch Work with
   the cross-island Works. torch 2.8 excludes Python ProcessGroup subclasses
