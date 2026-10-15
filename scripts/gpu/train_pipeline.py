@@ -116,6 +116,16 @@ def stage_compute(stage: Stage, example: torch.Tensor, target: torch.Tensor | No
     return out
 
 
+def release_mismatch(releases: list[str]) -> str | None:
+    """None if every rank runs the same PyTorch release (``torch.__version__`` by rank, the
+    local tag aside), else why not: torch.distributed.pipelining's stage setup exchanges
+    different messages in different releases (2.14.1's don't match 2.9.1's)."""
+    if len({r.split("+")[0] for r in releases}) == 1:
+        return None
+    return ("every rank needs the same PyTorch release: torch.distributed.pipelining's "
+            f"stage setup differs between releases (by rank: {', '.join(releases)})")
+
+
 def stage_order(vendors: list[str]) -> list[int]:
     """The ranks in stage order: NVIDIA ranks first, then the rest, each in rank order."""
     return sorted(range(len(vendors)), key=lambda r: (vendors[r] != "nvidia", r))
@@ -183,6 +193,9 @@ def main() -> int:
     if len(split) != world or sum(split) != config.blocks or min(split) < 1:
         raise SystemExit(f"--split {args.split}: need {world} positive counts adding up to "
                          f"{config.blocks} blocks")
+    mismatch = release_mismatch(gather(torch.__version__))
+    if mismatch:
+        raise SystemExit(mismatch)
     order = stage_order(gather(vendor))
     me = order.index(rank)  # this rank's stage
     first, last = me == 0, me == world - 1

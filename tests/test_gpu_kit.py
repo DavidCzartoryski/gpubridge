@@ -2456,6 +2456,12 @@ def test_pipeline_puts_nvidia_stages_first_whatever_the_ranks():
     assert train_pipeline.stage_order(["cpu", "cpu"]) == [0, 1]
 
 
+def test_pipeline_needs_one_pytorch_release_on_every_rank():
+    assert train_pipeline.release_mismatch(["2.9.1+cu126", "2.9.1+rocm6.3"]) is None
+    mismatch = train_pipeline.release_mismatch(["2.14.1+cu126", "2.9.1+rocm6.3"])
+    assert "same PyTorch release" in mismatch and "2.14.1+cu126, 2.9.1+rocm6.3" in mismatch
+
+
 def test_pipeline_splits_blocks_evenly():
     assert train_pipeline.even_split(12, 2) == [6, 6]
     assert train_pipeline.even_split(5, 3) == [2, 2, 1]
