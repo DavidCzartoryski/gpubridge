@@ -406,6 +406,16 @@ hardware.
 
 ### Fixed
 
+- The `gpubridge` torch.distributed backend's setup hung until its timeout when the
+  ranks had created different numbers of groups before their first collective: its
+  own groups took torch's names, which count each process's groups, so the ranks
+  waited on different store keys. HSDP across torch 2.14.1 and 2.9.1 reproduced
+  this on CPU (their `DeviceMesh` creates one group more on 2.9.1). The V100 + MI50
+  jobs hung at the same step, likely for the same reason; the fix has not run on
+  those GPUs yet. Each world setup now names its groups and transport links with
+  a fresh generation, so destroying and recreating a backend group inside a Gloo
+  world cannot reuse its old names or store keys. On a torch
+  whose private naming function has changed, torch's names are kept, with a warning.
 - Point-to-point lifecycle: future callbacks no longer run under the engine
   lock or on lane threads, so a callback waiting on another (or its own) P2P
   Work completes and teardown does not wait for it; idle lanes release
