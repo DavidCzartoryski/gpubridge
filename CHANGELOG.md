@@ -193,6 +193,16 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   module; UCX copies bundled with some application modules have `ib`, none
   `cuda` or `rocm`. Details in
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md#rdma-between-the-node-types).
+- **A multi-stream TCP bridge prototype (#66, not merged), commit 23180fe of its
+  branch**, step 08 with `MULTITCP_BRIDGE=1`, two jobs on a V100 + MI50: with
+  pinned staging, a float32 all_reduce took 1.099 and 1.098 s at 1 GB against
+  1.250 and 1.241 s on the pinned Gloo bridge, 0.88 times its time, and 1.07 and
+  1.02 times at 64 MB. Its pre-set gate (at most 0.8 times at every size from 64
+  MB) isn't met, so the prototype stops there. Its first run was seven times
+  slower: torch's intra-op threads competing with the transport's network threads
+  on 4-CPU jobs made each reduction 10 to 25 times slower, until it reduced on one
+  thread. Details in
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype-not-merged).
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
