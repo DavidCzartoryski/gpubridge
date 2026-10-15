@@ -68,13 +68,16 @@ def in_flight(schedule: str, stages: int, microbatches: int) -> list[int]:
 
 
 def _timer(device: torch.device):
-    if device.type == "cuda":  # CUDA and HIP events: the GPU's own clock
+    if device.type == "cuda":  # CUDA and HIP events: the GPU's own clock, on its own stream
         def timed(fn):
-            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            start.record()
-            result = fn()
-            end.record()
-            end.synchronize()
+            with torch.cuda.device(device):
+                stream = torch.cuda.current_stream()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record(stream)
+                result = fn()
+                end.record(stream)
+                end.synchronize()
             return result, start.elapsed_time(end)
     else:
         def timed(fn):
@@ -92,38 +95,55 @@ def profile_layers(layers: Sequence[nn.Module], example: torch.Tensor, device: t
     ``example`` is the first layer's input; each later layer gets the one before's output.
     The backward starts from a gradient of ones. Each layer goes to ``device`` for its turn
     and back to where it was, so only one is on the device at a time. 16 bytes per
-    parameter is float32 weights, gradients and AdamW's two moments."""
+    parameter is float32 weights, gradients and AdamW's two moments. Saved activations
+    count each storage once and leave out the layer's own parameters (its state).
+
+    The layers come back as they were: their gradients, their buffers (a BatchNorm's
+    running statistics) and the random number generators (dropout) are restored."""
     timed = _timer(device)
-    x = example.to(device)
-    costs = []
-    for layer in layers:
-        home = next(layer.parameters(), torch.empty(0)).device
-        layer.to(device)
-        forward, backward, saved = [], [], []
-        for i in range(warmup + trials):
-            inp = x.detach().requires_grad_(x.is_floating_point())
-            sizes: list[int] = []
+    devices = [device] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        x = example.to(device)
+        costs = []
+        for layer in layers:
+            home = next(layer.parameters(), torch.empty(0)).device
+            grads = [p.grad for p in layer.parameters()]
+            buffers = [b.detach().clone() for b in layer.buffers()]
+            for p in layer.parameters():
+                p.grad = None
+            layer.to(device)
+            own = {p.untyped_storage().data_ptr() for p in layer.parameters()}
+            forward, backward, saved = [], [], []
+            for i in range(warmup + trials):
+                inp = x.detach().requires_grad_(x.is_floating_point())
+                storages: dict[int, int] = {}
 
-            def pack(t: torch.Tensor) -> torch.Tensor:
-                sizes.append(t.numel() * t.element_size())
-                return t
+                def pack(t: torch.Tensor) -> torch.Tensor:
+                    storage = t.untyped_storage()
+                    if storage.data_ptr() not in own:
+                        storages[storage.data_ptr()] = storage.nbytes()
+                    return t
 
-            with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
-                out, f_ms = timed(lambda: layer(inp))
-            grad = torch.ones_like(out)
-            _, b_ms = timed(lambda: out.backward(grad))
-            if i >= warmup:
-                forward.append(f_ms)
-                backward.append(b_ms)
-                saved.append(sum(sizes))
-        layer.zero_grad(set_to_none=True)
-        parameters = sum(p.numel() for p in layer.parameters())
-        costs.append(LayerCost(round(statistics.median(forward), 4),
-                               round(statistics.median(backward), 4),
-                               out.numel() * out.element_size(),
-                               parameters * state_bytes_per_parameter, max(saved)))
-        layer.to(home)
-        x = out.detach()
+                with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+                    out, f_ms = timed(lambda: layer(inp))
+                grad = torch.ones_like(out)
+                _, b_ms = timed(lambda: out.backward(grad))
+                if i >= warmup:
+                    forward.append(f_ms)
+                    backward.append(b_ms)
+                    saved.append(sum(storages.values()))
+            layer.to(home)
+            for p, g in zip(layer.parameters(), grads):
+                p.grad = g
+            with torch.no_grad():
+                for b, kept in zip(layer.buffers(), buffers):
+                    b.copy_(kept)
+            parameters = sum(p.numel() for p in layer.parameters())
+            costs.append(LayerCost(round(statistics.median(forward), 4),
+                                   round(statistics.median(backward), 4),
+                                   out.numel() * out.element_size(),
+                                   parameters * state_bytes_per_parameter, max(saved)))
+            x = out.detach()
     return costs
 
 
@@ -168,8 +188,9 @@ def partition(layer_ms: Sequence[Sequence[float]], boundary_bytes: Sequence[floa
               memory_bytes: Sequence[float | None] | None = None) -> Plan:
     """The contiguous split (each stage at least one layer) whose slowest stage is fastest
     under the cost model (arguments as for :func:`evaluate`), with each stage's memory, if
-    given, within ``memory_bytes[s]`` (``None``: no limit). Exact; of equally good splits,
-    the one that gives earlier stages fewer layers. Raises ``ValueError`` if no split fits.
+    given, within ``memory_bytes[s]`` (``None``: no limit). Exact, and the same inputs give
+    the same split, so every rank computing it agrees. Raises ``ValueError`` if no split
+    fits.
     """
     stages, layers = _check(layer_ms, boundary_bytes, bytes_per_ms)
     limited = memory_bytes is not None

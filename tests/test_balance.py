@@ -116,6 +116,25 @@ def test_profile_layers_on_cpu():
     assert all(c.forward_ms >= 0 and c.backward_ms >= 0 and c.ms >= c.forward_ms for c in costs)
     assert [c.out_bytes for c in costs] == [5 * 16 * 4, 5 * 16 * 4, 5 * 4 * 4]
     assert [c.state_bytes for c in costs] == [(8 * 16 + 16) * 16, 0, (16 * 4 + 4) * 16]
-    assert costs[0].activation_bytes >= 5 * 8 * 4  # Linear saves its input
-    assert costs[1].activation_bytes >= 5 * 16 * 4
+    # Each saves its input; the Linears' weights, also saved, are state, not activations.
+    assert [c.activation_bytes for c in costs] == [5 * 8 * 4, 5 * 16 * 4, 5 * 16 * 4]
     assert all(p.grad is None for layer in layers for p in layer.parameters())
+
+
+def test_profiling_leaves_the_layers_as_they_were():
+    torch.manual_seed(0)
+    layers = [nn.Linear(4, 4), nn.BatchNorm1d(4), nn.Dropout(0.5)]
+    for layer in layers:
+        layer.train()
+    for p in layers[0].parameters():
+        p.grad = torch.full_like(p, 3.0)
+    weights = [p.detach().clone() for layer in layers for p in layer.parameters()]
+    buffers = [b.clone() for b in layers[1].buffers()]
+    example = torch.randn(6, 4)
+    rng = torch.get_rng_state()
+    balance.profile_layers(layers, example, torch.device("cpu"), trials=2)
+    assert all(torch.equal(p.grad, torch.full_like(p, 3.0)) for p in layers[0].parameters())
+    assert all(torch.equal(a, b) for a, b in zip(
+        weights, [p.detach() for layer in layers for p in layer.parameters()]))
+    assert all(torch.equal(a, b) for a, b in zip(buffers, layers[1].buffers()))
+    assert torch.equal(rng, torch.get_rng_state())
