@@ -24,6 +24,7 @@ same stages and microbatches), overlap of transfers with compute, and the optimi
 
 from __future__ import annotations
 
+import copy
 import statistics
 import time
 from collections.abc import Sequence
@@ -93,59 +94,45 @@ def profile_layers(layers: Sequence[nn.Module], example: torch.Tensor, device: t
     """Each layer's forward and backward on ``device`` (medians of ``trials`` after
     ``warmup``), its output's bytes, its state and its saved activations, one microbatch:
     ``example`` is the first layer's input; each later layer gets the one before's output.
-    The backward starts from a gradient of ones. Each layer goes to ``device`` for its turn
-    and back to where it was, so only one is on the device at a time. 16 bytes per
+    The backward starts from a gradient of ones. Each layer is profiled as a copy on
+    ``device``, one at a time; the layers themselves are never moved or run. 16 bytes per
     parameter is float32 weights, gradients and AdamW's two moments. Saved activations
     count each storage once and leave out the layer's own parameters (its state).
 
-    The layers come back as they were, even if one raises: each parameter and buffer on
-    its own device, the gradients, the buffers' values (a BatchNorm's running statistics)
-    and the random number generators (dropout)."""
+    So the layers stay as they were, even if one raises: their parameters (shared ones
+    included) and buffers, gradients and devices. The random number generators (dropout)
+    are restored too."""
     timed = _timer(device)
     devices = [device] if device.type == "cuda" else []
     with torch.random.fork_rng(devices=devices):
         x = example.to(device)
         costs = []
         for layer in layers:
-            # Where each parameter is and its gradient, and each buffer as it is, by module
-            # and name, so each goes back to its own device whatever happens below.
-            params = [(m, n, p.device, p.grad) for m in layer.modules()
-                      for n, p in m._parameters.items() if p is not None]
-            buffers = [(m, n, b.detach().clone()) for m in layer.modules()
-                       for n, b in m._buffers.items() if b is not None]
-            try:
-                for m, n, _, _ in params:
-                    m._parameters[n].grad = None
-                layer.to(device)
-                own = {p.untyped_storage().data_ptr() for p in layer.parameters()}
-                forward, backward, saved = [], [], []
-                for i in range(warmup + trials):
-                    inp = x.detach().requires_grad_(x.is_floating_point())
-                    held: dict[int, int] = {}
+            work = copy.deepcopy(layer)  # the layer itself is never moved or run
+            for p in work.parameters():
+                p.grad = None
+            work.to(device)
+            own = {p.untyped_storage().data_ptr() for p in work.parameters()}
+            forward, backward, saved = [], [], []
+            for i in range(warmup + trials):
+                inp = x.detach().requires_grad_(x.is_floating_point())
+                held: dict[int, int] = {}
 
-                    def pack(t: torch.Tensor) -> torch.Tensor:
-                        key, size = _held(t)
+                def pack(t: torch.Tensor) -> torch.Tensor:
+                    for key, size in _held(t):
                         if key not in own:
                             held[key] = size
-                        return t
+                    return t
 
-                    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
-                        out, f_ms = timed(lambda: layer(inp))
-                    grad = torch.ones_like(out)
-                    _, b_ms = timed(lambda: out.backward(grad))
-                    if i >= warmup:
-                        forward.append(f_ms)
-                        backward.append(b_ms)
-                        saved.append(sum(held.values()))
-            finally:
-                with torch.no_grad():
-                    for m, n, place, g in params:
-                        p = m._parameters[n]
-                        p.data = p.data.to(place)
-                        p.grad = g
-                    for m, n, kept in buffers:
-                        m._buffers[n] = kept
-            parameters = sum(p.numel() for p in layer.parameters())
+                with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+                    out, f_ms = timed(lambda: work(inp))
+                grad = torch.ones_like(out)
+                _, b_ms = timed(lambda: out.backward(grad))
+                if i >= warmup:
+                    forward.append(f_ms)
+                    backward.append(b_ms)
+                    saved.append(sum(held.values()))
+            parameters = sum(p.numel() for p in work.parameters())
             costs.append(LayerCost(round(statistics.median(forward), 4),
                                    round(statistics.median(backward), 4),
                                    out.numel() * out.element_size(),
@@ -154,22 +141,22 @@ def profile_layers(layers: Sequence[nn.Module], example: torch.Tensor, device: t
     return costs
 
 
-def _held(t: torch.Tensor) -> tuple[int, int]:
-    """A saved tensor's storage and the bytes it keeps alive: the whole storage, once, for a
-    dense tensor (a view keeps all of it); indices and values for a sparse one."""
-    try:
-        storage = t.untyped_storage()
-        return storage.data_ptr(), storage.nbytes()
-    except (NotImplementedError, RuntimeError):  # sparse and other layouts without one
-        if t.layout == torch.sparse_coo:
-            parts = [t._indices(), t._values()]
-        elif t.layout in (torch.sparse_csr, torch.sparse_bsr):
-            parts = [t.crow_indices(), t.col_indices(), t.values()]
-        elif t.layout in (torch.sparse_csc, torch.sparse_bsc):
-            parts = [t.ccol_indices(), t.row_indices(), t.values()]
-        else:
-            parts = [t]
-        return id(t), sum(q.numel() * q.element_size() for q in parts)
+def _held(t: torch.Tensor) -> list[tuple[int, int]]:
+    """The storages a saved tensor keeps alive, each with its bytes: the whole storage, as a
+    view keeps all of it. A sparse tensor's are those of its indices and values."""
+    if t.layout == torch.sparse_coo:
+        parts = [t._indices(), t._values()]
+    elif t.layout in (torch.sparse_csr, torch.sparse_bsr):
+        parts = [t.crow_indices(), t.col_indices(), t.values()]
+    elif t.layout in (torch.sparse_csc, torch.sparse_bsc):
+        parts = [t.ccol_indices(), t.row_indices(), t.values()]
+    else:
+        parts = [t]
+    out = []
+    for part in parts:
+        storage = part.untyped_storage()
+        out.append((storage.data_ptr(), storage.nbytes()))
+    return out
 
 
 def _check(layer_ms: Sequence[Sequence[float]], boundary_bytes: Sequence[float],

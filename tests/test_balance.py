@@ -172,3 +172,38 @@ def test_a_layer_without_parameters_goes_back_to_its_own_device():
     layer = nn.BatchNorm1d(4, affine=False).to("mps")
     balance.profile_layers([layer], torch.randn(6, 4), torch.device("cpu"), trials=1)
     assert all(b.device.type == "mps" for b in layer.buffers())
+
+
+def test_shared_parameters_and_buffers_stay_shared_and_in_place():
+    class Tied(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a, self.b = nn.Linear(4, 4), nn.Linear(4, 4)
+            self.b.weight = self.a.weight
+            counter = torch.zeros(1)
+            self.register_buffer("seen", counter)
+            self.register_buffer("also", counter)
+
+        def forward(self, x):
+            self.seen += 1
+            return self.b(self.a(x))
+
+    layer = Tied()
+    weight, seen = layer.a.weight, layer.seen
+    optimizer = torch.optim.SGD(layer.parameters(), lr=0.1)
+    previous = torch.__future__.get_overwrite_module_params_on_conversion()
+    torch.__future__.set_overwrite_module_params_on_conversion(True)
+    try:
+        balance.profile_layers([layer], torch.randn(2, 4), torch.device("cpu"), trials=1)
+    finally:
+        torch.__future__.set_overwrite_module_params_on_conversion(previous)
+    assert layer.a.weight is weight and layer.b.weight is weight
+    assert optimizer.param_groups[0]["params"][0] is weight
+    assert layer.seen is seen and layer.also is seen and seen.item() == 0
+
+
+def test_a_sparse_inputs_whole_values_storage_counts():
+    big = torch.randn(100_000)
+    sparse = torch.sparse_coo_tensor(torch.tensor([[0, 1], [0, 1]]), big[:2], (5, 8))
+    costs = balance.profile_layers([nn.Linear(8, 4)], sparse, torch.device("cpu"), trials=1)
+    assert costs[0].activation_bytes >= big.untyped_storage().nbytes()
