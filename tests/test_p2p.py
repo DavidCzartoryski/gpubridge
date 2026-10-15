@@ -7,11 +7,13 @@ import threading
 import time
 from datetime import timedelta
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _staging import LazyStaging
 
 from gpubridge import topology
 from gpubridge import p2p
@@ -105,6 +107,70 @@ def _tags_and_batches(rank, world):
 
 def test_out_of_order_tags_and_full_duplex_batch_fifo(tmp_path):
     run(["nvidia", "amd"], _tags_and_batches, tmp_path)
+
+
+@pytest.mark.parametrize("settings", [{"GPUBRIDGE_PINNED_STAGING": "1"},
+                                      {p2p.CHUNK_BYTES_ENV: "128"}], ids=["pinned", "chunks"])
+def test_staging_options_keep_tag_and_fifo_matching(settings, tmp_path, monkeypatch):
+    for key, value in settings.items():
+        monkeypatch.setenv(key, value)
+    run(["nvidia", "amd"], _tags_and_batches, tmp_path)
+
+
+@pytest.mark.parametrize("raw", ["0", "7", "12", "-8", "bad"])
+def test_invalid_p2p_chunk_setting_is_refused(raw, monkeypatch):
+    monkeypatch.setenv(p2p.CHUNK_BYTES_ENV, raw)
+    with pytest.raises(ValueError):
+        p2p.chunk_bytes_setting()
+
+
+class _MemoryLink:
+    def __init__(self, incoming):
+        self.incoming = iter(incoming.split(16))
+        self.sent = []
+
+    def post(self, host, peer, tag, sending):
+        if sending:
+            self.sent.append(host.clone())
+        else:
+            host.copy_(next(self.incoming))
+        return self
+
+    def wait(self, timeout):
+        pass
+
+
+def _check_lazy_pipeline(monkeypatch, sending, mutation):
+    expected = torch.arange(117, dtype=torch.uint8)  # 8 chunks, both slots reused
+    link = _MemoryLink(expected)
+    staging = LazyStaging(16, 2)
+    if mutation == "skip-host-wait":
+        staging.wait_host = lambda event: None
+    elif mutation == "skip-final-stream-wait":
+        staging.end = lambda event: None
+    monkeypatch.setattr(p2p, "make_staging", lambda *args: staging)
+    lane = object.__new__(p2p._Lane)
+    lane.engine = SimpleNamespace(link=link, chunk_bytes=16)
+    lane.peer, lane.tag, lane.sending = 1, 0, sending
+    target = expected.clone() if sending else torch.full_like(expected, 254)
+    lane._pipeline(target, time.monotonic() + 2)
+    got = torch.cat(link.sent) if sending else target
+    assert torch.equal(got, expected), "lazy-copy protocol returned incorrect bytes"
+
+
+@pytest.mark.parametrize("sending", [False, True], ids=["receive", "send"])
+def test_lazy_staging_preserves_bytes(sending, monkeypatch):
+    _check_lazy_pipeline(monkeypatch, sending, "")
+
+
+@pytest.mark.parametrize(("sending", "mutation"), [
+    (True, "skip-host-wait"),
+    (False, "skip-host-wait"),
+    (False, "skip-final-stream-wait"),
+], ids=["copy-out-before-send", "copy-back-before-slot-reuse", "output-stream-wait"])
+def test_staging_ordering_mutations_are_detected(sending, mutation, monkeypatch):
+    with pytest.raises(AssertionError, match="incorrect bytes"):
+        _check_lazy_pipeline(monkeypatch, sending, mutation)
 
 
 def _concurrent(rank, world):
@@ -288,6 +354,44 @@ def test_torch_work_wait_and_future_both_report_transfer_failure(monkeypatch):
         assert work.is_completed() and not work.is_success()
     finally:
         engine.close()
+
+
+def _check_lane_fifo(monkeypatch, mutation):
+    link = _BlockedLink()
+    posted = []
+    original_post = link.post
+
+    def post(tensor, peer, tag, sending):
+        posted.append(int(tensor[0]))
+        return original_post(tensor, peer, tag, sending)
+
+    monkeypatch.setattr(link, "post", post)
+    engine = p2p.Engine(link, torch.device("cpu"), 0, dist.HashStore(), timedelta(seconds=5))
+    monkeypatch.setattr(engine, "match", lambda *args: None)
+    try:
+        works = [engine.submit(torch.tensor([0], dtype=torch.uint8), 1, 9, True)]
+        assert link.entered.wait(2)
+        for i in (1, 2):
+            if mutation:
+                # Remove lane reuse, the fix that keeps repeated same-tag
+                # requests behind their predecessor rather than posting at once.
+                engine._lanes.clear()
+            works.append(engine.submit(torch.tensor([i], dtype=torch.uint8), 1, 9, True))
+        time.sleep(0.03)
+        assert posted == [0], "a later same-tag request overtook its predecessor"
+        link.release.set()
+        for work in works:
+            work.wait()
+        assert posted == [0, 1, 2]
+    finally:
+        link.release.set()
+        engine.close()
+
+
+def test_same_tag_fifo_and_mutation(monkeypatch):
+    _check_lane_fifo(monkeypatch, False)
+    with pytest.raises(AssertionError, match="overtook"):
+        _check_lane_fifo(monkeypatch, True)
 
 
 def test_tag_range_is_checked_without_a_process_group():
