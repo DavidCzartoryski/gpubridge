@@ -192,7 +192,7 @@ hardware.
   compression, subgroups, failures and teardown (`tests/test_multitcp.py`,
   `cargo test`, a CI job). Step 08 measures it against the Gloo bridge with
   `MULTITCP_BRIDGE=1`; HARDWARE_VALIDATION.md item 32; docs/RUST_TRANSPORT.md
-  (#PRNUM).
+  (#66).
 - `scripts/gpu/rdma_report.sh`, a step of the network check (`net-nvidia`,
   `net-amd`): what RDMA from GPU memory would need on the node, one file each
   in `rdma/<side>/`: the kernel's dma-buf and peer-to-peer options, the RDMA
