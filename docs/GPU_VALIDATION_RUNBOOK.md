@@ -449,8 +449,7 @@ releases, set `TORCH_VERSION` (and `CUDA_INDEX` if needed) for `submit.sh setup`
 
 ### The comparison matrix and training throughput
 
-What gpubridge costs, measured on the same nodes as the baselines it is
-compared with. Every run is
+What gpubridge costs against native NCCL/RCCL and flat Gloo. Every run is
 2 ranks, one GPU each on two nodes, `bench_all_reduce.py` with float32 from
 1 KB to 1 GB, timed with CUDA events, with `--phases` on every gpubridge run.
 
@@ -465,10 +464,13 @@ compared with. Every run is
 | E | V100 + MI50 | one flat Gloo group of both ranks (`flat-gloo`) | `08` |
 | E-nvidia, E-amd | the pairs | the same | the pair jobs |
 
-How to read it: **A1 against A2 is the network** (InfiniBand against TCP for
-the same NCCL), **A2 against C is gpubridge's own cost** (the same GPUs and
-wire), **C against D is the vendor mixing**, and D's variants against
-`D-default` are what each policy buys.
+How to read it: **A1 against A2 is the network** (the transport NCCL picks
+against TCP, for the same NCCL in one job), **A2 against C is gpubridge's own
+cost** (the same job, GPUs and interface), **C against D is the vendor mixing**,
+and D's variants against `D-default` are what each policy buys. Each pair is
+its own job on its own nodes, so C against D, and every multiple of A1 or A2 on
+a D or E row, also compares two node pairs' networks: `matrix.md` lists each
+job's preflight and marks those multiples with †.
 
 ```bash
 scripts/gpu/explorer/submit.sh net-nvidia   # one V100 node's network (~1 min)
@@ -486,7 +488,8 @@ GPUs, runs the preflight, then each run into `matrix/<run>/`, and ends with
 `bench_matrix.py`, which writes `matrix.md`: per size range (up to 64 KB,
 256 KB to 16 MB, 64 MB and up) every run's latency and bus bandwidth, its time
 as a multiple of A2's and A1's, the bridge phase against the preflight's
-prediction (on the bytes that cross, so compressed for `bf16` and `fp8`), each
+prediction (a ring all_reduce of the tensor, both ways at once; with `bf16` or
+`fp8`, each leader's compressed payload broadcast in turn, one way at a time), each
 gpubridge run's phases, and what NCCL and RCCL logged about the network in
 each run (`Using network IB` or `Socket`, `via NET/IB` or `NET/Socket`). Point
 `bench_matrix.py` at several jobs' results to put the pairs side by side; with
@@ -513,7 +516,10 @@ gradient buckets all_reduced with no compute. Step 07 runs it on both sides
 runs only the probe, the preflight and those), and `submit.sh train-nvidia` or
 `train-amd` on one GPU alone, the baseline: adding a GPU through gpubridge
 pays off only if the pair's `samples_per_s` beats the faster GPU's alone.
-`TRAIN_BENCH_MODELS` and `TRAIN_BENCH_ARGS` choose the models and flags.
+`TRAIN_BENCH_MODELS` and `TRAIN_BENCH_ARGS` choose the models and flags. Both
+models need BLAS on every GPU (the probe's `blas_available`): with a ROCm build
+whose rocBLAS lacks the GPU's kernels, its rank aborts at the first matmul, as
+the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
 
 ## Kaggle (free): two NVIDIA T4s
 

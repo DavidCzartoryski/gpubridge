@@ -1811,8 +1811,11 @@ def _matrix_tree(root: Path) -> None:
                   env={"NCCL_IB_DISABLE": "1", "NCCL_SOCKET_IFNAME": "eth1"}))
     mixed = root / "08_matrix_nvidia-amd"
     _write(mixed / "preflight" / "preflight-master.json",
-           {"role": "master", "hostname": "gpunode17",
+           {"role": "master", "hostname": "gpunode17", "chosen_ifname": "eth1",
             "bandwidth": {"MBps_in": 1000.0, "MBps_out": 1200.0, "rtt_ms": 0.1}})
+    _write(mixed / "preflight" / "preflight-worker.json",
+           {"role": "worker", "hostname": "amdnode3", "chosen_ifname": "ib0",
+            "bandwidth": {"MBps_in": 1200.0, "MBps_out": 1000.0, "rtt_ms": 0.1}})
     _write(mixed / "matrix" / "D-default" / "bench.json",
            _bench("gpubridge", {n: 40 + n / 500 for n in sizes},
                   phases=lambda n: {"island-reduce": 0.01, "bridge": n / 5e5, "island-broadcast": 0.01}))
@@ -1842,8 +1845,10 @@ def _matrix_tree(root: Path) -> None:
         "gpunode17:1:1 [0] NCCL INFO Using network IB\n")
     (logs / "amdnode3.2.log").write_text(
         "amdnode3:2:2 [0] NCCL INFO ROCr version 1.18\n"
-        "amdnode3:2:2 [0] NCCL INFO Bootstrap: Using ibs8:172.16.5.6<0>\n"
-        "amdnode3:2:2 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] [send] via NET/Socket/0\n")
+        "amdnode3:2:2 [0] NCCL INFO Bootstrap : Using ibs8:172.16.5.6<0>\n"
+        "amdnode3:2:2 [0] NCCL INFO NET/Socket : Using [0]ib0:fe80::1%ib0<0>\n"
+        "amdnode3:2:2 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] [send] via NET/Socket/0\n"
+        "amdnode3:2:2 [0] NCCL INFO Channel 01/0 : 0[0] -> 1[1] [send] via NET/Socket/0\n")
 
 
 def test_matrix_compares_every_run_with_both_native_baselines(tmp_path):
@@ -1861,9 +1866,12 @@ def test_matrix_compares_every_run_with_both_native_baselines(tmp_path):
     assert d["predicted_bridge_ms"] == pytest.approx(0.1 + big / 1e9 * 1e3, abs=1e-3)
     assert d["measured_over_predicted"] == pytest.approx(d["bridge_ms"] / d["predicted_bridge_ms"],
                                                          abs=0.01)
-    # bf16 sends half the bytes, so half the prediction (plus the round trip).
+    # Compressed, each leader broadcasts its payload in turn: bf16's half-size payload
+    # crosses twice, one way at a time, so two islands predict what uncompressed does.
     assert rows[("D-bf16", big)]["predicted_bridge_ms"] == pytest.approx(
-        0.1 + big / 2 / 1e9 * 1e3, abs=1e-3)
+        0.1 + 2 * (big / 2) / 1e9 * 1e3, abs=1e-3)
+    # D ran in another job than A1 and A2, so its multiples are marked; A2's own isn't.
+    assert d["x_A2_other_job"] and not rows[("A2", big)]["x_A2_other_job"]
     assert "predicted_bridge_ms" not in rows[("E", big)]  # flat Gloo has no bridge phase
     assert bench_matrix.described(runs[1]) == "native NCCL, NCCL_IB_DISABLE=1, NCCL_SOCKET_IFNAME=eth1"
     assert "bf16 compression" in bench_matrix.described(runs[3])
@@ -1877,12 +1885,17 @@ def test_matrix_markdown_has_a_table_per_size_range_and_no_hosts_or_addresses(tm
                   "## Network", "A2 against C is gpubridge's own cost"):
         assert title in md
     assert "**B1** (waiting on access); **B2** (waiting on access)" in md
-    assert "| 1GB | D-default |" in md
+    assert re.search(r"\| 1GB \| D-default \| [^|]+ \| [^|]+ \| [\d.]+x † \|", md), md
+    assert re.search(r"\| 1GB \| A2 \| [^|]+ \| [^|]+ \| 1\.00x \|", md), md
+    # Each job's network, from its preflight.
+    assert "| 08_matrix_nvidia-amd | amd+nvidia | eth1, ib0 | 1200.0 | 1000.0 | 0.1 |" in md
     # The network: InfiniBand on the V100 node, none on the other; what each library chose.
     assert "mlx5_0:1 InfiniBand, Active, 100 Gb/s" in md
     assert "ibstat and ibv_devinfo not installed" in md
-    assert "Using network IB" in md and "channels via NET/Socket/0" in md
-    assert "OOB eth1" in md and "Bootstrap: Using ibs8" in md
+    assert "Using network IB" in md
+    assert "2 channel connections via NET/Socket/0 (one rank's log)" in md
+    assert "OOB eth1" in md and "Bootstrap : Using ibs8" in md
+    assert "NET/Socket : Using [0]ib0" in md and "fe80" not in md
     for secret in ("gpunode17", "amdnode3", "10.0.12.", "172.16.", "example.edu"):
         assert secret not in md
     data = json.loads((tmp_path / "matrix.json").read_text())
@@ -1904,9 +1917,28 @@ def test_matrix_needs_results(tmp_path, capsys):
 
 
 def test_matrix_names_runs_in_order():
-    names = ["E", "D-default-repeat", "D-pipelined-1M", "A2", "C-amd", "D-default", "C", "A1"]
+    names = ["E", "D-default-repeat", "D-pipelined-16M", "D-pipelined-1M", "A2", "C-amd",
+             "D-pipelined-4M", "D-default", "C", "A1"]
     assert sorted(names, key=bench_matrix.order_key) == [
-        "A1", "A2", "C", "C-amd", "D-default", "D-pipelined-1M", "D-default-repeat", "E"]
+        "A1", "A2", "C", "C-amd", "D-default", "D-pipelined-1M", "D-pipelined-4M",
+        "D-pipelined-16M", "D-default-repeat", "E"]
+
+
+def test_matrix_size_ranges_cover_every_size():
+    for size in (1, 2**10, 100 * 2**10, 256 * 2**10, 32 * 2**20, 64 * 2**20 - 1, 2**30):
+        assert sum(lo <= size < hi for _, lo, hi in bench_matrix.RANGES) == 1, size
+
+
+@pytest.mark.parametrize("mode", ["fp8", "FP8", " bf16 "])
+def test_matrix_predicts_compressed_payloads_whatever_the_case(mode):
+    from gpubridge.compression import payload_nbytes
+
+    run = bench_matrix.Run("D-x", "job", {"environment": {"env": {
+        "GPUBRIDGE_BRIDGE_COMPRESSION": mode}}}, None)
+    row = {"bytes": 2**20, "islands": 2, "dtype": "float16"}
+    payload = payload_nbytes(mode.strip().lower(), 2**19)
+    assert bench_matrix.predicted_ms(run, row, 100.0, 0.5) == pytest.approx(
+        0.5 + 2 * payload / 1e8 * 1e3)
 
 
 def test_train_bench_splits_the_step_into_compute_waiting_and_exposed_communication():

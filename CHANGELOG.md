@@ -153,9 +153,11 @@ hardware.
   B2), gpubridge between two islands of one vendor (C), gpubridge between a
   V100 and an MI50 under every policy, chunk size and compression mode (D),
   and one flat Gloo group (E). `matrix.md` has a table per size range with
-  each run as a multiple of the two native baselines and the bridge phase
-  against the preflight's prediction, each node's InfiniBand ports, and the
-  transport NCCL and RCCL chose. `submit.sh 08` submits the V100 + MI50 job;
+  each run as a multiple of the two native baselines (marked where the
+  baseline ran in another job, on other nodes) and the bridge phase against
+  the preflight's prediction, each job's preflight, each node's InfiniBand
+  ports, and the transport NCCL and RCCL chose. `submit.sh 08` submits the
+  V100 + MI50 job;
   `08-nvidia-pair` and `08-amd-pair`, two GPUs of one type in one partition,
   are refused until `SAME_PARTITION_PAIRS_OK=1`.
 - `submit.sh net-nvidia` and `net-amd` (`net_check.sbatch`,

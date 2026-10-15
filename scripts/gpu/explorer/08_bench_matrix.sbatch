@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=gpubridge-08-bench-matrix
 #SBATCH --time=00:40:00
-# Step 08, the comparison matrix (docs/BENCHMARKS.md): what gpubridge costs against
-# native NCCL/RCCL and flat Gloo on the same two nodes. One heterogeneous job of two
-# components, one GPU each on its own node; MATRIX_PAIR (set by submit.sh) says which:
+# Step 08, the comparison matrix: what gpubridge costs against native NCCL/RCCL and
+# flat Gloo. One heterogeneous job of two components, one GPU each on its own node;
+# MATRIX_PAIR (set by submit.sh) says which pair, and each pair is its own job on its
+# own nodes, so bench_matrix.py lists each job's network next to the ratios:
 #
 #   nvidia-amd     a V100 (gpu) + an MI50 (sharing): D, every policy, and E   submit.sh 08
 #   nvidia-nvidia  two V100s: A1, A2, C and E-nvidia               submit.sh 08-nvidia-pair
@@ -42,9 +43,6 @@ else
         die "not a heterogeneous job; submit with scripts/gpu/explorer/submit.sh 08"
     HEAD=$(scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_0:-}" | head -n 1)
     OTHER=$(scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_1:-}" | head -n 1)
-    # Two components of one partition can share a node, and then NCCL never touches
-    # the network: not what this job measures.
-    [ "$HEAD" != "$OTHER" ] || die "both components are on one node; the matrix needs two"
 fi
 
 # fill ARG GROUP: ARG with @VENV@, @SIDE@, @ROLE@ and @IFNAME@ replaced for component
@@ -91,7 +89,13 @@ matrix_run() {
         --out "$RESULTS/matrix/$name" --max-bytes "$BENCH_MAX_BYTES" "$@"
 }
 
+# The batch node runs this job's Python (bench_matrix.py) with its own side's venv.
+[ "$MATRIX_PAIR" != amd-amd ] || VENV=$VENV_ROCM
 job_setup "08_matrix_$MATRIX_PAIR"
+# Two components of one partition can share a node, and then NCCL never touches the
+# network: not what this job measures. After job_setup, so job.jsonl records why.
+[ "$DRY_RUN" = 1 ] || [ "$HEAD" != "$OTHER" ] ||
+    die "both components are on one node ($HEAD); the matrix needs two"
 if [ "$MATRIX_PAIR" != nvidia-nvidia ]; then
     rocm_asic_ids "$VENV_ROCM/bin/python"  # the ROCm wheel's GPU-name table (common.sh)
 fi
@@ -120,9 +124,15 @@ if [ -z "${GLOO_SOCKET_IFNAME:-}" ] && [ "$USE_PREFLIGHT_IFNAME" = 1 ]; then
 elif [ -n "${GLOO_SOCKET_IFNAME:-}" ]; then
     IFNAME_0=$GLOO_SOCKET_IFNAME IFNAME_1=$GLOO_SOCKET_IFNAME
 fi
-# A2 and B2 put NCCL/RCCL on the bridge's wire: TCP on the interface Gloo uses.
+# A2 and B2 put NCCL/RCCL on the bridge's wire: TCP on the interface Gloo uses, by
+# its exact name ("=": NCCL otherwise matches it as a prefix).
 tcp=(NCCL_IB_DISABLE=1)
-if [ -n "$IFNAME_0" ] && [ -n "$IFNAME_1" ]; then tcp+=(NCCL_SOCKET_IFNAME=@IFNAME@); fi
+if [ -n "$IFNAME_0" ] && [ -n "$IFNAME_1" ]; then
+    tcp+=(NCCL_SOCKET_IFNAME==@IFNAME@)
+elif [ "$MATRIX_PAIR" != nvidia-amd ]; then
+    log "warning: no interface for Gloo on both nodes, so the TCP baseline runs on" \
+        "the interface NCCL picks, which may not be the bridge's"
+fi
 
 case $MATRIX_PAIR in
 nvidia-amd)

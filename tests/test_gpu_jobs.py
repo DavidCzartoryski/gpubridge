@@ -422,6 +422,8 @@ def test_step_08_matrix_on_the_mixed_pair(tmp_path):
     assert bench("D-pinned")["environment"]["env"]["GPUBRIDGE_PINNED_STAGING"] == "1"
     assert bench("D-pipelined-4K")["run"]["policy"] == "pipelined-reduce-bridge-broadcast"
     assert bench("D-fp8")["environment"]["env"]["GPUBRIDGE_BRIDGE_COMPRESSION"] == "fp8"
+    assert bench("D-bf16")["environment"]["env"]["GPUBRIDGE_BRIDGE_COMPRESSION"] == "bf16"
+    assert bench("D-pipelined-4K")["environment"]["env"]["GPUBRIDGE_CHUNK_BYTES"] == "4K"
     assert {r["op"] for r in bench("E")["rows"]} == {"flat-gloo"}
     assert all(r.get("phases_ms") for r in bench("D-default")["rows"])
     assert {p.name for p in (out / "network").iterdir()} == {"nvidia", "amd"}
@@ -445,11 +447,25 @@ def test_step_08_matrix_on_a_same_vendor_pair(target, vendor, names, tmp_path):
     assert {r["op"] for r in native["rows"]} == {"native"}
     chosen = json.loads((out / "preflight" / "preflight-master.json").read_text())["chosen_ifname"]
     assert tcp["environment"]["env"]["NCCL_IB_DISABLE"] == "1"
-    assert tcp["environment"]["env"]["NCCL_SOCKET_IFNAME"] == chosen
+    assert tcp["environment"]["env"]["NCCL_SOCKET_IFNAME"] == f"={chosen}"  # exact name
     assert bridged["run"]["split_test"] == "node" and len(bridged["run"]["islands"]) == 2
     md = (out / "matrix.md").read_text()
     if vendor == "nvidia":
         assert re.search(r"\| 1KB \| A2 \| [^|]+ \| [^|]+ \| 1\.00x \|", md), md
+
+
+def test_step_08_refuses_two_components_on_one_node(tmp_path):
+    # Slurm put both 1-GPU components on one node: NCCL would never use the network.
+    env = cluster_env(tmp_path, SLURM_JOB_ID="4242", MATRIX_PAIR="nvidia-nvidia",
+                      SLURM_JOB_NODELIST_HET_GROUP_0="gpunode1",
+                      SLURM_JOB_NODELIST_HET_GROUP_1="gpunode1")
+    result = subprocess.run(["bash", str(EXPLORER / "08_bench_matrix.sbatch")], env=env,
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 1
+    assert "both components are on one node (gpunode1); the matrix needs two" in result.stderr
+    out = tmp_path / "results" / "08_matrix_nvidia-nvidia"
+    assert [e["event"] for e in events(out)] == ["started", "error", "exit"]
+    assert not (out / "matrix").exists()
 
 
 def test_same_partition_pairs_wait_for_research_computing(tmp_path):
