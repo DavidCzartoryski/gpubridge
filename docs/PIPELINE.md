@@ -134,7 +134,8 @@ Per stage, from the same runs (GPipe; 1F1B within 0.5 ms of each):
   V100 running the same 4 micro-batches (the run that computes the same
   gradient) and 0.92x the V100 with the batch in one piece. Each hop carries
   one microbatch's activations, 3 MB, against the 536 MB of gradients that
-  data parallelism sends over the same link each step ([BENCHMARKS.md](BENCHMARKS.md)).
+  data parallelism sends over the same link each step, where DDP reaches
+  0.32x the V100 alone ([BENCHMARKS.md](BENCHMARKS.md#data-parallel-training-on-a-llama-style-model)).
 - **The MI50's stage is the slow one**: 61.8 ms a microbatch against the
   V100's 37.0, so the V100 idles about 164 ms of each 312 ms step. Not all of
   that is the GPU: both stages have 6 blocks, but stage 1 also runs the output
