@@ -270,7 +270,7 @@ def main() -> int:
         sync(device)
         step_s.append(time.perf_counter() - begin)
         if last:
-            last_losses.append(float(torch.stack(losses).mean()))
+            last_losses.append(float(torch.stack(losses).detach().mean()))
 
     everyone = gather({"step_s": step_s, "losses": last_losses, "compute": compute,
                        "hops": hops, "vendor": vendor, "blocks": [start, start + split[me]],
