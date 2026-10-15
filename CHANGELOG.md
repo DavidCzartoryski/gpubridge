@@ -182,6 +182,11 @@ hardware.
 
 ### Added
 
+- Host-staged UCX P2P for arbitrary island members, with independent
+  directional lane workers and optional pinned/chunked staging. Tested on
+  CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA
+  validation or device-direct P2P claim.
+
 - Native P2P batch coalescing for the torch backend, plus an explicit
   `gpubridge.batch_isend_irecv` helper for torch 2.8, whose batch function
   excludes Python process groups from coalescing. CPU tested; GPU unvalidated.

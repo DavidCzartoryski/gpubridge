@@ -109,7 +109,7 @@ class BridgeTransport(abc.ABC):
         """Release resources. Called by :func:`gpubridge.destroy`; the default does nothing."""
 
     @classmethod
-    def create_p2p(cls, group: ProcessGroup):
+    def create_p2p(cls, group: ProcessGroup, *, store=None, timeout=None):
         """An optional all-member point-to-point link for the torch backend.
 
         Unlike :meth:`create`, this hook runs locally after topology setup. It
@@ -143,7 +143,7 @@ class GlooTransport(BridgeTransport):
         dist.broadcast(tensor, src=src, group=self.group)
 
     @classmethod
-    def create_p2p(cls, group: ProcessGroup):
+    def create_p2p(cls, group: ProcessGroup, *, store=None, timeout=None):
         from gpubridge.p2p import GlooLink
 
         return GlooLink(group)

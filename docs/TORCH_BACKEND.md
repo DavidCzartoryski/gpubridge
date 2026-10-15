@@ -342,8 +342,19 @@ Between islands, `BridgeTransport.create_p2p` supplies an all-member link;
 Gloo reuses the existing discovery group and transfers host-staged raw bytes.
 This is separate from the leader-only collective link and does not create
 another process group. Collective-only custom transports need to implement
-the optional hook before carrying cross-island P2P. UCX P2P is not implemented
-in this change.
+the optional hook before carrying cross-island P2P.
+
+With `GPUBRIDGE_BRIDGE=ucx`, each matched directional `(src, dst, tag)` lane
+lazily connects its own two-endpoint UCX worker, including non-leaders. This
+keeps the existing collective worker separate (it is not thread-safe) and
+lets unrelated pairs/tags progress concurrently. Address exchange uses the
+same scoped Store; it does not rendezvous with uninvolved ranks or create
+another ProcessGroup. Payloads are host-staged, including pinned/chunked
+options; there is no device-direct UCX P2P path. Separate workers cost a UCX
+context and endpoints per used directional tag for the group's lifetime.
+Use a bounded set of tags. The adapter is CPU tested over UCX TCP; RDMA and
+GPU behavior are unvalidated. Closing schedules worker cleanup after any
+native wait has completed or failed, without blocking the main thread.
 
 `GPUBRIDGE_PINNED_STAGING=1` uses pinned host buffers on GPUs. Setting
 `GPUBRIDGE_P2P_CHUNK_BYTES=4M` instead enables two-slot chunked staging, also

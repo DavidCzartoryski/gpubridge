@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from _staging import LazyStaging
+from test_ucx import TCP, needs_ucx
 
 from gpubridge import topology
 from gpubridge import p2p
@@ -197,6 +198,25 @@ def _concurrent(rank, world):
 
 
 def test_all_pairs_in_flight_native_and_bridged(tmp_path):
+    run(["nvidia", "nvidia", "amd", "amd"], _concurrent, tmp_path)
+
+
+@needs_ucx
+@pytest.mark.parametrize("chunks", [False, True], ids=["whole", "chunked"])
+def test_ucx_p2p_reverse_tags_and_duplex(chunks, tmp_path, monkeypatch):
+    monkeypatch.setenv("GPUBRIDGE_BRIDGE", "ucx")
+    for key, value in TCP.items():
+        monkeypatch.setenv(key, value)
+    if chunks:
+        monkeypatch.setenv(p2p.CHUNK_BYTES_ENV, "128")
+    run(["nvidia", "amd"], _tags_and_batches, tmp_path)
+
+
+@needs_ucx
+def test_ucx_p2p_includes_nonleaders_and_multiple_pairs(tmp_path, monkeypatch):
+    monkeypatch.setenv("GPUBRIDGE_BRIDGE", "ucx")
+    for key, value in TCP.items():
+        monkeypatch.setenv(key, value)
     run(["nvidia", "nvidia", "amd", "amd"], _concurrent, tmp_path)
 
 
