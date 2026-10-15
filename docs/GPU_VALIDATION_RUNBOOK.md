@@ -679,8 +679,12 @@ interface (`IFNAME`), which checks:
 5. a real two-machine Gloo handshake succeeds
 
 The preflight **stops with a specific message before torchrun starts** if any
-check fails. After that, the script runs the correctness check and a bridged
-benchmark, and packs the results.
+check fails. After that, the script runs the correctness check, the bridged
+benchmarks (uncompressed, then bf16 and fp8), FSDP2 through the backend, and
+training throughput (`train_bench.py` on GPT-2 small and ResNet-50, DDP with
+`gpubridge.ddp_comm_hook`): first each machine's GPUs alone, one island and
+nothing on the bridge, then both machines together. Last it writes
+`triage.txt` (this machine's half) and packs the results.
 
 Ports: torchrun uses `MASTER_PORT` (29500) and the preflight uses
 `PREFLIGHT_PORT` (29501), plus Gloo's random ports. All are covered by an
@@ -690,6 +694,97 @@ Each machine only holds its own ranks' records. For the full verdict, copy
 both `results/mixed-*/check/rank*.json` sets into one directory and run
 `python scripts/gpu/summarize.py <dir>`. That run's `run.kind` must be
 `gpu-mixed`, with `split_test` null.
+
+### Dry run first: two containers
+
+[`mixed/containers.sh`](../scripts/gpu/mixed/containers.sh) runs `node.sh` end to
+end on CPU in two Linux containers on one Docker network, a stand-in for the
+two machines on an overlay: the master pretends to be the NVIDIA machine and the
+worker the AMD one (`GPUBRIDGE_VENDOR`), two ranks each by default (`NPROC`).
+Everything after setup runs as it would on GPUs, over a real network between
+two hosts: the preflight on `eth0`, the check, the benchmarks, FSDP2, training
+throughput on the tiny models, triage and both tarballs. It can't show GPUs,
+NCCL/RCCL, the overlay itself or a wide-area link.
+
+```bash
+scripts/gpu/mixed/containers.sh            # results in results/mixed_containers/
+NPROC=4 CPUS=4 scripts/gpu/mixed/containers.sh   # four ranks a machine
+```
+
+It builds a small image (`mixed/Dockerfile`: torch's CPU build and gpubridge)
+and needs only Docker. With Colima or Docker Desktop, keep the repo under your
+home directory, which the VM shares. Run it after any change to `node.sh` and
+before renting machines.
+
+### An 8+8 run, step by step
+
+One machine with 8 NVIDIA GPUs and one with 8 AMD GPUs. Nothing here has run on
+8-GPU machines yet, so the times below are the limits the kit enforces, not
+measurements.
+
+1. **Pick the pair.** Prefer one provider and region with a private network
+   between the two machines (no overlay needed, and the most bandwidth); else
+   any two machines and Tailscale. Both on Linux with the GPU driver installed
+   and a ROCm release that supports the AMD GPU.
+2. **Network.** Same provider: note each machine's private IP and interface
+   (`ip -br addr`), and open all TCP between the two in the provider's
+   firewall. Otherwise, Tailscale on both, as [above](#network-what-gpubridge-needs).
+   Check both ways: `ping` the other machine's address from each.
+3. **Code, on both, at one commit:**
+
+   ```bash
+   git clone https://github.com/DavidCzartoryski/gpubridge.git && cd gpubridge
+   git checkout <commit>       # the same on both machines
+   ```
+
+4. **Look at the commands first**, on both (`--dry-run` only prints them):
+
+   ```bash
+   ROLE=master MASTER_ADDR=<master IP> IFNAME=<interface> NPROC=8 \
+       bash scripts/gpu/mixed/node.sh --dry-run
+   ```
+
+5. **Run.** Master first, the worker within about 90 seconds (the preflight's
+   timeout). `node.sh` sets up the venv first (PyTorch 2.14.1 for the
+   machine's GPUs: about 7 GB for the CUDA build, more for ROCm's). On a
+   private network of 25 Gb/s or more, `BENCH_MAX_BYTES=1G` also measures the
+   large sizes:
+
+   ```bash
+   # NVIDIA machine:
+   ROLE=master MASTER_ADDR=<master IP> IFNAME=<interface> NPROC=8 BENCH_MAX_BYTES=1G \
+       bash scripts/gpu/mixed/node.sh
+   # AMD machine:
+   ROLE=worker MASTER_ADDR=<master IP> IFNAME=<interface> NPROC=8 BENCH_MAX_BYTES=1G \
+       bash scripts/gpu/mixed/node.sh
+   ```
+
+   Each machine is one island of 8 (NCCL on one, RCCL on the other) and the
+   bridge joins the two leaders. Every launch is stopped after `KIT_TIMEOUT`
+   seconds (1200 by default) and recorded as timed out, so a hung step costs
+   at most 20 minutes; 11 steps follow the preflight.
+6. **Collect.** Each machine prints the `scp` line for its tarball. Copy both,
+   then:
+
+   ```bash
+   python scripts/gpu/triage.py mixed-master-<host>.tgz
+   python scripts/gpu/triage.py mixed-worker-<host>.tgz
+   ```
+
+   The master's tarball holds the two-machine training records
+   (`train_bench_<model>.json`: rank 0 writes them); each holds its own
+   machine's baseline (`train_bench_alone_<model>.json`). For the check's
+   verdict, see above.
+7. **Stop billing.** Destroy both machines once the tarballs are copied; on
+   some providers a powered-off GPU machine still bills.
+
+What it answers: whether gpubridge's bridge, compression and training paths
+work on 8+8 GPUs of current generations; what the bridge costs at each size on
+that network (the benchmark against the preflight's prediction); and whether
+16 GPUs across vendors train faster than each machine's 8 alone, for GPT-2
+small and ResNet-50 (`samples_per_s`, with the step split into compute, waiting
+for the slower machine and exposed communication). Pipeline-parallel training
+isn't in the kit yet; when it is, it becomes one more step here.
 
 ## Reading results
 

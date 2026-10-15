@@ -182,6 +182,15 @@ hardware.
 
 ### Added
 
+- `mixed/node.sh` (a real mixed job on two machines) also measures training
+  throughput, as Explorer's step 07 does: `train_bench.py` on each model in
+  `TRAIN_BENCH_MODELS` (GPT-2 small and ResNet-50 by default), first on each
+  machine's GPUs alone, then on both together; and it writes `triage.txt`
+  before packing the results (#PRNUM).
+- `scripts/gpu/mixed/containers.sh`: `node.sh` end to end on CPU in two Linux
+  containers on one Docker network, standing in for the two machines, with
+  `triage.py` over both; and the runbook's exact steps for an 8+8 run on two
+  cloud machines (#PRNUM).
 - `scripts/gpu/rdma_report.sh`, a step of the network check (`net-nvidia`,
   `net-amd`): what RDMA from GPU memory would need on the node, one file each
   in `rdma/<side>/`: the kernel's dma-buf and peer-to-peer options, the RDMA
