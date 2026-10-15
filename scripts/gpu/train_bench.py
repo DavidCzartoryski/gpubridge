@@ -32,6 +32,11 @@ From the medians (the ddp step time is the slowest rank's at each step):
   ``alone_samples_per_s`` (batch / its compute) says what its GPU does by itself;
   with one rank there is no communication and the two agree.
 
+On a GPU each rank's ``memory`` has, for each phase, the caching allocator's
+peaks (``torch.cuda.max_memory_allocated`` and ``max_memory_reserved``, MiB) and
+the allocations it retried after freeing its cache (``num_alloc_retries``: a
+sign it ran short), and the GPU's total; ``memory`` is null on CPU.
+
 Batches per rank. By default every rank takes ``--batch-size`` samples. Unequal
 batches, so a faster GPU does more of each step:
 
@@ -355,6 +360,31 @@ def comm_alone(sizes: list[tuple[int, torch.dtype]], device: torch.device,
     return out
 
 
+def mib(size: int) -> float:
+    return round(size / 2**20, 1)
+
+
+def memory_mark(device: torch.device) -> int:
+    """Start a phase's memory record: reset the caching allocator's peaks; its
+    allocation retries so far (0 on CPU)."""
+    if device.type != "cuda":
+        return 0
+    torch.cuda.reset_peak_memory_stats(device)
+    return torch.cuda.memory_stats(device).get("num_alloc_retries", 0)
+
+
+def memory_peaks(device: torch.device, retries_before: int) -> dict[str, Any] | None:
+    """A phase's memory since :func:`memory_mark`: the peaks allocated to tensors and
+    reserved from the GPU (MiB), and the allocations retried after freeing the cache.
+    None on CPU."""
+    if device.type != "cuda":
+        return None
+    retries = torch.cuda.memory_stats(device).get("num_alloc_retries", 0)
+    return {"max_allocated_mib": mib(torch.cuda.max_memory_allocated(device)),
+            "max_reserved_mib": mib(torch.cuda.max_memory_reserved(device)),
+            "alloc_retries": retries - retries_before}
+
+
 def gather(value: Any) -> list[Any]:
     everyone: list[Any] = [None] * dist.get_world_size()
     dist.all_gather_object(everyone, value)
@@ -502,15 +532,19 @@ def main() -> int:
 
     # 1. compute: this rank's GPU alone. Its optimizer state is thrown away; DDP below
     # starts again from rank 0's parameters.
+    memory = {}  # each phase's peaks (GPU only)
+    mark = memory_mark(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     compute, _ = timed_steps(model, optimizer, data, device, args.warmup_steps, args.steps,
                              scale)
+    memory["compute"] = memory_peaks(device, mark)
     del optimizer
     model.zero_grad(set_to_none=True)
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
     # 2. ddp: the gradient sync through gpubridge, overlapping backward.
+    mark = memory_mark(device)
     ddp = DistributedDataParallel(model, device_ids=[device.index] if device.type == "cuda"
                                   else None, bucket_cap_mb=args.bucket_mb,
                                   broadcast_buffers=False)
@@ -521,6 +555,7 @@ def main() -> int:
     ddp_times, losses = timed_steps(ddp, optimizer, data, device, args.warmup_steps, args.steps,
                                     scale)
     exchanges_per_step = exchanges[0] / (args.warmup_steps + args.steps)
+    memory["ddp"] = memory_peaks(device, mark)
 
     # Every rank's parameters: their bits, their sum, and whether they are finite.
     digest, total, finite = hashlib.sha256(), 0.0, True
@@ -532,20 +567,25 @@ def main() -> int:
     del optimizer, ddp
 
     # 3. comm alone: the same buckets, no compute.
+    mark = memory_mark(device)
     alone = comm_alone(sizes, device, args.comm_trials)
+    memory["comm_alone"] = memory_peaks(device, mark)
 
+    gpu = device.type == "cuda"
     everyone = gather({"compute": compute, "ddp": ddp_times, "alone": alone,
                        "digest": digest.hexdigest(), "sum": total, "finite": finite,
                        "vendor": topology.vendor,
-                       "device": torch.cuda.get_device_name(device) if device.type == "cuda"
-                       else str(device)})
+                       "device": torch.cuda.get_device_name(device) if gpu else str(device),
+                       "memory": ({"total_mib": mib(torch.cuda.get_device_properties(device)
+                                                    .total_memory), **memory}
+                                  if gpu else None)})
     environments = gather(environment()) if args.json else []
     result = decompose([e["compute"] for e in everyone], [e["ddp"] for e in everyone],
                        [e["alone"] for e in everyone], shares)
     for entry, mine in zip(result["ranks"], everyone, strict=True):
         entry.update(vendor=mine["vendor"], device=mine["device"],
                      compute_ms_all=[ms(t) for t in mine["compute"]],
-                     ddp_step_ms_all=[ms(t) for t in mine["ddp"]])
+                     ddp_step_ms_all=[ms(t) for t in mine["ddp"]], memory=mine["memory"])
     ok = all(e["finite"] for e in everyone)
     if rank == 0:
         record = {
