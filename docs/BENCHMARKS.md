@@ -13,7 +13,7 @@ intended use (see [Waiting on Research Computing](#waiting-on-research-computing
 | Run | What it measures | Status |
 | --- | --- | --- |
 | Network check | InfiniBand/RoCE on each node type; the transport NCCL and RCCL choose | ran, one V100 node and one MI50 node |
-| RDMA check | what RDMA from GPU memory would need on each node type: peer-memory modules, dma-buf, UCX | ran, one V100 node and one MI50 node: no RDMA path between them |
+| RDMA check | what RDMA from GPU memory would need on each node type: peer-memory modules, dma-buf, UCX | ran, one V100 node and one MI50 node: no RDMA path between the nodes checked |
 | A1, A2 | two V100s, native NCCL: as NCCL chooses, then TCP on the bridge's interface | waiting on Research Computing |
 | B1, B2 | two MI50s, native RCCL: the same two | waiting on Research Computing |
 | C, C-amd | two V100s (two MI50s) through gpubridge's bridge, one island each: gpubridge's own cost without vendor mixing | waiting on Research Computing |
@@ -71,7 +71,7 @@ What this means for the comparison:
   interface.
 - In the D runs each island has one rank, so NCCL and RCCL never cross the
   network; their lines above say what they would choose, not a transport in use.
-- **There is no RDMA path between the two node types**; see
+- **No RDMA path between the V100 and MI50 nodes checked**; see
   [RDMA between the node types](#rdma-between-the-node-types).
 
 ### RDMA between the node types
@@ -83,7 +83,9 @@ dma-buf and peer-to-peer options, the RDMA and GPU kernel modules, rdma-core,
 `rdma link`, the HSA runtime's dma-buf export, and UCX, with the cluster's
 OpenMPI 4.1.6 module loaded for its `ucx_info` (`RDMA_MODULES`). One node of
 each type: a different V100 node from the first network check's, and the same
-MI50 node. The V100 node's ports matched the first one's.
+MI50 node. The V100 node's ports matched the first one's. Step 00's records list
+two MI50 nodes in `sharing`, one of them drained; every MI50 job so far ran on
+the other.
 
 | | V100 node (`gpu`) | MI50 node (`sharing`) |
 | --- | --- | --- |
@@ -93,27 +95,33 @@ MI50 node. The V100 node's ports matched the first one's.
 | dma-buf and peer-to-peer in the kernel | `DMABUF_MOVE_NOTIFY`, `PCI_P2PDMA` | the same, and `HSA_AMD_P2P` |
 | rdma-core | 46.0; libibverbs has `ibv_reg_dmabuf_mr` | 57.0; the same |
 | GPU memory for the NIC | `nvidia_peermem` (545.23.08) installed for this kernel, not loaded; the NVIDIA kernel module is the proprietary one (license `NVIDIA`) | no `amdp2p` module; torch's HSA runtime (2.14.1+rocm7.2) has `hsa_amd_portable_export_dmabuf` |
-| UCX | 1.16.0, the only build found (in the OpenMPI 4.1.6 module): transports `self`, `tcp`, `sysv`, `posix`, `cma`; memory type host only | the same build, the same transports; host only |
+| UCX | 1.16.0, in the OpenMPI 4.1.6 module: `ucx_info -d` found `self`, `tcp`, `sysv`, `posix`, `cma`, all host memory only | the same build, the same transports; host only |
 
 What this means:
 
-- **No RDMA path between a V100 node and an MI50 node.** The V100 node's only
-  RDMA device is on InfiniBand; the MI50 node's only active one is on Ethernet,
-  and its InfiniBand port is disabled. An InfiniBand port can't reach a RoCE
-  port, and RoCE needs an RDMA device at both ends: the V100 node reaches the
-  MI50 node's Ethernet network through `internal`, which has none. So the UCX
-  transport's RDMA and GPUDirect paths (items 26 and 27 in
-  [HARDWARE_VALIDATION.md](../HARDWARE_VALIDATION.md)) can't be validated
-  between these two node types; the bridge stays on TCP.
-- **The cluster's UCX can't do RDMA or GPU memory even within one node type.**
-  It was built without verbs and without CUDA or ROCm, so it offers TCP and
-  shared memory only. RDMA through gpubridge's UCX transport on Explorer would
-  need another UCX build; none was tried.
+- **No RDMA path between the V100 and MI50 nodes checked** (two V100 nodes,
+  counting the first network check's, and the MI50 node in service). The V100
+  nodes' only RDMA device is on InfiniBand; the MI50 node's only active one is
+  on Ethernet, and its InfiniBand port is disabled. An InfiniBand port can't
+  reach a RoCE port, and RoCE needs an RDMA device at both ends: the V100 node
+  reaches the MI50 node's Ethernet network through `internal`, which has none.
+  So on these nodes the UCX transport's RDMA and GPUDirect paths (items 26 and
+  27 in [HARDWARE_VALIDATION.md](../HARDWARE_VALIDATION.md)) can't be
+  validated; the bridge stays on TCP. Other nodes, or a change to their ports,
+  could differ.
+- **The UCX found can't do RDMA or GPU memory, even between nodes of one
+  type.** At run time it offered only TCP and shared-memory transports, host
+  memory only, and its install has one transport module, `cma`: no `ib`,
+  `rdmacm`, `cuda` or `rocm` (`lib/ucx` in the module, listed from the login
+  node). No other UCX turned up in `module avail` or the system's packages.
+  RDMA through gpubridge's UCX transport on Explorer would need another UCX
+  build; none was tried.
 - **GPU side, for other hardware.** On the V100 nodes GPUDirect RDMA would
   need `nvidia_peermem` loaded, which it isn't; NVIDIA's dma-buf path needs the
-  open kernel modules, which these nodes don't run. The MI50 node has what
-  dma-buf RDMA from AMD GPU memory needs (the kernel option, the runtime's
-  export call, `ibv_reg_dmabuf_mr`), but nothing was tried.
+  open kernel modules, which these nodes don't run. The MI50 node has the
+  pieces dma-buf RDMA from AMD GPU memory would use (the kernel option, the
+  runtime's export call, `ibv_reg_dmabuf_mr`); neither exporting a GPU buffer
+  nor registering one with the NIC was tried.
 - Not recorded: `ulimit -l` in jobs and `perftest`. Neither changes the
   answer above.
 
