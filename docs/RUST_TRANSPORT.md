@@ -85,9 +85,12 @@ ordering guarantee the GPU tests enforce for the default bridge holds
 unchanged: the transport never sees a device pointer or a stream.
 
 **Failures and time limits.** Every wait has the deadline `init()` gave its
-groups (30 minutes without one). A socket error, a closed connection or a
-frame of the wrong size fails the worker; a wait that runs out of time, or
-any wait after a failure, raises, and the transport refuses every later call.
+groups (30 minutes without one). A member whose connections end (it closed
+them, or the network dropped them) fails the waits on operations with that
+member, not the others: with three or more leaders, one that has finished its
+part of a collective and closed must not fail another still receiving from the
+rest. A frame of the wrong size fails the worker; a wait that runs out of time,
+or any wait after a failure, raises, and the transport refuses every later call.
 **Before a failed wait returns, the worker stops**: every connection is shut
 down and every thread joined, so no thread can still read or write a
 collective's tensors once Python sees the error and frees them. If Python's own
@@ -104,7 +107,8 @@ unwinds into Python.
   connections, matched by tag in any order; a frame that arrives before its
   receive is posted; a missing message timing out, and the frame that comes
   after it never reaching the buffer; empty messages with null pointers; a
-  frame of the wrong size and a closed peer failing the wait; stray and
+  frame of the wrong size and a closed peer failing the wait; a member that
+  closes failing only the waits on it, with three members; stray and
   repeated dials not taking a real connection's place; bad arguments refused.
 - `tests/test_multitcp.py`, between processes over loopback TCP: every bridge
   policy at two, three and four leaders, bit for bit against `flat-gloo`, for

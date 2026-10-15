@@ -64,6 +64,10 @@ struct State {
     queues: Vec<VecDeque<Job>>,
     next_stream: Vec<usize>,
     connected: Vec<bool>,
+    /// Members whose connections ended: their operations can't finish, the others can.
+    gone: Vec<bool>,
+    /// The member of every unfinished operation, by id.
+    peer_of: HashMap<i64, usize>,
     failed: Option<String>,
     closing: bool,
 }
@@ -78,6 +82,15 @@ impl Shared {
         // A thread that panicked while holding the lock leaves the state usable for a
         // failure report, which is all that is left to do.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A member's connection ended (it closed, or the network dropped it): fail only the
+    /// waits on operations with that member. A peer that finished its collectives and
+    /// closed must not fail one still waiting on the others.
+    fn gone(&self, member: usize) {
+        let mut state = self.lock();
+        state.gone[member] = true;
+        self.changed.notify_all();
     }
 
     fn fail(&self, message: String) {
@@ -143,6 +156,7 @@ impl Worker {
             queues: (0..members * streams).map(|_| VecDeque::new()).collect(),
             next_stream: vec![0; members],
             connected: vec![false; members],
+            gone: vec![false; members],
             ..State::default()
         };
         let shared = Arc::new(Shared {
@@ -273,6 +287,9 @@ impl Worker {
         if state.closing {
             return Err("the worker has stopped".to_string());
         }
+        if state.gone[member] {
+            return Err(format!("member {member} closed its bridge connection"));
+        }
         Ok(())
     }
 
@@ -283,6 +300,7 @@ impl Worker {
         self.usable(&state, member)?;
         state.next_id += 1;
         let id = state.next_id;
+        state.peer_of.insert(id, member);
         let stream = state.next_stream[member];
         state.next_stream[member] = (stream + 1) % self.streams;
         state.queues[member * self.streams + stream].push_back(Job { id, tag, ptr, len });
@@ -301,6 +319,7 @@ impl Worker {
         }
         state.next_id += 1;
         let id = state.next_id;
+        state.peer_of.insert(id, member);
         state.posted.insert((member, tag), Recv { id, ptr, len });
         self.shared.changed.notify_all();
         Ok(id)
@@ -328,6 +347,18 @@ impl Worker {
             if state.closing {
                 drop(state);
                 self.set_error("the worker has stopped".to_string());
+                return PEER_FAILED;
+            }
+            let lost = ids
+                .iter()
+                .filter(|id| !state.finished.contains(id))
+                .find_map(|id| state.peer_of.get(id).filter(|m| state.gone[**m]).copied());
+            if let Some(member) = lost {
+                drop(state);
+                self.set_error(format!(
+                    "member {member} closed its bridge connection with operations outstanding"
+                ));
+                self.stop(STOP_TIMEOUT);
                 return PEER_FAILED;
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -472,12 +503,13 @@ fn send_loop(mut socket: TcpStream, queue: usize, member: usize, shared: Arc<Sha
         };
         let sent = write_header(&mut socket, &[job.tag, job.len as u64])
             .and_then(|_| socket.write_all(bytes));
-        if let Err(e) = sent {
-            shared.fail(format!("sending to member {member}: {e}"));
+        if sent.is_err() {
+            shared.gone(member); // its waits fail; the other members' carry on
             return;
         }
         let mut state = shared.lock();
         state.finished.insert(job.id);
+        state.peer_of.remove(&job.id);
         shared.changed.notify_all();
     }
 }
@@ -486,13 +518,8 @@ fn recv_loop(mut socket: TcpStream, member: usize, shared: Arc<Shared>) {
     loop {
         let [tag, len] = match read_words::<2>(&mut socket) {
             Ok(words) => words,
-            Err(e) => {
-                let closed = e.kind() == ErrorKind::UnexpectedEof;
-                shared.fail(if closed {
-                    format!("member {member} closed its bridge connection")
-                } else {
-                    format!("receiving from member {member}: {e}")
-                });
+            Err(_) => {
+                shared.gone(member); // closed or dropped: its waits fail, the others' don't
                 return;
             }
         };
@@ -524,12 +551,13 @@ fn recv_loop(mut socket: TcpStream, member: usize, shared: Arc<Shared>) {
         } else {
             unsafe { std::slice::from_raw_parts_mut(recv.ptr as *mut u8, recv.len) }
         };
-        if let Err(e) = socket.read_exact(bytes) {
-            shared.fail(format!("receiving from member {member}: {e}"));
+        if socket.read_exact(bytes).is_err() {
+            shared.gone(member);
             return;
         }
         let mut state = shared.lock();
         state.finished.insert(recv.id);
+        state.peer_of.remove(&recv.id);
         shared.changed.notify_all();
     }
 }
@@ -896,6 +924,44 @@ mod tests {
         assert_eq!(b.wait(&[got], Duration::from_secs(5)), 0);
         assert_eq!(a.wait(&[sent], Duration::from_secs(5)), 0);
         assert_eq!(out, data);
+    }
+
+    #[test]
+    fn a_member_that_closes_fails_only_the_waits_on_it() {
+        let mut workers: Vec<Worker> = (0..3)
+            .map(|i| Worker::new(3, i, 1, "127.0.0.1").unwrap())
+            .collect();
+        let addresses: Vec<String> = workers.iter().map(|w| w.address().to_string()).collect();
+        let handles: Vec<_> = workers
+            .drain(..)
+            .enumerate()
+            .map(|(i, mut w)| {
+                let addresses = addresses.clone();
+                thread::spawn(move || {
+                    for m in (0..3).filter(|&m| m != i) {
+                        w.connect(m, &addresses[m], Duration::from_secs(5)).unwrap();
+                    }
+                    w
+                })
+            })
+            .collect();
+        let mut w: Vec<Worker> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let (data, mut from_two, mut from_one) = ([4u8; 8], [0u8; 8], [0u8; 8]);
+        let got = w[0].recv(2, from_two.as_mut_ptr() as usize, 8, 1).unwrap();
+        let never = w[0].recv(1, from_one.as_mut_ptr() as usize, 8, 2).unwrap();
+        let one = w.remove(1);
+        assert!(one.close(Duration::from_secs(5))); // member 1 is done and leaves
+        thread::sleep(Duration::from_millis(50));
+        let sent = w[1].send(0, data.as_ptr() as usize, 8, 1).unwrap(); // member 2
+        assert_eq!(w[0].wait(&[got], Duration::from_secs(5)), 0);
+        assert_eq!(w[1].wait(&[sent], Duration::from_secs(5)), 0);
+        assert_eq!(from_two, data);
+        assert_eq!(w[0].wait(&[never], Duration::from_secs(5)), PEER_FAILED);
+        assert!(w[0]
+            .last_error
+            .to_str()
+            .unwrap()
+            .contains("member 1 closed"));
     }
 
     #[test]
