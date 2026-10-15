@@ -203,6 +203,19 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   on 4-CPU jobs made each reduction 10 to 25 times slower, until it reduced on one
   thread. Details in
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype-not-merged).
+- **Triton 3.8.0 with torch 2.9.1+rocm6.3 on the AMD MI50 (gfx906), commit
+  4e7f04e**: Triton from the default ROCm venv in front of `venv-rocm63`'s own
+  (3.5.1), which can't compile the compression kernels for gfx906. The kit's
+  GPU tests (`test_gpu.py`, `test_compression_kernels.py`,
+  `test_torch_backend.py`) gave 26 passed, 8 skipped, with Triton's bundled HIP
+  and with torch's HIP 6.3 (job 11091760); with 3.5.1, 20 failed. Then GPT-2
+  small through the bridge with fp8 and these Triton kernels on both ranks
+  (V100: torch 2.14.1+cu126, NCCL 2.29.3; MI50: RCCL 2.21.5): 29.631 samples/s
+  at batch 16 (job 11091811) and 32.726 at 32 (11093097), against 28.395 and
+  29.247 on the V100 alone (1.04x and 1.12x) and 26.274 and 28.311 with the
+  PyTorch kernels. Communication alone fell to 346 and 362 ms from 485 and
+  605. HSDP hung again in both. Details in
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#fp8-with-triton-kernels-on-the-mi50).
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
@@ -212,6 +225,19 @@ hardware.
 
 ### Added
 
+- `scripts/gpu/rocm_triton_overlay.sh`: an env-only venv of one ROCm venv's
+  torch with another's Triton linked in front, for an MI50 that trains on
+  torch 2.9.1+rocm6.3 (gfx906 rocBLAS kernels) and needs Triton 3.8.0 for the
+  compression kernels. Links, not copies; no Python runs.
+- `scripts/gpu/amd/run_all.sh` measures training throughput (`train_bench.py`):
+  each model on one GPU, and with 2+ GPUs as one RCCL island and split through
+  the bridge. The runbook has the steps for an MI300X on AMD Developer Cloud.
+- `submit.sh train-multi` and `07-multi`, for the day multigpu access arrives:
+  `train_bench.py` on one GPU, on `GPUS_TRAIN_MULTI` GPUs (4) as one NCCL
+  island, and on the same GPUs as two islands of half each through the bridge
+  (a split test); and step 07 with `GPUS_MIXED_NVIDIA_MULTI` NVIDIA GPUs (4) on
+  `multigpu` next to the AMD side. Both run end to end on the fake cluster
+  (#64).
 - Step 07: `STEPS_07=bench` runs only the probe, the preflight and the
   `train_bench_<model>` steps: no `train_ddp`, FSDP2 or HSDP (HSDP hung until
   its step limit in each of the four fp8 jobs above).
@@ -369,11 +395,26 @@ hardware.
 
 ### Fixed
 
+- Point-to-point lifecycle: future callbacks no longer run under the engine
+  lock or on lane threads, so a callback waiting on another (or its own) P2P
+  Work completes and teardown does not wait for it; idle lanes release
+  completed payloads and their threads exit, keeping per-tag sequence order;
+  a CPU request on a lane that earlier carried a CUDA tensor uses no stream.
+  A batch's Work (`batch_isend_irecv`, `_coalescing_manager`) waits on its
+  members rather than on futures behind user callbacks, so a slow callback
+  doesn't delay it, a callback can wait on it, and `wait(timeout)` works.
+  CPU tests only; the GPU stream paths are unvalidated.
 - The runbook's 8+8 steps said the master's tarball holds the two-machine
   training records. Rank 0 writes them, and torchrun numbers the machines by
   address, not by role, so they can be on either machine. The two-machine
   test assumed the master too, and failed when the worker's torchrun started
   first; it now expects the record on exactly one of the two (#74).
+- `examples/fsdp2_torch_backend.py --verify` is exact at any world size. It
+  averaged each rank's unscaled loss, which divides by the world size, inexact
+  unless that is a power of two, so on 3 or 5 ranks (2 NVIDIA GPUs and an AMD
+  one, say) the check failed with nothing wrong. Each rank's loss is now scaled
+  by the world size and the replay sums the ranks' losses; on CPU it matches bit
+  for bit on 2 to 6 ranks, and with `--hsdp 2` on 4 and 6 (#64).
 - The stream-ordering checks (`check.py`'s `busy_gpu` and `async` stages,
   `tests/test_gpu.py`) queued matmuls as busy work, and failed or aborted
   where rocBLAS has no kernels for the GPU (gfx906 on the ROCm 7.2 wheel).

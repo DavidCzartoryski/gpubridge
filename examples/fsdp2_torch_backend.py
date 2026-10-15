@@ -14,10 +14,11 @@ On a mixed NVIDIA + AMD cluster, the same command without the two variables.
 It exits non-zero unless the loss went down and every rank assembled the same
 parameters. With ``--hsdp 2`` it runs HSDP instead: parameters sharded within
 each vendor island, replicated across the two (docs/TORCH_BACKEND.md,
-"Subgroups and HSDP"). With ``--verify`` it trains a float64 model on integer-valued data
-(learning rate 4, so every update is a whole-number sum, exact in any order)
-and rank 0 replays the same steps in one process: the parameters must match
-bit for bit. A collective that read or wrote a tensor at the wrong moment on a
+"Subgroups and HSDP"). With ``--verify`` it trains a float64 model on integer-valued data,
+each rank's loss scaled by the world size, so the averaged gradient is the
+whole-number sum of every rank's, exact in any order and at any world size, and
+rank 0 replays the same steps in one process: the parameters must match bit
+for bit. A collective that read or wrote a tensor at the wrong moment on a
 GPU would show there, even when every rank agrees.
 """
 
@@ -130,8 +131,10 @@ def make_mesh(device: torch.device, world: int, islands: int | None):
 
 
 def verify(islands: int | None = None) -> int:
-    """float64, integer-valued data and lr=4: every rank's averaged update is a whole-number
-    sum, so FSDP2 through the backend must equal one process on the whole batch exactly."""
+    """float64, integer-valued data and lr=4, each rank's loss times the world size: FSDP2
+    averages gradients over the ranks, so the update is 4 x the whole-number sum of every
+    rank's gradient, which one process on the whole batch computes exactly too. (Averaging
+    an unscaled loss would divide by the world size, inexact unless it is a power of two.)"""
     dist.init_process_group(backend="gpubridge")
     rank, world = dist.get_rank(), dist.get_world_size()
     if torch.cuda.is_available() and not os.environ.get("GPUBRIDGE_VENDOR"):
@@ -160,7 +163,7 @@ def verify(islands: int | None = None) -> int:
     fully_shard(model, mesh=mesh)
     opt = torch.optim.SGD(model.parameters(), lr=4.0)
     for step in range(3):
-        model(batch(rank, step).to(device)).sum().backward()
+        (model(batch(rank, step).to(device)).sum() * world).backward()
         opt.step()
         opt.zero_grad()
     full = [p.full_tensor().detach().cpu() for p in model.parameters()]
@@ -169,7 +172,7 @@ def verify(islands: int | None = None) -> int:
         reference = make()
         ref_opt = torch.optim.SGD(reference.parameters(), lr=4.0)
         for step in range(3):
-            (sum(reference(batch(r, step)).sum() for r in range(world)) / world).backward()
+            sum(reference(batch(r, step)).sum() for r in range(world)).backward()
             ref_opt.step()
             ref_opt.zero_grad()
         ok = all(torch.equal(a, b.detach()) for a, b in zip(full, reference.parameters(),

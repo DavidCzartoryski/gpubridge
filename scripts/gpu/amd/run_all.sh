@@ -27,6 +27,9 @@ SKIP_SETUP="${SKIP_SETUP:-0}"            # 1 = reuse an existing venv (e.g. on a
 PACKAGE_RESULTS="${PACKAGE_RESULTS:-1}"  # 0 = no tarball (e.g. on a cluster's shared filesystem)
 # Opt-in collective policies also checked (space-separated).
 OPT_IN_POLICIES="${OPT_IN_POLICIES:-pipelined-reduce-bridge-broadcast sharded-bridge}"
+# Training throughput (train_bench.py): models, and extra flags such as "--batch-size 16".
+TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS:-gpt2-small resnet50}"
+read -ra train_args <<<"${TRAIN_BENCH_ARGS:-}"
 # -------------------------------------------------------------------------------
 
 RESULTS="$RESULTS_ROOT/$TARGET"
@@ -131,6 +134,22 @@ else
         --nproc-per-node=2 "$KIT_DIR/check.py" --out "$RESULTS/check_split_shared_gpu"
     checks+=("$RESULTS/check_split_shared_gpu")
 fi
+# Training throughput (train_bench.py, DDP with gpubridge.ddp_comm_hook): each model on one
+# GPU alone, then with 2+ GPUs on all of them as one RCCL island, and split into two
+# islands joined by the bridge (the cost of the bridge on one node).
+for model in $TRAIN_BENCH_MODELS; do
+    step "train_bench_${model}_1gpu" local_torchrun --nproc-per-node=1 "$KIT_DIR/train_bench.py" \
+        --model "$model" --json "$RESULTS/train_bench_${model}_1gpu.json" \
+        "${train_args[@]+"${train_args[@]}"}"
+    if [ "$GPUS" -ge 2 ]; then
+        step "train_bench_${model}_island" local_torchrun --nproc-per-node="$GPUS" \
+            "$KIT_DIR/train_bench.py" --model "$model" \
+            --json "$RESULTS/train_bench_${model}_island.json" "${train_args[@]+"${train_args[@]}"}"
+        step "train_bench_${model}_split" env_local_torchrun GPUBRIDGE_SPLIT_TEST=half \
+            --nproc-per-node="$GPUS" "$KIT_DIR/train_bench.py" --model "$model" \
+            --json "$RESULTS/train_bench_${model}_split.json" "${train_args[@]+"${train_args[@]}"}"
+    fi
+done
 step summarize python "$KIT_DIR/summarize.py" "${checks[@]}"
 
 [ "$PACKAGE_RESULTS" = 0 ] || package_results "$RESULTS"
