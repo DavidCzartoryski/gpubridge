@@ -138,3 +138,37 @@ def test_profiling_leaves_the_layers_as_they_were():
         weights, [p.detach() for layer in layers for p in layer.parameters()]))
     assert all(torch.equal(a, b) for a, b in zip(buffers, layers[1].buffers()))
     assert torch.equal(rng, torch.get_rng_state())
+
+
+def test_a_layer_that_raises_is_still_restored():
+    class Boom(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(4, 4)
+            self.register_buffer("seen", torch.zeros(1))
+
+        def forward(self, x):
+            self.seen += 1
+            raise RuntimeError("boom")
+
+    layer = Boom()
+    layer.lin.weight.grad = torch.ones_like(layer.lin.weight)
+    weight = layer.lin.weight.detach().clone()
+    with pytest.raises(RuntimeError, match="boom"):
+        balance.profile_layers([layer], torch.randn(2, 4), torch.device("cpu"))
+    assert torch.equal(layer.seen, torch.zeros(1))
+    assert torch.equal(layer.lin.weight.grad, torch.ones_like(weight))
+    assert torch.equal(layer.lin.weight.detach(), weight)
+
+
+def test_a_sparse_input_is_profiled():
+    costs = balance.profile_layers([nn.Linear(8, 4)], torch.randn(5, 8).to_sparse(),
+                                   torch.device("cpu"), trials=1)
+    assert costs[0].activation_bytes > 0 and costs[0].out_bytes == 5 * 4 * 4
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs a second device")
+def test_a_layer_without_parameters_goes_back_to_its_own_device():
+    layer = nn.BatchNorm1d(4, affine=False).to("mps")
+    balance.profile_layers([layer], torch.randn(6, 4), torch.device("cpu"), trials=1)
+    assert all(b.device.type == "mps" for b in layer.buffers())
