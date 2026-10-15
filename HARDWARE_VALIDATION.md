@@ -14,16 +14,16 @@ inside Explorer as one heterogeneous Slurm job. For a first session there,
 [docs/EXPLORER_FIRST_SESSION.md](docs/EXPLORER_FIRST_SESSION.md) has the
 commands in order, from a fresh login to the ladder's first rungs.
 
-**GPU results:** none yet. After GPU runs,
-[`scripts/gpu/validation_tables.py`](scripts/gpu/validation_tables.py) turns
-the kit's results into the tables for this file: what each job ran on (hosts,
-GPUs, driver, torch, CUDA or ROCm, NCCL or RCCL, gpubridge commit, interface),
-a verdict per item below from the steps and stages that test it, the
-preflight's network numbers, benchmark ratios against their named baseline,
-and the predicted against the measured bridge time. Runs in CPU simulation
-never count towards an item. The tables number hosts instead of naming them
-and show no paths, so they can go here as they are. See the runbook's
+**GPU results:** from 2026-10-14 on Explorer, in [GPU results](#gpu-results)
+below, made by [`scripts/gpu/validation_tables.py`](scripts/gpu/validation_tables.py)
+from the kit's results: what each job ran on (hosts, GPUs, driver, torch, CUDA
+or ROCm, NCCL or RCCL, gpubridge commit, interface), a verdict per item below
+from the steps and stages that test it, and the preflight's network numbers.
+Runs in CPU simulation never count towards an item. The tables number hosts
+instead of naming them and show no paths. See the runbook's
 [The validation tables](docs/GPU_VALIDATION_RUNBOOK.md#the-validation-tables).
+The *Status* lines under each item describe the CPU work; the GPU verdicts are
+in the tables. What the bridge costs is in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Blocking: can the job start at all?
 
@@ -425,6 +425,126 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     (`tests/test_torch_backend.py`), and the example's `--hsdp 2` and
     `--verify --hsdp 2` on 4 simulated ranks.* *Step:* `train_hsdp_backend`
     and `verify_hsdp_backend` in Explorer steps 04 and 07.
+
+## GPU results
+
+From `scripts/gpu/validation_tables.py` over every Explorer result of
+2026-10-14 (the kit's `results/explorer`, with tonight's rocm6.3 jobs in
+`results/explorer/rocm63`). Hosts are numbered, not named. A folder's
+`steps.jsonl` keeps every attempt run into it, so a job below can count a step
+twice, and a FAIL can be an early attempt that a later one in the same folder
+passed; the notes say which. GPU names are as the driver reports them: the
+MI50 shows as "AMD Instinct MI60 / MI50", or "AMD Radeon Graphics" with
+torch 2.9.1+rocm6.3.
+
+### Runs
+
+| Job | Steps passed | Failed | Hosts | GPUs | Driver | torch | CUDA / ROCm | NCCL / RCCL | gpubridge | Gloo interface |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 01_probe | 5 of 6 | `probe` | host 1 | Tesla V100-SXM2-32GB | 545.23.08 | 2.14.1+cu126 | CUDA 12.6 | NCCL 2.29.3 | 14ed60c | auto |
+| 02_a100_df80abb | 19 of 20 | `gpu_tests` | host 2 | NVIDIA A100-SXM4-80GB | 570.86.15 | 2.14.1+cu126 | CUDA 12.6 | NCCL 2.29.3 | df80abb+dirty, df80abb | auto |
+| 02_l40s_df80abb | 24 of 25 | `gpu_tests` | host 3 | NVIDIA L40S | 545.23.08 | 2.14.1+cu126 | CUDA 12.6 | NCCL 2.29.3 | df80abb+dirty, df80abb | auto |
+| 02_split_shared_gpu | 29 of 30 | `gpu_tests` | host 4 | Tesla T4 | 570.86.15 | 2.14.1+cu126 | CUDA 12.6 | NCCL 2.29.3 | df80abb+dirty, df80abb | auto |
+| 02_t4_df80abb | 29 of 30 | `gpu_tests` | host 4 | Tesla T4 | 570.86.15 | 2.14.1+cu126 | CUDA 12.6 | NCCL 2.29.3 | df80abb+dirty, df80abb | auto |
+| 02_v100_df80abb | 14 of 15 | `gpu_tests` | host 5 | Tesla V100-SXM2-32GB | 545.23.08 | 2.14.1+cu126 | CUDA 12.6 | NCCL 2.29.3 | df80abb | auto |
+| 07_mixed_hetjob | 15 of 20 | `train_ddp`, `train_fsdp2_backend`, `verify_fsdp2_backend`, `train_hsdp_backend`, `verify_hsdp_backend` | host 6, host 7 | Tesla V100-SXM2-32GB, AMD Instinct MI60 / MI50 | 545.23.08, 5.14.0-611.5.1.el9_7.x86_64 | 2.14.1+cu126, 2.14.1+rocm7.2 | CUDA 12.6, ROCm ? (HIP 7.2.53211) | NCCL 2.29.3, RCCL 2.27.7 | 4014234 | internal.2137, auto |
+| 07_mixed_hetjob_4014234_job11084294 | 10 of 16 | `bench`, `check_pinned`, `summarize_pinned`, `bench_pinned`, `bench_compression_kernels`, `train_ddp` | host 8, host 7 | Tesla V100-SXM2-32GB, AMD Instinct MI60 / MI50 | 545.23.08, 5.14.0-611.5.1.el9_7.x86_64 | 2.14.1+cu126, 2.14.1+rocm7.2 | CUDA 12.6, ROCm ? (HIP 7.2.53211) | NCCL 2.29.3, RCCL 2.27.7 | 4014234 | internal.2137, internal, auto |
+| 08_matrix_nvidia-amd | 15 of 15 | - | host 9, host 7 | Tesla V100-SXM2-32GB, AMD Instinct MI60 / MI50 | 545.23.08, 5.14.0-611.5.1.el9_7.x86_64 | 2.14.1+cu126, 2.14.1+rocm7.2 | CUDA 12.6, ROCm ? (HIP 7.2.53211) | NCCL 2.29.3, RCCL 2.27.7 | 934f87c | internal.2137, auto |
+| amd_node | 9 of 9 | - | host 7 | AMD Instinct MI60 / MI50 | 5.14.0-611.5.1.el9_7.x86_64 | 2.14.1+rocm7.2 | ROCm ? (HIP 7.2.53211) | RCCL 2.27.7 | 4014234 | auto |
+| amd_node_4014234_job11083835 | 14 of 18 | `check_1gpu`, `gpu_tests`, `check_split_shared_gpu`, `summarize` | host 7 | AMD Instinct MI60 / MI50 | 5.14.0-611.5.1.el9_7.x86_64 | 2.14.1+rocm7.2 | ROCm ? (HIP 7.2.53211) | RCCL 2.27.7 | 4014234 | auto |
+| net_check_amd | 4 of 4 | - | host 7 | AMD Instinct MI60 / MI50 | 5.14.0-611.5.1.el9_7.x86_64 | 2.14.1+rocm7.2 | ROCm ? (HIP 7.2.53211) | RCCL 2.27.7 | 934f87c | auto |
+| net_check_nvidia | 4 of 4 | - | host 10 | Tesla V100-SXM2-32GB | 545.23.08 | 2.14.1+cu126 | CUDA 12.6 | NCCL 2.29.3 | 934f87c | auto |
+| rocm63/07_mixed_hetjob | 7 of 8 | `train_hsdp_backend` | host 9, host 7 | Tesla V100-SXM2-32GB, AMD Radeon Graphics | 545.23.08, 5.14.0-611.5.1.el9_7.x86_64 | 2.14.1+cu126, 2.9.1+rocm6.3 | CUDA 12.6, ROCm ? (HIP 6.3.42134-a9a80e791) | NCCL 2.29.3, RCCL 2.21.5 | 934f87c | internal.2137, auto |
+| rocm63/amd_node | 7 of 9 | `gpu_tests`, `bench_compression_kernels` | host 7 | AMD Radeon Graphics | 5.14.0-611.5.1.el9_7.x86_64 | 2.9.1+rocm6.3 | ROCm ? (HIP 6.3.42134-a9a80e791) | RCCL 2.21.5 | dbed5c9 | auto |
+| rocm63/train_bench_amd | 3 of 3 | - | host 7 | AMD Radeon Graphics | 5.14.0-611.5.1.el9_7.x86_64 | 2.9.1+rocm6.3 | ROCm ? (HIP 6.3.42134-a9a80e791) | RCCL 2.21.5 | 934f87c | auto |
+| train_bench_nvidia | 3 of 3 | - | host 9 | Tesla V100-SXM2-32GB | 545.23.08 | 2.14.1+cu126 | CUDA 12.6 | NCCL 2.29.3 | 934f87c | auto |
+
+### Items
+
+`pass (n)` counts GPU runs only; one failed record makes an item `FAIL (k of
+n)`. The `gpu_tests` step tests items 6, 15, 16, 17, 28 and 30 together, so its
+failures count against all six whichever test failed.
+
+| Item | Tested by | Verdict |
+| --- | --- | --- |
+| 1. CUDA and ROCm processes rendezvous in one job | check.py `init` (gpu-mixed) | pass (7) |
+| 2. Version matching between builds | check.py `init` (gpu-mixed) | pass (7) |
+| 3. `new_group(backend="nccl")` on ranks outside the group | check.py `init` (gpu-mixed, split-test) | pass (15) |
+| 4. `"nccl"` on ROCm really runs RCCL | step `rccl_version` | pass (4) |
+| 5. Device selection | step `device_map` | pass (4) |
+| 6. Stream ordering in the bridge step | check.py `busy_gpu` (gpu-mixed, split-test); step `gpu_tests` | FAIL (7 of 43) |
+| 7. float16 and other dtypes over Gloo | check.py `dtypes` (gpu-mixed, split-test) | pass (15) |
+| 8. Gloo networking | step `preflight`; step `check_split_by_node` | pass (4) |
+| 9. Timeouts | check.py `busy_gpu` (gpu-mixed, split-test) | pass (15) |
+| 10. `barrier()` on GPUs | check.py `barrier` (gpu-mixed, gpu-single-vendor, split-test) | pass (18) |
+| 11. Bridge throughput and latency against native | step `bench`; step `bench_split_by_node` | FAIL (1 of 2) |
+| 12. A rank whose `LOCAL_RANK` has no GPU fails `init()` | step `local_rank_check` | pass (6) |
+| 13. The island step is a reduce onto the leader | step `bench`; step `bench_split_by_node` | FAIL (1 of 2) |
+| 14. Where NCCL/RCCL and Gloo agree on reductions | check.py `reduction_agreement` (gpu-mixed, gpu-single-vendor, split-test) | pass (18) |
+| 15. MAX, MIN, AVG, all_gather and reduce_scatter on GPUs | check.py `reductions` (gpu-mixed, gpu-single-vendor, split-test); check.py `all_gather` (gpu-mixed, gpu-single-vendor, split-test); check.py `reduce_scatter` (gpu-mixed, gpu-single-vendor, split-test); step `gpu_tests` | FAIL (7 of 82) |
+| 16. Async collectives keep their stream semantics | check.py `async` (gpu-mixed, gpu-single-vendor, split-test); step `gpu_tests` | FAIL (7 of 46) |
+| 17. The pipelined bridge is correct on GPUs | step `check_pipelined-reduce-bridge-broadcast`; step `gpu_tests` | FAIL (7 of 30) |
+| 18. The overlap pays off | step `bench_phases_pipelined-reduce-bridge-broadcast`; step `bench_candidates` | pass (2) |
+| 19. Thresholds measured on GPUs drive `auto-tuned` | step `bench_candidates`; step `check_auto_tuned` | pass (2) |
+| 20. The sharded bridge is correct on GPUs | step `check_sharded-bridge` | pass (2) |
+| 21. More bridge links mean more cross-vendor bandwidth | step `bench_phases_sharded-bridge`; step `bench_candidates` | pass (2) |
+| 22. DDP with `gpubridge.ddp_comm_hook` trains correctly | step `train_ddp(_split)?`; step `train_n\d+` | FAIL (2 of 3) |
+| 23. What `gpubridge.in_flight()` shows on GPUs | check.py `in_flight` (gpu-mixed, gpu-single-vendor, split-test) | pass (18) |
+| 24. No island puts two ranks on one GPU | step `shared_gpu_check` | pass (24) |
+| 25. Pinned staging for the default bridge | step `check_pinned`; step `bench_pinned` | FAIL (2 of 4) |
+| 26. The UCX bridge is correct on GPUs | step `ucx_build`; step `check_ucx` | not run |
+| 27. The UCX bridge against the Gloo bridge | step `bench_ucx` | not run |
+| 28. Bridge compression kernels give the reference's bits on GPUs | step `gpu_tests`; step `bench_compression_kernels` | FAIL (9 of 34) |
+| 29. Where bridge compression pays off | step `bench_compressed` | pass (2) |
+| 30. gpubridge as a torch.distributed backend: DDP and FSDP2 on GPUs | step `verify_fsdp2_backend`; step `train_fsdp2_backend`; step `gpu_tests` | FAIL (9 of 32) |
+| 31. HSDP through the backend: shard within islands, replicate across vendors | step `verify_hsdp_backend`; step `train_hsdp_backend` | FAIL (3 of 3) |
+
+Where the FAILs come from:
+
+- **`gpu_tests`, 7 records (items 6, 15, 16, 17, 28, 30).** Five are one
+  morning attempt on a V100 at af51b20, recorded in each step 02 folder: two
+  fp8 error-feedback residual tests failed, fixed in #50; every later attempt in
+  those folders passed. One is the first MI50 attempt at df80abb: 2 tests
+  failed in a matmul the tests used as busy work, which the wheel's rocBLAS
+  can't run on gfx906, replaced in #52; the folder's later attempt passed. The
+  last is the MI50 with torch 2.9.1+rocm6.3: its Triton (pytorch-triton-rocm
+  3.5.1) can't compile the compression kernels for gfx906, so the 20
+  compression-kernel tests failed; the other 6 passed.
+- **`bench` (items 11 and 13), `check_pinned` and `bench_pinned` (item 25),
+  one of the two `bench_compression_kernels` FAILs (item 28)**: step 07's first
+  run, where Slurm couldn't create the job steps; all passed in the second run.
+  The other `bench_compression_kernels` FAIL is the rocm6.3 Triton above.
+- **`train_ddp` (item 22)**: failed in step 07's first two runs, on the default
+  ROCm wheel (a Gloo timeout in the first, cause unknown; the MI50 aborting in
+  rocBLAS in the second); passed with the MI50 on torch 2.9.1+rocm6.3.
+- **`train_fsdp2_backend`, `verify_fsdp2_backend` (item 30)**: failed in step
+  07's second run (the same rocBLAS abort); passed with torch 2.9.1+rocm6.3,
+  bit for bit against a single-process replay.
+- **`train_hsdp_backend`, `verify_hsdp_backend` (item 31)**: failed in step
+  07's second run (the same rocBLAS abort). With the MI50 on torch
+  2.9.1+rocm6.3, `train_hsdp_backend` printed nothing for 20 minutes and the
+  kit's step timeout stopped it (exit 124); the job was then cancelled, so
+  `verify_hsdp_backend` didn't run. Why it hung is not known: nothing dumped
+  the stacks. That job mixed torch 2.14.1 (V100) and 2.9.1 (MI50); whether
+  that matters is not known either.
+
+### Network
+
+| Job | Master (host, interface) | Worker (host, interface) | MB/s master to worker | MB/s worker to master | Round trip (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 07_mixed_hetjob | host 6 internal.2137 | host 7 internal.2137 | 1173.4 | 1147.3 | 0.069 |
+| 07_mixed_hetjob_4014234_job11084294 | host 8 internal.2137 | host 7 internal | 1171.4 | 1173.8 | 0.047 |
+| 08_matrix_nvidia-amd | host 9 internal.2137 | host 7 internal.2137 | 1173.7 | 1172.1 | 0.048 |
+| rocm63/07_mixed_hetjob | host 9 internal.2137 | host 7 internal.2137 | 1173.8 | 1169.7 | 0.046 |
+
+The benchmark tables (gpubridge against each run's baseline, and the predicted
+against the measured bridge time) are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) with the full matrix;
+`validation_tables.py` writes them too.
+
+What has not run on GPUs at all: the UCX bridge (items 26 and 27), more than
+one GPU in an island of a mixed job (Explorer's `multigpu` partition isn't
+open to this account), and more than two islands.
 
 ## Mixed build results
 
