@@ -43,8 +43,12 @@ run() {
 
 run docker build -q -t "$IMAGE" -f "$REPO/scripts/gpu/mixed/Dockerfile" "$REPO" >/dev/null
 run docker network create --subnet "$SUBNET" "$NET" >/dev/null
-[ "$DRY_RUN" = 1 ] || trap 'docker rm -f "$NET-master" "$NET-worker" >/dev/null 2>&1
-                             docker network rm "$NET" >/dev/null 2>&1' EXIT
+# Cleanup keeps the script's own exit status, and each command may fail (a container
+# that never started) without skipping the next.
+[ "$DRY_RUN" = 1 ] || trap 'status=$?
+    docker rm -f "$NET-master" "$NET-worker" >/dev/null 2>&1 || true
+    docker network rm "$NET" >/dev/null 2>&1 || true
+    exit "$status"' EXIT
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 
