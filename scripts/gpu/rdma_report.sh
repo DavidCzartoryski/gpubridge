@@ -15,9 +15,10 @@ mkdir -p "$dir" || exit 0
 
 note() { echo "$*: not found on this node"; }
 strip_paths() { sed -E 's#/([^/[:space:]]+/)+#.../#g'; }
-# has LIB SYMBOL: whether LIB defines SYMBOL. grep reads all of nm's output, so nm never
-# dies of SIGPIPE, which pipefail would report as no match.
-has() { nm -D --defined-only "$1" 2>/dev/null | grep " $2\$" >/dev/null; }
+# has LIB SYMBOL: whether LIB defines SYMBOL, versioned (SYMBOL@@IBVERBS_1.12, as newer
+# binutils print it) or not. grep reads all of nm's output, so nm never dies of SIGPIPE,
+# which pipefail would report as no match.
+has() { nm -D --defined-only "$1" 2>/dev/null | grep -E " $2(@|\$)" >/dev/null; }
 
 {
     uname -r

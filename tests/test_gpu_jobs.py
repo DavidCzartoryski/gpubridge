@@ -509,7 +509,9 @@ def test_rdma_report_keeps_paths_out_and_reads_all_of_nm(tmp_path):
     for name in ("ucx/libuct_cma.so", "ucx/libuct_ib.so", "libibverbs.so.1"):
         (lib / name).touch()
     tools = {
-        "nm": "echo '0000 T ibv_reg_dmabuf_mr'; seq 1 200000 | sed 's/^/0000 T sym_/'",
+        # Versioned, as newer binutils print rdma-core's symbols; an unversioned near miss.
+        "nm": "echo '0000 T ibv_reg_dmabuf_mr@@IBVERBS_1.12'; echo '0000 T ibv_reg_dmabuf_mr_x'; "
+              "seq 1 200000 | sed 's/^/0000 T sym_/'",
         "ucx_info": f"""if [ "$1" = -v ]; then echo '# Library path: {lib}/libucs.so.0'
 echo '# Configured with: --prefix={tmp_path}/site'; else echo '# Memory domain: tcp'; fi""",
         "ldconfig": f"echo '\tlibibverbs.so.1 (libc6,x86-64) => {lib}/libibverbs.so.1'",
