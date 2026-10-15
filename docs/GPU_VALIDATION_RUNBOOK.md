@@ -141,7 +141,7 @@ would fail everything above it, for the same reason.
 | 4 | 2 | Explorer, 4 GPUs | `submit.sh 04` | two 2-GPU NCCL islands and the bridge, both layouts; native vs bridged benchmark | **3, 6, 7**, 9 (data), **11**, 13 | ~10 min | free* |
 | 5 | 2 | Explorer, 2 nodes | `submit.sh 05` | the network preflight between the nodes (interfaces, raw bandwidth); NCCL across nodes; the bridge crossing the network between nodes | **8**, 11 and 13 across nodes | ~10 min | free* |
 | 6 | 2 | Explorer, 4 GPUs | `submit.sh 06` | training throughput and scaling 1 to 4 GPUs (table for the multigpu request) | - | ~10 min | free* |
-| 7 | 3 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11, 12, 13 | 20-30 min | ~0.5 h of the hourly rate |
+| 7 | 3 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11, 12, 13 | 20-30 min plus training | ~0.5 h plus training at the hourly rate |
 | 7 alt | 3 | Explorer `sharing`, 1 AMD GPU | `submit.sh setup-rocm`, then `submit.sh amd` | rung 3 inside Explorer, **if** step 0a finds AMD GPUs in `sharing`: `amd/run_all.sh` on the node, without setup or tarball. Dry-run only until then | **4, 5** on AMD, 6, 7, 10 on ROCm, 12 | ~15 min + ~15 min ROCm setup | free |
 | 8 | 4 | NVIDIA + AMD cloud | `mixed/node.sh` on both | the real mixed-vendor job | **1, 2** on GPUs, **8** across networks | 30-45 min | ~0.75 h of each machine's rate |
 | 8 alt | 4 | Explorer `gpu` + `sharing`, one heterogeneous job | `submit.sh setup-rocm`, then `submit.sh 07` | the real mixed-vendor job inside Explorer, **if** step 0a finds AMD GPUs in `sharing`. Dry-run only until then | **1, 2** on GPUs, 3 with real RCCL ranks, 8 between nodes, 11 against per-island baselines, 13 | ~15 min + ~15 min ROCm setup | free |
@@ -467,6 +467,26 @@ VENV_ROCM=$WORK_DIR/venv-rocm63 STEPS_07=training scripts/gpu/explorer/submit.sh
 The probe's `blas` stage (`blas_available` in `probe.json`) says whether a venv's
 matmuls run on the GPU.
 
+**Compression kernels while training on an MI50.** The default venv's Triton
+(triton-rocm 3.8.0) compiles them for gfx906. `scripts/gpu/rocm_triton_overlay.sh`
+makes a third, env-only venv: `bin/python`, `python3` and `torchrun` that run
+`venv-rocm63`'s, with the default venv's Triton linked in front on the path.
+Nothing in either venv changes, nothing is copied, and no Python runs, so it is
+fine on a login node:
+
+```bash
+scripts/gpu/rocm_triton_overlay.sh $WORK_DIR/venv-rocm63 $WORK_DIR/venv-rocm \
+    $WORK_DIR/venv-rocm63-triton38
+VENV_ROCM=$WORK_DIR/venv-rocm63-triton38 GPUBRIDGE_BRIDGE_COMPRESSION=fp8 \
+    GPUBRIDGE_COMPRESSION_KERNELS=triton STEPS_07=training scripts/gpu/explorer/submit.sh 07
+```
+
+The GPU tests and fp8 training passed with a manually constructed overlay of
+the same Triton files; this script's generated wrappers have CPU tests but
+have not yet run on the MI50
+([BENCHMARKS.md](BENCHMARKS.md#fp8-with-triton-kernels-on-the-mi50)). Rebuilding
+the default venv changes the Triton the overlay links to.
+
 **`(null): No such file or directory`, once per GPU per process.** The
 `libdrm_amdgpu` that the ROCm wheels bundle looks for its GPU-name table,
 `amdgpu.ids`, in `/opt/amdgpu/share/libdrm` and then by walking the directory
@@ -623,7 +643,7 @@ image that already has a ROCm build of PyTorch saves the 6+ GB download, with
 ```bash
 git clone https://github.com/DavidCzartoryski/gpubridge && cd gpubridge
 bash scripts/gpu/amd/run_all.sh --dry-run       # 1 second, no cost surprises
-bash scripts/gpu/amd/run_all.sh                 # everything; ~20-30 min
+bash scripts/gpu/amd/run_all.sh                 # ~20-30 min plus training
 ```
 
 The script runs:
@@ -644,12 +664,41 @@ With 2+ GPUs it continues with:
 9. the native vs bridged benchmark
 10. training scaling
 
-With 1 GPU it runs a shared-GPU split test instead.
+With 1 GPU it runs a shared-GPU split test instead. Then, either way, training
+throughput (`train_bench.py`, `TRAIN_BENCH_MODELS`, default GPT-2 small and
+ResNet-50; `TRAIN_BENCH_ARGS` for extra flags): each model on one GPU alone and,
+with 2+ GPUs, on all of them as one RCCL island and split into two islands
+through the bridge.
 
 A failing step is logged and skipped, so one problem doesn't waste the
 session. At the end the script prints the exact `scp` command for the results
 tarball. **Download it before stopping the machine.** To rerun after fixing
 something, `SKIP_SETUP=1` skips the install.
+
+### An MI300X on AMD Developer Cloud
+
+AMD Developer Cloud runs on DigitalOcean's GPU Droplets, whose MI300X
+Droplets have 1 or 8 GPUs. gfx942 is in the default ROCm wheel's build, with
+rocBLAS and hipBLASLt files for it
+([BENCHMARKS.md](BENCHMARKS.md#which-rocm-wheels-can-train-on-an-mi50-gfx906)),
+so no second venv is needed. Nothing here has run on one yet.
+
+1. Create an MI300X GPU Droplet from an image with ROCm (one with a ROCm
+   PyTorch lets you set `TORCH_FLAVOR=system` and skip a 6+ GB download), and
+   add your SSH key.
+2. `ssh` in, then:
+
+   ```bash
+   git clone https://github.com/DavidCzartoryski/gpubridge && cd gpubridge
+   bash scripts/gpu/amd/run_all.sh --dry-run    # checks the plan, costs nothing
+   bash scripts/gpu/amd/run_all.sh              # 8 GPUs: about 20-30 min plus training
+   ```
+
+   With one GPU it runs the single-GPU steps and the shared-GPU split test.
+3. Copy the results tarball off with the `scp` command it prints, then run
+   `python scripts/gpu/triage.py <tarball>` locally.
+4. **Destroy the Droplet**: DigitalOcean bills a powered-off Droplet until it
+   is destroyed.
 
 ## Real mixed-vendor job (two cloud machines)
 

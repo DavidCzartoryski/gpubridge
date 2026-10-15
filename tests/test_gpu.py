@@ -769,7 +769,7 @@ def test_is_completed_means_the_result_is_ready(tmp_path):
 
 def point_to_point(rank: int, world: int, tmp_path: Path) -> None:
     """Send and receive through ``backend="gpubridge"`` across the two islands (and
-    within them with 4 ranks): every dtype and odd sizes bit for bit, the send's input
+    within them with 4 ranks): six dtypes and odd sizes bit for bit, the send's input
     written on a busy producer stream and dropped before the send completes, the
     received tensor read on another stream right after wait(), and tags matched out of
     order (gpukit.p2p_checks, which check.py's ``p2p`` stage runs too)."""
