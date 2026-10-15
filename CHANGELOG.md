@@ -215,6 +215,13 @@ hardware.
   send's input written on a busy producer stream and dropped before the send completes, the
   received tensor read on another stream right after `wait()`, and two tags matched out of
   order. HARDWARE_VALIDATION item 32. CPU only so far (1+1 and 2+2 ranks in simulation).
+- Step 07: `STEPS_07=bench` runs only the probe, the preflight and the
+  `train_bench_<model>` steps: no `train_ddp`, FSDP2 or HSDP (HSDP hung until
+  its step limit in each of the four fp8 jobs above).
+  `TRAIN_BENCH_BUCKETS="10 25 50 100"` runs each `train_bench_<model>` step
+  once per DDP bucket size (`--bucket-mb`), as `train_bench_<model>_bucket<MB>`
+  (step and JSON), for a bucket-size sweep in one job. Tested on the fake
+  cluster, CPU only (#77).
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
   CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA
@@ -310,6 +317,21 @@ hardware.
   batch on CPU with integer data (2 and 3 ranks), within 1e-5 relative on float
   data. The JSON records the global batch, the split and each rank's batch,
   compute per sample and waiting. No `src/` change (#74).
+- `train_bench.py --accumulate K` (CPU only): each rank's batch runs as K
+  micro-batches with `ddp.no_sync()` for the first K-1, one gradient exchange
+  per optimizer step; combines with `--batch-sizes`, `--global-batch` and
+  `--balance` (calibration at the micro-batch size, at least K samples per
+  rank). Bit-identical on CPU to one process over the same samples with
+  integer data (2 and 3 ranks, K = 2 and 3), within 1e-5 relative on float
+  data; BatchNorm normalizes over each micro-batch. The JSON records K, each
+  rank's micro-batch sizes, samples per step and the exchanges per step the
+  hook counted. No `src/` change (#75).
+- `train_bench.py` on GPUs: each rank's `memory` in the JSON, for the compute,
+  ddp and comm-alone phases: the caching allocator's peak allocated and
+  reserved MiB (`torch.cuda.max_memory_allocated`, `max_memory_reserved`) and
+  its allocation retries (`num_alloc_retries`), and the GPU's total. Null on
+  CPU; the GPU path is tested only against a faked allocator (CPU only)
+  (#78).
 
 ### Changed
 
