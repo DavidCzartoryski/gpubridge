@@ -62,10 +62,11 @@ END_TO_END = {
     "explorer/04_split_4gpu.sbatch": "test_step_04_split_4gpu",
     "explorer/05_multinode.sbatch": "test_step_05_two_nodes",
     "explorer/06_scaling.sbatch": "test_step_06_scaling",
-    "explorer/07_mixed_hetjob.sbatch": "test_step_07_mixed_hetjob, test_step_07_training_only",
+    "explorer/07_mixed_hetjob.sbatch": "test_step_07_mixed_hetjob, test_step_07_training_only, "
+                                       "test_step_07_multi",
     "explorer/08_bench_matrix.sbatch": "test_step_08_*",
     "explorer/net_check.sbatch": "test_net_check_job",
-    "explorer/train_bench.sbatch": "test_train_bench_job",
+    "explorer/train_bench.sbatch": "test_train_bench_job, test_train_multi_job",
     "explorer/amd_node.sbatch": "test_amd_node_job",
     "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines, mixed/containers.sh",
     "mixed/containers.sh": "test_mixed_containers_dry_run (the containers need Docker: run it "
@@ -432,6 +433,21 @@ def test_step_07_bench_only_sweeps_bucket_sizes(tmp_path):
 
 # ---- step 08, the network check and training throughput ------------------------------
 
+def test_step_07_multi(tmp_path):
+    # With multigpu access: an NVIDIA island of several GPUs and the AMD side, training only.
+    code = submit(tmp_path, "07-multi", AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
+                  GPU_TYPE_MULTI="v100-sxm2", GPUS_MIXED_NVIDIA_MULTI="2", STEPS_07="training",
+                  FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
+                  FAKE_SLURM_HET_ENV_1="GPUBRIDGE_VENDOR=amd")
+    out = tmp_path / "results" / "07_mixed_hetjob"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    record = json.loads((out / "train_bench_tiny-gpt.json").read_text())
+    assert record["world_size"] == 3 and record["params_identical"]
+    log = (tmp_path / "slurm.log").read_text()
+    assert "--partition=multigpu" in log and "--gres=gpu:v100-sxm2:2" in log
+    assert "--gres=gpu:mi50:1" in log
+
+
 def test_step_08_matrix_on_the_mixed_pair(tmp_path):
     code = submit(tmp_path, "08", AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
                   FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
@@ -571,6 +587,30 @@ def test_train_bench_job(tmp_path):
     record = json.loads((out / "train_bench_tiny-gpt.json").read_text())
     assert record["world_size"] == 1 and record["samples_per_s"] > 0
     assert record["ranks"][0]["waiting_ms"] == 0.0
+
+
+def test_train_multi_job(tmp_path):
+    # With multigpu access: 1 GPU, then 4 as one island, then two bridged halves.
+    code = submit(tmp_path, "train-multi", GPU_TYPE_MULTI="v100-sxm2")
+    out = tmp_path / "results" / "train_bench_nvidia_n4"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    assert list(steps(out)) == ["probe", "train_bench_tiny-gpt", "train_bench_tiny-gpt_n4",
+                                "train_bench_tiny-gpt_split"]
+    one, island, split = (json.loads((out / f"train_bench_tiny-gpt{suffix}.json").read_text())
+                          for suffix in ("", "_n4", "_split"))
+    assert (one["world_size"], island["world_size"], split["world_size"]) == (1, 4, 4)
+    assert split["params_identical"] and island["params_identical"]
+    log = (tmp_path / "slurm.log").read_text()
+    assert "--partition=multigpu" in log and "--gres=gpu:v100-sxm2:4" in log
+    assert "--time=01:00:00" in log
+
+
+def test_train_multi_needs_an_even_gpu_count(tmp_path):
+    result = subprocess.run(["bash", str(EXPLORER / "submit.sh"), "train-multi"],
+                            env=cluster_env(tmp_path, GPUS_TRAIN_MULTI="3"),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1 and "must be even" in result.stderr
+    assert not (tmp_path / "slurm.log").exists()
 
 
 def test_amd_node_job(tmp_path):
