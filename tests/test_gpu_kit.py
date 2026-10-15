@@ -1477,6 +1477,21 @@ def _job(root: Path, name: str, steps: list[tuple[str, int]], env: dict, device:
     return job
 
 
+@pytest.mark.parametrize("historical_exit", [0, 1])
+def test_historical_gpu_tests_are_not_p2p_evidence(tmp_path, historical_exit):
+    _job(tmp_path, "old", [("gpu_tests", historical_exit)], GPU_ENV, "cuda:0")
+    rows = validation_tables.build([tmp_path])["items"]
+    row = next(row for row in rows if row["item"] == 32)
+    assert row["verdict"] == "not run" and row["evidence"] == []
+
+
+@pytest.mark.parametrize("exit_code,expected", [(0, "pass (1)"), (1, "FAIL (1 of 1)")])
+def test_p2p_step_is_p2p_evidence(tmp_path, exit_code, expected):
+    _job(tmp_path, "new", [("check_p2p", exit_code)], GPU_ENV, "cuda:0")
+    row = next(row for row in validation_tables.build([tmp_path])["items"] if row["item"] == 32)
+    assert row["verdict"] == expected
+
+
 def test_tables_from_a_results_tree(tmp_path):
     passed = [("preflight", 0), ("check_split_by_node", 0), ("bench_phases_x", 0),
               ("shared_gpu_check", 0)]

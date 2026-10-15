@@ -399,17 +399,26 @@ def p2p_checks(topology: gpubridge.Topology, *, numels=(0, 1, 31, 4099, 1_000_00
             with context(producer):
                 incoming = torch.full((numel,), -99, device=device, dtype=dtype)
                 outgoing = torch.full_like(incoming, -99)
+                source_device = torch.empty_like(incoming)
+                source_device.copy_(values(rank, numel, dtype))
+                # Upload pageable host input before the delay: an H2D copy after
+                # it would synchronize the producer, hiding a missing stream wait.
+                sync(device)
                 if producer is not None:
                     queue_gpu_delay(device, busy_seconds)
-                outgoing.copy_(values(rank, numel, dtype))
+                outgoing.copy_(source_device)
                 works = gpubridge.batch_isend_irecv([
                     dist.P2POp(dist.irecv, incoming, src, tag=42),
                     dist.P2POp(dist.isend, outgoing, dst, tag=42)])
                 del outgoing  # the Work/native allocator must keep in-flight storage alive
+                # Reuse is stream-local. Allocating on the producer while the
+                # send is pending can overwrite an unprotected outgoing block.
+                scribble = torch.full_like(incoming, 77)
             with context(consumer):
                 for work in works:
                     work.wait()
                 observed = incoming.clone().cpu()  # read is queued directly after wait
+            del scribble  # keep allocator pressure alive until both Works completed
             ok = torch.equal(observed, values(src, numel, dtype))
             cases.append({"dtype": str(dtype), "numel": numel, "ok": ok})
             if not ok:
