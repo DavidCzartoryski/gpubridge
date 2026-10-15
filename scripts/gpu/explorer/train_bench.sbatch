@@ -5,6 +5,8 @@
 # gpubridge.ddp_comm_hook, nothing to sync), for each model in TRAIN_BENCH_MODELS. The
 # baseline for step 07's train_bench steps: does a second GPU through gpubridge raise
 # samples/s above this? probe.py first; its blas stage says whether matmuls run here.
+# Against a step-07 run at --global-batch N (with or without --balance), run this with
+# the same TRAIN_BENCH_ARGS: one rank takes all N samples.
 # Submit with scripts/gpu/explorer/submit.sh train-nvidia or train-amd (VENV_ROCM picks
 # the ROCm venv).
 set -euo pipefail

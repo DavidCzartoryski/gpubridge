@@ -9,7 +9,9 @@
 # every TCP port open both ways. Tailscale is the default way to get one,
 # WireGuard the alternative; see docs/GPU_VALIDATION_RUNBOOK.md. A preflight
 # check runs first and stops with a clear message if the machines can't talk,
-# before torchrun starts. Add --dry-run to only print commands.
+# before torchrun starts. Then the bridge check, the benchmarks, training through
+# the backend and training throughput; last, this machine's results are triaged
+# (triage.txt) and packed. Add --dry-run to only print commands.
 set -euo pipefail
 # shellcheck source=../common.sh
 source "$(dirname "$0")/../common.sh" "$@"
@@ -28,6 +30,8 @@ export TORCH_VERSION="${TORCH_VERSION:-2.14.1}"  # same release on both machines
 SKIP_SETUP="${SKIP_SETUP:-0}"
 WORK_DIR="${WORK_DIR:-$HOME/gpubridge-gpu}"
 BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-256M}"  # the bridge crosses the internet: keep it modest
+TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS:-gpt2-small resnet50}"  # train_bench.py's; "" = none
+TRAIN_BENCH_ARGS="${TRAIN_BENCH_ARGS:-}"  # extra train_bench.py arguments, e.g. "--steps 50"
 RESULTS_ROOT="${RESULTS_ROOT:-$REPO_DIR/results}"
 # -------------------------------------------------------------------------------
 
@@ -97,5 +101,21 @@ step train_fsdp2_backend mixed_torchrun fsdp2 "$REPO_DIR/examples/fsdp2_torch_ba
     --json "$RESULTS/train_fsdp2_backend.json"
 step verify_fsdp2_backend mixed_torchrun fsdp2-verify "$REPO_DIR/examples/fsdp2_torch_backend.py" \
     --verify
+# Training throughput (train_bench.py, as in Explorer's step 07): DDP with
+# gpubridge.ddp_comm_hook on each model, first on this machine's GPUs alone (one
+# island, nothing crosses the bridge: the baseline), then on both machines' together.
+# Both machines run their baseline at the same time; the faster one waits at the next
+# rendezvous.
+read -ra train_args <<<"$TRAIN_BENCH_ARGS"
+for model in $TRAIN_BENCH_MODELS; do
+    step "train_bench_alone_$model" local_torchrun --nproc-per-node="$NPROC" \
+        "$KIT_DIR/train_bench.py" --model "$model" \
+        --json "$RESULTS/train_bench_alone_$model.json" "${train_args[@]+"${train_args[@]}"}"
+    step "train_bench_$model" mixed_torchrun "train-bench-$model" "$KIT_DIR/train_bench.py" \
+        --model "$model" --json "$RESULTS/train_bench_$model.json" \
+        "${train_args[@]+"${train_args[@]}"}"
+done
+# This machine's half only: triage the other machine's tarball the same way.
+capture "$RESULTS/triage.txt" python "$KIT_DIR/triage.py" "$RESULTS"
 package_results "$RESULTS"
 finish

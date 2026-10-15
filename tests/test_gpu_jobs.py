@@ -37,7 +37,7 @@ END_TO_END = {
     "bench_matrix.py": "test_step_08_*, test_net_check_job, test_gpu_kit.py",
     "train_bench.py": "test_step_07_*, test_train_bench_job, test_gpu_kit.py",
     "net_report.sh": "test_step_08_*, test_net_check_job",
-    "rdma_report.sh": "test_net_check_job",
+    "rdma_report.sh": "test_net_check_job, test_rdma_report_keeps_paths_out_and_reads_all_of_nm",
     "stream_mutations.py": "test_gpu_kit.py: its plan, each mutation, and its refusal without a "
                            "GPU (the mutated tests themselves need one)",
     "time_triton_cache.py": "test_gpu_kit.py: filesystems and its refusal without a GPU (the "
@@ -67,7 +67,9 @@ END_TO_END = {
     "explorer/net_check.sbatch": "test_net_check_job",
     "explorer/train_bench.sbatch": "test_train_bench_job",
     "explorer/amd_node.sbatch": "test_amd_node_job",
-    "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines",
+    "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines, mixed/containers.sh",
+    "mixed/containers.sh": "test_mixed_containers_dry_run (the containers need Docker: run it "
+                           "by hand, see the runbook)",
     "amd/run_all.sh": "test_gpu_kit.py: test_amd_script_keeps_going_*",
     "kaggle/kaggle_gpubridge.py": "test_kaggle_runner.py: the plan, hard timeouts, feature decisions, "
                                   "the feature check and packaging (the GPU steps need GPUs)",
@@ -405,6 +407,27 @@ def test_step_07_training_only(tmp_path):
                                 "train_hsdp_backend", "verify_hsdp_backend"]
 
 
+
+def test_step_07_bench_only_sweeps_bucket_sizes(tmp_path):
+    # STEPS_07=bench: train_bench.py's steps alone, once per TRAIN_BENCH_BUCKETS size.
+    code = sbatch(tmp_path, "--job-name=gpubridge-07_mixed_hetjob", "--nodes=1",
+                  "--gres=gpu:1", ":", "--nodes=1", "--gres=gpu:mi100:1",
+                  str(EXPLORER / "07_mixed_hetjob.sbatch"),
+                  FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
+                  FAKE_SLURM_HET_ENV_1="GPUBRIDGE_VENDOR=amd", STEPS_07="bench",
+                  TRAIN_BENCH_BUCKETS="0.01 25")
+    out = tmp_path / "results" / "07_mixed_hetjob"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    assert list(steps(out)) == ["probe", "preflight", "train_bench_tiny-gpt_bucket0.01",
+                                "train_bench_tiny-gpt_bucket25"]
+    small, large = (json.loads((out / f"train_bench_tiny-gpt_bucket{mb}.json").read_text())
+                    for mb in ("0.01", "25"))
+    assert (small["bucket_mb"], large["bucket_mb"]) == (0.01, 25.0)
+    assert small["buckets"] > large["buckets"] >= 1
+    for record in (small, large):
+        assert record["world_size"] == 2 and record["params_identical"]
+        assert [r["vendor"] for r in record["ranks"]] == ["nvidia", "amd"]
+
 # ---- step 08, the network check and training throughput ------------------------------
 
 def test_step_08_matrix_on_the_mixed_pair(tmp_path):
@@ -499,6 +522,46 @@ def test_net_check_job(tmp_path):
     assert "--partition=gpu" in log and "--time=00:10:00" in log
 
 
+def test_rdma_report_keeps_paths_out_and_reads_all_of_nm(tmp_path):
+    # Stand-ins: an nm whose symbol comes first in a long listing (grep -q would stop
+    # reading and nm die of SIGPIPE, which pipefail reports as no match), and a ucx_info
+    # and ldconfig that print site paths, which the records must not keep.
+    bin_dir, lib = tmp_path / "bin", tmp_path / "site" / "lib"
+    (lib / "ucx").mkdir(parents=True)
+    bin_dir.mkdir()
+    for name in ("ucx/libuct_cma.so", "ucx/libuct_ib.so", "libibverbs.so.1"):
+        (lib / name).touch()
+    tools = {
+        # Versioned, as newer binutils print rdma-core's symbols; an unversioned near miss.
+        "nm": "echo '0000 T ibv_reg_dmabuf_mr@@IBVERBS_1.12'; echo '0000 T ibv_reg_dmabuf_mr_x'; "
+              "seq 1 200000 | sed 's/^/0000 T sym_/'",
+        "ucx_info": f"""if [ "$1" = -v ]; then echo '# Library path: {lib}/libucs.so.0'
+echo '# Configured with: --prefix={tmp_path}/site'; else echo '# Memory domain: tcp'; fi""",
+        "ldconfig": f"echo '\tlibibverbs.so.1 (libc6,x86-64) => {lib}/libibverbs.so.1'",
+    }
+    for name, body in tools.items():
+        (bin_dir / name).write_text(f"#!/usr/bin/env bash\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+    out = tmp_path / "out"
+    result = subprocess.run(["bash", str(KIT / "rdma_report.sh"), str(out)],
+                            env=clean_env(PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}"),
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert "libibverbs.so.1: has ibv_reg_dmabuf_mr" in (out / "rdma_core.txt").read_text()
+    ucx = (out / "ucx.txt").read_text()
+    assert "# transport modules installed: cma ib" in ucx
+    assert "# Library path: .../libucs.so.0" in ucx
+    assert not [p.name for p in out.iterdir() if str(tmp_path) in p.read_text()]
+
+
+def test_net_check_job_survives_a_module_that_wont_load(tmp_path):
+    code = submit(tmp_path, "net-nvidia", RDMA_MODULES="no-such-module",
+                  FAKE_MODULES_MISSING="no-such-module")
+    out = tmp_path / "results" / "net_check_nvidia"
+    assert code == 1 and failed(out) == {"rdma"}, job_output(tmp_path)
+    assert "finished" in [e["event"] for e in events(out)]  # finish ran: the job's records
+
+
 def test_train_bench_job(tmp_path):
     code = submit(tmp_path, "train-nvidia")
     out = tmp_path / "results" / "train_bench_nvidia"
@@ -530,7 +593,8 @@ def test_mixed_node_script_on_two_pretend_machines(tmp_path):
               "LOCAL_ADDR": "127.0.0.1", "NPROC": "1", "SKIP_SETUP": "1",
               "TORCH_FLAVOR": "system", "RUN_ID": f"test-{os.getpid()}",
               "BENCH_MAX_BYTES": "16K", "RESULTS_ROOT": str(tmp_path / "results"),
-              "VENV": sys.prefix, "KIT_TIMEOUT": "120"}
+              "VENV": sys.prefix, "KIT_TIMEOUT": "120", "TRAIN_BENCH_MODELS": "tiny-gpt",
+              "TRAIN_BENCH_ARGS": "--steps 2 --warmup-steps 1 --comm-trials 1"}
     procs = {
         role: subprocess.Popen(["bash", str(KIT / "mixed" / "node.sh")],
                                env=clean_env(ROLE=role, TARGET=role, GPUBRIDGE_VENDOR=vendor,
@@ -545,6 +609,32 @@ def test_mixed_node_script_on_two_pretend_machines(tmp_path):
         assert failed(out) == set()
         assert (out / f"preflight-{role}.json").exists()
         assert (tmp_path / "results" / f"{role}.tgz").exists()
+        assert "verdict: every step that ran passed" in (out / "triage.txt").read_text()
+        alone = json.loads((out / "train_bench_alone_tiny-gpt.json").read_text())
+        assert alone["world_size"] == 1
+    # The two machines together: rank 0 writes the record. torchrun numbers the
+    # machines by address, then process id, not by role: here (one address) rank 0
+    # is on whichever machine started its torchrun first.
+    records = [tmp_path / "results" / role / "train_bench_tiny-gpt.json" for role in procs]
+    written = [path for path in records if path.exists()]
+    assert len(written) == 1, records
+    both = json.loads(written[0].read_text())
+    assert both["world_size"] == 2 and both["params_identical"]
+
+
+def test_mixed_containers_dry_run(tmp_path):
+    result = subprocess.run(["bash", str(KIT / "mixed" / "containers.sh"), "--dry-run",
+                             str(tmp_path / "out")], env=clean_env(SUBNET="10.9.8.0/24"),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    runs = [line for line in result.stderr.splitlines() if line.startswith("+ docker run -d")]
+    assert len(runs) == 2
+    for line, role, vendor, ip in zip(runs, ("master", "worker"), ("nvidia", "amd"),
+                                      ("10.9.8.10", "10.9.8.11")):
+        for part in (f"--ip {ip}", f"ROLE={role}", f"GPUBRIDGE_VENDOR={vendor}",
+                     "MASTER_ADDR=10.9.8.10", "IFNAME=eth0", "scripts/gpu/mixed/node.sh"):
+            assert part in line, (part, line)
+    assert "triage.py /out/master" in result.stderr and "triage.py /out/worker" in result.stderr
 
 
 # ---- limits and NCCL logs --------------------------------------------------------

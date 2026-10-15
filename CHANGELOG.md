@@ -160,18 +160,38 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   659 ms of it exposed communication), against 25.3 on the V100 alone;
   ResNet-50 327.7 samples/s (a 195 ms step), against 315.8. Adding the MI50
   lowered GPT-2 small's throughput and left ResNet-50's about where it was.
+- **Training on a V100 and an MI50 with fp8 on the bridge, commit 4e7f04e**:
+  the same job and versions as the entry above, with
+  `GPUBRIDGE_BRIDGE_COMPRESSION=fp8` and `GPUBRIDGE_COMPRESSION_KERNELS=torch`
+  on both ranks (`venv-rocm63`'s Triton can't compile the compression kernels
+  for gfx906, so fp8's saving is understated); the bridge's link measured 1164
+  to 1174 MB/s each way. Jobs 11089348, 11090051, 11090726 and 11091146, and
+  the V100 alone at the same per-rank batches in 11090049, 11090725 and
+  11091145. `train_bench.py`, float32, GPT-2 small at 4, 8, 16 and 32 per
+  rank: 12.495, 19.686, 26.274 and 28.311 samples/s, against 25.3, 27.669,
+  28.395 and 29.247 on the V100 alone (0.49x to 0.97x); ResNet-50 at 32,
+  366.849 against 315.8 (1.16x). From batch 16 on, the V100 waits longer for
+  the MI50 each step (409 and 728 ms) than the exposed communication (258
+  and 445 ms). Communication alone was 472 to 485 ms up to batch 16 and 605
+  ms at 32, not yet explained. In the same jobs `train_ddp`'s parameters
+  diverged across ranks once (11090726), FSDP2's bit-for-bit check differed
+  from its uncompressed single-process replay in all four, and HSDP hung
+  until its step timeout in all four. Details in
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#fp8-on-the-bridge-and-larger-batches).
 - **RDMA between the node types, commit 1ac6fa9** (the network check with
   `rdma_report.sh`; its other steps as at 934f87c), one V100 node and one MI50
-  node: **no RDMA path between them.** The V100 node's only RDMA device is
+  node: **no RDMA path between the nodes checked.** The V100 node's only RDMA device is
   `mlx5_0`, InfiniBand; the interface the bridge uses there has none. The MI50
   node's only active one is `mlx5_0`, RoCE on that interface at 10 Gb/s; its
   InfiniBand port is disabled. On the GPU side, `nvidia_peermem` (545.23.08) is
   installed for the V100 node's kernel but not loaded; the MI50 node's kernel
   has `CONFIG_HSA_AMD_P2P` and torch 2.14.1+rocm7.2's HSA runtime exports
   dma-bufs; both kernels have `CONFIG_DMABUF_MOVE_NOTIFY`, and both nodes'
-  libibverbs (rdma-core 46.0 and 57.0) have `ibv_reg_dmabuf_mr`. The cluster's
-  only UCX (1.16.0, in the OpenMPI 4.1.6 module) has TCP and shared-memory
-  transports and host memory only. Details in
+  libibverbs (rdma-core 46.0 and 57.0) have `ibv_reg_dmabuf_mr`. The UCX
+  module (1.16.0, in OpenMPI 4.1.6) offered TCP and shared-memory transports
+  and host memory only, and installs no `ib`, `cuda` or `rocm` transport
+  module; UCX copies bundled with some application modules have `ib`, none
+  `cuda` or `rocm`. Details in
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md#rdma-between-the-node-types).
 
 Everything else is **validated on CPU only**:
@@ -182,6 +202,13 @@ hardware.
 
 ### Added
 
+- Step 07: `STEPS_07=bench` runs only the probe, the preflight and the
+  `train_bench_<model>` steps: no `train_ddp`, FSDP2 or HSDP (HSDP hung until
+  its step limit in each of the four fp8 jobs above).
+  `TRAIN_BENCH_BUCKETS="10 25 50 100"` runs each `train_bench_<model>` step
+  once per DDP bucket size (`--bucket-mb`), as `train_bench_<model>_bucket<MB>`
+  (step and JSON), for a bucket-size sweep in one job. Tested on the fake
+  cluster, CPU only (#77).
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
   CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA
@@ -205,8 +232,9 @@ hardware.
   in `rdma/<side>/`: the kernel's dma-buf and peer-to-peer options, the RDMA
   and GPU kernel modules (and whether `nvidia_peermem` or `nv_peer_mem` exist),
   rdma-core and `ibv_reg_dmabuf_mr`, `rdma link`, UCX (`ucx_info -v` and `-d`)
-  and the HSA runtime's dma-buf export. It runs last, after loading
-  `RDMA_MODULES`, so the steps before it are unchanged (#62).
+  and the HSA runtime's dma-buf export, with paths cut from the records. It runs
+  last and loads `RDMA_MODULES` inside its own step, so the steps before it are
+  unchanged and a module that won't load fails only that step (#62, #65).
 - A Kaggle runner for the GPU validation kit, for a free notebook with two
   T4s (`scripts/gpu/kaggle/`): a notebook and the same steps as one script,
   each step under a hard time limit. It checks what compute capability 7.5
@@ -267,6 +295,30 @@ hardware.
   for the slower GPU and exposed communication. Step 07 runs it across both
   vendors (`STEPS_07=training` runs only its training steps), and
   `submit.sh train-nvidia` or `train-amd` on one GPU alone.
+- `train_bench.py` per-rank batches (CPU only): `--batch-sizes a,b`,
+  `--global-batch N` (split evenly; one rank alone takes all N) and
+  `--global-batch N --balance` (a short calibration times each rank, then N is
+  split by speed, at least one sample per rank). Each rank's summed loss is
+  scaled by world size / N, so the hook's average is the gradient of the mean
+  loss over all N samples: bit-identical to one process over the concatenated
+  batch on CPU with integer data (2 and 3 ranks), within 1e-5 relative on float
+  data. The JSON records the global batch, the split and each rank's batch,
+  compute per sample and waiting. No `src/` change (#74).
+- `train_bench.py --accumulate K` (CPU only): each rank's batch runs as K
+  micro-batches with `ddp.no_sync()` for the first K-1, one gradient exchange
+  per optimizer step; combines with `--batch-sizes`, `--global-batch` and
+  `--balance` (calibration at the micro-batch size, at least K samples per
+  rank). Bit-identical on CPU to one process over the same samples with
+  integer data (2 and 3 ranks, K = 2 and 3), within 1e-5 relative on float
+  data; BatchNorm normalizes over each micro-batch. The JSON records K, each
+  rank's micro-batch sizes, samples per step and the exchanges per step the
+  hook counted. No `src/` change (#75).
+- `train_bench.py` on GPUs: each rank's `memory` in the JSON, for the compute,
+  ddp and comm-alone phases: the caching allocator's peak allocated and
+  reserved MiB (`torch.cuda.max_memory_allocated`, `max_memory_reserved`) and
+  its allocation retries (`num_alloc_retries`), and the GPU's total. Null on
+  CPU; the GPU path is tested only against a faked allocator (CPU only)
+  (#78).
 
 ### Changed
 
@@ -312,8 +364,15 @@ hardware.
   Work completes and teardown does not wait for it; idle lanes release
   completed payloads and their threads exit, keeping per-tag sequence order;
   a CPU request on a lane that earlier carried a CUDA tensor uses no stream.
+  A batch's Work (`batch_isend_irecv`, `_coalescing_manager`) waits on its
+  members rather than on futures behind user callbacks, so a slow callback
+  doesn't delay it, a callback can wait on it, and `wait(timeout)` works.
   CPU tests only; the GPU stream paths are unvalidated.
-
+- The runbook's 8+8 steps said the master's tarball holds the two-machine
+  training records. Rank 0 writes them, and torchrun numbers the machines by
+  address, not by role, so they can be on either machine. The two-machine
+  test assumed the master too, and failed when the worker's torchrun started
+  first; it now expects the record on exactly one of the two (#74).
 - The stream-ordering checks (`check.py`'s `busy_gpu` and `async` stages,
   `tests/test_gpu.py`) queued matmuls as busy work, and failed or aborted
   where rocBLAS has no kernels for the GPU (gfx906 on the ROCm 7.2 wheel).

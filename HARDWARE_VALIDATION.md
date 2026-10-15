@@ -352,9 +352,10 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     three and four leaders (`tests/test_ucx.py`); the flush's placement is
     tested on CPU against a fake worker whose receives land only when flushed
     (`tests/test_gdr_flush.py`); the device path's GPU tests are written
-    (`tests/test_gpu.py`). Nothing has run on RDMA hardware. Explorer has no
-    RDMA path between its V100 and MI50 nodes, and its UCX has no verbs
-    transport ([docs/BENCHMARKS.md](docs/BENCHMARKS.md#rdma-between-the-node-types)).*
+    (`tests/test_gpu.py`). Nothing has run on RDMA hardware. On Explorer, the
+    V100 and MI50 nodes checked have no RDMA path between them, and no UCX
+    there has a `cuda` or `rocm` transport
+    ([docs/BENCHMARKS.md](docs/BENCHMARKS.md#rdma-between-the-node-types)).*
     *Step:* `ucx_build` and `check_ucx` in Explorer steps 05 and 07, with
     `UCX_BRIDGE=1`. See [docs/RDMA_TRANSPORT.md](docs/RDMA_TRANSPORT.md) for
     the questions to settle first (InfiniBand on the GPU nodes, GPUDirect
