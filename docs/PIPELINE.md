@@ -121,7 +121,7 @@ a different order. Medians of steps 6 to 1,000.
 | V100 + MI50, GPipe | 13,115 | 312.3 | 1.05x | 1.823 | 0.0203 to 0.0251 |
 | V100 + MI50, 1F1B | 13,051 | 313.8 | 1.04x | 1.801 | 0.0036 to 0.0052 |
 
-Per stage, from the same runs (GPipe; 1F1B within 0.5 ms of each):
+Per stage, from the same runs (GPipe; 1F1B's within 1.5 ms of each):
 
 | Stage | GPU | Blocks | Forward + backward of one microbatch, alone (ms) | Idle per step (est., ms) | One microbatch's activations arriving (ms) |
 | --- | --- | --- | ---: | ---: | ---: |
@@ -146,14 +146,14 @@ Per stage, from the same runs (GPipe; 1F1B within 0.5 ms of each):
 - **1F1B tracks the one-V100 runs as closely as they track each other**: over
   the last 100 steps it's 0.0036 to 0.0052 from each, and they're 0.0041 to
   0.0056 apart.
-- **GPipe ends 0.02 above them**, because it left the plateau later. Every
-  run sits on a plateau near ln(32000) = 10.37 before dropping, and when the
-  drop starts depends on float rounding. GPipe's loss first fell below 9 at
-  step 341, the other five runs' between steps 172 and 210. A 500-step
-  one-V100 run with the same settings as `micro 1` above was still at 8.2 at
-  step 500 (job 11107533). Two of those identical runs part at step 5 and
-  are 0.1 apart by step 157. So one GPipe run doesn't show a GPipe-specific
-  difference; several seeds would.
+- **GPipe ends 0.02 above them, and it left the plateau later.** Every run
+  sits on a plateau near ln(32000) = 10.37 before dropping. GPipe's loss
+  first fell below 9 at step 341, the other five runs' between steps 172 and
+  210. When the drop starts varies from run to run: a 500-step one-V100 run
+  with the same settings as `micro 1` above was still at 8.2 at step 500
+  (job 11107533), and it and the `micro 1` run above differ by more than 0.1
+  from step 158. Whether GPipe's gap comes from its late drop or from its
+  schedule, one run can't tell; several seeds would.
 - 500 steps, which the prompt asked for, end in the middle of the drop for
   some runs, where the curves can't be compared, hence 1,000.
 - The first try failed in torch's stage setup, for the two reasons in
