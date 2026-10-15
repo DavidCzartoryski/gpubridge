@@ -77,7 +77,8 @@ END_TO_END = {
     "explorer/train_bench.sbatch": "test_train_bench_job, test_train_multi_job",
     "explorer/dp_baseline.sbatch": "test_dp_baseline_job",
     "explorer/amd_node.sbatch": "test_amd_node_job",
-    "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines, mixed/containers.sh",
+    "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines, "
+                     "test_mixed_node_script_leaves_out_what_is_set_empty, mixed/containers.sh",
     "mixed/containers.sh": "test_mixed_containers_dry_run (the containers need Docker: run it "
                            "by hand, see the runbook)",
     "amd/run_all.sh": "test_gpu_kit.py: test_amd_script_keeps_going_*",
@@ -769,6 +770,21 @@ def test_mixed_node_script_on_two_pretend_machines(tmp_path):
     assert pp["world_size"] == 2 and len(pp["losses"]) == 4
 
 
+def test_mixed_node_script_leaves_out_what_is_set_empty(tmp_path):
+    result = subprocess.run(["bash", str(KIT / "mixed" / "node.sh"), "--dry-run"],
+                            env=clean_env(ROLE="master", MASTER_ADDR="127.0.0.1",
+                                          LOCAL_ADDR="127.0.0.1", IFNAME=loopback(), NPROC="1",
+                                          SKIP_SETUP="1", TORCH_FLAVOR="system",
+                                          VENV=sys.prefix, RESULTS_ROOT=str(tmp_path),
+                                          TRAIN_BENCH_MODELS="", DP_RUNS="", PP_RUNS=""),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    printed = result.stdout + result.stderr
+    assert "bench_all_reduce.py" in printed
+    for script in ("train_bench.py", "train_dp.py", "train_pipeline.py"):
+        assert script not in printed, script
+
+
 def test_mixed_containers_dry_run(tmp_path):
     result = subprocess.run(["bash", str(KIT / "mixed" / "containers.sh"), "--dry-run",
                              str(tmp_path / "out")], env=clean_env(SUBNET="10.9.8.0/24"),
@@ -779,7 +795,8 @@ def test_mixed_containers_dry_run(tmp_path):
     for line, role, vendor, ip in zip(runs, ("master", "worker"), ("nvidia", "amd"),
                                       ("10.9.8.10", "10.9.8.11")):
         for part in (f"--ip {ip}", f"ROLE={role}", f"GPUBRIDGE_VENDOR={vendor}",
-                     "MASTER_ADDR=10.9.8.10", "IFNAME=eth0", "scripts/gpu/mixed/node.sh"):
+                     "MASTER_ADDR=10.9.8.10", "IFNAME=eth0", "-e DP_RUNS", "-e PP_RUNS",
+                     "-e PP_MICROBATCHES", "scripts/gpu/mixed/node.sh"):
             assert part in line, (part, line)
     assert "triage.py /out/master" in result.stderr and "triage.py /out/worker" in result.stderr
 

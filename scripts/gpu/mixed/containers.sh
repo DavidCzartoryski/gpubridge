@@ -70,7 +70,8 @@ for role in master worker; do
         -e TORCH_FLAVOR=system -e VENV=/venv -e GPUBRIDGE_VENDOR="$vendor" -e TARGET="$role" \
         -e RESULTS_ROOT=/out -e RUN_ID="containers-$$" -e NPROC -e BENCH_MAX_BYTES \
         -e TRAIN_BENCH_MODELS -e TRAIN_BENCH_ARGS -e KIT_TIMEOUT -e DP_MODEL -e DP_STEPS \
-        -e DP_GLOBAL_BATCH -e DP_SEQ -e DP_ARGS -e PP_ARGS \
+        -e DP_GLOBAL_BATCH -e DP_SEQ -e DP_MICRO -e DP_RUNS -e DP_KERNELS_ON_AMD -e DP_ARGS \
+        -e PP_RUNS -e PP_MICROBATCHES -e PP_ARGS \
         "$IMAGE" bash scripts/gpu/mixed/node.sh >/dev/null
 done
 

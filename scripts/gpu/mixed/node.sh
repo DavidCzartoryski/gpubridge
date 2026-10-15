@@ -31,7 +31,7 @@ export TORCH_VERSION="${TORCH_VERSION:-2.14.1}"  # same release on both machines
 SKIP_SETUP="${SKIP_SETUP:-0}"
 WORK_DIR="${WORK_DIR:-$HOME/gpubridge-gpu}"
 BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-256M}"  # the bridge crosses the internet: keep it modest
-TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS:-gpt2-small resnet50}"  # train_bench.py's; "" = none
+TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS-gpt2-small resnet50}"  # train_bench.py's; "" = none
 TRAIN_BENCH_ARGS="${TRAIN_BENCH_ARGS:-}"  # extra train_bench.py arguments, e.g. "--steps 50"
 # Data-parallel and pipeline training (train_dp.py, train_pipeline.py), as in Explorer's
 # step 07 with STEPS_07=dp and pipeline. Every GPU gets one rank; the pipeline puts one
@@ -41,10 +41,10 @@ DP_STEPS="${DP_STEPS:-500}"              # 1000 to compare loss curves (docs/COM
 DP_GLOBAL_BATCH="${DP_GLOBAL_BATCH:-8}"  # sequences per step, over every GPU
 DP_SEQ="${DP_SEQ:-512}"                  # tokens per sequence
 DP_MICRO="${DP_MICRO:-1}"                # the one-GPU baseline's micro-batches
-DP_RUNS="${DP_RUNS:-ddp ddp-bf16 ddp-fp8}"  # step 07's run names; "" = none
+DP_RUNS="${DP_RUNS-ddp ddp-bf16 ddp-fp8}"  # step 07's run names; "" = none
 DP_KERNELS_ON_AMD="${DP_KERNELS_ON_AMD:-auto}"  # torch where Triton can't compile them
 DP_ARGS="${DP_ARGS:-}"                   # extra train_dp.py arguments
-PP_RUNS="${PP_RUNS:-gpipe 1f1b}"         # schedules; "" = none
+PP_RUNS="${PP_RUNS-gpipe 1f1b}"          # schedules; "" = none
 PP_MICROBATCHES="${PP_MICROBATCHES:-4}"
 PP_ARGS="${PP_ARGS:-}"                   # extra train_pipeline.py arguments, e.g. "--split 7,5"
 RESULTS_ROOT="${RESULTS_ROOT:-$REPO_DIR/results}"
