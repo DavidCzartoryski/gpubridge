@@ -647,7 +647,9 @@ def test_amd_dry_run_with_several_gpus():
                  "GPUBRIDGE_SPLIT_TEST=half", "bench_all_reduce.py", "train_n4", "tar -czf",
                  "--policy pipelined-reduce-bridge-broadcast", "--policy sharded-bridge",
                  "train_ddp_split.json", "GPUBRIDGE_PINNED_STAGING=1", "bench_pinned",
-                 "--durations=15", "export AMDGPU_ASIC_ID_TABLE_PATHS="]:
+                 "--durations=15", "export AMDGPU_ASIC_ID_TABLE_PATHS=",
+                 "train_bench_gpt2-small_1gpu.json", "train_bench_resnet50_island.json",
+                 "train_bench_gpt2-small_split.json"]:
         assert text in out, text
     assert "train_n5" not in out
 
@@ -656,7 +658,144 @@ def test_amd_dry_run_with_one_gpu_shares_it():
     out = dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="1").stdout
     assert "check_split_shared_gpu" in out and "--nproc-per-node=2" in out
     assert "bench_all_reduce.py" not in out
+    # Training throughput on the one GPU alone; nothing to split it with.
+    assert "train_bench_gpt2-small_1gpu.json" in out and "_split.json" not in out
 
+
+def test_amd_dry_run_passes_train_bench_args_to_every_run():
+    out = dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="2", TRAIN_BENCH_MODELS="gpt2-small",
+                  TRAIN_BENCH_ARGS="--batch-size 16").stdout
+    runs = [line for line in out.splitlines()
+            if line.startswith("+ timeout") and "train_bench.py" in line]
+    assert len(runs) == 3, out
+    assert all("--batch-size 16" in line for line in runs)
+    assert "resnet50" not in out
+
+
+def _overlay_venvs(tmp_path: Path, triton_minor: int | None = None) -> tuple[Path, Path]:
+    """A base venv whose python runs this interpreter with its own site-packages (an old
+    triton) after PYTHONPATH, and a venv holding a newer triton and its dist-info."""
+    minor = f"python3.{sys.version_info.minor}"
+    base, newer = tmp_path / "venv-old", tmp_path / "venv-new"
+    base_site = base / "lib" / minor / "site-packages"
+    (base_site / "triton").mkdir(parents=True)
+    (base_site / "triton" / "__init__.py").write_text('__version__ = "3.5.1"\n')
+    (base / "bin").mkdir()
+    for tool in ("python", "python3", "torchrun"):
+        (base / "bin" / tool).write_text(
+            "#!/usr/bin/env bash\n"
+            f'export PYTHONPATH="${{PYTHONPATH:+$PYTHONPATH:}}{base_site}"\n'
+            f'exec {sys.executable} "$@"\n')
+        (base / "bin" / tool).chmod(0o755)
+    newer_site = newer / "lib" / f"python3.{triton_minor or sys.version_info.minor}" / "site-packages"
+    (newer_site / "triton").mkdir(parents=True)
+    (newer_site / "triton" / "__init__.py").write_text('__version__ = "3.8.0"\n')
+    (newer_site / "triton_rocm-3.8.0.dist-info").mkdir()
+    return base, newer
+
+
+@pytest.mark.parametrize("directory", ["plain", "with spaces"])
+def test_rocm_triton_overlay_puts_the_newer_triton_first(tmp_path, directory):
+    tmp_path = tmp_path / directory
+    base, newer = _overlay_venvs(tmp_path)
+    out = tmp_path / "venv-old-triton38"
+    result = subprocess.run([str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(out)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert "triton_rocm-3.8.0" in result.stdout
+    overlay = out / "overlay"
+    assert sorted(p.name for p in overlay.iterdir()) == ["triton", "triton_rocm-3.8.0.dist-info"]
+    assert all(p.is_symlink() for p in overlay.iterdir())  # links, not a 1 GB copy
+    for tool in ("python", "python3", "torchrun"):
+        run = subprocess.run([str(out / "bin" / tool), "-c",
+                              "import triton; print(triton.__version__)"],
+                             capture_output=True, text=True, timeout=60)
+        assert run.stdout.strip() == "3.8.0", (tool, run.stderr)
+    # Without the overlay the base venv's own triton is the one imported.
+    run = subprocess.run([str(base / "bin" / "python"), "-c",
+                          "import triton; print(triton.__version__)"],
+                         capture_output=True, text=True, timeout=60)
+    assert run.stdout.strip() == "3.5.1"
+    # Rerunning replaces the links instead of failing on them.
+    again = subprocess.run(["bash", str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                            str(out)], capture_output=True, text=True, timeout=60)
+    assert again.returncode == 0, again.stderr
+
+
+@pytest.mark.parametrize("destination", ["base", "triton", "alias", "venv"])
+def test_rocm_triton_overlay_refuses_source_or_existing_venv(tmp_path, destination):
+    base, newer = _overlay_venvs(tmp_path)
+    interpreter = base / "bin" / "python"
+    original = interpreter.read_bytes()
+    if destination == "base":
+        out = base
+    elif destination == "triton":
+        out = newer
+    elif destination == "alias":
+        out = tmp_path / "alias"
+        out.symlink_to(base, target_is_directory=True)
+    else:
+        out = tmp_path / "existing-venv"
+        out.mkdir()
+        (out / "pyvenv.cfg").write_text("home = example\n")
+    result = subprocess.run([str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(out)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1, result.stderr
+    assert "OUT_DIR" in result.stderr
+    assert interpreter.read_bytes() == original
+    assert not (out / "overlay").exists()
+
+
+@pytest.mark.parametrize("directory", ["bin", "overlay"])
+def test_rocm_triton_overlay_refuses_linked_output_directories(tmp_path, directory):
+    base, newer = _overlay_venvs(tmp_path)
+    original = (base / "bin" / "python").read_bytes()
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / directory).symlink_to(base / "bin", target_is_directory=True)
+    result = subprocess.run([str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(out)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1 and "symbolic link" in result.stderr
+    assert (base / "bin" / "python").read_bytes() == original
+
+
+@pytest.mark.parametrize("link_type", ["symlink", "hardlink"])
+def test_rocm_triton_overlay_replaces_wrapper_links_without_overwriting_target(tmp_path, link_type):
+    base, newer = _overlay_venvs(tmp_path)
+    target = tmp_path / "shared-interpreter"
+    target.write_text("preserve the shared interpreter\n")
+    out = tmp_path / "out"
+    (out / "bin").mkdir(parents=True)
+    for tool in ("python", "python3", "torchrun"):
+        link = out / "bin" / tool
+        if link_type == "symlink":
+            link.symlink_to(target)
+        else:
+            link.hardlink_to(target)
+    result = subprocess.run([str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(out)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert target.read_text() == "preserve the shared interpreter\n"
+    for tool in ("python", "python3", "torchrun"):
+        run = subprocess.run([str(out / "bin" / tool), "-c",
+                              "import triton; print(triton.__version__)"],
+                             capture_output=True, text=True, timeout=60)
+        assert run.returncode == 0 and run.stdout.strip() == "3.8.0", run.stderr
+
+
+def test_rocm_triton_overlay_refuses_another_python_version(tmp_path):
+    base, newer = _overlay_venvs(tmp_path, triton_minor=sys.version_info.minor + 1)
+    result = subprocess.run(["bash", str(KIT / "rocm_triton_overlay.sh"), str(base), str(newer),
+                             str(tmp_path / "out")], capture_output=True, text=True, timeout=60)
+    minor = sys.version_info.minor
+    assert result.returncode == 1, result.stderr
+    assert f"{newer} is python3.{minor + 1}, {base} is python3.{minor}" in result.stderr
+
+
+def test_rocm_triton_overlay_needs_three_arguments():
+    result = subprocess.run(["bash", str(KIT / "rocm_triton_overlay.sh")],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2 and "BASE_VENV TRITON_VENV OUT_DIR" in result.stderr
 
 @pytest.mark.parametrize(("role", "is_host"), [("master", "1"), ("worker", "0")])
 def test_mixed_node_dry_run(role, is_host):
@@ -1714,13 +1853,18 @@ def test_amd_script_keeps_going_after_failures_and_packages_results(tmp_path):
     # No GPU here: probe, device_map and rccl_version must fail, everything else must run.
     result = run_script(KIT / "amd" / "run_all.sh", GPUBRIDGE_VENDOR="amd", SKIP_SETUP="1",
                         GPU_COUNT="2", SCALING_MAX_GPUS="2", BENCH_MAX_BYTES="16K",
-                        BENCH_TRIALS="3", RESULTS_ROOT=str(tmp_path), TARGET="sim")
+                        BENCH_TRIALS="3", RESULTS_ROOT=str(tmp_path), TARGET="sim",
+                        TRAIN_BENCH_MODELS="tiny-gpt")
     assert result.returncode == 1  # some steps failed, so the run reports failure
     codes = steps(tmp_path / "sim")
     assert {name for name, code in codes.items() if code} == {"probe", "device_map",
                                                                "rccl_version"}
     assert {"check_1gpu", "check_island", "check_split", "bench", "train_n2",
-            "summarize"} <= {name for name, code in codes.items() if code == 0}
+            "train_bench_tiny-gpt_1gpu", "train_bench_tiny-gpt_island",
+            "train_bench_tiny-gpt_split", "summarize"} <= {
+                name for name, code in codes.items() if code == 0}
+    split = json.loads((tmp_path / "sim" / "train_bench_tiny-gpt_split.json").read_text())
+    assert split["world_size"] == 2 and split["run"]["split_test"] == "half"
     assert (tmp_path / "sim.tgz").exists()
     assert "Download it before stopping this machine" in result.stderr
 
