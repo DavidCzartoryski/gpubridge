@@ -65,10 +65,17 @@ struct State {
     queues: Vec<VecDeque<Job>>,
     next_stream: Vec<usize>,
     connected: Vec<bool>,
-    /// Members whose connections ended: their operations can't finish, the others can.
-    gone: Vec<bool>,
-    /// The member of every unfinished operation, by id.
-    peer_of: HashMap<i64, usize>,
+    /// Per member, its receiving threads still running. A connection that ends at a frame
+    /// boundary has delivered every frame it carried, so a receive from a member can't
+    /// arrive any more only once all of that member's connections have ended.
+    readers_left: Vec<usize>,
+    /// Per connection (as `queues`), whether its sending thread hit an error.
+    writer_ended: Vec<bool>,
+    /// Unfinished receives, by id: from which member.
+    recv_from: HashMap<i64, usize>,
+    /// Operations that can't finish any more (a send whose connection broke, a receive cut
+    /// off mid-frame), by id: with which member.
+    lost: HashMap<i64, usize>,
     failed: Option<String>,
     closing: bool,
 }
@@ -85,12 +92,30 @@ impl Shared {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A member's connection ended (it closed, or the network dropped it): fail only the
-    /// waits on operations with that member. A peer that finished its collectives and
-    /// closed must not fail one still waiting on the others.
-    fn gone(&self, member: usize) {
+    /// One of `member`'s connections stopped delivering (it closed, or the network dropped
+    /// it), after `cut` (a receive it was in the middle of), if any. Only waits that can
+    /// no longer be met fail; a peer that finished its part and closed must not fail
+    /// operations still arriving on its other connections, or on other members'.
+    fn reader_ended(&self, member: usize, cut: Option<i64>) {
         let mut state = self.lock();
-        state.gone[member] = true;
+        state.readers_left[member] -= 1;
+        if let Some(id) = cut {
+            state.recv_from.remove(&id);
+            state.lost.insert(id, member);
+        }
+        self.changed.notify_all();
+    }
+
+    /// A connection's sending thread hit an error: its send and every one queued behind it
+    /// can't finish.
+    fn writer_ended(&self, queue: usize, member: usize, id: i64) {
+        let mut state = self.lock();
+        state.writer_ended[queue] = true;
+        state.lost.insert(id, member);
+        let stuck: Vec<i64> = state.queues[queue].drain(..).map(|job| job.id).collect();
+        for id in stuck {
+            state.lost.insert(id, member);
+        }
         self.changed.notify_all();
     }
 
@@ -161,7 +186,8 @@ impl Worker {
             queues: (0..members * streams).map(|_| VecDeque::new()).collect(),
             next_stream: vec![0; members],
             connected: vec![false; members],
-            gone: vec![false; members],
+            readers_left: vec![0; members],
+            writer_ended: vec![false; members * streams],
             ..State::default()
         };
         let shared = Arc::new(Shared {
@@ -279,7 +305,9 @@ impl Worker {
             self.threads
                 .push(thread::spawn(move || recv_loop(reader, member, shared)));
         }
-        self.shared.lock().connected[member] = true;
+        let mut state = self.shared.lock();
+        state.connected[member] = true;
+        state.readers_left[member] = self.streams;
         Ok(())
     }
 
@@ -293,8 +321,8 @@ impl Worker {
         if state.closing {
             return Err("the worker has stopped".to_string());
         }
-        if state.gone[member] {
-            return Err(format!("member {member} closed its bridge connection"));
+        if state.readers_left[member] == 0 {
+            return Err(format!("member {member} closed its bridge connections"));
         }
         Ok(())
     }
@@ -304,11 +332,20 @@ impl Worker {
     pub fn send(&self, member: usize, ptr: usize, len: usize, tag: u64) -> Result<i64, String> {
         let mut state = self.shared.lock();
         self.usable(&state, member)?;
+        // The next connection to `member`, round-robin, past any whose writer broke.
+        let mut stream = state.next_stream[member];
+        for _ in 0..self.streams {
+            if !state.writer_ended[member * self.streams + stream] {
+                break;
+            }
+            stream = (stream + 1) % self.streams;
+        }
+        if state.writer_ended[member * self.streams + stream] {
+            return Err(format!("every connection to member {member} is broken"));
+        }
+        state.next_stream[member] = (stream + 1) % self.streams;
         state.next_id += 1;
         let id = state.next_id;
-        state.peer_of.insert(id, member);
-        let stream = state.next_stream[member];
-        state.next_stream[member] = (stream + 1) % self.streams;
         state.queues[member * self.streams + stream].push_back(Job { id, tag, ptr, len });
         self.shared.changed.notify_all();
         Ok(id)
@@ -325,7 +362,7 @@ impl Worker {
         }
         state.next_id += 1;
         let id = state.next_id;
-        state.peer_of.insert(id, member);
+        state.recv_from.insert(id, member);
         state.posted.insert((member, tag), Recv { id, ptr, len });
         self.shared.changed.notify_all();
         Ok(id)
@@ -355,10 +392,17 @@ impl Worker {
                 self.set_error("the worker has stopped".to_string());
                 return PEER_FAILED;
             }
-            let lost = ids
-                .iter()
-                .filter(|id| !state.finished.contains(id))
-                .find_map(|id| state.peer_of.get(id).filter(|m| state.gone[**m]).copied());
+            // A wait that can't be met any more: an operation lost with its connection, or
+            // a receive from a member none of whose connections still delivers.
+            let lost = ids.iter().find_map(|id| {
+                state.lost.get(id).copied().or_else(|| {
+                    state
+                        .recv_from
+                        .get(id)
+                        .filter(|m| state.readers_left[**m] == 0)
+                        .copied()
+                })
+            });
             if let Some(member) = lost {
                 drop(state);
                 self.set_error(format!(
@@ -518,12 +562,11 @@ fn send_loop(mut socket: TcpStream, queue: usize, member: usize, shared: Arc<Sha
         let sent = write_header(&mut socket, &[job.tag, job.len as u64])
             .and_then(|_| socket.write_all(bytes));
         if sent.is_err() {
-            shared.gone(member); // its waits fail; the other members' carry on
+            shared.writer_ended(queue, member, job.id);
             return;
         }
         let mut state = shared.lock();
         state.finished.insert(job.id);
-        state.peer_of.remove(&job.id);
         shared.changed.notify_all();
     }
 }
@@ -533,7 +576,7 @@ fn recv_loop(mut socket: TcpStream, member: usize, shared: Arc<Shared>) {
         let [tag, len] = match read_words::<2>(&mut socket) {
             Ok(words) => words,
             Err(_) => {
-                shared.gone(member); // closed or dropped: its waits fail, the others' don't
+                shared.reader_ended(member, None); // at a frame boundary: nothing cut off
                 return;
             }
         };
@@ -566,12 +609,12 @@ fn recv_loop(mut socket: TcpStream, member: usize, shared: Arc<Shared>) {
             unsafe { std::slice::from_raw_parts_mut(recv.ptr as *mut u8, recv.len) }
         };
         if socket.read_exact(bytes).is_err() {
-            shared.gone(member);
+            shared.reader_ended(member, Some(recv.id));
             return;
         }
         let mut state = shared.lock();
         state.finished.insert(recv.id);
-        state.peer_of.remove(&recv.id);
+        state.recv_from.remove(&recv.id);
         shared.changed.notify_all();
     }
 }
@@ -995,6 +1038,30 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("member 1 closed"));
+    }
+
+    #[test]
+    fn frames_sent_before_a_member_closed_still_arrive_on_its_other_connections() {
+        let (mut a, mut b) = pair(4);
+        let data: Vec<[u8; 16]> = (0..8u8).map(|i| [i; 16]).collect();
+        let sent: Vec<i64> = (0..8)
+            .map(|i| a.send(1, data[i].as_ptr() as usize, 16, i as u64).unwrap())
+            .collect();
+        assert_eq!(a.wait(&sent, Duration::from_secs(5)), 0);
+        assert!(a.close(Duration::from_secs(5))); // done, and gone before b even posts
+        thread::sleep(Duration::from_millis(100));
+        let mut out = vec![[0u8; 16]; 8];
+        let ids: Vec<i64> = (0..8)
+            .map(|i| {
+                b.recv(0, out[i].as_mut_ptr() as usize, 16, i as u64)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(b.wait(&ids, Duration::from_secs(5)), 0);
+        assert_eq!(out, data);
+        // Now every connection of member 0 has ended: a receive from it can't be met.
+        thread::sleep(Duration::from_millis(50));
+        assert!(b.recv(0, out[0].as_mut_ptr() as usize, 16, 99).is_err());
     }
 
     #[test]

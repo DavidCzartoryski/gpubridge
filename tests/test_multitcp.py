@@ -250,6 +250,28 @@ def test_empty_tensors_and_bad_arguments(tmp_path):
               init_kwargs={"bridge": "multitcp"})
 
 
+def _check_a_receiver_after_the_root_left(topology):
+    bridge = topology.bridge
+    if bridge is not None:
+        tensor = torch.arange(4, dtype=torch.float32) if bridge.index == 0 else torch.zeros(4)
+        if bridge.index == 1:
+            time.sleep(0.5)  # the root has sent, finished and closed by now
+        bridge.broadcast(tensor, bridge.members[0])
+        if bridge.index == 0:
+            bridge.close()  # done: it leaves before the other leader has read a byte
+        assert torch.equal(tensor, torch.arange(4, dtype=torch.float32))
+    dist.barrier()
+
+
+@needs_library
+def test_a_receiver_still_gets_what_a_leader_sent_before_it_closed(tmp_path):
+    # Four connections: the frames sent before the root closed sit on some of them while
+    # others already show the close; the receive must still be met.
+    env = {**LOCAL, STREAMS_ENV: "4", CHUNK_BYTES_ENV: "8"}
+    run_ranks(["nvidia", "amd"], _check_a_receiver_after_the_root_left, tmp_path,
+              before_init=partial(_label_islands, None, env), init_kwargs={"bridge": "multitcp"})
+
+
 @needs_library
 def test_subgroups_on_the_multitcp_bridge(tmp_path):
     # A subgroup's members build its links on their own: their store keys must not

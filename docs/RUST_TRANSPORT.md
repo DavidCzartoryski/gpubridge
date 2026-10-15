@@ -85,11 +85,12 @@ ordering guarantee the GPU tests enforce for the default bridge holds
 unchanged: the transport never sees a device pointer or a stream.
 
 **Failures and time limits.** Every wait has the deadline `init()` gave its
-groups (30 minutes without one). A member whose connections end (it closed
-them, or the network dropped them) fails the waits on operations with that
-member, not the others: with three or more leaders, one that has finished its
-part of a collective and closed must not fail another still receiving from the
-rest. A frame of the wrong size fails the worker; a wait that runs out of time,
+groups (30 minutes without one). A connection that ends at a frame boundary has
+delivered everything it carried, so a member closing fails only what can no
+longer arrive: a receive from it once all its connections have ended, a send on
+a connection whose writer broke (and those queued behind it), a receive cut off
+mid-frame. A leader that has finished its part of a collective and closed fails
+nothing still arriving on its other connections or from other leaders. A frame of the wrong size fails the worker; a wait that runs out of time,
 or any wait after a failure, raises, and the transport refuses every later call.
 **Before a failed wait returns, the worker stops**: every connection is shut
 down and every sending and receiving thread joined, without a time limit (shutting
@@ -111,7 +112,8 @@ unwinds into Python.
   receive is posted; a missing message timing out, and the frame that comes
   after it never reaching the buffer; empty messages with null pointers; a
   frame of the wrong size and a closed peer failing the wait; a member that
-  closes failing only the waits on it, with three members; stray and
+  closes failing only the waits on it, with three members, and frames it sent
+  before closing still arriving on its other connections; stray and
   repeated dials not taking a real connection's place; bad arguments refused.
 - `tests/test_multitcp.py`, between processes over loopback TCP: every bridge
   policy at two, three and four leaders, bit for bit against `flat-gloo`, for
@@ -121,7 +123,8 @@ unwinds into Python.
   64 KB chunks; subgroups (the torch.distributed backend); a bad setting or
   mismatched settings on one leader failing `init()` on every rank; a leader
   that never joins tripping the deadline, then every later call refused;
-  teardown with a receive still posted, and a new bridge after it; a message of
+  teardown with a receive still posted, and a new bridge after it; a receiver
+  that posts only after the broadcast's root has closed; a message of
   the wrong size; empty tensors, and a bad argument leaving the bridge working;
   the address and setting rules; and the library's build and load errors.
 - CI: `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test`, then
