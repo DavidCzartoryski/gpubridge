@@ -25,6 +25,7 @@ vendor islands. Design and limits: docs/TORCH_BACKEND.md.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import warnings
@@ -597,6 +598,26 @@ def _teardown(group: GpubridgeProcessGroup) -> None:
         _close_subgroup(sub)
 
 
+def _world_group_names() -> contextlib.AbstractContextManager[None]:
+    """Name the world setup's groups the way a subgroup's are (``gpubridge:world.{ranks}.{k}``,
+    :func:`gpubridge.topology._members_only`), not from torch's count of the groups each
+    process has created. The ranks can reach their first collective having created
+    different numbers of groups: torch 2.9.1's ``DeviceMesh`` creates one for a (2, 1)
+    mesh's replicate dimension where 2.14.1's reuses the default group, and groups of this
+    backend are created without any exchange, so nothing stops there. torch's names would
+    then differ by one between the ranks, and they would wait on different store keys
+    until the timeout. On a torch whose private naming isn't what the patch expects,
+    torch's names are used as before, with a warning."""
+    problem = _topology._subgroup_naming_problem()
+    if problem is None:
+        return _topology._members_only("gpubridge:world")
+    warnings.warn(
+        f"gpubridge names its setup groups the way torch {torch.__version__} does ({problem}), "
+        "so every rank must have created the same number of groups before the first "
+        f"collective on the {NAME} backend, or setup waits until the timeout", stacklevel=3)
+    return contextlib.nullcontext()
+
+
 def setup(timeout: timedelta | None) -> dist.ProcessGroup:
     """Build gpubridge's topology inside an existing ``torch.distributed`` job; return the
     backend's Gloo group for CPU tensors.
@@ -609,25 +630,26 @@ def setup(timeout: timedelta | None) -> dist.ProcessGroup:
     leaving the others waiting in ``new_group``.
     """
     ranks = list(range(dist.get_world_size()))
-    world = dist.new_group(ranks, backend=CPU_BACKEND, timeout=timeout)
-    cpu = dist.new_group(ranks, backend=CPU_BACKEND, timeout=timeout)
-    problem = None
-    try:
-        transport = resolve_transport(os.environ.get(BRIDGE_ENV, "").strip()
-                                      or DEFAULT_TRANSPORT)
-        chosen = resolve_policy(os.environ.get(POLICY_ENV, "").strip() or DEFAULT_POLICY)
-        local, config = _topology.describe_local(transport.name, chosen)
-    except (ValueError, TypeError) as exc:
-        problem = str(exc)
-    problems: list[Any] = [None] * len(ranks)
-    dist.all_gather_object(problems, problem, group=world)
-    failing = [(rank, p) for rank, p in enumerate(problems) if p]
-    if failing:
-        raise RuntimeError(
-            f"gpubridge cannot start: {len(failing)} of {len(ranks)} ranks reported problems.\n"
-            + "\n".join(f"  rank {rank}: {p}" for rank, p in failing))
-    topology = _topology.build_topology(local, config, transport=transport, policy=chosen,
-                                        timeout=timeout, world_group=world)
+    with _world_group_names():
+        world = dist.new_group(ranks, backend=CPU_BACKEND, timeout=timeout)
+        cpu = dist.new_group(ranks, backend=CPU_BACKEND, timeout=timeout)
+        problem = None
+        try:
+            transport = resolve_transport(os.environ.get(BRIDGE_ENV, "").strip()
+                                          or DEFAULT_TRANSPORT)
+            chosen = resolve_policy(os.environ.get(POLICY_ENV, "").strip() or DEFAULT_POLICY)
+            local, config = _topology.describe_local(transport.name, chosen)
+        except (ValueError, TypeError) as exc:
+            problem = str(exc)
+        problems: list[Any] = [None] * len(ranks)
+        dist.all_gather_object(problems, problem, group=world)
+        failing = [(rank, p) for rank, p in enumerate(problems) if p]
+        if failing:
+            raise RuntimeError(
+                f"gpubridge cannot start: {len(failing)} of {len(ranks)} ranks reported "
+                "problems.\n" + "\n".join(f"  rank {rank}: {p}" for rank, p in failing))
+        topology = _topology.build_topology(local, config, transport=transport, policy=chosen,
+                                            timeout=timeout, world_group=world)
     _work.shutdown()
     _observe._reset()
     _topology._set_topology(topology)

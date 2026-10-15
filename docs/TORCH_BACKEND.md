@@ -136,7 +136,13 @@ which `gpubridge.init()` takes as arguments, come from `GPUBRIDGE_POLICY` and
 other settings. A setting one rank can't read at all (an unknown policy name,
 a malformed `GPUBRIDGE_*` value) also fails every rank. The Gloo groups are
 created first, and every rank's error is exchanged over them before
-anything else, so no rank is left waiting in `new_group`.
+anything else, so no rank is left waiting in `new_group`. These groups are
+named like a subgroup's (below), `gpubridge:world.{ranks}.{k}`, not from
+torch's count of the groups each process has created: the ranks can reach the
+first collective having created different numbers of groups (torch 2.9.1's
+`DeviceMesh` creates one for a (2, 1) mesh's replicate dimension where 2.14.1's
+reuses the default group, and this backend's groups are created without an
+exchange), and torch's names would then differ between them.
 
 **Collectives.**
 - Each torch collective maps onto gpubridge's public collective of the same

@@ -769,6 +769,23 @@ NAMING_CHANGES = {
 }
 
 
+def _different_group_counts_before_setup(rank, world):
+    # torch 2.9.1's DeviceMesh creates a group for a (2, 1) mesh's replicate dimension
+    # where 2.14.1's reuses the default group, so the two ranks reach gpubridge's first
+    # collective having created different numbers of groups. gpubridge's world setup
+    # must still meet: its groups can't take names from torch's counter of each
+    # process's groups (they did, and HSDP hung across those two releases).
+    if rank == world - 1:
+        dist.new_group(list(range(world)))
+    x = torch.ones(3)
+    dist.all_reduce(x)
+    assert torch.equal(x, torch.full((3,), float(world)))
+
+
+def test_the_world_setup_meets_after_ranks_created_different_numbers_of_groups(tmp_path):
+    run_backend(["nvidia", "amd"], _different_group_counts_before_setup, tmp_path)
+
+
 def test_this_torch_has_the_private_group_naming_subgroups_patch():
     assert topology._subgroup_naming_problem() is None, torch.__version__
 
