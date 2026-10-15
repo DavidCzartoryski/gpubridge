@@ -452,6 +452,20 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     planned here, end mid-drop for some runs, so the curves were compared at
     1,000.* *Step:* `dp_*` in Explorer step 07 with `STEPS_07=dp`, and
     `dp_single` in `submit.sh dp-baseline`.
+34. **Pipeline training across vendors tracks one GPU.** `train_pipeline.py`
+    (docs/PIPELINE.md): `llama.py`'s model in two stages, the first on the
+    NVIDIA GPU and the second on the AMD one, with torch's GPipe and 1F1B
+    schedules through `backend="gpubridge"`'s point-to-point, 500 steps.
+    Check that the loss curve tracks one V100's with the same global batch,
+    microbatches and seed, and record tokens/s, each stage's compute, its idle
+    time and the time an activation takes to cross the bridge. *Status: works
+    on CPU in simulation mode: bit for bit like the same pipeline on a plain
+    Gloo group (2 stages, and 4 over 2 + 2 islands), within 1e-4 of one
+    process (`tests/test_gpu_kit.py`). Not run on GPUs.* *Step:* `pp_gpipe`
+    and `pp_1f1b` in Explorer step 07 with `STEPS_07=pipeline`, and
+    `dp_single` in `submit.sh dp-baseline` with `DP_MICRO` set to the
+    microbatches.
+
 35. **The multitcp bridge against the Gloo bridge.** `bridge="multitcp"`
     (docs/RUST_TRANSPORT.md) carries the bridge over several TCP connections
     per pair and reduces each chunk as it arrives. Between two machines, its
@@ -555,6 +569,7 @@ failures count against all six whichever test failed.
 | 30. gpubridge as a torch.distributed backend: DDP and FSDP2 on GPUs | step `verify_fsdp2_backend`; step `train_fsdp2_backend`; step `gpu_tests` | FAIL (9 of 32) |
 | 31. HSDP through the backend: shard within islands, replicate across vendors | step `verify_hsdp_backend`; step `train_hsdp_backend` | FAIL (3 of 3) |
 | 33. Data-parallel training across vendors tracks one GPU, compressed or not | step `dp_(ddp\|fsdp2)(-.+)?`; step `dp_single` | not run |
+| 34. Pipeline training across vendors tracks one GPU | step `pp_(gpipe\|1f1b)`; step `dp_single` | not run |
 | 35. The multitcp bridge against the Gloo bridge | step `multitcp_build`; step `matrix_D-multitcp(-pinned\|-1stream)?` | not run |
 
 Where the FAILs come from:

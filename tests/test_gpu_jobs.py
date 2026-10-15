@@ -39,6 +39,7 @@ END_TO_END = {
     "train_dp.py": "test_step_07_data_parallel, test_dp_baseline_job, test_gpu_kit.py",
     "llama.py": "imported by train_dp.py: the same tests",
     "dp_report.py": "test_step_07_data_parallel, test_gpu_kit.py",
+    "train_pipeline.py": "test_step_07_pipeline, test_gpu_kit.py",
     "net_report.sh": "test_step_08_*, test_net_check_job",
     "rdma_report.sh": "test_net_check_job, test_rdma_report_keeps_paths_out_and_reads_all_of_nm",
     "stream_mutations.py": "test_gpu_kit.py: its plan, each mutation, and its refusal without a "
@@ -68,7 +69,8 @@ END_TO_END = {
     "explorer/05_multinode.sbatch": "test_step_05_two_nodes",
     "explorer/06_scaling.sbatch": "test_step_06_scaling",
     "explorer/07_mixed_hetjob.sbatch": "test_step_07_mixed_hetjob, test_step_07_training_only, "
-                                       "test_step_07_multi, test_step_07_data_parallel",
+                                       "test_step_07_multi, test_step_07_data_parallel, "
+                                       "test_step_07_pipeline",
     "explorer/08_bench_matrix.sbatch": "test_step_08_*",
     "explorer/net_check.sbatch": "test_net_check_job",
     "explorer/train_bench.sbatch": "test_train_bench_job, test_train_multi_job",
@@ -476,6 +478,22 @@ def test_step_07_data_parallel(tmp_path):
     assert runs["dp_fsdp2"]["mode"] == "fsdp2" and runs["dp_ddp-bucket-5"]["bucket_mb"] == 5.0
     assert runs["dp_ddp-speed"]["shares_rule"] == "speed"
     assert {r["world_size"] for r in runs.values()} == {2}
+
+
+def test_step_07_pipeline(tmp_path):
+    code = sbatch(tmp_path, "--job-name=gpubridge-07_mixed_hetjob", "--nodes=1",
+                  "--gres=gpu:1", ":", "--nodes=1", "--gres=gpu:mi100:1",
+                  str(EXPLORER / "07_mixed_hetjob.sbatch"),
+                  FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
+                  FAKE_SLURM_HET_ENV_1="GPUBRIDGE_VENDOR=amd", STEPS_07="pipeline",
+                  PP_MICROBATCHES="2", PP_ARGS="--probe-trials 1", **SMALL_DP)
+    out = tmp_path / "results" / "07_mixed_hetjob_pp"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    assert list(steps(out)) == ["probe", "preflight", "pp_gpipe", "pp_1f1b"]
+    runs = {p.stem: json.loads(p.read_text()) for p in out.glob("pp_*.json")}
+    assert runs["pp_gpipe"]["mode"] == "pipeline-gpipe" and runs["pp_1f1b"]["mode"] == "pipeline-1f1b"
+    assert [r["vendor"] for r in runs["pp_gpipe"]["ranks"]] == ["nvidia", "amd"]
+    assert runs["pp_gpipe"]["microbatches"] == 2 and len(runs["pp_gpipe"]["losses"]) == 4
 
 
 def test_dp_baseline_job(tmp_path):

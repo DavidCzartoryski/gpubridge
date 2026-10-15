@@ -225,6 +225,16 @@ hardware.
 
 ### Added
 
+- Pipeline training across vendors: `scripts/gpu/train_pipeline.py` cuts
+  `llama.py`'s model into contiguous stages, one per rank, and trains it with
+  torch's GPipe or 1F1B through `backend="gpubridge"`'s point-to-point (or on a
+  plain Gloo group, the reference). It records every step's loss and time,
+  each stage's compute alone, the time an activation takes to arrive from the
+  previous stage, and idle-time and bubble estimates. Step 07's
+  `STEPS_07=pipeline`; `dp_report.py` reads its records too;
+  docs/PIPELINE.md; HARDWARE_VALIDATION.md item 34. On CPU: bit for bit like
+  plain Gloo (2 stages, and 4 over 2 + 2 islands), within 1e-4 of one process.
+  Not run on GPUs (#PRNUM).
 - `bridge="multitcp"`, an opt-in bridge transport over several TCP connections
   per pair of leaders (`GPUBRIDGE_MULTITCP_STREAMS`, 4), from a small Rust
   library (`src/gpubridge/multitcp/crate`, standard library only, a C interface

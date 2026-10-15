@@ -1,15 +1,16 @@
-"""Side by side: train_dp.py's runs against the single-GPU baseline (a markdown table, the
-loss curves as CSV and as an SVG plot).
+"""Side by side: train_dp.py's and train_pipeline.py's runs against the single-GPU baseline
+(a markdown table, the loss curves as CSV and as an SVG plot).
 
     python scripts/gpu/dp_report.py results/explorer/07_mixed_hetjob_dp \\
         results/explorer/dp_baseline_nvidia --out results/explorer/dp_report
 
-Every ``dp_*.json`` under the paths is a run; the one with ``"mode": "single"`` is the
-baseline (``--baseline`` picks another). Per run: mode, compression, batch shares,
-tokens/s from the median step, DDP's exposed communication and the share of it backward
-hid (estimates: see train_dp.py), the last loss, and against the baseline the largest gap between the loss curves over
-every step and the mean gap over the last 100 steps; then whether every parameter check
-found the ranks' parameters identical. Needs only Python 3.10 or later: no torch.
+Every ``dp_*.json`` (and train_pipeline.py's ``pp_*.json``) under the paths is a run;
+the one with ``"mode": "single"`` is the baseline (``--baseline`` picks another). Per
+run: mode, compression, batch shares, tokens/s from the median step, DDP's exposed
+communication and the share of it backward hid (estimates: see train_dp.py), the last
+loss, and against the baseline the largest gap between the loss curves over every step
+and the mean gap over the last 100 steps; then whether every parameter check found the
+ranks' parameters identical. Needs only Python 3.10 or later: no torch.
 """
 
 from __future__ import annotations
@@ -29,12 +30,15 @@ def load(paths: list[Path]) -> dict[str, dict]:
     then the file's path under it), so none is dropped."""
     found = []
     for path in paths:
-        files = [path] if path.is_file() else sorted(path.rglob("dp_*.json"))
+        files = [path] if path.is_file() else sorted(
+            [*path.rglob("dp_*.json"), *path.rglob("pp_*.json")])
         for f in files:
             record = json.loads(f.read_text())
-            if record.get("script") == "scripts/gpu/train_dp.py":
+            if record.get("script") in ("scripts/gpu/train_dp.py",
+                                        "scripts/gpu/train_pipeline.py"):
                 where = f.name if path.is_file() else f.relative_to(path).as_posix()
-                found.append((f.stem.removeprefix("dp_"), f"{path.name}/{where}", record))
+                name = f.stem.removeprefix("dp_").removeprefix("pp_")
+                found.append((name, f"{path.name}/{where}", record))
     names = [name for name, _, _ in found]
     runs = {}
     for name, where, record in found:

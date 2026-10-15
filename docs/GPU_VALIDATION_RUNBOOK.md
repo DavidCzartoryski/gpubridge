@@ -619,6 +619,14 @@ Both models need BLAS on every GPU (the probe's `blas_available`):
 with a ROCm build whose rocBLAS lacks the GPU's kernels, its rank aborts at the
 first matmul, as the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
 
+### Pipeline training across vendors
+
+`STEPS_07=pipeline` runs [`train_pipeline.py`](../scripts/gpu/train_pipeline.py):
+the same model in two stages, the first on the NVIDIA GPU, the second on the AMD
+one, with GPipe and 1F1B (`PP_RUNS`), against `submit.sh dp-baseline` with
+`DP_MICRO` set to the microbatches. The design, the commands and what's validated
+where are in [docs/PIPELINE.md](PIPELINE.md).
+
 ### Data-parallel training across vendors
 
 [`train_dp.py`](../scripts/gpu/train_dp.py) trains [`llama.py`](../scripts/gpu/llama.py)'s
