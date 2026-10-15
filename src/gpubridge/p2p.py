@@ -4,6 +4,12 @@ The collective worker cannot run these: a receive waiting for one peer must
 not prevent posting a send to another peer (or in the opposite direction).
 Each (peer, tag, direction) lane has its own queue and stream. It keeps the
 input alive until completion, and never reorders messages in that lane.
+
+A lane's thread exits as soon as its queue is empty, so resident threads
+follow the keys with queued or running operations, not every tag ever used;
+sequence numbers live in the engine and survive the lane. User futures are
+resolved on one completion thread per engine, never on a lane thread or under
+the engine lock.
 """
 
 from __future__ import annotations
@@ -71,6 +77,64 @@ class TorchWork(dist.Work):
         return self.source
 
 
+class _P2PWork(Work):
+    """Publishes host completion only; the engine's completer resolves the future.
+
+    ``wait()`` and ``is_completed()`` therefore see completion before any
+    callback runs, including a callback waiting on this same handle.
+    """
+
+    def _finish(self, error: BaseException | None) -> None:
+        self._error = error
+        self._done.set()
+
+
+class _Completer:
+    """Resolves futures one at a time, in completion order, on its own thread.
+
+    Future callbacks run inline in ``set_result``. A callback may wait on any
+    P2P handle, since lanes publish completion without this thread, but a
+    callback that blocks delays the later futures of this group.
+    """
+
+    def __init__(self) -> None:
+        self.queue: queue.SimpleQueue = queue.SimpleQueue()
+        self.streams: dict[torch.device, torch.cuda.Stream] = {}
+        self.thread = threading.Thread(target=self._run, name="gpubridge-p2p-completion",
+                                       daemon=True)
+        self.thread.start()
+
+    def put(self, work: _P2PWork) -> None:
+        self.queue.put(work)
+
+    def close(self) -> None:
+        self.queue.put(None)  # resolves what is queued first; never joined
+
+    def _run(self) -> None:
+        while True:
+            work = self.queue.get()
+            if work is None:
+                return
+            self._resolve(work)
+            del work
+
+    def _resolve(self, work: _P2PWork) -> None:
+        context = contextlib.nullcontext()
+        if work._event is not None:
+            # The device-aware future records on the current stream; use a
+            # private one ordered after the transfer, not the caller's.
+            if work._device not in self.streams:
+                self.streams[work._device] = torch.cuda.Stream(work._device)
+            stream = self.streams[work._device]
+            stream.wait_event(work._event)
+            context = torch.cuda.stream(stream)
+        with context:
+            if work._error is None:
+                work._future.set_result(work._result)
+            else:
+                work._future.set_exception(work._error)
+
+
 class GlooLink:
     """Raw bytes over an already-created Gloo group of all members."""
 
@@ -103,9 +167,11 @@ class Engine:
         self.pinned, self.chunk_bytes = pinned, chunk_bytes
         self._lock = threading.RLock()
         self._lanes: dict[tuple[int, int, bool], _Lane] = {}
-        self._pending: set[Work] = set()
+        self._sequences: dict[tuple[int, int, bool], int] = {}
+        self._pending: dict[_P2PWork, None] = {}  # ordered: failures resolve in posting order
         self._closed = False
         self._failed: BaseException | None = None
+        self._completer = _Completer()
         self._stop = threading.Event()
         self._watcher = threading.Thread(target=self._watch, name="gpubridge-p2p-health",
                                          daemon=True)
@@ -136,22 +202,31 @@ class Engine:
         if tensor.device.type == "cuda":
             ready = torch.cuda.Event()
             ready.record(torch.cuda.current_stream(tensor.device))
-        work = Work("send" if sending else "recv", tensor.device, [tensor])
+        work = _P2PWork("send" if sending else "recv", tensor.device, [tensor])
         with self._lock:
             self.check()
             key = peer, tag, sending
+            sequence = self._sequences.get(key, 0)
+            self._sequences[key] = sequence + 1
             if key not in self._lanes:
                 self._lanes[key] = _Lane(self, peer, tag, sending)
-            self._pending.add(work)
-            self._lanes[key].queue.put((work, tensor, ready, time.monotonic() + self.timeout))
+            self._pending[work] = None
+            self._lanes[key].queue.put((work, tensor, ready, time.monotonic() + self.timeout,
+                                        sequence))
         return work
 
-    def _finish(self, work: Work, error: BaseException | None = None) -> None:
+    def _complete(self, works, error: BaseException | None) -> None:
+        # No user code runs here: callers may hold the engine lock.
+        for work in works:
+            work._finish(error)
+            self._completer.put(work)
+
+    def _finish(self, work: _P2PWork, error: BaseException | None = None) -> None:
         with self._lock:
             if work not in self._pending:
                 return
-            self._pending.remove(work)
-            work._finish(error)
+            del self._pending[work]
+        self._complete([work], error)
 
     def _fail(self, error: BaseException, *, publish: bool = True) -> None:
         with self._lock:
@@ -161,8 +236,9 @@ class Engine:
             if publish:
                 with contextlib.suppress(Exception):
                     self.store.compare_set("failure", "", f"rank {self.rank}: {error}")
-            for work in tuple(self._pending):
-                self._finish(work, error)
+            pending = list(self._pending)
+            self._pending.clear()
+        self._complete(pending, error)
 
     def match(self, tensor: torch.Tensor, peer: int, tag: int, seq: int,
               sending: bool, deadline: float) -> None:
@@ -188,7 +264,7 @@ class Engine:
                              f"local {descriptor}, peer {other}")
 
     def close(self, timeout: float = 0.2) -> None:
-        """Fail queued handles immediately; never wait for a missing peer at teardown.
+        """Fail queued handles immediately; never wait for a missing peer or a callback.
 
         In-flight Gloo requests retain their buffers in daemon lane threads
         until torch destroys the group or its timeout passes.
@@ -198,11 +274,14 @@ class Engine:
                 return
             self._closed = True
             self._stop.set()
-            for work in tuple(self._pending):
-                self._finish(work, RuntimeError("point-to-point group was destroyed"))
+            pending = list(self._pending)
+            self._pending.clear()
             lanes = list(self._lanes.values())
+            self._lanes.clear()
             for lane in lanes:
                 lane.queue.put(None)
+        self._complete(pending, RuntimeError("point-to-point group was destroyed"))
+        self._completer.close()
         deadline = time.monotonic() + timeout
         for lane in lanes:
             lane.thread.join(max(0, deadline - time.monotonic()))
@@ -212,38 +291,56 @@ class Engine:
 class _Lane:
     def __init__(self, engine: Engine, peer: int, tag: int, sending: bool) -> None:
         self.engine, self.peer, self.tag, self.sending = engine, peer, tag, sending
-        self.queue: queue.Queue = queue.Queue()
+        self.queue: queue.SimpleQueue = queue.SimpleQueue()
         self.stream: torch.cuda.Stream | None = None
         self.thread = threading.Thread(target=self._run, name="gpubridge-p2p", daemon=True)
         self.thread.start()
 
     def _run(self) -> None:
-        seq = 0
         while True:
-            item = self.queue.get()
+            try:
+                item = self.queue.get_nowait()
+            except queue.Empty:
+                if self._retire():
+                    return
+                continue
             if item is None:
                 return
-            work, tensor, ready, deadline = item
-            try:
-                self.engine.check()
-                if tensor.device.type == "cuda":
-                    torch.cuda.set_device(tensor.device)
-                    if self.stream is None:
-                        self.stream = torch.cuda.Stream(tensor.device)
-                    self.stream.wait_event(ready)
-                    tensor.record_stream(self.stream)
-                context = (torch.cuda.stream(self.stream) if self.stream is not None
-                           else contextlib.nullcontext())
-                with context:
-                    self.engine.match(tensor, self.peer, self.tag, seq, self.sending, deadline)
-                    self._transfer(tensor, deadline)
-                    if self.stream is not None:
-                        work._event = torch.cuda.Event()
-                        work._event.record(self.stream)
-                    self.engine._finish(work)
-            except BaseException as exc:  # noqa: BLE001 - delivered through every pending Work
-                self.engine._fail(exc)
-            seq += 1
+            self._run_one(*item)
+            del item  # an idle lane keeps no completed payload or Work
+
+    def _retire(self) -> bool:
+        # Under the lock that submit holds while queueing, so nothing is lost.
+        with self.engine._lock:
+            if not self.queue.empty():
+                return False
+            key = self.peer, self.tag, self.sending
+            if self.engine._lanes.get(key) is self:
+                del self.engine._lanes[key]
+            return True
+
+    def _run_one(self, work: _P2PWork, tensor: torch.Tensor, ready, deadline: float,
+                 sequence: int) -> None:
+        try:
+            self.engine.check()
+            stream = None
+            if tensor.device.type == "cuda":
+                torch.cuda.set_device(tensor.device)
+                if self.stream is None or self.stream.device != tensor.device:
+                    self.stream = torch.cuda.Stream(tensor.device)
+                stream = self.stream
+                stream.wait_event(ready)
+                tensor.record_stream(stream)
+            context = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+            with context:
+                self.engine.match(tensor, self.peer, self.tag, sequence, self.sending, deadline)
+                self._transfer(tensor, deadline)
+                if stream is not None:
+                    work._event = torch.cuda.Event()
+                    work._event.record(stream)
+            self.engine._finish(work)
+        except BaseException as exc:  # noqa: BLE001 - delivered through every pending Work
+            self.engine._fail(exc)
 
     def _transfer(self, tensor: torch.Tensor, deadline: float) -> None:
         # Byte views cover every dense dtype, including types Gloo cannot carry
