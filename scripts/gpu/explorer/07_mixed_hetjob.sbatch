@@ -9,7 +9,10 @@
 # joined by the Gloo bridge over the cluster network. Items 1 and 2 on GPUs,
 # 3 with real RCCL ranks, 8 between nodes. The benchmark times each island's
 # native all_reduce (NCCL, RCCL) in the same job as the bridged one (item 11).
-# STEPS_07=training runs only the probe, the preflight and the training steps.
+# STEPS_07=training runs only the probe, the preflight and the training steps;
+# STEPS_07=bench only the probe, the preflight and train_bench.py's steps.
+# TRAIN_BENCH_BUCKETS="10 25 50 100" runs each train_bench step once per DDP bucket
+# size (MB), each under its own name: train_bench_<model>_bucket<MB>.
 set -euo pipefail
 REPO="${GPUBRIDGE_REPO:?submit with scripts/gpu/explorer/submit.sh}"
 # shellcheck source=../common.sh
@@ -22,10 +25,17 @@ GPUS_AMD="${GPUS_MIXED_AMD:-1}"
 RDZV_PORT="${RDZV_PORT:-29500}"
 PREFLIGHT_PORT="${PREFLIGHT_PORT:-29501}"
 BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-1G}"
-STEPS_07="${STEPS_07:-all}"  # all, or training
-case $STEPS_07 in all | training) ;; *) die "STEPS_07 must be all or training" ;; esac
+STEPS_07="${STEPS_07:-all}"  # all, training, or bench
+case $STEPS_07 in all | training | bench) ;; *) die "STEPS_07 must be all, training or bench" ;; esac
 TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS:-gpt2-small resnet50}"
 read -ra train_args <<<"${TRAIN_BENCH_ARGS:-}"
+TRAIN_BENCH_BUCKETS="${TRAIN_BENCH_BUCKETS:-}"  # DDP bucket sizes (MB); empty: train_bench.py's
+for mb in $TRAIN_BENCH_BUCKETS; do
+    [[ $mb =~ ^[0-9]+([.][0-9]+)?$ ]] || die "TRAIN_BENCH_BUCKETS: '$mb' is not a size in MB"
+done
+if [ -n "$TRAIN_BENCH_BUCKETS" ] && [[ " ${train_args[*]-} " == *" --bucket-mb"* ]]; then
+    die "set the bucket size in TRAIN_BENCH_BUCKETS or in TRAIN_BENCH_ARGS, not both"
+fi
 # Interfaces: empty lets NCCL choose, and Gloo on each node use the interface
 # the preflight picks there (names may differ between the two partitions).
 [ -n "${NCCL_SOCKET_IFNAME:-}" ] && export NCCL_SOCKET_IFNAME
@@ -150,16 +160,32 @@ if [ "$STEPS_07" = all ]; then
         --write-thresholds "$RESULTS/thresholds.json"
 fi
 # DDP with gpubridge.ddp_comm_hook on real NVIDIA + AMD ranks (item 22).
-step train_ddp mixed_torchrun train "$REPO_DIR/examples/train_synthetic.py" \
-    --json "$RESULTS/train_ddp.json"
+if [ "$STEPS_07" != bench ]; then
+    step train_ddp mixed_torchrun train "$REPO_DIR/examples/train_synthetic.py" \
+        --json "$RESULTS/train_ddp.json"
+fi
+# train_bench MODEL [MB]: one train_bench.py run on both sides; with MB, at that DDP
+# bucket size, under its own step and JSON name.
+train_bench() {
+    local name="train_bench_$1${2:+_bucket$2}"
+    step "$name" mixed_torchrun "${name//_/-}" "$KIT_DIR/train_bench.py" --model "$1" \
+        --json "$RESULTS/$name.json" "${train_args[@]+"${train_args[@]}"}" ${2:+--bucket-mb "$2"}
+}
 # Training throughput through the same hook on real models (train_bench.py): samples/s,
 # and the step split into compute, waiting for the slower GPU and exposed
 # communication. Set against train_bench.sbatch's runs of each GPU alone.
 for model in $TRAIN_BENCH_MODELS; do
-    step "train_bench_$model" mixed_torchrun "train-bench-$model" "$KIT_DIR/train_bench.py" \
-        --model "$model" --json "$RESULTS/train_bench_$model.json" \
-        "${train_args[@]+"${train_args[@]}"}"
+    if [ -z "$TRAIN_BENCH_BUCKETS" ]; then
+        train_bench "$model"
+    fi
+    for mb in $TRAIN_BENCH_BUCKETS; do
+        train_bench "$model" "$mb"
+    done
 done
+if [ "$STEPS_07" = bench ]; then  # no FSDP2 or HSDP
+    finish
+    exit
+fi
 # gpubridge as the torch.distributed backend (item 30): a plain FSDP2 script apart from
 # backend="gpubridge" and `import gpubridge`. Exits non-zero if ranks disagree.
 step train_fsdp2_backend mixed_torchrun fsdp2 "$REPO_DIR/examples/fsdp2_torch_backend.py" \
