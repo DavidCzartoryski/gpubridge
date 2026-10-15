@@ -52,6 +52,7 @@ END_TO_END = {
     "validation_tables.py": "test_step_05, test_gpu_kit.py",
     "triage.py": "test_triage.py: Explorer, Kaggle and CPU-simulation results trees, and tarballs",
     "setup_env.sh": "test_setup_job_creates_the_cuda_venv",
+    "bench_p2p.py": "test_gpu_kit.py: test_bench_p2p_*, test_step_02 and 07",
     "explorer/submit.sh": "every test_step_*, and test_gpu_kit.py for 00",
     "explorer/job_env.sh": "sourced by every Explorer job",
     "explorer/00_partitions.sh": "test_gpu_kit.py: test_step_00_*",

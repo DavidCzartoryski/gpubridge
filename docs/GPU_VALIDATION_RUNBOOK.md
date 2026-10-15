@@ -168,6 +168,12 @@ bit, with the send's input written on a busy stream and dropped before it comple
 received tensor read on another stream right after `wait()`, and two tags matched out of
 order. `gpu_tests` runs the same check in
 `test_point_to_point_across_islands_keeps_stream_order_and_storage`.
+Both steps also run `bench_p2p.py` (`bench_p2p`, and in step 07 `bench_p2p_pinned`
+with `GPUBRIDGE_PINNED_STAGING=1`): ping-pong between rank 0 and a rank of another island
+(the bridge route) and, where rank 0's island has another rank, that rank (the native
+route), from 1 KB to `BENCH_MAX_BYTES`, with the one-way latency, bandwidth and a payload
+check per size in `bench_p2p/summary.md`. To compare other staging, rerun it with
+`GPUBRIDGE_P2P_CHUNK_BYTES` or `GPUBRIDGE_BRIDGE=ucx`; each record names its staging.
 With `UCX_BRIDGE=1`, steps 05 and 07 also run the check and the gpubridge
 benchmark over the UCX bridge (`check_ucx`, `bench_ucx`; items 26 and 27); the
 run records say whether GPU tensors went to UCX directly or through pinned host

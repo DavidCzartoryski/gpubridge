@@ -112,6 +112,10 @@ if [ "$STEPS_07" = all ]; then
     step check_p2p mixed_torchrun check-p2p "$KIT_DIR/check.py" --out "$RESULTS/check_p2p" \
         --p2p-only
     step summarize_p2p python "$KIT_DIR/summarize.py" "$RESULTS/check_p2p"
+    # Point-to-point latency and bandwidth between the V100 and the MI50 (bench_p2p.py);
+    # again with pinned staging below.
+    step bench_p2p mixed_torchrun bench-p2p "$KIT_DIR/bench_p2p.py" --out "$RESULTS/bench_p2p" \
+        --max-bytes "$BENCH_MAX_BYTES"
     step bench mixed_torchrun bench "$KIT_DIR/bench_all_reduce.py" --out "$RESULTS/bench" \
         --ops island,gpubridge,flat-gloo --phases --max-bytes "$BENCH_MAX_BYTES"
     # Pinned staging for the default bridge (item 25) on real NVIDIA + AMD leaders.
@@ -120,6 +124,8 @@ if [ "$STEPS_07" = all ]; then
     step summarize_pinned python "$KIT_DIR/summarize.py" "$RESULTS/check_pinned"
     step bench_pinned mixed_torchrun bench-pinned "$KIT_DIR/bench_all_reduce.py" \
         --out "$RESULTS/bench_pinned" --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES"
+    step bench_p2p_pinned mixed_torchrun bench-p2p-pinned "$KIT_DIR/bench_p2p.py" \
+        --out "$RESULTS/bench_p2p_pinned" --max-bytes "$BENCH_MAX_BYTES"
     unset GPUBRIDGE_PINNED_STAGING
     # Bridge compression between real NVIDIA and AMD leaders (items 28 and 29). The kernel
     # benchmark runs on each side's GPU; the digests in the two summaries must match.
