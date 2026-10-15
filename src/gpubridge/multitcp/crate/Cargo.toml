@@ -1,0 +1,18 @@
+[package]
+name = "gpubridge-transport"
+version = "0.1.0"
+edition = "2021"
+# Explorer's nodes have 1.88 from the OS packages; nothing here needs newer than this.
+rust-version = "1.70"
+description = "Multi-stream TCP messaging for gpubridge's bridge=\"multitcp\" (docs/RUST_TRANSPORT.md)"
+license = "MIT"
+publish = false
+
+# std only, so it builds offline on a cluster node with nothing but a Rust toolchain.
+[dependencies]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3

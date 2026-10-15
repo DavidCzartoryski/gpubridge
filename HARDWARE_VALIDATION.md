@@ -442,6 +442,20 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     FSDP2 within 1e-4 of one process over 12 steps, fp8 within 0.05
     (`tests/test_gpu_kit.py`). Not run on GPUs.* *Step:* `dp_*` in Explorer
     step 07 with `STEPS_07=dp`, and `dp_single` in `submit.sh dp-baseline`.
+35. **The multitcp bridge against the Gloo bridge.** `bridge="multitcp"`
+    (docs/RUST_TRANSPORT.md) carries the bridge over several TCP connections
+    per pair and reduces each chunk as it arrives. Between two machines, its
+    bridge phase at each size against the Gloo bridge's (default and pinned
+    staging) in the same job, and against the preflight's prediction; one
+    connection against several, for the connections' share. It takes host
+    tensors only, so the GPU side is the policies' usual staging. Stage 1 stays
+    only if, in each of two jobs, the median time of the whole float32
+    all_reduce with pinned staging is at most 0.8 times the pinned Gloo
+    bridge's at every size from 64 MB to 1 GB.
+    *Status: works on CPU over loopback TCP, every bridge policy on two, three
+    and four leaders, bit for bit against `flat-gloo` (`tests/test_multitcp.py`).
+    Not run between two machines.* *Step:* `multitcp_build` and the
+    `matrix_D-multitcp*` runs in Explorer step 08, with `MULTITCP_BRIDGE=1`.
 
 32. **Point-to-point across islands through the backend on GPUs.** `send`,
     `recv`, `isend`, `irecv` and `batch_isend_irecv` on `backend="gpubridge"`
@@ -531,6 +545,7 @@ failures count against all six whichever test failed.
 | 30. gpubridge as a torch.distributed backend: DDP and FSDP2 on GPUs | step `verify_fsdp2_backend`; step `train_fsdp2_backend`; step `gpu_tests` | FAIL (9 of 32) |
 | 31. HSDP through the backend: shard within islands, replicate across vendors | step `verify_hsdp_backend`; step `train_hsdp_backend` | FAIL (3 of 3) |
 | 33. Data-parallel training across vendors tracks one GPU, compressed or not | step `dp_(ddp\|fsdp2)(-.+)?`; step `dp_single` | not run |
+| 35. The multitcp bridge against the Gloo bridge | step `multitcp_build`; step `matrix_D-multitcp(-pinned\|-1stream)?` | not run |
 
 Where the FAILs come from:
 

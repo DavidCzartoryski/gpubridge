@@ -61,6 +61,7 @@ from gpubridge.transport import (
 from gpubridge.work import Work
 
 from gpubridge.ucx import transport as _ucx_transport  # noqa: E402,F401 - registers bridge="ucx"
+from gpubridge.multitcp import transport as _multitcp_transport  # noqa: E402,F401 - bridge="multitcp"
 from gpubridge import torch_backend as _torch_backend  # noqa: E402
 
 _torch_backend.register()  # backend="gpubridge" for torch.distributed

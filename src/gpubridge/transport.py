@@ -3,8 +3,9 @@
 By default the bridge moves CPU tensors between island leaders, so anything
 that can sum and broadcast a CPU tensor among a fixed set of processes can
 carry it (a transport with ``device_tensors`` also takes GPU tensors). Gloo is
-the default; ``bridge="ucx"`` (:mod:`gpubridge.ucx.transport`) is the other
-built-in one. Another transport (MPI, an RDMA path) plugs in by subclassing
+the default; ``bridge="ucx"`` (:mod:`gpubridge.ucx.transport`) and
+``bridge="multitcp"`` (:mod:`gpubridge.multitcp.transport`) are the other
+built-in ones. Another transport (MPI, an RDMA path) plugs in by subclassing
 :class:`BridgeTransport` and registering it, without touching the
 reduce-bridge-broadcast logic in ``collectives.py``.
 """

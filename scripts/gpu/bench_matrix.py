@@ -58,8 +58,9 @@ from validation_tables import predicted_bridge_ms
 #: Which op of a run's bench.json is the run, by the run name's letter.
 OP_OF = {"A": "native", "B": "native", "C": "gpubridge", "D": "gpubridge", "E": "flat-gloo"}
 #: Run names in table order; anything else sorts after them, by name.
-ORDER = ("A1", "A2", "B1", "B2", "C", "C-amd", "D-default", "D-pinned", "D-pipelined", "D-sharded",
-         "D-bf16", "D-fp8", "D-default-repeat", "E", "E-nvidia", "E-amd")
+ORDER = ("A1", "A2", "B1", "B2", "C", "C-amd", "D-default", "D-pinned", "D-multitcp",
+         "D-pipelined", "D-sharded", "D-bf16", "D-fp8", "D-default-repeat", "E", "E-nvidia",
+         "E-amd")
 #: Size ranges: (title, smallest, end) in bytes, the end excluded; together they cover
 #: every size.
 RANGES = (("Small: under 256 KB (latency)", 0, 256 * 2**10),

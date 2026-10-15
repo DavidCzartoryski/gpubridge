@@ -1567,7 +1567,7 @@ def test_tables_cover_every_hardware_validation_item():
 
 
 def test_every_step_the_tables_look_for_is_one_a_job_runs():
-    runs = [dry_run(KIT / "explorer" / job, UCX_BRIDGE="1") for job in sorted(
+    runs = [dry_run(KIT / "explorer" / job, UCX_BRIDGE="1", MULTITCP_BRIDGE="1") for job in sorted(
         p.name for p in (KIT / "explorer").glob("0*.sbatch"))]
     runs += [dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="dp"),
              dry_run(KIT / "explorer" / "dp_baseline.sbatch"),
