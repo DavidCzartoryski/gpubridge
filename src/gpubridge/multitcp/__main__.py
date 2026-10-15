@@ -3,12 +3,13 @@
 On a cluster, run ``build`` once where a Rust toolchain is (``cargo`` on PATH),
 e.g. in the kit's setup job, so jobs don't compile it on first use. Without one
 on the nodes, build it on a machine of the same architecture and set
-``GPUBRIDGE_MULTITCP_LIB`` to the library.
+``GPUBRIDGE_MULTITCP_LIB`` to the library; ``build`` then only checks that it loads.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from gpubridge import multitcp
@@ -21,7 +22,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "build":
-            print(multitcp.build(force=args.force))
+            if os.environ.get(multitcp.LIB_ENV, "").strip():  # built elsewhere: just load it
+                print(f"{multitcp.load()._name} (protocol {multitcp.protocol()})")
+            else:
+                print(multitcp.build(force=args.force))
             return 0
         print(f"library: {multitcp.load()._name}\nprotocol {multitcp.protocol()}")
         return 0

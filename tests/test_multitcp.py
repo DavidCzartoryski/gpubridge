@@ -125,6 +125,8 @@ def test_a_library_built_elsewhere_is_used_as_given(monkeypatch, tmp_path):
     monkeypatch.setenv(multitcp.LIB_ENV, str(copy))
     assert multitcp.protocol() >= 1
     assert multitcp.load()._name == str(copy)
+    from gpubridge.multitcp.__main__ import main
+    assert main(["build"]) == 0  # no cargo here: build only loads the given library
 
 
 # ---- collectives against flat-gloo ----------------------------------------------------

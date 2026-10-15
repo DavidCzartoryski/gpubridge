@@ -146,7 +146,11 @@ runs to the comparison matrix, in the same job as the Gloo bridge's:
 MULTITCP_BRIDGE=1 scripts/gpu/explorer/submit.sh 08
 ```
 
-The venvs must import this branch's gpubridge. The kit's setup installs gpubridge in
+Explorer's compute nodes have no Rust toolchain (a login node has cargo 1.88), so
+build the library once there and hand it to the jobs: `cargo build --release
+--offline --manifest-path src/gpubridge/multitcp/crate/Cargo.toml`, then
+`GPUBRIDGE_MULTITCP_LIB=<the .so>` with the command above (`multitcp_build` then only
+checks that it loads). The venvs must import this branch's gpubridge. The kit's setup installs gpubridge in
 editable mode from the clone that ran it, so from any other clone add
 `PYTHONPATH=$PWD/src` to that command; otherwise the jobs run that clone's scripts
 against the other clone's library.
