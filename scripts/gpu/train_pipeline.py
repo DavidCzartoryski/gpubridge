@@ -126,6 +126,26 @@ def release_mismatch(releases: list[str]) -> str | None:
             f"stage setup differs between releases (by rank: {', '.join(releases)})")
 
 
+def float_handshake(pipe_stage: Any) -> None:
+    """torch 2.9's schedules open with a handshake between neighbouring stages that sends
+    each stage's index as an int64 scalar into the neighbour's one-element float32 buffer.
+    NCCL moves the bytes regardless; gpubridge's point-to-point and Gloo refuse a payload
+    whose size or dtype isn't the receiver's. Later releases send a float32 (2.14.1 does);
+    this has 2.9 do the same. Sends that are float32 already are left alone."""
+    handshake = getattr(pipe_stage, "_get_init_p2p_neighbors_ops", None)
+    if handshake is None:  # a release without it (2.8)
+        return
+
+    def ops() -> list[Any]:
+        found = handshake()
+        for op in found:
+            if op.op is dist.isend and op.tensor.dtype != torch.float32:
+                op.tensor = op.tensor.to(torch.float32).reshape(1)
+        return found
+
+    pipe_stage._get_init_p2p_neighbors_ops = ops
+
+
 def stage_order(vendors: list[str]) -> list[int]:
     """The ranks in stage order: NVIDIA ranks first, then the rest, each in rank order."""
     return sorted(range(len(vendors)), key=lambda r: (vendors[r] != "nvidia", r))
@@ -227,6 +247,7 @@ def main() -> int:
     # Stage i's neighbours are the ranks holding stages i - 1 and i + 1 (torch's default
     # puts stage i on rank i).
     pipe_stage.stage_index_to_group_rank = dict(enumerate(order))
+    float_handshake(pipe_stage)
     schedule = (ScheduleGPipe if args.schedule == "gpipe" else Schedule1F1B)(
         pipe_stage, n_microbatches=args.microbatches, loss_fn=loss_fn)
     optimizer = torch.optim.AdamW(stage.parameters(), lr=args.lr)

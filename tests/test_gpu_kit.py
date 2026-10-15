@@ -2462,6 +2462,22 @@ def test_pipeline_needs_one_pytorch_release_on_every_rank():
     assert "same PyTorch release" in mismatch and "2.14.1+cu126, 2.9.1+rocm6.3" in mismatch
 
 
+def test_pipeline_handshake_sends_float32_as_torch_2_14_does():
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+    sent = SimpleNamespace(op=dist.isend, tensor=torch.tensor(1))  # torch 2.9.1's int64 index
+    received = SimpleNamespace(op=dist.irecv, tensor=torch.zeros(1))
+    stage = SimpleNamespace(_get_init_p2p_neighbors_ops=lambda: [sent, received])
+    train_pipeline.float_handshake(stage)
+    ops = stage._get_init_p2p_neighbors_ops()
+    assert ops[0].tensor.dtype == torch.float32 and ops[0].tensor.tolist() == [1.0]
+    assert ops[1] is received and ops[1].tensor.dtype == torch.float32
+    plain = SimpleNamespace()
+    train_pipeline.float_handshake(plain)  # torch 2.8: no handshake, nothing to change
+    assert not vars(plain)
+
+
 def test_pipeline_splits_blocks_evenly():
     assert train_pipeline.even_split(12, 2) == [6, 6]
     assert train_pipeline.even_split(5, 3) == [2, 2, 1]
