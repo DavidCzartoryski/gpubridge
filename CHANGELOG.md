@@ -169,10 +169,11 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   installed for the V100 node's kernel but not loaded; the MI50 node's kernel
   has `CONFIG_HSA_AMD_P2P` and torch 2.14.1+rocm7.2's HSA runtime exports
   dma-bufs; both kernels have `CONFIG_DMABUF_MOVE_NOTIFY`, and both nodes'
-  libibverbs (rdma-core 46.0 and 57.0) have `ibv_reg_dmabuf_mr`. The UCX found
-  (1.16.0, in the OpenMPI 4.1.6 module) offered TCP and shared-memory
-  transports and host memory only, and installs no `ib`, `cuda` or `rocm`
-  transport module. Details in
+  libibverbs (rdma-core 46.0 and 57.0) have `ibv_reg_dmabuf_mr`. The UCX
+  module (1.16.0, in OpenMPI 4.1.6) offered TCP and shared-memory transports
+  and host memory only, and installs no `ib`, `cuda` or `rocm` transport
+  module; UCX copies bundled with some application modules have `ib`, none
+  `cuda` or `rocm`. Details in
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md#rdma-between-the-node-types).
 
 Everything else is **validated on CPU only**:

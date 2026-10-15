@@ -378,8 +378,9 @@ and MI50 nodes it ran on (2026-10-14,
 [BENCHMARKS.md](BENCHMARKS.md#rdma-between-the-node-types)): the V100 nodes'
 RDMA is InfiniBand and the MI50 node's is RoCE, so they aren't on one fabric;
 `nvidia_peermem` is installed but not loaded; the MI50 node has the dma-buf
-export call and `ibv_reg_dmabuf_mr` (untried); the UCX found (1.16.0, in an
-OpenMPI module) has no `ib`, `cuda` or `rocm` transport.
+export call and `ibv_reg_dmabuf_mr` (untried); the UCX module (1.16.0, in
+OpenMPI) has no `ib`, `cuda` or `rocm` transport, and the UCX copies some
+application modules bundle have `ib` but no `cuda` or `rocm`.
 
 ## 10. Results so far
 
@@ -399,8 +400,9 @@ OpenMPI module) has no `ib`, `cuda` or `rocm` transport.
   writes into GPU memory before reporting a receive complete, for CUDA or ROCm
   memory, so the transport does (section 4).
 - Explorer (2026-10-14): **no RDMA path between the V100 and MI50 nodes
-  checked** (InfiniBand on one, RoCE on the other), and the UCX found has no
-  verbs transport. So the RDMA paths can't be validated on those nodes; see
+  checked** (InfiniBand on one, RoCE on the other), and no UCX there has a
+  `cuda` or `rocm` transport. So the RDMA paths can't be validated on those
+  nodes; see
   [BENCHMARKS.md](BENCHMARKS.md#rdma-between-the-node-types).
 - Nothing has run on RDMA hardware or a GPU.
 

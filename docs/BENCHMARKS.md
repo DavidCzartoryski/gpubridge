@@ -109,13 +109,17 @@ What this means:
   27 in [HARDWARE_VALIDATION.md](../HARDWARE_VALIDATION.md)) can't be
   validated; the bridge stays on TCP. Other nodes, or a change to their ports,
   could differ.
-- **The UCX found can't do RDMA or GPU memory, even between nodes of one
-  type.** At run time it offered only TCP and shared-memory transports, host
-  memory only, and its install has one transport module, `cma`: no `ib`,
+- **The OpenMPI module's UCX can't do RDMA or GPU memory, even between nodes
+  of one type.** At run time it offered only TCP and shared-memory transports,
+  host memory only, and its install has one transport module, `cma`: no `ib`,
   `rdmacm`, `cuda` or `rocm` (`lib/ucx` in the module, listed from the login
-  node). No other UCX turned up in `module avail` or the system's packages.
-  RDMA through gpubridge's UCX transport on Explorer would need another UCX
-  build; none was tried.
+  node). It is the only UCX module in `module avail`, and the system has no
+  UCX package. Some application modules bundle their own UCX: AMBER's has only
+  `cma` too, while LAMMPS's and OpenFOAM's have `ib` and `rdmacm`, still with
+  no `cuda` or `rocm`. A UCX like those could carry host-staged RDMA between
+  nodes on one fabric (two V100 nodes), never GPU memory; none was tried, and
+  their versions weren't checked. GPU memory over RDMA on Explorer would need
+  a UCX built with CUDA or ROCm.
 - **GPU side, for other hardware.** On the V100 nodes GPUDirect RDMA would
   need `nvidia_peermem` loaded, which it isn't; NVIDIA's dma-buf path needs the
   open kernel modules, which these nodes don't run. The MI50 node has the
