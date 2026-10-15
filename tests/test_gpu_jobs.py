@@ -408,6 +408,27 @@ def test_step_07_training_only(tmp_path):
                                 "train_hsdp_backend", "verify_hsdp_backend"]
 
 
+
+def test_step_07_bench_only_sweeps_bucket_sizes(tmp_path):
+    # STEPS_07=bench: train_bench.py's steps alone, once per TRAIN_BENCH_BUCKETS size.
+    code = sbatch(tmp_path, "--job-name=gpubridge-07_mixed_hetjob", "--nodes=1",
+                  "--gres=gpu:1", ":", "--nodes=1", "--gres=gpu:mi100:1",
+                  str(EXPLORER / "07_mixed_hetjob.sbatch"),
+                  FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
+                  FAKE_SLURM_HET_ENV_1="GPUBRIDGE_VENDOR=amd", STEPS_07="bench",
+                  TRAIN_BENCH_BUCKETS="0.01 25")
+    out = tmp_path / "results" / "07_mixed_hetjob"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    assert list(steps(out)) == ["probe", "preflight", "train_bench_tiny-gpt_bucket0.01",
+                                "train_bench_tiny-gpt_bucket25"]
+    small, large = (json.loads((out / f"train_bench_tiny-gpt_bucket{mb}.json").read_text())
+                    for mb in ("0.01", "25"))
+    assert (small["bucket_mb"], large["bucket_mb"]) == (0.01, 25.0)
+    assert small["buckets"] > large["buckets"] >= 1
+    for record in (small, large):
+        assert record["world_size"] == 2 and record["params_identical"]
+        assert [r["vendor"] for r in record["ranks"]] == ["nvidia", "amd"]
+
 # ---- step 08, the network check and training throughput ------------------------------
 
 def test_step_08_matrix_on_the_mixed_pair(tmp_path):
@@ -592,8 +613,13 @@ def test_mixed_node_script_on_two_pretend_machines(tmp_path):
         assert "verdict: every step that ran passed" in (out / "triage.txt").read_text()
         alone = json.loads((out / "train_bench_alone_tiny-gpt.json").read_text())
         assert alone["world_size"] == 1
-    # The two machines together: rank 0, on the master, writes the record.
-    both = json.loads((tmp_path / "results" / "master" / "train_bench_tiny-gpt.json").read_text())
+    # The two machines together: rank 0 writes the record. torchrun numbers the
+    # machines by address, then process id, not by role: here (one address) rank 0
+    # is on whichever machine started its torchrun first.
+    records = [tmp_path / "results" / role / "train_bench_tiny-gpt.json" for role in procs]
+    written = [path for path in records if path.exists()]
+    assert len(written) == 1, records
+    both = json.loads(written[0].read_text())
     assert both["world_size"] == 2 and both["params_identical"]
 
 
