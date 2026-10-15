@@ -245,7 +245,7 @@ hardware.
   sample-weighted averaging), step 07's `STEPS_07=dp`, `submit.sh dp-baseline`
   and `scripts/gpu/dp_report.py` (the runs against the baseline, with the loss
   curves as CSV and SVG). CPU only so far; HARDWARE_VALIDATION.md item 33
-  (#PRNUM).
+  (#67).
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
   CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA
