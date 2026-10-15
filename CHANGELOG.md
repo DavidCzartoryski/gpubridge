@@ -365,6 +365,15 @@ hardware.
 
 ### Fixed
 
+- Point-to-point lifecycle: future callbacks no longer run under the engine
+  lock or on lane threads, so a callback waiting on another (or its own) P2P
+  Work completes and teardown does not wait for it; idle lanes release
+  completed payloads and their threads exit, keeping per-tag sequence order;
+  a CPU request on a lane that earlier carried a CUDA tensor uses no stream.
+  A batch's Work (`batch_isend_irecv`, `_coalescing_manager`) waits on its
+  members rather than on futures behind user callbacks, so a slow callback
+  doesn't delay it, a callback can wait on it, and `wait(timeout)` works.
+  CPU tests only; the GPU stream paths are unvalidated.
 - The runbook's 8+8 steps said the master's tarball holds the two-machine
   training records. Rank 0 writes them, and torchrun numbers the machines by
   address, not by role, so they can be on either machine. The two-machine
