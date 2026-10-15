@@ -193,6 +193,16 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   module; UCX copies bundled with some application modules have `ib`, none
   `cuda` or `rocm`. Details in
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md#rdma-between-the-node-types).
+- **A multi-stream TCP bridge prototype (#66, not merged), commit 23180fe of its
+  branch**, step 08 with `MULTITCP_BRIDGE=1`, two jobs on a V100 + MI50: with
+  pinned staging, a float32 all_reduce took 1.099 and 1.098 s at 1 GB against
+  1.250 and 1.241 s on the pinned Gloo bridge, 0.88 times its time, and 1.07 and
+  1.02 times at 64 MB. Its pre-set gate (at most 0.8 times at every size from 64
+  MB) isn't met, so the prototype stops there. Its first run was seven times
+  slower: torch's intra-op threads competing with the transport's network threads
+  on 4-CPU jobs made each reduction 10 to 25 times slower, until it reduced on one
+  thread. Details in
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype-not-merged).
 - **Triton 3.8.0 with torch 2.9.1+rocm6.3 on the AMD MI50 (gfx906), commit
   4e7f04e**: Triton from the default ROCm venv in front of `venv-rocm63`'s own
   (3.5.1), which can't compile the compression kernels for gfx906. The kit's
@@ -246,6 +256,17 @@ hardware.
   once per DDP bucket size (`--bucket-mb`), as `train_bench_<model>_bucket<MB>`
   (step and JSON), for a bucket-size sweep in one job. Tested on the fake
   cluster, CPU only (#77).
+- Data-parallel training across vendors on a LLaMA-style model:
+  `scripts/gpu/llama.py` (RMSNorm, rotary embeddings, SwiGLU; 134M to 1.03B
+  parameters; the same weights on every vendor; synthetic tokens with a
+  learnable rule, the same global batch for any world size),
+  `scripts/gpu/train_dp.py` (DDP with the comm hook, FSDP2 or HSDP through the
+  backend, or one GPU; every step's loss over the whole batch; parameter checks
+  across ranks; tokens/s and DDP's step split; batch shares by GPU speed with
+  sample-weighted averaging), step 07's `STEPS_07=dp`, `submit.sh dp-baseline`
+  and `scripts/gpu/dp_report.py` (the runs against the baseline, with the loss
+  curves as CSV and SVG). CPU only so far; HARDWARE_VALIDATION.md item 33
+  (#67).
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
   CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA
@@ -396,6 +417,16 @@ hardware.
 
 ### Fixed
 
+- The `gpubridge` torch.distributed backend's setup hung until its timeout when the
+  ranks had created different numbers of groups before their first collective: its
+  own groups took torch's names, which count each process's groups, so the ranks
+  waited on different store keys. HSDP across torch 2.14.1 and 2.9.1 reproduced
+  this on CPU (their `DeviceMesh` creates one group more on 2.9.1). The V100 + MI50
+  jobs hung at the same step, likely for the same reason; the fix has not run on
+  those GPUs yet. Each world setup now names its groups and transport links with
+  a fresh generation, so destroying and recreating a backend group inside a Gloo
+  world cannot reuse its old names or store keys. On a torch
+  whose private naming function has changed, torch's names are kept, with a warning.
 - Point-to-point lifecycle: future callbacks no longer run under the engine
   lock or on lane threads, so a callback waiting on another (or its own) P2P
   Work completes and teardown does not wait for it; idle lanes release

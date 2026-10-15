@@ -430,6 +430,43 @@ run, the x A2 and x A1 columns are empty.
 | 1GB | D-default-repeat | 1.6 s | 0.6713 | - | - | 916.132 | 1596.9077 | 1.74x |
 | 1GB | E | 1.64 s | 0.656 | - | - | - | - | - |
 
+## A multi-stream TCP bridge (prototype, not merged)
+
+#66 is a prototype bridge transport, `bridge="multitcp"`: a small Rust library that
+carries each leader pair's traffic over several TCP connections (4 by default), with
+Python reducing each 4 MiB chunk as soon as it has arrived. Before any run, its gate
+was set: it stays only if, with pinned staging, the whole float32 all_reduce's median
+takes at most 0.8 times the pinned Gloo bridge's at every size from 64 MB to 1 GB, in
+each of two jobs. **It doesn't meet that**, so the prototype stops here.
+
+Two step-08 jobs (11104565, 11105069), each one V100 + one MI50, as in the matrix
+above, at commit 23180fe of #66's branch (clean): torch 2.14.1+cu126 and NCCL 2.29.3
+on the V100, torch 2.14.1+rocm7.2 on the MI50, the bridge on `internal.2137` on both.
+Median of the whole all_reduce, gpubridge's default policy:
+
+| Run | 1 MB | 16 MB | 64 MB | 256 MB | 1 GB |
+| --- | --- | --- | --- | --- | --- |
+| Gloo bridge, pageable (D-default) | 4.5 / 3.9 ms | 33.4 / 30.8 ms | 99.8 / 99.6 ms | 394.4 / 398.0 ms | 1.581 / 1.630 s |
+| Gloo bridge, pinned (D-pinned) | 3.1 / 3.1 ms | 28.1 / 32.7 ms | 80.0 / 85.3 ms | 313.5 / 307.2 ms | 1.250 / 1.241 s |
+| multitcp, pageable | 2.9 / 4.0 ms | 30.9 / 33.9 ms | 110.1 / 114.9 ms | 388.6 / 387.7 ms | 1.551 / 1.580 s |
+| multitcp, pinned | 2.7 / 2.3 ms | 28.3 / 27.5 ms | 85.9 / 87.4 ms | 281.9 / 275.4 ms | 1.099 / 1.098 s |
+| multitcp, one connection | 3.9 / 4.1 ms | 31.1 / 31.8 ms | 104.3 / 105.2 ms | 397.4 / 435.4 ms | 1.656 / 1.603 s |
+
+(first job / second job.) Pinned multitcp against pinned Gloo: 1.07 and 1.02 times
+its time at 64 MB, 0.90 and 0.90 at 256 MB, 0.88 and 0.88 at 1 GB. So several
+connections bought about 12% at 1 GB and nothing at 64 MB, and one connection was no
+faster than Gloo's. The path itself wasn't the limit at these sizes: the library alone
+moved about 1.15 GB/s between such a pair of nodes (256 MiB in 4 MiB messages, one
+direction at a time), and Gloo's pinned bridge at 1 GB already reaches about 0.86 GB/s.
+
+**A finding for every bridge that reduces in Python.** The first run of the prototype
+(job 11102041) was about seven times slower than these: the reduction of each chunk,
+a `torch.Tensor.add_` on host memory, took 12 to 27 ms instead of 0.3 to 1 ms. On
+these 4-CPU jobs, torch's intra-op threads (`OMP_NUM_THREADS=4`) competed with the
+transport's network threads; with one torch thread for the duration of the
+collective it ran as above. The UCX transport also reduces with torch ops in Python
+and may meet the same contention on GPU nodes; that isn't measured.
+
 ## Training throughput
 
 `scripts/gpu/train_bench.py`: DDP with `gpubridge.ddp_comm_hook` on a real

@@ -556,8 +556,9 @@ def build_topology(
         raise RuntimeError(_gpu_clash_error(clashes, local.split_test))
     policy_cls = choose_policy(policy, layout)
 
-    # new_group is collective over the whole world: every rank creates every
-    # group, in the same order, including groups it is not a member of.
+    # Every rank visits the groups in the same order. Backend setup wraps this
+    # in _members_only: only a group's members create it and synchronize.
+    # Direct gpubridge.init() keeps torch's default whole-world synchronization.
     island_group: ProcessGroup | None = None
     for island in layout.islands:
         group = dist.new_group(list(island.ranks), timeout=timeout, backend=config.island_backend)
@@ -655,7 +656,9 @@ def _members_only(prefix: str) -> Iterator[None]:
     later groups of the whole job too. Only a group's ranks name it (torch
     returns early on the others), and they create the same groups in the same
     order. ``prefix`` is the subgroup's own name, the same on every member.
-    Transports name their links the same way (:func:`gpubridge.transport.scoped_name`).
+    Transports name their links similarly, with a separate counter and a ``link``
+    namespace (:func:`gpubridge.transport.scoped_name`). Unlike torch's group
+    naming, transport setup may request a link name on non-members too.
 
     The patch is process-wide: no other thread may create groups meanwhile
     (the backend holds the subgroup's setup lock; the training thread is in
@@ -664,6 +667,7 @@ def _members_only(prefix: str) -> Iterator[None]:
     c10d = dist.distributed_c10d
     plain_new, plain_name = dist.new_group, c10d._process_group_name
     seen: dict[tuple[int, ...], int] = {}
+    links: dict[tuple[int, ...], int] = {}
 
     def local(*args: Any, **kwargs: Any) -> Any:
         kwargs["use_local_synchronization"] = True
@@ -674,8 +678,13 @@ def _members_only(prefix: str) -> Iterator[None]:
         seen[key] = seen.get(key, -1) + 1
         return f"{prefix}.{'_'.join(map(str, key))}.{seen[key]}"
 
+    def link_name(ranks: Sequence[int]) -> str:
+        key = tuple(ranks)
+        links[key] = links.get(key, -1) + 1
+        return f"{prefix}.link.{'_'.join(map(str, key))}.{links[key]}"
+
     dist.new_group, c10d._process_group_name = local, name  # type: ignore[assignment]
-    token = _transport_scope.set(name)
+    token = _transport_scope.set(link_name)
     try:
         yield
     finally:

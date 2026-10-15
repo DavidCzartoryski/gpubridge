@@ -118,7 +118,9 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
          [Step("verify_fsdp2_backend"), Step("train_fsdp2_backend"), Step("gpu_tests")]),
     31: ("HSDP through the backend: shard within islands, replicate across vendors",
          [Step("verify_hsdp_backend"), Step("train_hsdp_backend")]),
-    32: ("The multitcp bridge against the Gloo bridge",
+    33: ("Data-parallel training across vendors tracks one GPU, compressed or not",
+         [Step(r"dp_(ddp|fsdp2)(-.+)?"), Step("dp_single")]),
+    35: ("The multitcp bridge against the Gloo bridge",
          [Step("multitcp_build"), Step(r"matrix_D-multitcp(-pinned|-1stream)?")]),
 }
 

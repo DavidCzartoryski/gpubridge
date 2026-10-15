@@ -13,6 +13,8 @@
 # STEPS_07=bench only the probe, the preflight and train_bench.py's steps.
 # TRAIN_BENCH_BUCKETS="10 25 50 100" runs each train_bench step once per DDP bucket
 # size (MB), each under its own name: train_bench_<model>_bucket<MB>.
+# STEPS_07=dp only the probe, the preflight and the data-parallel runs (DP_RUNS, below),
+# into 07_mixed_hetjob_dp/.
 set -euo pipefail
 REPO="${GPUBRIDGE_REPO:?submit with scripts/gpu/explorer/submit.sh}"
 # shellcheck source=../common.sh
@@ -25,8 +27,23 @@ GPUS_AMD="${GPUS_MIXED_AMD:-1}"
 RDZV_PORT="${RDZV_PORT:-29500}"
 PREFLIGHT_PORT="${PREFLIGHT_PORT:-29501}"
 BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-1G}"
-STEPS_07="${STEPS_07:-all}"  # all, training, or bench
-case $STEPS_07 in all | training | bench) ;; *) die "STEPS_07 must be all, training or bench" ;; esac
+STEPS_07="${STEPS_07:-all}"  # all, training, bench or dp
+case $STEPS_07 in all | training | bench | dp) ;; *) die "STEPS_07 must be all, training, bench or dp" ;; esac
+# STEPS_07=dp: train_dp.py on llama.py's model, DP_STEPS steps of DP_GLOBAL_BATCH sequences
+# of DP_SEQ tokens, one run per name in DP_RUNS: ddp, ddp-bf16 and ddp-fp8 (DDP through
+# gpubridge.ddp_comm_hook, the bridge uncompressed or compressed), fsdp2 (FSDP2 through
+# the backend), ddp-speed (batch shares by each GPU's speed), ddp-bucket-<MB> (DDP's
+# bucket size). Set against dp_baseline.sbatch's run on one V100 (submit.sh dp-baseline).
+DP_MODEL="${DP_MODEL:-llama-125m}"
+DP_STEPS="${DP_STEPS:-500}"
+DP_GLOBAL_BATCH="${DP_GLOBAL_BATCH:-8}"
+DP_SEQ="${DP_SEQ:-512}"
+DP_RUNS="${DP_RUNS:-ddp ddp-bf16 ddp-fp8 fsdp2 ddp-speed ddp-bucket-5 ddp-bucket-100}"
+# The AMD side's compression kernels: torch (gpubridge's PyTorch codec, the same bits) where
+# its ROCm build's Triton can't compile them, as venv-rocm63's own Triton can't for gfx906.
+# auto with a Triton that can: VENV_ROCM=<rocm_triton_overlay.sh's venv> DP_KERNELS_ON_AMD=auto.
+DP_KERNELS_ON_AMD="${DP_KERNELS_ON_AMD:-torch}"
+read -ra dp_args <<<"${DP_ARGS:-}"
 TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS:-gpt2-small resnet50}"
 read -ra train_args <<<"${TRAIN_BENCH_ARGS:-}"
 TRAIN_BENCH_BUCKETS="${TRAIN_BENCH_BUCKETS:-}"  # DDP bucket sizes (MB); empty: train_bench.py's
@@ -84,7 +101,11 @@ mixed_torchrun() {
         --rdzv-endpoint="$HEAD:$RDZV_PORT" --rdzv-id="${SLURM_JOB_ID:-local}-$tag" "$@"
 }
 
-job_setup 07_mixed_hetjob   # on the gpu node, with the CUDA venv
+if [ "$STEPS_07" = dp ]; then   # on the gpu node, with the CUDA venv
+    job_setup 07_mixed_hetjob_dp
+else
+    job_setup 07_mixed_hetjob
+fi
 # The AMD side's ROCm wheel needs its GPU-name table pointed out (common.sh); srun
 # passes the variable to both components.
 rocm_asic_ids "$VENV_ROCM/bin/python"
@@ -154,6 +175,25 @@ if [ "$STEPS_07" = all ]; then
     step bench_candidates mixed_torchrun candidates "$KIT_DIR/bench_all_reduce.py" \
         --out "$RESULTS/bench_candidates" --ops gpubridge --max-bytes "$BENCH_MAX_BYTES" \
         --write-thresholds "$RESULTS/thresholds.json"
+fi
+if [ "$STEPS_07" = dp ]; then
+    for run in $DP_RUNS; do
+        mode=${run%%-*} compression='' extra=()
+        case $run in
+        ddp | fsdp2) ;;
+        ddp-bf16 | ddp-fp8) compression=${run#ddp-} ;;
+        ddp-speed) extra=(--shares speed) ;;
+        ddp-bucket-*) extra=(--bucket-mb "${run#ddp-bucket-}") ;;
+        *) die "DP_RUNS: unknown run '$run'" ;;
+        esac
+        GPUBRIDGE_BRIDGE_COMPRESSION=$compression step "dp_$run" mixed_torchrun "dp-$run" \
+            "$KIT_DIR/train_dp.py" --model "$DP_MODEL" --mode "$mode" --steps "$DP_STEPS" \
+            --global-batch "$DP_GLOBAL_BATCH" --seq-len "$DP_SEQ" \
+            --kernels-on-amd "$DP_KERNELS_ON_AMD" --json "$RESULTS/dp_$run.json" \
+            "${extra[@]+"${extra[@]}"}" "${dp_args[@]+"${dp_args[@]}"}"
+    done
+    finish
+    exit
 fi
 # DDP with gpubridge.ddp_comm_hook on real NVIDIA + AMD ranks (item 22).
 if [ "$STEPS_07" != bench ]; then
