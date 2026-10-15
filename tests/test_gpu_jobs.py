@@ -67,7 +67,9 @@ END_TO_END = {
     "explorer/net_check.sbatch": "test_net_check_job",
     "explorer/train_bench.sbatch": "test_train_bench_job",
     "explorer/amd_node.sbatch": "test_amd_node_job",
-    "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines",
+    "mixed/node.sh": "test_mixed_node_script_on_two_pretend_machines, mixed/containers.sh",
+    "mixed/containers.sh": "test_mixed_containers_dry_run (the containers need Docker: run it "
+                           "by hand, see the runbook)",
     "amd/run_all.sh": "test_gpu_kit.py: test_amd_script_keeps_going_*",
     "kaggle/kaggle_gpubridge.py": "test_kaggle_runner.py: the plan, hard timeouts, feature decisions, "
                                   "the feature check and packaging (the GPU steps need GPUs)",
@@ -570,7 +572,8 @@ def test_mixed_node_script_on_two_pretend_machines(tmp_path):
               "LOCAL_ADDR": "127.0.0.1", "NPROC": "1", "SKIP_SETUP": "1",
               "TORCH_FLAVOR": "system", "RUN_ID": f"test-{os.getpid()}",
               "BENCH_MAX_BYTES": "16K", "RESULTS_ROOT": str(tmp_path / "results"),
-              "VENV": sys.prefix, "KIT_TIMEOUT": "120"}
+              "VENV": sys.prefix, "KIT_TIMEOUT": "120", "TRAIN_BENCH_MODELS": "tiny-gpt",
+              "TRAIN_BENCH_ARGS": "--steps 2 --warmup-steps 1 --comm-trials 1"}
     procs = {
         role: subprocess.Popen(["bash", str(KIT / "mixed" / "node.sh")],
                                env=clean_env(ROLE=role, TARGET=role, GPUBRIDGE_VENDOR=vendor,
@@ -585,6 +588,27 @@ def test_mixed_node_script_on_two_pretend_machines(tmp_path):
         assert failed(out) == set()
         assert (out / f"preflight-{role}.json").exists()
         assert (tmp_path / "results" / f"{role}.tgz").exists()
+        assert "verdict: every step that ran passed" in (out / "triage.txt").read_text()
+        alone = json.loads((out / "train_bench_alone_tiny-gpt.json").read_text())
+        assert alone["world_size"] == 1
+    # The two machines together: rank 0, on the master, writes the record.
+    both = json.loads((tmp_path / "results" / "master" / "train_bench_tiny-gpt.json").read_text())
+    assert both["world_size"] == 2 and both["params_identical"]
+
+
+def test_mixed_containers_dry_run(tmp_path):
+    result = subprocess.run(["bash", str(KIT / "mixed" / "containers.sh"), "--dry-run",
+                             str(tmp_path / "out")], env=clean_env(SUBNET="10.9.8.0/24"),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    runs = [line for line in result.stderr.splitlines() if line.startswith("+ docker run -d")]
+    assert len(runs) == 2
+    for line, role, vendor, ip in zip(runs, ("master", "worker"), ("nvidia", "amd"),
+                                      ("10.9.8.10", "10.9.8.11")):
+        for part in (f"--ip {ip}", f"ROLE={role}", f"GPUBRIDGE_VENDOR={vendor}",
+                     "MASTER_ADDR=10.9.8.10", "IFNAME=eth0", "scripts/gpu/mixed/node.sh"):
+            assert part in line, (part, line)
+    assert "triage.py /out/master" in result.stderr and "triage.py /out/worker" in result.stderr
 
 
 # ---- limits and NCCL logs --------------------------------------------------------
