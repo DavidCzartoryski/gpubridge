@@ -3,8 +3,9 @@
 # ports: the kernel and its dma-buf and peer-to-peer options, the RDMA and GPU kernel
 # modules loaded (and whether nvidia_peermem or nv_peer_mem exist at all), rdma-core
 # and whether its libibverbs has ibv_reg_dmabuf_mr, the RDMA links, UCX (ucx_info -v
-# and -d) and, for AMD, whether the HSA runtime exports dma-bufs. A tool or file that
-# isn't there leaves a one-line note instead. Never fails.
+# and -d, and the transport modules its build installed) and, for AMD, whether the HSA
+# runtime exports dma-bufs. A tool or file that isn't there leaves a one-line note
+# instead. Paths are cut to their last part (.../libucs.so.0). Never fails.
 #
 #   scripts/gpu/rdma_report.sh DIR [PYTHON]    PYTHON: the venv's, to find its HSA runtime
 set -uo pipefail
@@ -13,6 +14,10 @@ python=${2:-}
 mkdir -p "$dir" || exit 0
 
 note() { echo "$*: not found on this node"; }
+strip_paths() { sed -E 's#/([^/[:space:]]+/)+#.../#g'; }
+# has LIB SYMBOL: whether LIB defines SYMBOL. grep reads all of nm's output, so nm never
+# dies of SIGPIPE, which pipefail would report as no match.
+has() { nm -D --defined-only "$1" 2>/dev/null | grep " $2\$" >/dev/null; }
 
 {
     uname -r
@@ -21,7 +26,7 @@ note() { echo "$*: not found on this node"; }
     if [ -r "$config" ]; then
         grep -E '^(# )?CONFIG_(DMA_SHARED_BUFFER|DMABUF_MOVE_NOTIFY|PCI_P2PDMA|HSA_AMD_P2P|INFINIBAND_USER_MEM|INFINIBAND_ON_DEMAND_PAGING)[= ]' "$config"
     else
-        note "$config"
+        note "this kernel's config in /boot"
     fi
 } >"$dir/kernel.txt" 2>&1
 
@@ -51,10 +56,10 @@ note() { echo "$*: not found on this node"; }
     fi
     verbs=$(ldconfig -p 2>/dev/null | awk '/libibverbs\.so\.1 /{print $NF; exit}')
     if [ -n "$verbs" ] && command -v nm >/dev/null 2>&1; then
-        if nm -D --defined-only "$verbs" 2>/dev/null | grep -q ' ibv_reg_dmabuf_mr'; then
-            echo "$verbs: has ibv_reg_dmabuf_mr"
+        if has "$verbs" ibv_reg_dmabuf_mr; then
+            echo "${verbs##*/}: has ibv_reg_dmabuf_mr"
         else
-            echo "$verbs: no ibv_reg_dmabuf_mr"
+            echo "${verbs##*/}: no ibv_reg_dmabuf_mr"
         fi
     else
         note "libibverbs.so.1 (or nm)"
@@ -70,12 +75,22 @@ fi
 {
     if command -v ucx_info >/dev/null 2>&1; then
         ucx_info -v
+        # The transport modules this build installed (libuct_ib, _cuda, _rocm, ...), next
+        # to its libraries: what it could load, as against what -d found usable here.
+        libs=$(ucx_info -v | sed -n 's/^# Library path: //p')
+        modules=
+        for lib in "${libs%/*}"/ucx/libuct_*.so; do
+            [ -f "$lib" ] || continue
+            lib=${lib##*/libuct_}
+            modules="$modules ${lib%.so}"
+        done
+        printf '# transport modules installed:%s\n' "${modules:- none found}"
         ucx_info -d
     else
         note ucx_info
         ldconfig -p 2>/dev/null | grep -E 'libuc[pt]\.so' || note "libucp.so"
     fi
-} >"$dir/ucx.txt" 2>&1
+} 2>&1 | strip_paths >"$dir/ucx.txt"
 
 # AMD: ROCm exports a GPU buffer as a dma-buf through hsa_amd_portable_export_dmabuf
 # (in torch's bundled HSA runtime for a pip-installed ROCm build).
@@ -91,7 +106,7 @@ fi
         case $lib in "${torch_lib:-/nonexistent}"/*) where=torch ;; esac
         if ! command -v nm >/dev/null 2>&1; then
             note nm
-        elif nm -D --defined-only "$lib" 2>/dev/null | grep -q ' hsa_amd_portable_export_dmabuf'; then
+        elif has "$lib" hsa_amd_portable_export_dmabuf; then
             echo "${lib##*/} ($where): has hsa_amd_portable_export_dmabuf"
         else
             echo "${lib##*/} ($where): no hsa_amd_portable_export_dmabuf"
