@@ -190,7 +190,7 @@ hardware.
   rdma-core and `ibv_reg_dmabuf_mr`, `rdma link`, UCX (`ucx_info -v` and `-d`)
   and the HSA runtime's dma-buf export, with paths cut from the records. It runs
   last and loads `RDMA_MODULES` inside its own step, so the steps before it are
-  unchanged and a module that won't load fails only that step (#62).
+  unchanged and a module that won't load fails only that step (#62, #65).
 - A Kaggle runner for the GPU validation kit, for a free notebook with two
   T4s (`scripts/gpu/kaggle/`): a notebook and the same steps as one script,
   each step under a hard time limit. It checks what compute capability 7.5
