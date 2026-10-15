@@ -24,9 +24,12 @@ sys.path.insert(0, str(KIT))
 
 import bench_all_reduce  # noqa: E402
 import bench_matrix  # noqa: E402
+import dp_report  # noqa: E402
+import llama  # noqa: E402
 import preflight  # noqa: E402
 import summarize  # noqa: E402
 import train_bench  # noqa: E402
+import train_dp  # noqa: E402
 import validation_tables  # noqa: E402
 
 SHELL_SCRIPTS = sorted(
@@ -530,7 +533,7 @@ def test_mixed_hetjob_step_selection(env, expected):
 
 
 @pytest.mark.parametrize(("env", "message"), [
-    ({"STEPS_07": "hsdp"}, "STEPS_07 must be all, training or bench"),
+    ({"STEPS_07": "hsdp"}, "STEPS_07 must be all, training, bench or dp"),
     ({"TRAIN_BENCH_BUCKETS": "10 big"}, "TRAIN_BENCH_BUCKETS: 'big' is not a size in MB"),
     ({"TRAIN_BENCH_BUCKETS": "10", "TRAIN_BENCH_ARGS": "--steps 5 --bucket-mb 5"},
      "in TRAIN_BENCH_BUCKETS or in TRAIN_BENCH_ARGS, not both"),
@@ -1564,7 +1567,9 @@ def test_tables_cover_every_hardware_validation_item():
 def test_every_step_the_tables_look_for_is_one_a_job_runs():
     runs = [dry_run(KIT / "explorer" / job, UCX_BRIDGE="1") for job in sorted(
         p.name for p in (KIT / "explorer").glob("0*.sbatch"))]
-    runs += [dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="4"),
+    runs += [dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="dp"),
+             dry_run(KIT / "explorer" / "dp_baseline.sbatch"),
+             dry_run(KIT / "amd" / "run_all.sh", GPU_COUNT="4"),
              dry_run(KIT / "mixed" / "node.sh", ROLE="master", MASTER_ADDR="10.0.0.1",
                      GPU_COUNT="2")]
     names = set(re.findall(r"^\+ \[([^\]]+)\]", "".join(r.stdout for r in runs),
@@ -2295,3 +2300,102 @@ def test_train_bench_rejects_batch_settings_it_cant_honour(args, message):
                       GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
     assert result.returncode != 0
     assert message in result.stderr
+
+
+# ---- data-parallel training: llama.py, train_dp.py, dp_report.py -------------------------
+
+def test_llama_models_are_the_stated_sizes():
+    assert {n: llama.parameters(n) for n in llama.MODELS} == {
+        "llama-125m": 134_105_856, "llama-350m": 373_867_520, "llama-1b": 1_032_931_328,
+        "llama-tiny": 26_784}
+    model = llama.build("llama-tiny")
+    assert sum(p.numel() for p in model.parameters()) == llama.parameters("llama-tiny")
+
+
+def test_llama_weights_and_batches_are_the_same_everywhere():
+    a, b = llama.build("llama-tiny", seed=3), llama.build("llama-tiny", seed=3)
+    assert all(torch.equal(p, q) for p, q in zip(a.parameters(), b.parameters(), strict=True))
+    assert not torch.equal(next(a.parameters()), next(llama.build("llama-tiny").parameters()))
+    x, y = llama.global_batch("llama-tiny", 7, 6, 10)
+    again, _ = llama.global_batch("llama-tiny", 7, 6, 10)
+    assert torch.equal(x, again) and torch.equal(x[:, 1:], y[:, :-1])
+    assert torch.equal(y, (x * 7 + 13 + (y - x * 7 - 13) % 128) % 128)  # the rule, noise 0..3
+    assert int(((y - x * 7 - 13) % 128).max()) <= 3
+
+
+def test_train_dp_splits_rows_by_weight():
+    assert train_dp.shares_for([1.0, 1.0], 8) == [4, 4]
+    assert train_dp.shares_for([3.0, 1.0], 8) == [6, 2]
+    assert train_dp.shares_for([1.0, 1.0, 1.0], 8) == [3, 3, 2]  # ties to the lower rank
+    assert train_dp.shares_for([100.0, 1.0], 4) == [3, 1]  # everyone keeps a row
+    with pytest.raises(ValueError):
+        train_dp.shares_for([1.0, 1.0, 1.0], 2)
+    assert train_dp.rows([3, 5], 1) == slice(3, 8)
+
+
+def _train_dp(tmp_path, name: str, nproc: int, *args: str, **env: str) -> dict:
+    out = tmp_path / f"dp_{name}.json"
+    common = ("--model", "llama-tiny", "--steps", "12", "--global-batch", "8", "--seq-len", "16",
+              "--lr", "3e-3", "--check-every", "6", "--probe-steps", "1", "--comm-trials", "1",
+              "--json", str(out))
+    if nproc == 1:
+        result = subprocess.run([sys.executable, str(KIT / "train_dp.py"), *common, *args],
+                                env=clean_env(**env), capture_output=True, text=True,
+                                timeout=300)
+    else:
+        result = torchrun(nproc, KIT / "train_dp.py", *common, *args, GPUBRIDGE_VENDOR="nvidia",
+                          GPUBRIDGE_SPLIT_TEST="half", **env)
+    assert result.returncode == 0, result.stderr[-3000:]
+    return json.loads(out.read_text())
+
+
+def test_data_parallel_runs_track_one_gpu_on_cpu(tmp_path):
+    single = _train_dp(tmp_path, "single", 1, "--mode", "single", "--micro", "2")
+    assert single["world_size"] == 1 and single["loss_last"] < single["loss_first"]
+    runs = {"ddp": _train_dp(tmp_path, "ddp", 2, "--mode", "ddp"),
+            "uneven": _train_dp(tmp_path, "uneven", 2, "--mode", "ddp", "--shares", "6,2"),
+            "fsdp2": _train_dp(tmp_path, "fsdp2", 2, "--mode", "fsdp2")}
+    for name, run in runs.items():
+        gap = max(abs(a - b) for a, b in zip(run["losses"], single["losses"], strict=True))
+        assert gap < 1e-4, (name, gap)  # the same mean gradient, summed in another order
+        assert [r["vendor"] for r in run["ranks"]] == ["nvidia", "amd"]
+    assert [r["share"] for r in runs["uneven"]["ranks"]] == [6, 2]
+    assert all(c["identical"] for c in runs["ddp"]["param_checks"])
+    assert [c["step"] for c in runs["ddp"]["param_checks"]] == [6, 12]
+    assert runs["fsdp2"]["param_checks"] == []  # one copy of each shard: nothing to compare
+    assert runs["ddp"]["buckets"] >= 1 and 0 <= runs["ddp"]["hidden_fraction"] <= 1
+    fp8 = _train_dp(tmp_path, "fp8", 2, "--mode", "ddp", "--kernels-on-amd", "torch",
+                    GPUBRIDGE_BRIDGE_COMPRESSION="fp8")
+    # Step 1's loss comes before any (compressed) gradient: the same as one GPU's.
+    assert fp8["compression"] == "fp8" and abs(fp8["losses"][0] - single["losses"][0]) < 1e-5
+    assert [r["compression_kernels"] for r in fp8["ranks"]] == ["auto", "torch"]
+    assert max(abs(a - b) for a, b in zip(fp8["losses"], single["losses"], strict=True)) < 0.05
+    report = dp_report.table(dp_report.load([tmp_path]), "single")
+    assert "| single (baseline) | single |" in report and "| uneven | ddp | none |" in report
+
+
+def test_dp_report_compares_curves_with_the_baseline(tmp_path):
+    def record(mode, losses, **extra):
+        return {"script": "scripts/gpu/train_dp.py", "mode": mode, "compression": "none",
+                "ranks": [{"device": "Tesla V100-SXM2-32GB", "share": 8}], "tokens_per_s": 10.0,
+                "median_step_ms": 5.0, "loss_last": losses[-1], "losses": losses, **extra}
+
+    (tmp_path / "dp_single.json").write_text(json.dumps(record("single", [3.0, 2.0, 1.0])))
+    (tmp_path / "dp_ddp.json").write_text(json.dumps(record(
+        "ddp", [3.0, 2.5, 1.0], exposed_comm_ms=1.0, hidden_fraction=0.25,
+        param_checks=[{"step": 3, "identical": False, "sum_spread": 0.5, "finite": True}])))
+    runs = dp_report.load([tmp_path])
+    assert dp_report.gaps(runs["ddp"]["losses"], runs["single"]["losses"]) == (0.5, 0.5 / 3)
+    table = dp_report.table(runs, "single")
+    assert "| ddp | ddp | none | V100 | 8 | 10 | 5.0 | 1.0 | 25% | 1.0000 | 0.5000 |" in table
+    assert "no (sums up to 0.5 apart)" in table
+    assert dp_report.main([str(tmp_path), "--out", str(tmp_path / "out")]) == 0
+    assert (tmp_path / "out" / "dp_losses.svg").read_text().count("<polyline") == 2
+    assert (tmp_path / "out" / "dp_losses.csv").read_text().startswith("step,ddp,single\n1,3.0,3.0")
+    for job in ("a", "b", "c"):  # three jobs' runs of one name: none dropped
+        (tmp_path / "jobs" / job / "07_mixed_hetjob_dp").mkdir(parents=True)
+        (tmp_path / "jobs" / job / "07_mixed_hetjob_dp" / "dp_ddp.json").write_text(
+            json.dumps(record("ddp", [3.0])))
+    assert sorted(dp_report.load([tmp_path / "jobs"])) == [
+        f"jobs/{job}/07_mixed_hetjob_dp/dp_ddp" for job in ("a", "b", "c")]
+

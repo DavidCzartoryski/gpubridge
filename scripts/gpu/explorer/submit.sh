@@ -25,6 +25,8 @@
 #   train-multi   the same on 1 GPU, then GPUS_TRAIN_MULTI GPUs as one island and as two
 #          bridged halves (split test)                        multigpu
 #   07-multi   step 07 with GPUS_MIXED_NVIDIA_MULTI NVIDIA GPUs (multigpu) + the AMD side
+#   dp-baseline, dp-baseline-amd   step 07's data-parallel runs (STEPS_07=dp) on one GPU
+#          alone: the loss curve and tokens/s to set them against
 #
 # See docs/GPU_VALIDATION_RUNBOOK.md for what each step proves.
 set -euo pipefail
@@ -73,6 +75,7 @@ TIME_NET="${TIME_NET:-00:10:00}"
 TIME_08="${TIME_08:-00:40:00}"
 TIME_TRAIN="${TIME_TRAIN:-00:30:00}"
 TIME_TRAIN_MULTI="${TIME_TRAIN_MULTI:-01:00:00}"
+TIME_DP_BASELINE="${TIME_DP_BASELINE:-00:30:00}"
 # Each job's STEP_TIMEOUT (common.sh: the limit on each launch) is capped at its
 # Slurm limit less STEP_MARGIN seconds, so a stuck launch is stopped and recorded
 # as timed out before Slurm ends the job.
@@ -345,11 +348,20 @@ train-multi)
     gpu_request "$PARTITION_AMD" "$AMD_TYPE" 1 "$GPUS_MIXED_AMD" "$TIME_07"
     sbatch_job 07_mixed_hetjob 07_mixed_hetjob.sbatch "${nvidia[@]}" : "${REQUEST[@]}"
     ;;
+dp-baseline)
+    export DP_SIDE=nvidia
+    submit dp_baseline.sbatch "$TIME_DP_BASELINE" 1 1 "$PARTITION_1GPU" "$GPU_TYPE_1GPU"
+    ;;
+dp-baseline-amd)
+    amd_gate
+    export DP_SIDE=amd
+    submit dp_baseline.sbatch "$TIME_DP_BASELINE" 1 1 "$PARTITION_AMD" "$AMD_TYPE"
+    ;;
 free | multi)
     # DRY_RUN is exported, so the recursive calls inherit --dry-run.
     steps=(01 02)
     [ "${ARGS[0]}" = multi ] && steps=(03 04 05 06)
     for s in "${steps[@]}"; do "$0" "$s"; done
     ;;
-*) sed -n '2,29p' "$0" >&2; exit 2 ;;
+*) sed -n '2,31p' "$0" >&2; exit 2 ;;
 esac
