@@ -580,6 +580,8 @@ def test_step_08_matrix_on_the_mixed_pair(tmp_path):
     order = list(steps(out))
     first = min(order.index(f"matrix_{name}") for name in ("D-bf16", "D-fp8"))
     assert "triton_check" in order[:first] and order.count("triton_check") == 1, order
+    log = "\n".join(p.read_text() for p in (tmp_path / "work" / "logs").glob("*.out"))
+    assert "step triton_check: both @VENV@/bin/python" in log  # on both sides
 
     def bench(name):
         return json.loads((out / "matrix" / name / "bench.json").read_text())
@@ -782,21 +784,32 @@ def test_mixed_node_script_on_two_pretend_machines(tmp_path):
               "TRAIN_BENCH_ARGS": "--steps 2 --warmup-steps 1 --comm-trials 1",
               **SMALL_DP, "DP_RUNS": "ddp ddp-fp8", "PP_RUNS": "1f1b", "PP_MICROBATCHES": "2",
               "PP_ARGS": "--probe-trials 1"}
+    # The worker's Triton check fails (TRITON_CHECK_LAUNCH=false), the master's passes: each
+    # machine decides alone, so the worker skips only its own kernel benchmark and every
+    # mixed step, compressed ones included, still runs on both, in step.
     procs = {
         role: subprocess.Popen(["bash", str(KIT / "mixed" / "node.sh")],
                                env=clean_env(ROLE=role, TARGET=role, GPUBRIDGE_VENDOR=vendor,
-                                             **common),
+                                             **common, **extra),
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        for role, vendor in (("master", "nvidia"), ("worker", "amd"))
+        for role, vendor, extra in (("master", "nvidia", {}),
+                                    ("worker", "amd", {"TRITON_CHECK_LAUNCH": "false"}))
     }
     output = {role: proc.communicate(timeout=600)[0] for role, proc in procs.items()}
     for role, proc in procs.items():
-        assert proc.returncode == 0, output[role][-3000:]
         out = tmp_path / "results" / role
-        assert failed(out) == set()
+        if role == "master":
+            assert proc.returncode == 0, output[role][-3000:]
+            assert failed(out) == set()
+            assert "verdict: every step that ran passed" in (out / "triage.txt").read_text()
+        else:
+            assert proc.returncode == 1, output[role][-3000:]
+            assert failed(out) == {"triton_check", "bench_compression_kernels"}
+            records = [json.loads(line) for line in (out / "steps.jsonl").read_text().splitlines()]
+            skipped = {r["step"] for r in records if "not_run" in r}
+            assert skipped == {"bench_compression_kernels"}
         assert (out / f"preflight-{role}.json").exists()
         assert (tmp_path / "results" / f"{role}.tgz").exists()
-        assert "verdict: every step that ran passed" in (out / "triage.txt").read_text()
         alone = json.loads((out / "train_bench_alone_tiny-gpt.json").read_text())
         assert alone["world_size"] == 1
         baseline = json.loads((out / "dp_single.json").read_text())
