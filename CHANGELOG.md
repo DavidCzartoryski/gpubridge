@@ -238,6 +238,19 @@ hardware.
 
 ### Added
 
+- One model's throughput, every way (docs/BENCHMARKS.md, "What mixing vendors
+  costs, and whether it helps"). `llama-125m`, 500 steps, each setting run twice
+  (spread at most 5.4%):
+  - one V100 alone, 14,264 tokens/s; one MI50 alone, 9,614;
+  - a V100 + MI50 pipeline, 15,686 with the 9 + 3 split (1.10x the V100) and
+    15,316 with the automatic one;
+  - V100 + MI50 data parallelism, 4,543 uncompressed (0.32x) and 9,689 with fp8
+    on the bridge (0.68x).
+
+  `submit.sh 07-nvidia-pair` and `07-amd-pair` run step 07's dp or pipeline
+  runs on two GPUs of one type, one island (native NCCL or RCCL), for the
+  same-vendor baselines. They're refused until `SAME_PARTITION_PAIRS_OK=1`
+  (#92).
 - The GPU kit refuses runs whose records would mislead. Every job stops before
   its first step if `import gpubridge` isn't the running checkout's `src/`
   (`scripts/gpu/import_check.py`, and the probe on every side of a mixed job).

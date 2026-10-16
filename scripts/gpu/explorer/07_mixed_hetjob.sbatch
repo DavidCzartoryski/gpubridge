@@ -135,10 +135,19 @@ mixed_torchrun() {
         --rdzv-endpoint="$HEAD:$RDZV_PORT" --rdzv-id="${SLURM_JOB_ID:-local}-$tag" "$@"
 }
 
+# PAIR_07 (nvidia or amd, set by submit.sh 07-nvidia-pair and 07-amd-pair): two GPUs of one
+# type, one island, for the dp and pipeline runs only.
+PAIR_07="${PAIR_07:-}"
+case ${PAIR_07:+$STEPS_07} in
+'' | dp | pipeline) ;;
+*) die "a same-vendor pair runs STEPS_07=dp or pipeline, not $STEPS_07" ;;
+esac
+results_name=07_mixed_hetjob
+[ -z "$PAIR_07" ] || results_name=07_pair_$PAIR_07
 if [ "$STEPS_07" = dp ]; then   # on the gpu node, with the CUDA venv
-    job_setup 07_mixed_hetjob_dp
+    job_setup "${results_name}_dp"
 elif [ "$STEPS_07" = pipeline ]; then
-    job_setup 07_mixed_hetjob_pp
+    job_setup "${results_name}_pp"
 else
     job_setup 07_mixed_hetjob
 fi

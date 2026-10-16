@@ -21,6 +21,85 @@ intended use (see [Waiting on Research Computing](#waiting-on-research-computing
 | E | the same two ranks as one flat Gloo group | ran |
 | Training | DDP with `gpubridge.ddp_comm_hook` on GPT-2 small and ResNet-50: each GPU alone, then both | ran: the V100 alone, the MI50 alone (torch 2.9.1+rocm6.3) and both together, uncompressed and with fp8 on the bridge (GPT-2 small at batches 4 to 32) |
 | Data-parallel training | `train_dp.py` on a LLaMA-style model: DDP uncompressed, bf16 and fp8, FSDP2, shares by speed, bucket sizes; one V100 alone | ran: [below](#data-parallel-training-on-a-llama-style-model) |
+| One model, every way | the same LLaMA-style model on one V100, one MI50, a V100 + MI50 pipeline and V100 + MI50 data parallelism, twice each; the same-vendor pairs | ran, but the pairs wait on Research Computing: [What mixing vendors costs](#what-mixing-vendors-costs-and-whether-it-helps) |
+
+## What mixing vendors costs, and whether it helps
+
+One model, data and seed for every run: `llama.py`'s `llama-125m` (134 M
+parameters), 8 sequences x 512 tokens a step, AdamW 3e-4, seed 0, 500 steps.
+Each setting ran twice, in separate Explorer jobs, at commit 1f372b1 (clean on
+every rank):
+
+- **GPUs and software.** The V100 (Tesla V100-SXM2-32GB) ran torch
+  2.9.1+cu126 with NCCL 2.27.5, driver 545.23.08. The MI50 ran torch
+  2.9.1+rocm6.3 with RCCL 2.21.5, under the amdgpu driver in the node's kernel
+  (5.14.0-611, RHEL 9.7); for fp8 it had Triton 3.8.0 in front
+  (`venv-rocm63-triton38`), so the compression kernels ran as Triton on both
+  GPUs.
+- **Network.** The bridge ran over TCP on `internal.2137`; the preflights
+  measured 1151 to 1174 MB/s each way, 0.05 ms round trip.
+- **Runs.** The pipeline is 1F1B with 4 microbatches ([PIPELINE.md](PIPELINE.md#automatic-stage-balancing)),
+  both with the automatic split and with the best hand-tuned one.
+  Data parallelism is DDP through `gpubridge.ddp_comm_hook`, 4 + 4 sequences,
+  25 MB buckets ([below](#data-parallel-training-on-a-llama-style-model)).
+- **Jobs:**
+
+  | Setting | Run 1 | Run 2 |
+  | --- | --- | --- |
+  | V100 alone | 11115074 | 11116181 |
+  | MI50 alone | 11115230 | 11116401 |
+  | Pipeline | 11115487 | 11116512 |
+  | Data parallel | 11115759 | 11116801 |
+
+| Setting | Tokens/s, run 1 | Tokens/s, run 2 | Mean | Spread | Against the V100 alone | Step (ms, mean) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| (a) one V100 alone | 14,197 | 14,331 | 14,264 | 0.9% | 1.00x | 287.2 |
+| (b) one MI50 alone | 9,613 | 9,615 | 9,614 | <0.1% | 0.67x | 426.0 |
+| (c) V100 + MI50, pipeline, automatic split (8 + 4) | 15,497 | 15,135 | 15,316 | 2.4% | 1.07x | 267.5 |
+| (c) V100 + MI50, pipeline, best hand-tuned split (9 + 3) | 15,882 | 15,490 | 15,686 | 2.5% | 1.10x | 261.2 |
+| (d) V100 + MI50, data parallel, uncompressed | 4,666 | 4,419 | 4,543 | 5.4% | 0.32x | 902.4 |
+| (d) V100 + MI50, data parallel, fp8 on the bridge | 9,663 | 9,714 | 9,689 | 0.5% | 0.68x | 422.8 |
+| (e) V100 + V100, pipeline and data parallel, native NCCL | - | - | - | - | - | waiting on Research Computing |
+| (f) MI50 + MI50, the same with RCCL | - | - | - | - | - | waiting on Research Computing |
+
+Where each step goes (means of the two runs, ms; "est." marks estimates from
+each GPU's compute timed alone):
+
+| Setting | Compute | Waiting on the slower GPU (est.) | Exposed communication (est.) |
+| --- | --- | --- | --- |
+| (a), (b) | the whole step | - | - |
+| (c) automatic, 8 + 4 | 43.7 a microbatch on the V100, 46.6 on the MI50 | the V100 idles 92.8 of each step, the MI50 81.1 | one microbatch's activations arrive in 7.1 |
+| (c) hand-tuned, 9 + 3 | 53.3 on the V100, 38.8 on the MI50 | the V100 idles 47.9, the MI50 105.9 | 8.1 a hop |
+| (d) uncompressed | 231.2 on the MI50, the slower | the V100 waits 76.8 | 671.2 of the bridge's 835.6 alone; 20% hidden behind backward |
+| (d) fp8 | 234.0 on the MI50 | the V100 waits 80.9 | 188.8 of the bridge's 370.1 alone; 48% hidden |
+
+**Answers:**
+
+- **Does adding the MI50 to the V100 beat the V100 alone?** Through the
+  pipeline, yes: 1.10x with the best hand-tuned split and 1.07x with the
+  automatic one, each run within 2.5% of the other. Through data parallelism,
+  no: 0.32x uncompressed and 0.68x with fp8. Every step all_reduces 536 MB of
+  gradients over a link of about 1.17 GB/s, against 3 MB of activations a
+  microbatch for the pipeline.
+- **How close to the two GPUs' sum?** The MI50 alone does 0.67x the V100's
+  work, so the two alone add up to 23,878 tokens/s. The best pipeline reaches
+  66% of that; data parallelism with fp8 reaches 41%.
+- **What share of a same-vendor pair's throughput does the mixed pair
+  reach?** Not measured yet. Explorer's same-partition GPU pairs wait on
+  Research Computing ([below](#waiting-on-research-computing)). The jobs are
+  ready, refused until `SAME_PARTITION_PAIRS_OK=1`:
+  `STEPS_07=dp DP_RUNS=ddp` and `STEPS_07=pipeline PP_RUNS=1f1b` with
+  `submit.sh 07-nvidia-pair` (two V100s) or `07-amd-pair` (two MI50s). Each
+  runs one island of two GPUs, so DDP's all_reduce and the pipeline's hops are
+  native NCCL or RCCL, from the same model, data and seed.
+
+**Reading guide.** Tokens/s is the whole step's tokens (8 x 512) over the
+median step after the first 5. "Against the V100 alone" divides means. The
+pipeline's idle times and data parallelism's waiting and exposed times are
+estimates from each GPU's compute timed alone, as their records say.
+Everything else is measured. The unflattering results (data parallelism
+below the V100 alone; the automatic split below the best hand-tuned one) are
+reported the same way as the others.
 
 ## Setup
 

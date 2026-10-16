@@ -27,6 +27,8 @@
 #   07-multi   step 07 with GPUS_MIXED_NVIDIA_MULTI NVIDIA GPUs (multigpu) + the AMD side
 #   dp-baseline, dp-baseline-amd   step 07's data-parallel runs (STEPS_07=dp) on one GPU
 #          alone: the loss curve and tokens/s to set them against
+#   07-nvidia-pair, 07-amd-pair   step 07's dp or pipeline runs on two V100s or two MI50s,
+#          one island (native NCCL/RCCL)  refused until SAME_PARTITION_PAIRS_OK=1
 #
 # See docs/GPU_VALIDATION_RUNBOOK.md for what each step proves.
 set -euo pipefail
@@ -342,6 +344,27 @@ net-amd)
     matrix_job amd-amd "$TIME_08" "$PARTITION_PAIR_AMD" "$AMD_TYPE" "$PARTITION_PAIR_AMD" \
         "$AMD_TYPE"
     ;;
+07-nvidia-pair | 07-amd-pair)
+    # Step 07's training on two GPUs of one type: one island, so DDP's all_reduce and the
+    # pipeline's hops are native NCCL or RCCL, the homogeneous pair to set the mixed one
+    # against. Both components get the same venv.
+    pair=${ARGS[0]#07-}
+    pair=${pair%-pair}
+    [ "$pair" = nvidia ] || amd_gate
+    pair_gate "${ARGS[0]}"
+    if [ "$pair" = nvidia ]; then
+        partition=$PARTITION_PAIR_NVIDIA type=$GPU_TYPE_1GPU
+        export VENV_ROCM=$VENV
+    else
+        partition=$PARTITION_PAIR_AMD type=$AMD_TYPE
+        export VENV=$VENV_ROCM
+    fi
+    export PAIR_07=$pair
+    gpu_request "$partition" "$type" 1 1 "$TIME_07"
+    first=("${REQUEST[@]}")
+    gpu_request "$partition" "$type" 1 1 "$TIME_07"
+    sbatch_job "07_pair_$pair" 07_mixed_hetjob.sbatch "${first[@]}" : "${REQUEST[@]}"
+    ;;
 train-nvidia)
     export TRAIN_SIDE=nvidia
     submit train_bench.sbatch "$TIME_TRAIN" 1 1 "$PARTITION_1GPU" "$GPU_TYPE_1GPU"
@@ -382,5 +405,5 @@ free | multi)
     [ "${ARGS[0]}" = multi ] && steps=(03 04 05 06)
     for s in "${steps[@]}"; do "$0" "$s"; done
     ;;
-*) sed -n '2,31p' "$0" >&2; exit 2 ;;
+*) sed -n '2,33p' "$0" >&2; exit 2 ;;
 esac

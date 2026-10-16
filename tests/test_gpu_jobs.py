@@ -78,6 +78,7 @@ END_TO_END = {
                                        "test_step_07_pipeline, "
                                        "test_step_07_pipeline_compares_splits, "
                                        "test_step_07_refuses_bad_pipeline_splits, "
+                                       "test_step_07_trains_on_a_same_vendor_pair, "
                                        "test_step_07_multi_trains_data_parallel_and_pipelined",
     "explorer/08_bench_matrix.sbatch": "test_step_08_*",
     "explorer/net_check.sbatch": "test_net_check_job",
@@ -693,8 +694,31 @@ def test_step_08_refuses_two_components_on_one_node(tmp_path):
     assert not (out / "matrix").exists()
 
 
+@pytest.mark.parametrize("vendor", ["nvidia", "amd"])
+@pytest.mark.parametrize("mode, out_dir, record", [("dp", "dp", "dp_ddp.json"),
+                                                   ("pipeline", "pp", "pp_1f1b.json")])
+def test_step_07_trains_on_a_same_vendor_pair(vendor, mode, out_dir, record, tmp_path):
+    # Two GPUs of one type: one island, so the runs never touch the bridge.
+    code = submit(tmp_path, f"07-{vendor}-pair", AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
+                  SAME_PARTITION_PAIRS_OK="1", GPUBRIDGE_VENDOR=vendor, STEPS_07=mode,
+                  DP_RUNS="ddp", PP_RUNS="1f1b", PP_MICROBATCHES="2",
+                  PP_ARGS="--probe-trials 1", **SMALL_DP)
+    out = tmp_path / "results" / f"07_pair_{vendor}_{out_dir}"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    run = json.loads((out / record).read_text())
+    assert run["world_size"] == 2 and len(run["run"]["islands"]) == 1
+    gres = "gpu:mi50:1" if vendor == "amd" else "gpu:1"
+    assert (tmp_path / "slurm.log").read_text().count(f"--gres={gres}") == 2
+
+
+def test_step_07_pairs_only_train(tmp_path):
+    code = submit(tmp_path, "07-nvidia-pair", SAME_PARTITION_PAIRS_OK="1",
+                  GPUBRIDGE_VENDOR="nvidia", STEPS_07="all")
+    assert code != 0 and "a same-vendor pair runs STEPS_07=dp or pipeline" in job_output(tmp_path)
+
+
 def test_same_partition_pairs_wait_for_research_computing(tmp_path):
-    for target in ("08-nvidia-pair", "08-amd-pair"):
+    for target in ("08-nvidia-pair", "08-amd-pair", "07-nvidia-pair", "07-amd-pair"):
         result = subprocess.run(["bash", str(EXPLORER / "submit.sh"), target],
                                 env=cluster_env(tmp_path, AMD_NODES_CONFIRMED="1",
                                                 GPU_TYPE_AMD="mi50"),
