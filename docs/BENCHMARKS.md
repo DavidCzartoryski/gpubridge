@@ -786,8 +786,9 @@ side in one job (11111037), 100 steps each:
   each other over the last 100 of 1,000 steps, and so does FSDP2 over steps 401
   to 500, the last it ran (0.007 to 0.069 from the four V100 runs, which are
   0.024 to 0.093 apart there, still falling). Compressed DDP ended 0.02 to 0.03
-  above after 1,000 steps in that job; four later runs ended 0.033 to 6.92
-  above, each after a late drop (HARDWARE_VALIDATION.md item 33). The
+  above after 1,000 steps in job 11111481; four later runs ended 0.033 to 6.92
+  above, each after a late drop (one `fp8` run still falling at step 1,000,
+  8.73 over its last 100 steps; HARDWARE_VALIDATION.md item 33). The
   comparison, and why it needs 1,000 steps rather than 500, is in
   [COMPRESSION.md](COMPRESSION.md#training-with-compression).
 

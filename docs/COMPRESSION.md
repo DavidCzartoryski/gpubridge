@@ -442,8 +442,9 @@ error from the timing of the drop. The ranks' parameters were bit-identical at e
 check, every 50 steps, compressed or not. Four later 1,000-step compressed runs
 (two `bf16`, two `fp8`, Triton kernels on both GPUs; HARDWARE_VALIDATION.md,
 item 33) landed 0.033 to 6.92 from eight one-V100 runs (median gap), each after
-a late drop: one `bf16` run about as close as the two above, the other three
-0.041 to 6.92. So "within about 0.03" doesn't hold for compressed DDP in
+a late drop (one `fp8` run still falling at step 1,000, 8.73 over its last 100
+steps): one `bf16` run about as close as the two above, the other three 0.041
+to 6.92. So "within about 0.03" doesn't hold for compressed DDP in
 general.
 
 **Open: does compression delay the drop?** In the first four compressed runs

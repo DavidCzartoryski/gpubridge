@@ -468,9 +468,9 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     timing (inferred; untested at 2,000 steps). bf16 and fp8 fail by the rule,
     all four runs outside S (2.51 S to 528 S): a lossy mode is expected to
     land outside a measure of uncompressed noise, and whether these gaps are
-    acceptable is open. The
-    ranks' parameters were bit-identical at every check in every DDP run,
-    compressed or not; FSDP2's sharded parameters aren't compared. At 2,000
+    acceptable is open. The ranks' parameters were bit-identical at every
+    check in every DDP run, compressed or not; FSDP2's sharded parameters
+    aren't compared. At 2,000
     steps one V100 alone also falls outside S against its own runs (one run
     of three, at 25 S), so the planned next step is a redesigned test:
     several seeds per mode, the end loss once every run has reached the
@@ -748,14 +748,15 @@ Every run: `train_dp.py`, `llama-125m`, global batch 8 x 512 tokens, AdamW
 3e-4, seed 0.
 
 Eight one-V100 runs (11109239, 11109665, 11109872 and 11110316 with 1, 2, 4 and
-8 micro-batches, at dc47b6a, though 11109239's probe recorded abd9d74, its
-parent; 11122896 to 11122899 with 1, at fe84663; the training scripts are the
-same at all three) are 0.0033 to 0.0131 apart, so by the rule **S = 0.0131**. S
-measures how far uncompressed runs land from each other: the same mean gradient
-summed in another order, and run-to-run nondeterminism. A lossy mode adds its
-own error on top of that, so `bf16` and `fp8` are expected to land outside S;
-the rule is applied to them as written, and their gaps are given as multiples of
-S.
+8 micro-batches, the first at abd9d74 and the rest at dc47b6a: 11109239's
+checkout moved to dc47b6a, its child, which changes only `train_pipeline.py`,
+during the run, so its training record names dc47b6a; 11122896 to 11122899
+with 1, at fe84663; the training scripts are the same at all three) are 0.0033
+to 0.0131 apart, so by the rule **S = 0.0131**. S measures how far uncompressed
+runs land from each other: the same mean gradient summed in another order, and
+run-to-run nondeterminism. A lossy mode adds its own error on top of that, so
+`bf16` and `fp8` are expected to land outside S; the rule is applied to them as
+written, and their gaps are given as multiples of S.
 
 At 1,000 steps (the plateau exit is the first step, counted from 1, at which
 the mean loss of the last 10 steps is below 2.0):
