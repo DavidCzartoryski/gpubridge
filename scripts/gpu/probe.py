@@ -1,9 +1,12 @@
 """Single-process environment probe for the GPU validation kit.
 
 Records gpubridge.probe(), every visible GPU and the PyTorch build, and checks
-that this build can run on these GPUs. Writes OUT/probe.json. If a check
+that this build can run on these GPUs, that ``import gpubridge`` found
+this checkout's src (import_check.py). It also records whether an installed
+Triton compiles gpubridge's compression kernels for the GPU, without failing on it:
+only steps that use them check (triton_check.py). Writes OUT/probe.json. If a check
 fails, it prints one line per failure on stderr, naming the check and its
-values, and exits 1.
+values, and exits 1. A failed import check also stops the job (common.sh).
 
     python scripts/gpu/probe.py --out results/explorer/01_probe
 """
@@ -11,10 +14,12 @@ values, and exits 1.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
-from gpukit import Record, blas_check
+from gpukit import Record, blas_check, triton_check
+from import_check import message as import_problem
 
 
 def main() -> int:
@@ -52,6 +57,22 @@ def main() -> int:
         entry["nccl_available"] = probe["nccl_available"]
         entry["gloo_available"] = probe["gloo_available"]
         entry["ok"] = probe["gloo_available"] and (probe["nccl_available"] or args.allow_no_gpu)
+    with rec.stage("kit_import") as entry:
+        entry.update(env["import"] if isinstance(env["import"], dict) else {})
+        problem = (import_problem(env["import"]) if isinstance(env["import"], dict)
+                   else f"could not tell where gpubridge came from: {env['import']}")
+        entry["ok"] = problem is None
+        if problem:
+            entry["error"] = problem
+    with rec.stage("triton_kernels") as entry:
+        # Informational: only steps that use the kernels check them (triton_check.py).
+        entry["kernels_setting"] = os.environ.get("GPUBRIDGE_COMPRESSION_KERNELS", "auto")
+        entry.update(triton_check(0) if env["device_count"] else {"compiles": None})
+        if entry["compiles"] is False:
+            print(f"note: Triton {entry['triton']} can't compile gpubridge's compression "
+                  f"kernels here ({entry['error']}); steps that use them won't run",
+                  file=sys.stderr)
+        entry["ok"] = True
     with rec.stage("blas") as entry:
         # Informational: gpubridge never needs BLAS, so this never fails the probe.
         if env["device_count"]:

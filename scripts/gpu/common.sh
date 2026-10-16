@@ -50,6 +50,7 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-3}"
 # (coreutils timeout, where installed; 0 = none). It is above KIT_TIMEOUT, so a
 # stuck collective fails with its own error first. Slurm's --time caps each job.
 export STEP_TIMEOUT="${STEP_TIMEOUT:-1200}"
+JOB_STEP_TIMEOUT=$STEP_TIMEOUT  # the job's, for checks nested in a step with its own
 # NCCL/RCCL say which version, transport and interfaces they picked at INFO;
 # step sends it to files, so it costs nothing until a step fails.
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
@@ -262,6 +263,12 @@ step() {
     local name=$1
     shift
     : "${RESULTS:?set RESULTS before calling step}"
+    if [ "$name" != triton_check ] && needs_triton "$name" "$@" &&
+        { [ "$TRITON_GATE_MIXED" != 0 ] || [ "${1:-}" != mixed_torchrun ]; } && ! triton_ready; then
+        not_run "$name" "triton_check failed: Triton can't run gpubridge's compression" \
+            "kernels on some side of this job (triton_check.log)"
+        return 0
+    fi
     log "step $name: $(quote "$@")"
     if [ "$DRY_RUN" = 1 ]; then
         if declare -F "$1" >/dev/null; then
@@ -308,6 +315,13 @@ step() {
     printf '{"step": "%s", "exit_code": %d, "seconds": %d, "log": "%s.log", "timed_out": %s%s}\n' \
         "$name" "$code" "$(($(date +%s) - start))" "$name" "$timed_out" \
         "${result:+, \"result\": \"$result\"}" >>"$RESULTS/steps.jsonl"
+    if grep -q -F "gpubridge-kit: import check failed" "$RESULTS/$name.log"; then
+        # probe.py on some side of the job found that side's gpubridge isn't this
+        # checkout's: every later step would measure other code.
+        FAILED_STEPS+=("$name")
+        die "step $name: a rank imported gpubridge from outside this checkout; stopping" \
+            "before any other step. See $RESULTS/$name.log."
+    fi
     if [ "$code" = 0 ]; then
         PASSED_STEPS+=("$name")
     else
@@ -318,6 +332,65 @@ step() {
         printf '%s\n' "${own_tail:-(empty)}" | sed 's/^/    | /' >&2
     fi
     return 0
+}
+
+# ---- Triton kernels --------------------------------------------------------------
+# gpubridge compresses GPU tensors with Triton kernels when Triton is installed
+# (GPUBRIDGE_COMPRESSION_KERNELS=auto, the default) or forced (=triton). Where Triton
+# can't compile them (venv-rocm63's 3.5.1 on an MI50's gfx906), only the steps that use
+# them would fail. So before the first such step, step triton_check runs
+# triton_check.py once through TRITON_CHECK_LAUNCH (each side of a mixed job; the jobs
+# set it); if it fails, each such step is recorded as failed without running, and the
+# rest of the job goes on. Uncompressed steps never check.
+
+#: Steps that use the kernels whatever the compression setting.
+TRITON_STEPS="${TRITON_STEPS:-gpu_tests bench_compression_kernels bench_compressed}"
+#: How to run triton_check.py: a command prefix (words), default this node's python.
+TRITON_CHECK_LAUNCH="${TRITON_CHECK_LAUNCH:-limited python}"
+#: 0: never skip a mixed_torchrun step. For runners whose machines each decide alone
+#: (mixed/node.sh): a step skipped on one machine and started on the other would leave
+#: the two a step apart for the rest of the run. Ungated, it fails on both together.
+TRITON_GATE_MIXED="${TRITON_GATE_MIXED:-1}"
+TRITON_CHECKED_WITH="" TRITON_CHECK_RESULT=""
+
+# needs_triton NAME CMD...: whether step NAME uses the kernels: one of TRITON_STEPS, or
+# a torchrun launch (collectives) with GPUBRIDGE_BRIDGE_COMPRESSION set and the PyTorch
+# kernels not forced. Probes, preflights and one-process runs never use them, even with
+# compression exported for the whole job.
+needs_triton() {
+    local name=$1 arg compression=${GPUBRIDGE_BRIDGE_COMPRESSION:-} kernels
+    shift
+    case " $TRITON_STEPS " in *" $name "*) return 0 ;; esac
+    kernels=$(printf '%s' "${GPUBRIDGE_COMPRESSION_KERNELS:-auto}" | tr '[:upper:]' '[:lower:]')
+    [ -n "$compression" ] && [ "$compression" != none ] && [ "$kernels" != torch ] || return 1
+    for arg in "$@"; do
+        case $arg in *torchrun*) return 0 ;; esac
+    done
+    return 1
+}
+
+# triton_ready: step triton_check, once per TRITON_CHECK_LAUNCH; whether it passed.
+triton_ready() {
+    if [ "$TRITON_CHECKED_WITH" != "$TRITON_CHECK_LAUNCH" ]; then
+        # Not a negative step's expectation or time limit: the check may run inside one.
+        local failed_before=${#FAILED_STEPS[@]} STEP_EXPECT=""
+        local -x STEP_TIMEOUT=$JOB_STEP_TIMEOUT
+        # shellcheck disable=SC2086 # TRITON_CHECK_LAUNCH is a command prefix: split it
+        step triton_check $TRITON_CHECK_LAUNCH "$KIT_DIR/triton_check.py"
+        TRITON_CHECKED_WITH=$TRITON_CHECK_LAUNCH TRITON_CHECK_RESULT=ok
+        [ "${#FAILED_STEPS[@]}" = "$failed_before" ] || TRITON_CHECK_RESULT=failed
+    fi
+    [ "$TRITON_CHECK_RESULT" = ok ]
+}
+
+# not_run NAME REASON...: record step NAME as failed without running it.
+not_run() {
+    local name=$1
+    shift
+    log "step $name not run: $*" 2>&1 | tee "$RESULTS/$name.log"
+    printf '{"step": "%s", "exit_code": 1, "seconds": 0, "log": "%s.log", "timed_out": false, "not_run": "%s"}\n' \
+        "$name" "$name" "$(json_string "$*")" >>"$RESULTS/steps.jsonl"
+    FAILED_STEPS+=("$name")
 }
 
 # negative_step NAME SECONDS REGEX CMD...: a step whose CMD checks that something
@@ -351,9 +424,44 @@ activate_venv() {
         printf '+ source %s/bin/activate\n' "$venv"
         return 0
     fi
+    if [ ! -f "$venv/bin/activate" ] && [ -x "$venv/bin/python" ]; then
+        # A directory of wrappers around another venv's python and torchrun (e.g.
+        # rocm_triton_overlay.sh's): put them first on PATH.
+        log "$venv has no bin/activate; using its bin/ wrappers"
+        export PATH="$venv/bin:$PATH"
+        return 0
+    fi
     [ -f "$venv/bin/activate" ] || die "no venv at $venv; run setup first"
     # shellcheck disable=SC1091
     source "$venv/bin/activate"
+}
+
+# fresh_results DIR: DIR, or DIR_job<id> when DIR already holds another run's
+# records (job.jsonl or steps.jsonl), so a run never writes into, or over,
+# another's folder. The id is SLURM_JOB_ID, else RUN_ID, else this shell's pid.
+fresh_results() {
+    local dir=$1 base n=1
+    if [ -e "$dir/job.jsonl" ] || [ -e "$dir/steps.jsonl" ]; then
+        base="${dir}_job${SLURM_JOB_ID:-${RUN_ID:-$$}}"
+        dir=$base
+        while [ -e "$dir/job.jsonl" ] || [ -e "$dir/steps.jsonl" ]; do
+            n=$((n + 1))
+            dir="${base}_$n"
+        done
+        log "$1 already holds another run's records; this run's go to $dir"
+    fi
+    printf '%s\n' "$dir"
+}
+
+# require_kit_import: stop unless the active python imports this checkout's
+# gpubridge (import_check.py). Run after activate_venv.
+require_kit_import() {
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '+ python %s/import_check.py\n' "$KIT_DIR"
+        return 0
+    fi
+    python "$KIT_DIR/import_check.py" >&2 ||
+        die "the venv's gpubridge isn't this checkout's (above); stopping before any step"
 }
 
 # Number of GPUs PyTorch sees. GPU_COUNT overrides (and is required in dry-run mode).

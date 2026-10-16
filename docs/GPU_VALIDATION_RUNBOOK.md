@@ -103,7 +103,7 @@ would fail everything above it, for the same reason.
 | --- | --- | --- | --- | --- |
 | 1. Single NVIDIA | the CUDA build runs; NCCL in one native island; the records | `submit.sh 01` (1 GPU, free); with `multigpu`, `submit.sh 03` (2+ GPUs, one NCCL island, native benchmark) | any NVIDIA machine: `torchrun --nnodes=1 --master-addr=127.0.0.1 --nproc-per-node=<GPUs> scripts/gpu/check.py --out results/nvidia` | `01_probe/probe.json` names the GPU and `build_supports_gpus` passes; `03_single_island/check/summary.md` passes with `run.kind` `gpu-single-vendor` |
 | 2. NVIDIA split test | two NCCL islands and the Gloo bridge on device tensors, every policy, the GPU-only tests | `submit.sh 02` (2 ranks share 1 GPU, free); with `multigpu`, `submit.sh 04` (2 + 2 on one 4-GPU node, both layouts), then `05` (split by node, so the bridge crosses the network) | one multi-GPU NVIDIA machine: the same command with `GPUBRIDGE_SPLIT_TEST=half` | every summary passes with `run.kind` `split-test`, including `busy_gpu` and `async`; `gpu_tests.xml` has no failures |
-| 3. Single AMD | the ROCm build runs; RCCL in one native island; an AMD split test | `submit.sh setup-rocm`, then `submit.sh amd` (one node in `sharing`), if step 00 finds AMD GPUs there | `amd/run_all.sh` on an AMD cloud machine | `check_1gpu`, `rccl_version` and `gpu_tests` pass; with 2+ GPUs, `check_island` and `check_split` too |
+| 3. Single AMD | the ROCm build runs; RCCL in one native island; an AMD split test | the ROCm venvs and the MI50 overlay ([Choosing the ROCm build](#choosing-the-rocm-build)), then `submit.sh amd` (one node in `sharing`), if step 00 finds AMD GPUs there | `amd/run_all.sh` on an AMD cloud machine | `check_1gpu`, `rccl_version` and `gpu_tests` pass; with 2+ GPUs, `check_island` and `check_split` too |
 | 4. Mixed | NCCL and RCCL islands joined by the bridge: the result items 1 and 2 ask for | `submit.sh 07` (one heterogeneous job on `gpu` + `sharing`), if AMD GPUs are there | `mixed/node.sh` on an NVIDIA and an AMD machine | `check/summary.md` passes with `run.kind` `gpu-mixed` |
 
 - **Split-test mode on one NVIDIA node.** Leave `GPUBRIDGE_VENDOR` unset:
@@ -142,9 +142,9 @@ would fail everything above it, for the same reason.
 | 5 | 2 | Explorer, 2 nodes | `submit.sh 05` | the network preflight between the nodes (interfaces, raw bandwidth); NCCL across nodes; the bridge crossing the network between nodes | **8**, 11 and 13 across nodes | ~10 min | free* |
 | 6 | 2 | Explorer, 4 GPUs | `submit.sh 06` | training throughput and scaling 1 to 4 GPUs (table for the multigpu request) | - | ~10 min | free* |
 | 7 | 3 | AMD cloud machine | `amd/run_all.sh` | RCCL islands, split test on AMD, benchmark, scaling | **4, 5** on AMD, 6, 7, 10 on ROCm, 11, 12, 13 | 20-30 min plus training | ~0.5 h plus training at the hourly rate |
-| 7 alt | 3 | Explorer `sharing`, 1 AMD GPU | `submit.sh setup-rocm`, then `submit.sh amd` | rung 3 inside Explorer, **if** step 0a finds AMD GPUs in `sharing`: `amd/run_all.sh` on the node, without setup or tarball. Dry-run only until then | **4, 5** on AMD, 6, 7, 10 on ROCm, 12 | ~15 min + ~15 min ROCm setup | free |
+| 7 alt | 3 | Explorer `sharing`, 1 AMD GPU | the ROCm venvs and the MI50 overlay ([Choosing the ROCm build](#choosing-the-rocm-build)), then `submit.sh amd` | rung 3 inside Explorer, **if** step 0a finds AMD GPUs in `sharing`: `amd/run_all.sh` on the node, without setup or tarball. Dry-run only until then | **4, 5** on AMD, 6, 7, 10 on ROCm, 12 | ~15 min + ~15 min ROCm setup | free |
 | 8 | 4 | NVIDIA + AMD cloud | `mixed/node.sh` on both | the real mixed-vendor job | **1, 2** on GPUs, **8** across networks | 30-45 min | ~0.75 h of each machine's rate |
-| 8 alt | 4 | Explorer `gpu` + `sharing`, one heterogeneous job | `submit.sh setup-rocm`, then `submit.sh 07` | the real mixed-vendor job inside Explorer, **if** step 0a finds AMD GPUs in `sharing`. Dry-run only until then | **1, 2** on GPUs, 3 with real RCCL ranks, 8 between nodes, 11 against per-island baselines, 13 | ~15 min + ~15 min ROCm setup | free |
+| 8 alt | 4 | Explorer `gpu` + `sharing`, one heterogeneous job | the ROCm venvs and the MI50 overlay ([Choosing the ROCm build](#choosing-the-rocm-build)), then `submit.sh 07` | the real mixed-vendor job inside Explorer, **if** step 0a finds AMD GPUs in `sharing`. Dry-run only until then | **1, 2** on GPUs, 3 with real RCCL ranks, 8 between nodes, 11 against per-island baselines, 13 | ~15 min + ~15 min ROCm setup | free |
 
 \* Steps 3 to 6 need the `multigpu` partition, which needs an access request
 (see [Explorer](#explorer)). Steps 1 and 2 run on the open `gpu` partition.
@@ -233,7 +233,8 @@ as of 2026-10-06; **verify each one**:
 | `TIME_01` ... `TIME_07` | 10-40 min (`TIME_04` is 40) | maximum walltime per step's job |
 | `PROJECT_DIR` | none: **required** | your group's project space, e.g. `/projects/<your-project>`; set it in the environment or in `scripts/gpu/explorer/local.env` (see [Steps](#steps)) |
 | `WORK_DIR` | `$PROJECT_DIR/$USER/gpubridge-gpu` | venvs, caches and job logs: ~7 GB, ~25 GB with the ROCm venv. Not home, which is capped at 75 GB |
-| `VENV`, `VENV_ROCM` | `$WORK_DIR/venv`, `$WORK_DIR/venv-rocm` | - |
+| `VENV`, `VENV_ROCM` | `$WORK_DIR/venv`, `$WORK_DIR/venv-rocm63-triton38` | the CUDA venv, and the AMD side's: the MI50's Triton overlay (see [Choosing the ROCm build](#choosing-the-rocm-build)) |
+| `ROCM_SETUP_VENV` | `VENV_ROCM` if you set it, else `$WORK_DIR/venv-rocm` | the venv `setup-rocm` builds |
 | `ROCM_TORCH_VERSION`, `ROCM_INDEX`, `ROCM_INDEX_URL` | `2.14.1`, `rocm7.2`, the PyTorch index for `ROCM_INDEX` | the ROCm build for `setup-rocm`; see [Choosing the ROCm build](#choosing-the-rocm-build) |
 | `PARTITION_MIXED_NVIDIA`, `GPUS_MIXED_NVIDIA`, `GPUS_MIXED_AMD` | `gpu`, `1`, `1` | step 07's GPUs per side |
 | `SETUP_MODULES` | `explorer` | loaded before installing: it routes compute nodes through the proxy. Set it to `""` to load nothing |
@@ -319,6 +320,34 @@ nothing. It writes to `results/explorer/00_partitions/`:
 - `gpu-types.txt`: every GPU type per partition, labelled `amd`, `nvidia` or `unknown` from its name, and a closing line that says whether `sharing` has AMD GPUs.
 
 Job logs go to `$WORK_DIR/logs/`, and results to `results/explorer/<step>/`.
+A job never writes into another run's folder: if `results/explorer/<step>/`
+already holds a `job.jsonl` or `steps.jsonl`, its results go to
+`results/explorer/<step>_job<id>/` instead (`_2`, `_3` ... if that is taken too), and
+the log says so.
+
+A job stops before its first step if **`import gpubridge` isn't this checkout's
+`src/`** (`import_check.py`, and the probe on each side of a mixed job). The venvs
+install gpubridge editable from one checkout, so a job run from another checkout, or
+with `PYTHONPATH` set, would otherwise run that checkout's scripts on other code. Run from the checkout the venv
+installs, or put this checkout's `src` first on `PYTHONPATH`. The probe records where
+gpubridge came from, its commit and `PYTHONPATH`.
+
+Steps that use gpubridge's Triton compression kernels check first that Triton can
+compile and run them (all four: quantize and dequantize, bf16 and fp8), once per job
+before the first such step (step `triton_check`, `triton_check.py`): on both sides of
+07 and 08, on the NVIDIA side only for 07's dp runs with `DP_KERNELS_ON_AMD=torch`, and
+on the machine itself elsewhere. The steps: `gpu_tests`,
+`bench_compression_kernels`, `bench_compressed`, and any torchrun launch with
+`GPUBRIDGE_BRIDGE_COMPRESSION` set unless `GPUBRIDGE_COMPRESSION_KERNELS=torch`. The
+probe, the preflight and one-process runs never check, even with compression
+exported for the whole job. If the check fails, as `venv-rocm63`'s own Triton does on
+the MI50's gfx906, those steps are recorded as failed without running (`"not_run"` in
+`steps.jsonl`) and the rest of the job goes on; `gpu_tests` is skipped as a whole,
+its Triton-free tests included, so use the overlay venv for it. The probe records
+whether Triton compiles the kernels, without failing on it. `mixed/node.sh` checks
+the import too, but never skips a mixed step: its two machines decide alone, so a
+compressed step runs on both and fails on both if either's Triton can't compile.
+
 Keep the raw results on the cluster: the step logs, stack dumps and NCCL logs
 aren't redacted (see [Reading results](#reading-results)). For review, paste
 the output of `"$PROJECT_DIR/$USER/gpubridge-gpu/venv/bin/python" scripts/gpu/triage.py results/explorer`
@@ -344,7 +373,11 @@ GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh --dry-run setup-rocm
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh --dry-run amd
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh --dry-run 07
 # once the hardware is confirmed and AMD_NODES_CONFIRMED=1 is in explorer/local.env:
-GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh setup-rocm   # ROCm venv (~16 GB), on an AMD node
+GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh setup-rocm   # venv-rocm (~16 GB), on an AMD node
+VENV_ROCM=$WORK_DIR/venv-rocm63 ROCM_TORCH_VERSION=2.9.1 ROCM_INDEX=rocm6.3 \
+    GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh setup-rocm   # venv-rocm63, for training
+scripts/gpu/rocm_triton_overlay.sh $WORK_DIR/venv-rocm63 $WORK_DIR/venv-rocm \
+    $WORK_DIR/venv-rocm63-triton38                                # the jobs' default VENV_ROCM
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh amd          # rung 3: one AMD node on its own
 GPU_TYPE_AMD=<type> scripts/gpu/explorer/submit.sh 07           # rung 4, once amd passes
 ```
@@ -456,8 +489,9 @@ kernels for it ([BENCHMARKS.md](BENCHMARKS.md#which-rocm-wheels-can-train-on-an-
 has the scan). With the default wheel the kit's checks pass, but the first
 matmul aborts, so the training steps fail. With 2.9.1+rocm6.3, matmuls run, but
 its Triton (pytorch-triton-rocm 3.5.1) can't compile gpubridge's compression
-kernels for gfx906. So on an MI50, keep the default venv and add a second one
-for training, then point `VENV_ROCM` at it for the steps that train:
+kernels for gfx906. So on an MI50, keep `venv-rocm` and add `venv-rocm63` for
+training; the jobs' default, the overlay below, joins the two. To use `venv-rocm63`
+alone, for steps that train without the compression kernels:
 
 ```bash
 VENV_ROCM=$WORK_DIR/venv-rocm63 ROCM_TORCH_VERSION=2.9.1 ROCM_INDEX=rocm6.3 \
@@ -473,7 +507,11 @@ matmuls run on the GPU.
 makes a third, env-only venv: `bin/python`, `python3` and `torchrun` that run
 `venv-rocm63`'s, with the default venv's Triton linked in front on the path.
 Nothing in either venv changes, nothing is copied, and no Python runs, so it is
-fine on a login node:
+fine on a login node. On Explorer it is the default `VENV_ROCM`
+(`$WORK_DIR/venv-rocm63-triton38`) for every job with an AMD side; submit.sh stops
+with these commands if it is missing, and setup-rocm still builds `venv-rocm` unless
+`VENV_ROCM` (or `ROCM_SETUP_VENV`) names another venv; it refuses to build into a
+directory of wrapper scripts such as the overlay:
 
 ```bash
 scripts/gpu/rocm_triton_overlay.sh $WORK_DIR/venv-rocm63 $WORK_DIR/venv-rocm \

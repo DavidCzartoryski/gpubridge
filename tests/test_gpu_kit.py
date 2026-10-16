@@ -388,6 +388,10 @@ def test_amd_nodes_confirmed_comes_from_local_env(tmp_path):
     local_env = tmp_path / "local.env"
     local_env.write_text("AMD_NODES_CONFIRMED=1\nGPU_TYPE_AMD=mi50\n")
     path = fake_command(tmp_path / "bin", "sbatch", "echo 4242\n")
+    overlay = tmp_path / "venv-rocm63-triton38" / "bin"  # the default ROCm venv
+    overlay.mkdir(parents=True)
+    (overlay / "python").write_text("#!/bin/sh\n")
+    (overlay / "python").chmod(0o755)
     result = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), "amd"],
                             env=clean_env(GPUBRIDGE_REPO=str(REPO), PATH=path,
                                           WORK_DIR=str(tmp_path),
@@ -570,8 +574,9 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     assert "--hsdp 2 --json" in sruns[-2] and "--verify --hsdp 2" in sruns[-1]
     for line in sruns:
         nvidia, amd = line.split(" : ")
-        assert "/w/venv/bin/" in nvidia and "/w/venv-rocm/" not in nvidia
-        assert amd.startswith("--het-group=1 ") and "/w/venv-rocm/bin/" in amd
+        assert "/w/venv/bin/" in nvidia and "/w/venv-rocm" not in nvidia
+        # The MI50's default: the Triton overlay of venv-rocm63 (submit.sh).
+        assert amd.startswith("--het-group=1 ") and "/w/venv-rocm63-triton38/bin/" in amd
     assert "--role master" in sruns[1] and "--role worker" in sruns[1]
     assert "probe_nvidia" in sruns[0] and "probe_amd" in sruns[0]
     assert out.index("preflight.py") < out.index("torchrun")
@@ -1288,16 +1293,20 @@ def test_target_match_rules(target, capability, arch_list, match):
 
 
 def run_probe(monkeypatch, tmp_path, devices: list, *, nccl: bool = True,
-              blas: dict | None = None) -> int:
-    """probe.py's main() on a made-up environment (BLAS available unless ``blas``)."""
+              blas: dict | None = None, triton: dict | None = None) -> int:
+    """probe.py's main() on a made-up environment (BLAS available unless ``blas``; no
+    Triton unless ``triton``; gpubridge imported from this checkout, as it is here)."""
     import gpukit
     import probe
 
     env = {"device_count": len(devices), "devices": devices, "arch_list": CU126,
            "probe": {"nccl_available": nccl, "gloo_available": True}, "torch": "2.14.1+cu126",
-           "torch_cuda": "12.6", "torch_hip": None, "nccl_version": "2.21.5"}
+           "torch_cuda": "12.6", "torch_hip": None, "nccl_version": "2.21.5",
+           "import": gpukit.kit_import()}
     monkeypatch.setattr(gpukit, "environment", lambda: env)
     monkeypatch.setattr(probe, "blas_check", lambda index: blas or {"blas_available": True})
+    monkeypatch.setattr(probe, "triton_check",
+                        lambda index: triton or {"triton": None, "compiles": None})
     monkeypatch.setattr(sys, "argv", ["probe.py", "--out", str(tmp_path)])
     return probe.main()
 
@@ -2076,14 +2085,15 @@ def test_matrix_job_runs_every_policy_on_the_mixed_pair():
     assert "--ops flat-gloo" in runs["E"]
     for line in runs.values():
         nvidia, amd = line.split(" : ")
-        assert "/w/venv/bin/torchrun" in nvidia and "/w/venv-rocm/bin/torchrun" in amd
+        assert "/w/venv/bin/torchrun" in nvidia and "/w/venv-rocm63-triton38/bin/torchrun" in amd
         assert "--phases" in line or "flat-gloo" in line
         assert "--max-bytes 1G" in line
 
 
 @pytest.mark.parametrize(("pair", "names", "venv"),
                          [("nvidia-nvidia", ["A1", "A2", "C", "E-nvidia"], "/w/venv/"),
-                          ("amd-amd", ["B1", "B2", "C-amd", "E-amd"], "/w/venv-rocm/")])
+                          ("amd-amd", ["B1", "B2", "C-amd", "E-amd"],
+                           "/w/venv-rocm63-triton38/")])
 def test_matrix_job_runs_the_native_baselines_on_same_vendor_pairs(pair, names, venv):
     runs = _matrix_launches(pair)
     assert list(runs) == names
@@ -2513,6 +2523,387 @@ def test_dp_report_compares_curves_with_the_baseline(tmp_path):
             json.dumps(record("ddp", [3.0])))
     assert sorted(dp_report.load([tmp_path / "jobs"])) == [
         f"jobs/{job}/07_mixed_hetjob_dp/dp_ddp" for job in ("a", "b", "c")]
+
+
+
+# ---- run guards: the import, the results folder, the MI50's Triton ---------------
+
+def _other_checkout(tmp_path: Path) -> Path:
+    """A copy of this checkout's package somewhere else, as another clone would hold it."""
+    other = tmp_path / "other" / "src"
+    shutil.copytree(REPO / "src" / "gpubridge", other / "gpubridge",
+                    ignore=shutil.ignore_patterns("__pycache__", "target"))
+    return other
+
+
+def test_import_check_passes_for_this_checkout_and_names_a_foreign_import(tmp_path):
+    ok = subprocess.run([sys.executable, str(KIT / "import_check.py")],
+                        env=clean_env(PYTHONPATH=str(REPO / "src")), capture_output=True,
+                        text=True, timeout=120)
+    assert ok.returncode == 0, ok.stderr[-2000:]
+    assert "gpubridge from" in ok.stdout
+    other = _other_checkout(tmp_path)
+    bad = subprocess.run([sys.executable, str(KIT / "import_check.py")],
+                         env=clean_env(PYTHONPATH=str(other)), capture_output=True,
+                         text=True, timeout=120)
+    assert bad.returncode == 1
+    assert "gpubridge-kit: import check failed" in bad.stderr
+    assert str(other / "gpubridge") in bad.stderr and "PYTHONPATH is" in bad.stderr
+
+
+def test_probe_records_where_gpubridge_came_from_and_fails_on_a_foreign_import(tmp_path):
+    out = tmp_path / "probe"
+    ok = subprocess.run([sys.executable, str(KIT / "probe.py"), "--out", str(out),
+                         "--allow-no-gpu"], env=clean_env(PYTHONPATH=str(REPO / "src")),
+                        capture_output=True, text=True, timeout=120)
+    assert ok.returncode == 0, ok.stderr[-2000:]
+    record = json.loads((out / "probe.json").read_text())
+    imported = record["environment"]["import"]
+    assert imported["gpubridge_in_kit_checkout"] is True
+    assert imported["gpubridge_file"].endswith("src/gpubridge/__init__.py")
+    assert record["environment"]["env"]["PYTHONPATH"]  # recorded, redacted like any path
+    stages = {s["name"]: s for s in record["stages"]}
+    assert stages["kit_import"]["ok"] and stages["triton_kernels"]["ok"]
+
+    other = _other_checkout(tmp_path)
+    bad = subprocess.run([sys.executable, str(KIT / "probe.py"), "--out", str(tmp_path / "b"),
+                          "--allow-no-gpu"], env=clean_env(PYTHONPATH=str(other)),
+                         capture_output=True, text=True, timeout=120)
+    assert bad.returncode == 1 and "gpubridge-kit: import check failed" in bad.stderr
+
+
+def _bash(script: str, **env: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["bash", "-e", "-c", script], env=clean_env(**env),
+                          capture_output=True, text=True, timeout=60)
+
+
+@pytest.mark.parametrize("marker", ["gpubridge-kit: import check failed: elsewhere"])
+def test_a_failed_probe_check_stops_the_job_before_the_next_step(marker, tmp_path):
+    result = _bash(f"""
+source {KIT}/common.sh
+RESULTS={tmp_path}
+step probe sh -c 'echo "{marker}"; exit 1'
+step after echo should-not-run
+""")
+    assert result.returncode != 0
+    assert "stopping before any other step" in result.stderr
+    assert "should-not-run" not in result.stdout + result.stderr
+    assert not (tmp_path / "after.log").exists()
+
+
+def test_require_kit_import_stops_on_a_foreign_import(tmp_path):
+    other = _other_checkout(tmp_path)
+    venv_path = f"{Path(sys.executable).parent}:{os.environ['PATH']}"  # as an active venv
+    good = _bash(f"source {KIT}/common.sh; require_kit_import; echo went-on",
+                 PYTHONPATH=str(REPO / "src"), PATH=venv_path)
+    assert good.returncode == 0 and "went-on" in good.stdout, good.stderr[-2000:]
+    bad = _bash(f"source {KIT}/common.sh; require_kit_import; echo went-on",
+                PYTHONPATH=str(other), PATH=venv_path)
+    assert bad.returncode != 0 and "went-on" not in bad.stdout
+    assert "isn't this checkout's" in bad.stderr
+
+
+def test_a_results_folder_with_records_gets_a_job_folder_of_its_own(tmp_path):
+    fresh = tmp_path / "07_mixed_hetjob"
+    used = tmp_path / "amd_node"
+    used.mkdir()
+    (used / "steps.jsonl").write_text("{}\n")
+    out = _bash(f"source {KIT}/common.sh; fresh_results {fresh}; fresh_results {used}",
+                SLURM_JOB_ID="4242")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == [str(fresh), f"{used}_job4242"]
+    assert "already holds another run's records" in out.stderr
+    for taken in (f"{used}_jobgpubridge-mixed", f"{used}_jobgpubridge-mixed_2"):
+        Path(taken).mkdir()
+        (Path(taken) / "job.jsonl").write_text("{}\n")
+    again = _bash(f"source {KIT}/common.sh; fresh_results {used}", RUN_ID="gpubridge-mixed")
+    assert again.stdout.split() == [f"{used}_jobgpubridge-mixed_3"]  # a fixed RUN_ID's 4th run
+
+
+def test_job_setup_never_writes_into_another_runs_folder(tmp_path):
+    # job_setup (explorer/job_env.sh), the start of every Explorer job.
+    used = tmp_path / "02_split_shared_gpu"
+    used.mkdir()
+    (used / "job.jsonl").write_text('{"event": "started", "job_id": "1"}\n')
+    out = _bash(f"""
+source {KIT}/common.sh --dry-run
+source {KIT}/explorer/job_env.sh
+VENV={tmp_path}/no-venv
+job_setup 02_split_shared_gpu
+echo "RESULTS=$RESULTS"
+""", SLURM_JOB_ID="77", RESULTS_ROOT=str(tmp_path), PROJECT_DIR=FAKE_PROJECT,
+                GPUBRIDGE_REPO=str(REPO))
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert f"RESULTS={used}_job77" in out.stdout
+    assert (used / "job.jsonl").read_text().count("started") == 1  # untouched
+    assert "import_check.py" in out.stdout  # and checks where gpubridge comes from
+
+
+@pytest.mark.parametrize("script,target,env", [
+    ("amd/run_all.sh", "amd_node", {}),
+    ("mixed/node.sh", "master", {"ROLE": "master", "MASTER_ADDR": "127.0.0.1",
+                                 "TORCH_FLAVOR": "system"}),
+])
+def test_the_scripts_for_other_machines_check_the_import_and_keep_old_folders(
+        script, target, env, tmp_path):
+    used = tmp_path / target
+    used.mkdir()
+    (used / "steps.jsonl").write_text("{}\n")
+    out = subprocess.run(["bash", str(KIT / script), "--dry-run"],
+                         env=clean_env(RESULTS_ROOT=str(tmp_path), TARGET=target, RUN_ID="r1",
+                                       SKIP_SETUP="1", VENV=str(tmp_path / "venv"),
+                                       GPUBRIDGE_REPO=str(REPO), **env),
+                         capture_output=True, text=True, timeout=120)
+    both = out.stdout + out.stderr
+    assert "import_check.py" in out.stdout, both[-2000:]
+    assert f"{used}_jobr1" in both and (used / "steps.jsonl").read_text() == "{}\n"
+
+
+def test_a_directory_of_wrappers_is_a_venv_the_kit_can_use(tmp_path):
+    # rocm_triton_overlay.sh writes bin/python, bin/torchrun wrappers and no bin/activate.
+    wrappers = tmp_path / "venv-overlay" / "bin"
+    wrappers.mkdir(parents=True)
+    (wrappers / "python").write_text(f"#!/usr/bin/env bash\nexec {sys.executable} \"$@\"\n")
+    (wrappers / "python").chmod(0o755)
+    out = _bash(f"source {KIT}/common.sh; activate_venv {wrappers.parent}; command -v python")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == str(wrappers / "python")
+    missing = _bash(f"source {KIT}/common.sh; activate_venv {tmp_path}/nothing")
+    assert missing.returncode != 0 and "run setup first" in missing.stderr
+
+
+@pytest.mark.parametrize("compiles", [True, None, False])
+def test_probe_records_whether_triton_compiles_without_failing_on_it(compiles, monkeypatch,
+                                                                      tmp_path, capsys):
+    # Only the steps that use the kernels check them (triton_check.py, common.sh).
+    mi50 = fake_device(monkeypatch, name="AMD Instinct MI50", capability=(9, 0),
+                       gcn="gfx906:sramecc+:xnack-", hip="6.3.42134", arch_list=["gfx906"])
+    triton = {"triton": "3.5.1", "compiles": compiles,
+              **({"error": "RuntimeError: PassManager::run failed"} if compiles is False else {})}
+    assert run_probe(monkeypatch, tmp_path, [mi50], triton=triton) == 0
+    stage = next(s for s in json.loads((tmp_path / "probe.json").read_text())["stages"]
+                 if s["name"] == "triton_kernels")
+    assert stage["ok"] is True and stage["compiles"] is compiles
+    assert ("steps that use them won't run" in capsys.readouterr().err) is (compiles is False)
+
+
+@pytest.mark.parametrize("broken", [None, ("bf16", "quantize"), ("fp8", "dequantize")])
+def test_triton_check_runs_every_kernel_a_compressed_collective_uses(broken, monkeypatch):
+    import gpukit
+
+    import gpubridge
+    calls = []
+
+    def kernel(name):
+        def run(mode, *args):
+            calls.append((mode, name))
+            if (mode, name) == broken:
+                raise RuntimeError("PassManager::run failed\nmore")
+        return run
+
+    kernels = SimpleNamespace(quantize=kernel("quantize"),
+                              dequantize_accumulate=kernel("dequantize"))
+    monkeypatch.setitem(sys.modules, "triton", SimpleNamespace(__version__="3.5.1"))
+    monkeypatch.setitem(sys.modules, "gpubridge._compression_kernels", kernels)
+    monkeypatch.setattr(gpubridge, "_compression_kernels", kernels, raising=False)
+    cpu = torch.device("cpu")
+    monkeypatch.setattr(gpukit.torch, "device", lambda *a: cpu)
+    monkeypatch.setattr(gpukit.torch.cuda, "synchronize", lambda *a: None)
+    result = gpukit.triton_check(0)
+    if broken is None:
+        assert result == {"triton": "3.5.1", "compiles": True}
+        assert calls == [("bf16", "quantize"), ("bf16", "dequantize"),
+                         ("fp8", "quantize"), ("fp8", "dequantize")]
+    else:
+        assert result["compiles"] is False and calls[-1] == broken
+        assert result["error"] == "RuntimeError: PassManager::run failed"
+
+
+def _triton_check_module():
+    sys.path.insert(0, str(KIT))
+    import triton_check
+    return triton_check
+
+
+@pytest.mark.parametrize("result,forced,ok", [
+    (None, "auto", True),                                        # no GPU: PyTorch ops on CPU
+    ({"triton": None, "compiles": None}, "auto", True),          # no Triton: PyTorch kernels
+    ({"triton": None, "compiles": None}, "triton", False),       # forced but not installed
+    ({"triton": "3.8.0", "compiles": True}, "auto", True),
+    ({"triton": "3.5.1", "compiles": False, "error": "x"}, "auto", False),
+    ({"triton": "3.5.1", "compiles": False, "error": "x"}, "triton", False),
+])
+def test_triton_check_says_whether_the_kernels_can_run(result, forced, ok):
+    problem = _triton_check_module().verdict(result, forced)
+    assert (problem is None) is ok
+    if result and result["compiles"] is False:
+        assert "rocm_triton_overlay.sh" in problem and "3.5.1" in problem
+
+
+def _gate(tmp_path: Path, check_passes: bool, body: str, **env: str):
+    """common.sh with a stand-in triton_check.py launcher that passes or fails."""
+    launcher = tmp_path / "fake-python"
+    launcher.write_text(f"#!/bin/sh\necho checked >>{tmp_path}/checks\nexit "
+                        f"{0 if check_passes else 1}\n")
+    launcher.chmod(0o755)
+    result = _bash(f"""
+source {KIT}/common.sh
+RESULTS={tmp_path}
+TRITON_CHECK_LAUNCH={launcher}
+{body}
+finish || true
+""", **env)
+    steps = [json.loads(line) for line in (tmp_path / "steps.jsonl").read_text().splitlines()]
+    checks = (tmp_path / "checks").read_text().count("checked") if (
+        tmp_path / "checks").exists() else 0
+    return result, {s["step"]: s for s in steps}, checks
+
+
+def test_uncompressed_steps_never_check_triton_and_run_even_where_it_would_fail(tmp_path):
+    result, steps, checks = _gate(tmp_path, False, """
+step train_ddp echo ran-train
+step check echo ran-check
+GPUBRIDGE_BRIDGE_COMPRESSION=none step bench echo ran-bench
+""")
+    assert checks == 0 and "triton_check" not in steps
+    assert all(steps[name]["exit_code"] == 0 for name in ("train_ddp", "check", "bench"))
+    assert "ran-train" in result.stdout and "ran-bench" in result.stdout
+
+
+def test_steps_that_use_the_kernels_are_not_run_when_the_check_fails(tmp_path):
+    result, steps, checks = _gate(tmp_path, False, """
+mixed_torchrun() { echo "ran-$1"; }
+step check echo ran-check
+step gpu_tests echo ran-gpu-tests
+step bench_compression_kernels echo ran-kernels
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 step dp_ddp-fp8 mixed_torchrun fp8
+step train_ddp echo ran-train
+echo "failed: ${FAILED_STEPS[*]}"
+""")
+    assert checks == 1 and steps["triton_check"]["exit_code"] != 0  # checked once
+    for name in ("gpu_tests", "bench_compression_kernels", "dp_ddp-fp8"):
+        assert steps[name]["exit_code"] == 1
+        assert steps[name]["not_run"].startswith("triton_check failed")
+        assert f"ran-{name}" not in result.stdout
+    assert "ran-gpu-tests" not in result.stdout and "ran-fp8" not in result.stdout
+    assert steps["check"]["exit_code"] == 0 and steps["train_ddp"]["exit_code"] == 0
+    assert "ran-train" in result.stdout  # the rest of the job goes on
+    failed_line = next(line for line in result.stdout.splitlines() if line.startswith("failed:"))
+    assert set(failed_line.split()[1:]) == {"triton_check", "gpu_tests",
+                                            "bench_compression_kernels", "dp_ddp-fp8"}
+
+
+def test_runners_whose_machines_decide_alone_never_skip_a_mixed_step(tmp_path):
+    # mixed/node.sh: a step skipped on one machine only would leave the two a step apart.
+    result, steps, checks = _gate(tmp_path, False, """
+mixed_torchrun() { echo "ran-mixed $1"; }
+TRITON_GATE_MIXED=0
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 step dp_ddp-fp8 mixed_torchrun dp-ddp-fp8
+step bench_compressed mixed_torchrun bench-compressed
+step bench_compression_kernels echo ran-kernels
+""")
+    assert "ran-mixed dp-ddp-fp8" in result.stdout and "ran-mixed bench-compressed" in result.stdout
+    assert steps["dp_ddp-fp8"]["exit_code"] == 0 and "not_run" not in steps["dp_ddp-fp8"]
+    assert checks == 1 and "ran-kernels" not in result.stdout  # a local step still checks
+    assert steps["bench_compression_kernels"]["not_run"].startswith("triton_check failed")
+
+
+def test_a_negative_steps_expectation_and_time_limit_stay_out_of_the_triton_check(tmp_path):
+    (tmp_path / "check-env").write_text("")
+    result, steps, checks = _gate(tmp_path, True, f"""
+mixed_torchrun() {{ echo "ran-$1 fired"; }}
+TRITON_CHECK_LAUNCH="env-check {tmp_path}/fake-python"
+env-check() {{ echo "timeout=$STEP_TIMEOUT expect=${{STEP_EXPECT:-}}" >>{tmp_path}/check-env; "$@"; }}
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 negative_step neg_fp8 7 fired mixed_torchrun fp8
+""", STEP_TIMEOUT="900")
+    assert checks == 1 and steps["triton_check"]["exit_code"] == 0
+    assert "result" not in steps["triton_check"]  # not "check did not fire"
+    assert (tmp_path / "check-env").read_text().split() == ["timeout=900", "expect="]
+    assert steps["neg_fp8"]["result"] == "expected failure confirmed"
+
+
+def test_steps_that_use_the_kernels_run_after_a_passing_check(tmp_path):
+    result, steps, checks = _gate(tmp_path, True, """
+mixed_torchrun() { echo "ran-$1"; }
+GPUBRIDGE_BRIDGE_COMPRESSION=bf16 step bench_bf16 mixed_torchrun bf16
+step gpu_tests echo ran-gpu-tests
+""")
+    assert checks == 1 and steps["triton_check"]["exit_code"] == 0
+    assert "ran-gpu-tests" in result.stdout and "ran-bf16" in result.stdout
+
+
+def test_forced_pytorch_kernels_need_no_triton_check_for_compressed_steps(tmp_path):
+    result, steps, checks = _gate(tmp_path, False, """
+mixed_torchrun() { echo "ran-$1"; }
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 step dp_ddp-fp8 mixed_torchrun fp8
+""", GPUBRIDGE_COMPRESSION_KERNELS="torch")
+    assert checks == 0 and "ran-fp8" in result.stdout
+
+
+def test_compression_exported_for_the_whole_job_gates_only_its_collectives(tmp_path):
+    # The runbook's overlay recipe exports GPUBRIDGE_BRIDGE_COMPRESSION for a whole job:
+    # the probe, the preflight and one-process runs must still run, checked or not.
+    result, steps, checks = _gate(tmp_path, False, """
+mixed_torchrun() { echo "ran-$1"; }
+step probe both @VENV@/bin/python probe.py
+step preflight echo ran-preflight
+step dp_single limited echo ran-single
+step matrix_D both env A=1 @VENV@/bin/torchrun x
+step train_ddp mixed_torchrun train
+""", GPUBRIDGE_BRIDGE_COMPRESSION="fp8")
+    assert checks == 1 and "ran-preflight" in result.stdout and "ran-single" in result.stdout
+    assert all("not_run" not in steps[name] for name in ("probe", "preflight", "dp_single"))
+    assert steps["matrix_D"]["not_run"] and steps["train_ddp"]["not_run"]
+    assert "ran-train" not in result.stdout
+
+
+def test_setup_rocm_builds_venv_rocm_unless_vENV_ROCM_names_another():
+    # Jobs default to the overlay; setup-rocm still builds a real venv.
+    default = dry_run(KIT / "explorer" / "setup.sbatch", USER="alice", TORCH_FLAVOR="rocm")
+    assert default.returncode == 0, default.stderr
+    assert f"{FAKE_PROJECT}/alice/gpubridge-gpu/venv-rocm " in default.stdout
+    assert "triton38" not in default.stdout
+    named = dry_run(KIT / "explorer" / "setup.sbatch", USER="alice", TORCH_FLAVOR="rocm",
+                    VENV_ROCM="/w/venv-rocm63", ROCM_TORCH_VERSION="2.9.1",
+                    ROCM_INDEX="rocm6.3")
+    assert named.returncode == 0, named.stderr
+    assert "/w/venv-rocm63 " in named.stdout and "torch==2.9.1+rocm6.3" in named.stdout
+
+
+def test_the_amd_path_says_how_to_build_the_overlay_when_it_is_missing(tmp_path):
+    path = fake_command(tmp_path / "bin", "sbatch", "echo 4242\n")
+    result = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), "amd"],
+                            env=clean_env(GPUBRIDGE_REPO=str(REPO), PATH=path,
+                                          AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
+                                          WORK_DIR=str(tmp_path)),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1
+    assert f"no ROCm venv at {tmp_path}/venv-rocm63-triton38" in result.stderr
+    assert "rocm_triton_overlay.sh" in result.stderr and "4242" not in result.stderr
+
+
+def test_setup_rocm_builds_its_venv_when_no_rocm_venv_exists_yet(tmp_path):
+    path = fake_command(tmp_path / "bin", "sbatch", "echo 4242\n")
+    for extra in ({}, {"VENV_ROCM": str(tmp_path / "venv-rocm63"), "ROCM_TORCH_VERSION": "2.9.1"}):
+        result = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), "setup-rocm"],
+                                env=clean_env(GPUBRIDGE_REPO=str(REPO), PATH=path,
+                                              AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
+                                              WORK_DIR=str(tmp_path), **extra),
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+        assert "4242" in result.stderr + result.stdout
+    overlay = tmp_path / "venv-rocm63-triton38" / "bin"
+    overlay.mkdir(parents=True)
+    (overlay / "python").write_text("#!/bin/sh\n")
+    (overlay / "python").chmod(0o755)
+    refused = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), "setup-rocm"],
+                             env=clean_env(GPUBRIDGE_REPO=str(REPO), PATH=path,
+                                           AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
+                                           WORK_DIR=str(tmp_path),
+                                           VENV_ROCM=str(overlay.parent)),
+                             capture_output=True, text=True, timeout=60)
+    assert refused.returncode == 1 and "wrapper scripts" in refused.stderr
+    assert "4242" not in refused.stderr + refused.stdout
 
 
 # ---- pipeline training: train_pipeline.py ------------------------------------------------

@@ -79,18 +79,27 @@ both() {
 # matrix_run NAME [NAME=VALUE...] -- ARGS...: run NAME of the matrix: the benchmark on
 # both ranks with those settings (@IFNAME@ is each node's Gloo interface) and ARGS.
 matrix_run() {
-    local name=$1 settings=()
+    local name=$1 settings=() compression=""
     shift
     while [ $# -gt 0 ] && [ "$1" != -- ]; do
         settings+=("$1")
+        case $1 in GPUBRIDGE_BRIDGE_COMPRESSION=*) compression=${1#*=} ;; esac
         shift
     done
     shift
-    step "matrix_$name" both env "${settings[@]+"${settings[@]}"}" @VENV@/bin/torchrun \
-        --nnodes=2 --nproc-per-node=1 --rdzv-backend=c10d --rdzv-endpoint="$HEAD:$RDZV_PORT" \
-        --rdzv-id="${SLURM_JOB_ID:-local}-$name" "$KIT_DIR/bench_all_reduce.py" \
-        --out "$RESULTS/matrix/$name" --max-bytes "$BENCH_MAX_BYTES" "$@"
+    local run=(step "matrix_$name" both env "${settings[@]+"${settings[@]}"}" @VENV@/bin/torchrun
+        --nnodes=2 --nproc-per-node=1 --rdzv-backend=c10d --rdzv-endpoint="$HEAD:$RDZV_PORT"
+        --rdzv-id="${SLURM_JOB_ID:-local}-$name" "$KIT_DIR/bench_all_reduce.py"
+        --out "$RESULTS/matrix/$name" --max-bytes "$BENCH_MAX_BYTES" "$@")
+    if [ -n "$compression" ]; then
+        # So step sees that this run compresses, and checks Triton first (common.sh).
+        GPUBRIDGE_BRIDGE_COMPRESSION=$compression "${run[@]}"
+    else
+        "${run[@]}"
+    fi
 }
+# Triton's check (common.sh) before the first compressed run: on both nodes.
+TRITON_CHECK_LAUNCH="both @VENV@/bin/python"
 
 # The batch node runs this job's Python (bench_matrix.py) with its own side's venv.
 [ "$MATRIX_PAIR" != amd-amd ] || VENV=$VENV_ROCM
