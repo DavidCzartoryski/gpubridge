@@ -238,6 +238,20 @@ hardware.
 
 ### Added
 
+- The GPU kit refuses runs whose records would mislead. Every job stops before
+  its first step if `import gpubridge` isn't the running checkout's `src/`
+  (`scripts/gpu/import_check.py`, and the probe on every side of a mixed job).
+  Steps that use the Triton compression kernels (`gpu_tests`, the kernel and
+  compressed benchmarks, compressed collective runs) first check that Triton
+  compiles and runs all four kernels where the step runs (both sides of a mixed
+  job; `scripts/gpu/triton_check.py`, once per job); where it can't, those steps are recorded as not run and the rest
+  of the job goes on (`mixed/node.sh`, whose machines decide alone, never skips a
+  mixed step). The probe records where gpubridge was imported from,
+  its commit, `PYTHONPATH`, and whether Triton compiles the kernels. A job whose
+  results folder already holds another run's records writes to `<step>_job<id>/`
+  instead. The AMD node job writes
+  `job.jsonl` like the others, and a directory of wrapper scripts, such as
+  `rocm_triton_overlay.sh`'s, works as `VENV` or `VENV_ROCM`.
 - Automatic pipeline stage balancing: `gpubridge.balance`, an opt-in module
   nothing else imports. `profile_layers` times each layer's forward and
   backward on a device (CUDA or HIP events), with its output size, state and
@@ -470,6 +484,13 @@ hardware.
 
 ### Changed
 
+- On Explorer, the AMD side's default venv (`VENV_ROCM`) is now the MI50's
+  Triton overlay, `venv-rocm63-triton38`: torch 2.9.1+rocm6.3, whose rocBLAS
+  trains on gfx906, with Triton 3.8.0 in front, which compiles the compression
+  kernels. It was `venv-rocm` (torch 2.14.1+rocm7.2). `submit.sh setup-rocm`
+  still builds `venv-rocm` unless `VENV_ROCM` or `ROCM_SETUP_VENV` names another
+  venv, and AMD jobs stop with the commands that build the overlay if it's
+  missing (docs/GPU_VALIDATION_RUNBOOK.md, "Choosing the ROCm build").
 - A rank's island and whether it leads, and a policy's supported reduce ops,
   are worked out once instead of on every collective. Every call still checks
   its op. On CPU, gpubridge's own work per small reduce-bridge-broadcast call

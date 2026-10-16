@@ -31,6 +31,9 @@ SMALL_TRAINING = "--steps 3 --warmup-steps 1 --batch-size 8 --dim 32 --layers 2"
 END_TO_END = {
     "common.sh": "sourced by every shell script below",
     "gpukit.py": "imported by check, bench, probe and device_map",
+    "import_check.py": "every job below (job_setup, run_all.sh), and test_gpu_kit.py",
+    "triton_check.py": "test_step_02, 04, 07, test_amd_node_job (before the kernel steps), "
+                       "and test_gpu_kit.py",
     "check.py": "every job below, and test_gpu_kit.py",
     "bench_all_reduce.py": "test_step_03, 04, 05, 07, the node pair",
     "bench_compression.py": "test_step_04, 07, the node pair, test_amd_node_job",
@@ -401,6 +404,12 @@ def test_step_07_mixed_hetjob(tmp_path):
     assert check["ok"] and check["split_test"] is None
     assert summary(out / "check_p2p")["ok"]
     assert (out / "train_ddp.json").exists() and (out / "thresholds.json").exists()
+    # Triton's check runs on both sides, once, before the first step that uses the kernels.
+    order = list(steps(out))
+    assert order.index("triton_check") == order.index("bench_compression_kernels") - 1, order
+    log = "\n".join(p.read_text() for p in (tmp_path / "work" / "logs").glob("*.out"))
+    check = [line for line in log.splitlines() if "step triton_check:" in line]
+    assert len(check) == 1 and "step triton_check: both @VENV@/bin/python" in check[0]
     bench = json.loads((out / "train_bench_tiny-gpt.json").read_text())
     assert bench["world_size"] == 2 and [r["vendor"] for r in bench["ranks"]] == ["nvidia", "amd"]
     # Every job step after the preflight runs with each side's chosen interface.
@@ -474,8 +483,13 @@ def test_step_07_data_parallel(tmp_path):
                   DP_RUNS="ddp ddp-fp8 fsdp2 ddp-speed ddp-bucket-5", **SMALL_DP)
     out = tmp_path / "results" / "07_mixed_hetjob_dp"
     assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
-    assert list(steps(out)) == ["probe", "preflight", "dp_ddp", "dp_ddp-fp8", "dp_fsdp2",
-                                "dp_ddp-speed", "dp_ddp-bucket-5"]
+    # Triton's check before the first compressed run only, on the NVIDIA side (the AMD
+    # side runs the PyTorch kernels: DP_KERNELS_ON_AMD=torch).
+    assert list(steps(out)) == ["probe", "preflight", "dp_ddp", "triton_check", "dp_ddp-fp8",
+                                "dp_fsdp2", "dp_ddp-speed", "dp_ddp-bucket-5"]
+    log = "\n".join(p.read_text() for p in (tmp_path / "work" / "logs").glob("*.out"))
+    check = [line for line in log.splitlines() if "step triton_check:" in line]
+    assert check and "--het-group=0" in check[0] and "--het-group=1" not in check[0]
     runs = {p.stem: json.loads(p.read_text()) for p in out.glob("dp_*.json")}
     assert runs["dp_ddp-fp8"]["compression"] == "fp8" and runs["dp_ddp"]["compression"] == "none"
     assert [r["compression_kernels"] for r in runs["dp_ddp-fp8"]["ranks"]] == ["auto", "torch"]
@@ -562,6 +576,12 @@ def test_step_08_matrix_on_the_mixed_pair(tmp_path):
     runs = sorted(p.parent.name for p in (out / "matrix").glob("*/bench.json"))
     assert runs == ["D-bf16", "D-default", "D-default-repeat", "D-fp8", "D-pinned",
                     "D-pipelined-4K", "D-sharded", "E"]
+    # Each run's compression reaches step, so Triton's check comes before the first compressed run.
+    order = list(steps(out))
+    first = min(order.index(f"matrix_{name}") for name in ("D-bf16", "D-fp8"))
+    assert "triton_check" in order[:first] and order.count("triton_check") == 1, order
+    log = "\n".join(p.read_text() for p in (tmp_path / "work" / "logs").glob("*.out"))
+    assert "step triton_check: both @VENV@/bin/python" in log  # on both sides
 
     def bench(name):
         return json.loads((out / "matrix" / name / "bench.json").read_text())
@@ -743,6 +763,10 @@ def test_amd_node_job(tmp_path):
     assert code == 1
     assert {"check_1gpu", "gpu_tests", "check_split_shared_gpu", "summarize"} <= set(steps(out))
     assert not (tmp_path / "results" / "amd_node.tgz").exists()
+    # job.jsonl, as every Explorer job writes it: started, finished (3 failed), exit 1.
+    events = [json.loads(line) for line in (out / "job.jsonl").read_text().splitlines()]
+    assert [e["event"] for e in events] == ["started", "finished", "exit"]
+    assert events[1]["failed"] == 3 and events[2]["code"] == 1
 
 
 def loopback() -> str:
@@ -760,21 +784,32 @@ def test_mixed_node_script_on_two_pretend_machines(tmp_path):
               "TRAIN_BENCH_ARGS": "--steps 2 --warmup-steps 1 --comm-trials 1",
               **SMALL_DP, "DP_RUNS": "ddp ddp-fp8", "PP_RUNS": "1f1b", "PP_MICROBATCHES": "2",
               "PP_ARGS": "--probe-trials 1"}
+    # The worker's Triton check fails (TRITON_CHECK_LAUNCH=false), the master's passes: each
+    # machine decides alone, so the worker skips only its own kernel benchmark and every
+    # mixed step, compressed ones included, still runs on both, in step.
     procs = {
         role: subprocess.Popen(["bash", str(KIT / "mixed" / "node.sh")],
                                env=clean_env(ROLE=role, TARGET=role, GPUBRIDGE_VENDOR=vendor,
-                                             **common),
+                                             **common, **extra),
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        for role, vendor in (("master", "nvidia"), ("worker", "amd"))
+        for role, vendor, extra in (("master", "nvidia", {}),
+                                    ("worker", "amd", {"TRITON_CHECK_LAUNCH": "false"}))
     }
     output = {role: proc.communicate(timeout=600)[0] for role, proc in procs.items()}
     for role, proc in procs.items():
-        assert proc.returncode == 0, output[role][-3000:]
         out = tmp_path / "results" / role
-        assert failed(out) == set()
+        if role == "master":
+            assert proc.returncode == 0, output[role][-3000:]
+            assert failed(out) == set()
+            assert "verdict: every step that ran passed" in (out / "triage.txt").read_text()
+        else:
+            assert proc.returncode == 1, output[role][-3000:]
+            assert failed(out) == {"triton_check", "bench_compression_kernels"}
+            records = [json.loads(line) for line in (out / "steps.jsonl").read_text().splitlines()]
+            skipped = {r["step"] for r in records if "not_run" in r}
+            assert skipped == {"bench_compression_kernels"}
         assert (out / f"preflight-{role}.json").exists()
         assert (tmp_path / "results" / f"{role}.tgz").exists()
-        assert "verdict: every step that ran passed" in (out / "triage.txt").read_text()
         alone = json.loads((out / "train_bench_alone_tiny-gpt.json").read_text())
         assert alone["world_size"] == 1
         baseline = json.loads((out / "dp_single.json").read_text())

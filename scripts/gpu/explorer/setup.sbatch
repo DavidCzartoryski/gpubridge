@@ -21,7 +21,7 @@ source "$KIT_DIR/explorer/job_env.sh"
 FLAVOR="${TORCH_FLAVOR:-cuda}"
 SETUP_MODULES="${SETUP_MODULES-explorer}"
 if [ "$FLAVOR" = rocm ]; then
-    VENV=$VENV_ROCM
+    VENV=$ROCM_SETUP_VENV
     export TORCH_VERSION="${ROCM_TORCH_VERSION:-2.14.1}" ROCM_INDEX="${ROCM_INDEX:-rocm7.2}"
     export TORCH_INDEX_URL="${ROCM_INDEX_URL:-https://download.pytorch.org/whl/$ROCM_INDEX}"
 fi

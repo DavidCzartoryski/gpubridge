@@ -49,6 +49,8 @@ ENV_NAMES = frozenset({
     "SLURM_NNODES", "SLURM_JOB_NUM_NODES", "SLURM_NODEID", "SLURM_PROCID", "SLURM_LOCALID",
     "SLURM_NTASKS", "SLURM_GPUS", "SLURM_GPUS_ON_NODE", "SLURM_GPUS_PER_NODE",
     "SLURM_JOB_GPUS", "SLURM_STEP_GPUS", "SLURM_HET_SIZE",
+    # Can put another checkout's gpubridge ahead of the venv's (kit_import).
+    "PYTHONPATH",
 })
 #: Never recorded, even under an allowed prefix: names that may hold a
 #: credential or say who ran the job.
@@ -124,6 +126,60 @@ def _command(*args: str) -> str | None:
 
 def _git_commit() -> str | None:
     return _command("git", "-C", str(REPO), "rev-parse", "--short", "HEAD")
+
+
+def kit_import() -> dict[str, Any]:
+    """Where ``import gpubridge`` came from, and whether that is this checkout's src.
+
+    The venvs install gpubridge editable from one checkout; a job run from another
+    checkout (or with PYTHONPATH set) can import a different gpubridge than the
+    scripts it runs. ``git_commit`` describes the scripts; this describes the package.
+    """
+    package = Path(gpubridge.__file__).resolve().parent
+    expected = (REPO / "src" / "gpubridge").resolve()
+    checkout = _command("git", "-C", str(package), "rev-parse", "--show-toplevel")
+    status = (_command("git", "-C", str(package), "status", "--porcelain",
+                       "--untracked-files=no") if checkout else None)
+    return {
+        "gpubridge_file": str(package / "__init__.py"),
+        "gpubridge_git_commit": (_command("git", "-C", str(package), "rev-parse", "--short",
+                                          "HEAD") if checkout else None),
+        "gpubridge_git_dirty": None if status is None else bool(status),
+        "gpubridge_in_kit_checkout": package == expected,
+        "kit_checkout_src": str(expected),
+    }
+
+
+def triton_check(index: int) -> dict[str, Any]:
+    """Whether gpubridge's Triton compression kernels compile and run on GPU ``index``.
+
+    With Triton installed, ``GPUBRIDGE_COMPRESSION_KERNELS=auto`` (the default) uses
+    it for GPU tensors, so a Triton that can't compile for this GPU (the MI50's
+    gfx906 with pytorch-triton-rocm 3.5.1) fails every compressed collective.
+    """
+    try:
+        import triton
+    except ImportError:
+        return {"triton": None, "compiles": None, "note": "Triton not installed: torch kernels"}
+    except Exception as exc:  # installed but broken: whatever the probe hits, it only records
+        return {"triton": "unknown", "compiles": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    try:  # every kernel a compressed collective launches: quantize and dequantize, both modes
+        from gpubridge import _compression_kernels, compression
+
+        device = torch.device("cuda", index)
+        x = torch.linspace(-3, 3, 4096, device=device)
+        for mode in ("bf16", "fp8"):
+            payload = torch.empty(compression.payload_nbytes(mode, x.numel()), dtype=torch.uint8,
+                                  device=device)
+            _compression_kernels.quantize(mode, x, torch.zeros_like(x), payload)
+            _compression_kernels.dequantize_accumulate(mode, payload.view(1, -1),
+                                                       torch.zeros_like(x))
+        torch.cuda.synchronize(device)
+    except Exception as exc:  # a compiler error as Triton reports it, or anything else
+        first = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+        return {"triton": triton.__version__, "compiles": False,
+                "error": f"{type(exc).__name__}: {first}"[:300]}
+    return {"triton": triton.__version__, "compiles": True}
 
 
 def _git_dirty() -> bool | None:
@@ -242,6 +298,8 @@ def environment() -> dict[str, Any]:
         "gpubridge": gpubridge.__version__,
         "git_commit": _git_commit(),
         "git_dirty": _git_dirty(),
+        # The imported package, which can differ from the scripts' checkout above.
+        "import": _safe(kit_import),
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "torch_hip": torch.version.hip,

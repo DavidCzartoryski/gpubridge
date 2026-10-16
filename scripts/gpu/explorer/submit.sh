@@ -86,7 +86,12 @@ STEP_MARGIN="${STEP_MARGIN:-120}"
 PROJECT_DIR="${PROJECT_DIR:-}"             # e.g. /projects/<your-project>; or set it in local.env
 WORK_DIR="${WORK_DIR:-${PROJECT_DIR:+$PROJECT_DIR/${USER:-$(id -un)}/gpubridge-gpu}}"
 VENV="${VENV:-$WORK_DIR/venv}"             # CUDA build of torch: setup, steps 01 to 07
-VENV_ROCM="${VENV_ROCM:-$WORK_DIR/venv-rocm}"  # ROCm build: setup-rocm, steps amd and 07
+# setup-rocm builds ROCM_SETUP_VENV: VENV_ROCM if you set it, else venv-rocm.
+ROCM_SETUP_VENV="${ROCM_SETUP_VENV:-${VENV_ROCM:-$WORK_DIR/venv-rocm}}"
+# The ROCm venv the jobs run in (steps amd, 07, 08, train-amd, ...). The default is
+# rocm_triton_overlay.sh's: venv-rocm63's torch 2.9.1+rocm6.3 (whose rocBLAS trains on
+# an MI50) with venv-rocm's Triton (which compiles gpubridge's kernels for gfx906).
+VENV_ROCM="${VENV_ROCM:-$WORK_DIR/venv-rocm63-triton38}"
 # setup-rocm's PyTorch: pick a ROCm build that supports the AMD GPU from step 00
 # (see the runbook); older Instinct cards may not be supported by ROCm 7.2.
 ROCM_TORCH_VERSION="${ROCM_TORCH_VERSION:-2.14.1}"
@@ -113,7 +118,8 @@ PARTITION_PAIR_NVIDIA="${PARTITION_PAIR_NVIDIA:-$PARTITION_1GPU}"
 PARTITION_PAIR_AMD="${PARTITION_PAIR_AMD:-$PARTITION_AMD}"
 
 LOG_DIR="$WORK_DIR/logs"
-export GPUBRIDGE_REPO="$REPO_DIR" WORK_DIR VENV VENV_ROCM SETUP_MODULES MODULES RESULTS_ROOT
+export GPUBRIDGE_REPO="$REPO_DIR" WORK_DIR VENV VENV_ROCM ROCM_SETUP_VENV SETUP_MODULES MODULES \
+    RESULTS_ROOT
 export ROCM_TORCH_VERSION ROCM_INDEX ROCM_INDEX_URL
 export NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME
 export GPUS_SINGLE_ISLAND GPUS_PER_NODE_MULTINODE GPUS_MIXED_NVIDIA GPUS_MIXED_AMD
@@ -218,6 +224,8 @@ submit() {
     sbatch_job "${script%.sbatch}" "$script" "${REQUEST[@]}"
 }
 
+# amd_gate [building]: the AMD path's checks. "building" (setup-rocm) skips the
+# venv check: that job is what makes the venv.
 amd_gate() {
     if [ "$DRY_RUN" = 1 ]; then
         [ "$AMD_NODES_CONFIRMED" = 1 ] || log "dry-run only until step 00 confirms AMD GPUs" \
@@ -231,6 +239,12 @@ $RESULTS_ROOT/00_partitions/gpu-types.txt, then add AMD_NODES_CONFIRMED=1 to \
 $KIT_DIR/explorer/local.env (or set it in the environment)."
     [ -n "$GPU_TYPE_AMD" ] || die "set GPU_TYPE_AMD to the AMD GPUs' --gres type from \
 $RESULTS_ROOT/00_partitions/gpu-types.txt"
+    [ "${1:-}" = building ] || [ -x "$VENV_ROCM/bin/python" ] || die "no ROCm venv at $VENV_ROCM. The default is \
+the MI50 overlay (docs/GPU_VALIDATION_RUNBOOK.md, \"Choosing the ROCm build\"): build \
+venv-rocm (submit.sh setup-rocm) and venv-rocm63 (VENV_ROCM=\$WORK_DIR/venv-rocm63 \
+ROCM_TORCH_VERSION=2.9.1 ROCM_INDEX=rocm6.3 submit.sh setup-rocm), then run \
+scripts/gpu/rocm_triton_overlay.sh \$WORK_DIR/venv-rocm63 \$WORK_DIR/venv-rocm $VENV_ROCM; \
+or set VENV_ROCM to another ROCm venv."
     AMD_TYPE=$GPU_TYPE_AMD
 }
 
@@ -274,7 +288,12 @@ setup)
     setup_job setup-cuda "${REQUEST[@]}"
     ;;
 setup-rocm)
-    amd_gate
+    amd_gate building
+    if [ -x "$ROCM_SETUP_VENV/bin/python" ] && [ ! -e "$ROCM_SETUP_VENV/bin/activate" ]; then
+        die "$ROCM_SETUP_VENV is a directory of wrapper scripts (rocm_triton_overlay.sh's), \
+not a venv to build into: set ROCM_SETUP_VENV (or VENV_ROCM) to a real venv, e.g. \
+\$WORK_DIR/venv-rocm or \$WORK_DIR/venv-rocm63"
+    fi
     gpu_request "$PARTITION_AMD" "$AMD_TYPE" 1 1 "$TIME_SETUP"
     setup_job setup-rocm "${REQUEST[@]}"
     ;;

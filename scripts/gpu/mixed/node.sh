@@ -60,7 +60,7 @@ if [ -z "$TORCH_FLAVOR" ]; then
     if command -v nvidia-smi >/dev/null 2>&1; then TORCH_FLAVOR=cuda; else TORCH_FLAVOR=rocm; fi
 fi
 TARGET="${TARGET:-mixed-$ROLE-$(hostname -s)}"
-RESULTS="$RESULTS_ROOT/$TARGET"
+RESULTS=$(fresh_results "$RESULTS_ROOT/$TARGET")
 export RESULTS
 VENV="${VENV:-$WORK_DIR/venv}"
 
@@ -68,6 +68,9 @@ if [ "$SKIP_SETUP" != 1 ]; then
     step setup "$KIT_DIR/setup_env.sh" --flavor "$TORCH_FLAVOR" --venv "$VENV"
 fi
 activate_venv "$VENV"
+require_kit_import
+# Each machine runs its own Triton check, so mixed steps aren't skipped on one alone.
+TRITON_GATE_MIXED=0
 capture "$RESULTS/nvidia-smi.txt" nvidia-smi
 capture "$RESULTS/rocm-smi.txt" rocm-smi
 
