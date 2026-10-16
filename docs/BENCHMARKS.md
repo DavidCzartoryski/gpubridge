@@ -653,7 +653,9 @@ numbers come from that job's log.
 
 - `train_ddp` (`examples/train_synthetic.py`, DDP with the comm hook):
   **parameters diverged across ranks in the batch-16 job** (11090726); they
-  stayed in sync in the other three. Not yet investigated.
+  stayed in sync in the other three. That was the old float64-checksum check;
+  under the later bit-for-bit check, 24 of 24 runs stayed in sync, and it was
+  most likely the checksum's false alarm (HARDWARE_VALIDATION.md item 22).
 - `verify_fsdp2_backend`: parameters differed from the single-process replay
   in all four, against a bit-for-bit match without compression (above). fp8
   is lossy, so this check may not apply with compression on; whether it does

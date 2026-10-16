@@ -457,22 +457,23 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     hides. *Status: works on CPU in simulation mode: DDP, uneven shares and
     FSDP2 within 1e-4 of one process over 12 steps, fp8 within 0.05
     (`tests/test_gpu_kit.py`). On a V100 and an MI50 (Explorer, 1,000 steps,
-    two runs per mode against eight one-V100 runs; tolerance fixed before
-    the runs: S = 0.0131, the widest gap between two one-V100 runs, which
-    measures uncompressed run-to-run noise;
+    two runs per mode against eight one-V100 runs; the rule was fixed before
+    the runs, and by it S = 0.0131, the widest gap between two one-V100 runs,
+    which measures uncompressed run-to-run noise;
     [below](#items-22-and-33-2026-10-15-and-2026-10-16)): uncompressed DDP
     passes, at 0.32 S and 0.34 S. DDP with shares by speed and FSDP2 fail by
-    the rule, one run of each outside S (1.30 S and 10.2 S); both left the
-    loss plateau late, at steps 655 and 893 against 557 to 591 for nine of
-    eleven one-V100 runs, which points at timing (inferred; untested at
-    2,000 steps). bf16 and fp8 fail by the rule, all four runs outside S (2.5
-    S to 528 S): a lossy mode is expected to land outside a measure of
+    the rule, one run of each outside S (1.30 S and 10.2 S); both reached the
+    plateau exit (10-step mean loss below 2.0) late, at steps 655 and 893
+    against 557 to 591 for nine of eleven one-V100 runs, which points at
+    timing (inferred; untested at 2,000 steps). bf16 and fp8 fail by the rule,
+    all four runs outside S (2.51 S to 528 S): a lossy mode is expected to land outside a measure of
     uncompressed noise, and whether these gaps are acceptable is open. The
     ranks' parameters were bit-identical at every check in every DDP run,
-    compressed or not; FSDP2's sharded parameters aren't compared. One V100
-    alone also fails the rule against its own runs, so the planned next step
-    is a redesigned test: several seeds per mode, the end loss once every run
-    has left the plateau, and the steps and time to a target loss (below).
+    compressed or not; FSDP2's sharded parameters aren't compared. At 2,000
+    steps one V100 alone also falls outside S against its own runs (one run
+    of three, at 25 S), so the planned next step is a redesigned test:
+    several seeds per mode, the end loss once every run has reached the
+    plateau exit, and the steps and time to a target loss (below).
     Bucket sizes ran 100 steps each (docs/BENCHMARKS.md).* *Step:* `dp_*` in
     Explorer step 07 with `STEPS_07=dp`, and `dp_single` in `submit.sh
     dp-baseline`.
@@ -695,9 +696,11 @@ log, every job from the same checkout, with gpubridge imported from it:
   step passed (job 11113623). That job's records don't name the overlay's
   Triton version; it is inferred from the kernels compiling where 3.5.1 had
   failed half an hour earlier on the same node (job 11112824). Later jobs
-  record it: the kit's Triton check in jobs 11139974 and 11139976 (item 33,
-  below) reports Triton 3.8.0 compiling and running all four kernels on the
-  MI50.
+  with the overlay record Triton 3.8.0: the kit's Triton check in jobs
+  11139974 and 11139976 (item 33, below) reports it compiling and running
+  all four kernels on the MI50. The overlay links to a venv that can be
+  rebuilt, so that shows the version at their time, not necessarily at job
+  11113623's.
 
 ### Items 22 and 33, 2026-10-15 and 2026-10-16
 
@@ -725,12 +728,15 @@ check is what passes or fails the step; the checksum is recorded for
 information only. It still reported a difference in 4 of the 24, with the
 parameters identical: the V100 and the MI50 each sum their own copy, and the float64
 totals can differ in the last bits. The two earlier failures, jobs 11090726
-and 11112713, were judged by that check alone (2 of 8 runs then, 4 of 24
-now), and the code on DDP's path, `ddp.py` and the compression codec, hasn't
-changed since either job. So they were most likely the same false alarm. Their
-records hold only the sums, so that can't be confirmed for them.
+and 11112713, were judged by the checksum alone (2 of 8 runs then, 4 of 24
+now), and the code on DDP's path, `ddp.py`, `collectives.py` and the
+compression codec, hasn't changed since either job. So they were most likely
+the same false alarm. Their records hold only the sums, so that can't be
+confirmed for them; and the new runs add the bit check's two gathers across
+ranks after every step, which the old runs didn't have (outside the timed
+step and outside backward).
 
-**Item 33.** The tolerance was fixed before these runs. d is the mean absolute
+**Item 33.** The rule was fixed before these runs. d is the mean absolute
 difference of two runs' losses over their last 100 steps, the measure in
 docs/COMPRESSION.md. S is the largest d between any two one-V100 runs of
 1,000 steps. A mixed run is within S if the median of its d to the one-V100
@@ -741,8 +747,9 @@ Every run: `train_dp.py`, `llama-125m`, global batch 8 x 512 tokens, AdamW
 3e-4, seed 0.
 
 Eight one-V100 runs (11109239, 11109665, 11109872 and 11110316 with 1, 2, 4
-and 8 micro-batches; 11122896 to 11122899 with 1) are 0.0033 to 0.0131 apart,
-so **S = 0.0131**. S measures how far uncompressed runs land from each other:
+and 8 micro-batches, at dc47b6a; 11122896 to 11122899 with 1, at fe84663; the
+training scripts are the same at both) are 0.0033 to 0.0131 apart, so by the
+rule **S = 0.0131**. S measures how far uncompressed runs land from each other:
 the same mean gradient summed in another order, and run-to-run
 nondeterminism. A lossy mode adds its own error on top of that, so `bf16`
 and `fp8` are expected to land outside S; the rule is applied to them as
@@ -758,7 +765,7 @@ the mean loss of the last 10 steps is below 2.0):
 | DDP, shares by speed | 11122900 | fe84663 | 0.0041 (0.32 S) | 20 of 20 | 584 | yes |
 | DDP, shares by speed | 11122902 | fe84663 | 0.0170 (1.30 S) | 20 of 20 | 655 | no |
 | FSDP2 | 11125340 | fe84663 | 0.1334 (10.2 S) | not compared (sharded) | 893 | no |
-| FSDP2 | 11125342 | fe84663 | 0.0043 (0.33 S) | not compared (sharded) | 589 | yes |
+| FSDP2 | 11125342 | fe84663 | 0.0043 (0.32 S) | not compared (sharded) | 589 | yes |
 | DDP, `bf16` | 11139974 | 48840ba | 0.1547 (11.8 S) | 20 of 20 | 918 | no |
 | DDP, `bf16` | 11139976 | 48840ba | 0.0329 (2.51 S) | 20 of 20 | 722 | no |
 | DDP, `fp8` | 11139974 | 48840ba | 0.0407 (3.11 S) | 20 of 20 | 734 | no |
@@ -775,30 +782,30 @@ check found Triton 3.8.0 compiling and running them on the V100 and on the
 MI50 (`venv-rocm63` with `scripts/gpu/rocm_triton_overlay.sh`'s overlay,
 `DP_KERNELS_ON_AMD=auto`).
 
-**Plateau timing.** Every run sits on a plateau near ln(32000) before its loss
-falls, and when it leaves is set by float rounding (docs/COMPRESSION.md,
-"Training with compression"). The eleven one-V100 runs here (the eight
-above and three of 2,000 steps, below) left it at steps 557 to 591, except
-two: 11122898 at 652 and 11141231 at 1,991. Against that:
+**Plateau timing.** Every run sits on a plateau near ln(32000), then falls to
+about 2; when the fall starts depends on float rounding (docs/COMPRESSION.md,
+"Training with compression"). The eleven one-V100 runs here (the eight above
+and three of 2,000 steps, below) reached the plateau exit (10-step mean below
+2.0) at steps 557 to 591, except two: 11122898 at 652 and 11141231 at 1,991.
+Against that:
 
 - DDP with shares by speed: 584 (11122900, within S) and 655 (11122902,
-  1.30 S). 11122902 is 0.0073 from 11122898, the one-V100 run that left at
+  1.30 S). 11122902 is 0.0073 from 11122898, the one-V100 run that exited at
   652, and closed on the other runs the same way: over 100-step windows from
   step 501 to 1,000, its median gap to the one-V100 runs fell 0.150, 0.074,
   0.042, 0.027, 0.017; 11122898's to the other seven fell 0.143, 0.064,
   0.036, 0.020, 0.011.
 - FSDP2: 589 (11125342, within S) and 893 (11125340, 10.2 S), later than all
   but one one-V100 run; its gap fell from 4.73 to 0.13 over the same windows.
-- The compressed runs: 722 to 918, and `fp8` in 11139976 hadn't left by step
-  1,000 (8.73 over its last 100 steps).
+- The compressed runs: 722 to 918, and `fp8` in 11139976 hadn't reached it by
+  step 1,000 (8.73 over its last 100 steps).
 
-So each run outside S left the plateau late, and a late one-V100 run closes
-its gap the same way. That points at timing rather than at something the
-bridge computes wrong, and at compression delaying the drop; both are
-inferred, not tested. **For shares by speed and FSDP2 the timing explanation
-is untested at 2,000 steps: batch 4 below ran neither.**
+So each run outside S reached the plateau exit late, and a late one-V100 run
+closes its gap the same way. That points at timing rather than at something
+the bridge computes wrong, and at compression delaying the fall; both are
+inferred, not tested.
 
-**At 2,000 steps** (batch 4, 48840ba, one run per mode): S stays 0.0131, and
+**At 2,000 steps** (jobs at 48840ba, one run per mode): S stays 0.0131, and
 with one run per mode the rule gives no verdict at this length. The three
 one-V100 runs are the references.
 
@@ -807,33 +814,34 @@ one-V100 runs are the references.
 | One V100 | 11141232, 11141233 | 0.0031 apart | - | 588, 576 |
 | One V100 | 11141231 | 0.327 from those two (25 S) | - | 1,991 |
 | DDP, uncompressed | 11141122 | 0.0033 (0.26 S) | 40 of 40 checks | 580 |
-| DDP, `bf16` | 11141229 | 0.517 (39 S) | 40 of 40 | none by 2,000 |
+| DDP, `bf16` | 11141229 | 0.517 (39 S) | 40 of 40 | none by 2,000 (2.21 over the last 100 steps) |
 | DDP, `fp8` | 11141646 | 0.0221 (1.69 S) | 40 of 40 | 951 |
 
-One V100 alone, with no bridge, produced a run as slow as the slowest mixed
-ones: 11141231 first fell below 9 at step 521 and ended 25 S from the other
-two. So a late run is not specific to the bridge or to compression, but it
-is far more common with compression: the loss first fell below 9 after step
-250 in 9 of the 10 compressed runs so far (the four in docs/COMPRESSION.md
-included), against 2 of 11 one-V100 runs and 2 of 7 uncompressed mixed ones.
-After their drop the compressed runs keep closing: `fp8`'s gap fell from
-0.059 over steps 1,301 to 1,400 to 0.022 over the last 100. That is about
-where the earlier 1,000-step `fp8` run ended (job 11111481, 0.022 to 0.027
-from four one-V100 runs), so part of it may be `fp8`'s own error rather than
-timing; these runs can't separate the two (inferred).
+One V100 alone, with no bridge, produced a run slower than all but two of
+the 13 mixed runs (both compressed): 11141231 first fell below 9 at step 521
+and ended 25 S from the other two. So a late run is not specific to the
+bridge or to compression, but it is far more common with compression: the
+loss first fell below 9 after step 250 in all 6 compressed runs here (and 3
+of the 4 in docs/COMPRESSION.md), against 2 of 11 one-V100 runs and 2 of 7
+uncompressed mixed ones here. After their fall the compressed runs keep
+closing: `fp8`'s gap fell from 0.059 over steps 1,301 to 1,400 to 0.022 over
+the last 100. That is about where the earlier 1,000-step `fp8` run ended
+(job 11111481, 0.022 to 0.027 from four one-V100 runs), so part of it may be
+`fp8`'s own error rather than timing; these runs can't separate the two
+(inferred).
 
 **Not tested yet, and next.** The timing explanation for shares by speed and
-FSDP2 is untested at 2,000 steps: batch 4 ran neither. And one V100 alone
-fails this rule against its own runs (11141231, 25 S), so the rule measures
-when a run leaves the plateau as much as anything the bridge does. The
-planned next step is a redesigned test rather than more runs of this one:
-at least four seeds per mode, each with one-V100 runs of the same seed; the
-loss at the end, judged only once every run has left the plateau; and the
-steps and wall-clock time to a target loss, against uncompressed runs. For
-`bf16` and `fp8` the slower convergence is to be reported as a measured
-cost, not a pass or a fail. The MI50s are only in Explorer's `sharing`
-partition, whose one-hour limit bounds a mixed job: about 2,700 steps of DDP,
-but only about 1,150 of FSDP2.
+FSDP2 is untested at 2,000 steps: the 2,000-step runs above include neither.
+And at 2,000 steps one V100 alone falls outside S against its own runs
+(11141231, 25 S), so the rule measures when a run falls off the plateau as
+much as anything the bridge does. The planned next step is a redesigned
+test rather than more runs of this one: at least four seeds per mode, each
+with one-V100 runs of the same seed; the loss at the end, judged only once
+every run has reached the plateau exit; and the steps and wall-clock time to
+a target loss, against uncompressed runs. For `bf16` and `fp8` any slower
+convergence is to be reported as a measured cost, not a pass or a fail. The
+MI50s are only in Explorer's `sharing` partition, whose one-hour limit bounds
+a mixed job: about 2,700 steps of DDP, but only about 1,150 of FSDP2.
 
 ### Network
 

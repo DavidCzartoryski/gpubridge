@@ -439,14 +439,20 @@ schedule and runs torch 2.9.1 on the V100. So after 1,000 steps compressed
 DDP is within about 0.03 of one V100 on this model, an uncompressed run that
 dropped as late is within 0.025, and these runs can't separate compression's
 error from the timing of the drop. The ranks' parameters were bit-identical at every
-check, every 50 steps, compressed or not.
+check, every 50 steps, compressed or not. Four later 1,000-step compressed runs
+(two `bf16`, two `fp8`, Triton kernels on both GPUs; HARDWARE_VALIDATION.md,
+item 33) landed 0.033 to 6.92 from eight one-V100 runs, each after a late drop,
+so "within about 0.03" held for the two runs above only.
 
-**Open: does compression delay the drop?** In all four compressed runs so far
+**Open: does compression delay the drop?** In the first four compressed runs
 the drop came later than in the uncompressed DDP run of the same job: bf16 at
 steps 228 and 337, fp8 at 302 and 457, against 190 and 188 (job 11105619, 500
 steps with the PyTorch kernels on the MI50, and job 11111481).
 Fourteen uncompressed runs, on one GPU or two, dropped between steps 172 and
-444. Several seeds per setting would tell a delay from chance.
+444. Six later compressed runs, all seed 0, dropped at steps 345 to 875,
+against 179 to 289 for ten of eleven one-V100 runs (one at 521) and 183 to 418
+for seven uncompressed mixed runs (HARDWARE_VALIDATION.md, item 33). Several
+seeds per setting would tell a delay from chance.
 
 ## Not done
 
