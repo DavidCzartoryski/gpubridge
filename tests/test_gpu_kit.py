@@ -4,6 +4,7 @@ Shell scripts: shellcheck and --dry-run output. Python tools: run end to end
 under torchrun on CPU in simulation mode, including split-test runs.
 """
 
+import importlib.util
 import json
 import os
 import re
@@ -1103,6 +1104,71 @@ def test_training_demo_keeps_ranks_in_sync_and_learns(tmp_path):
         assert env["torch"] == torch.__version__ and env["git_commit"]
         assert env["env"]["GPUBRIDGE_VENDOR"] == "nvidia"
     assert data["timeout_s"] > 0 and data["warmup_steps"] == 5
+
+
+def _train_synthetic():
+    spec = importlib.util.spec_from_file_location("train_synthetic",
+                                                  REPO / "examples" / "train_synthetic.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_fingerprints_are_bit_exact_and_independent_of_summation_order():
+    ts = _train_synthetic()
+    x = torch.randn(1000, generator=torch.Generator().manual_seed(3))
+    assert ts.fingerprint(x) == ts.fingerprint(x.clone())
+    nudged = x.clone()
+    nudged[500] = torch.nextafter(nudged[500], nudged[500] + 1)  # one ulp
+    assert ts.fingerprint(nudged) != ts.fingerprint(x)
+    # The same bits summed in another order (as another device might) agree.
+    bits = x.view(torch.int32).to(torch.int64)
+    assert int(bits.flip(0).sum()) == ts.fingerprint(x)[0]
+    # -0.0 and 0.0 are equal as floats but not as bits: the check counts them as different.
+    assert ts.fingerprint(torch.tensor([0.0])) != ts.fingerprint(torch.tensor([-0.0]))
+    assert ts.fingerprint(torch.ones(4, dtype=torch.bfloat16)) != ts.fingerprint(
+        torch.full((4,), 2.0, dtype=torch.bfloat16))
+
+
+def test_mismatch_and_largest_difference_name_the_tensor_and_element():
+    ts = _train_synthetic()
+    assert ts.first_mismatch([[(1, 2), (3, 4)], [(1, 2), (3, 4)]]) == []
+    assert ts.first_mismatch([[(1, 2), (3, 4)], [(1, 2), (3, 5)]]) == [1]
+    a, b = torch.zeros(3), torch.tensor([0.0, 0.5, -2.0])
+    worst = ts.largest_difference(["w"], [[a], [b]])
+    assert worst == {"max_abs_diff": 2.0, "tensor": "w", "index": 2, "rank": 1,
+                     "elements_differing": 2}
+
+
+def test_training_demo_records_no_mismatch_when_ranks_agree(tmp_path):
+    record = tmp_path / "train.json"
+    result = torchrun(2, REPO / "examples" / "train_synthetic.py", "--steps", "4",
+                      "--warmup-steps", "1", "--dim", "32", "--batch-size", "8",
+                      "--json", str(record), GPUBRIDGE_VENDOR="nvidia",
+                      GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode == 0, result.stderr[-3000:]
+    data = json.loads(record.read_text())
+    assert data["params_in_sync"] is True
+    assert data["first_grad_mismatch"] is None and data["first_param_mismatch"] is None
+    assert data["params_checksums_equal"] is True
+
+
+def test_training_demo_finds_the_step_a_parameter_diverges_and_blames_the_optimizer(tmp_path):
+    # A one-ulp change to one parameter on the last rank after step 2: the
+    # gradients (synced) still agree, the parameters differ from step 2 on.
+    record = tmp_path / "train.json"
+    result = torchrun(2, REPO / "examples" / "train_synthetic.py", "--steps", "4",
+                      "--warmup-steps", "1", "--dim", "32", "--batch-size", "8",
+                      "--perturb-step", "2", "--json", str(record),
+                      GPUBRIDGE_VENDOR="nvidia", GPUBRIDGE_SPLIT_TEST="half")
+    assert result.returncode != 0 and "parameters diverged" in result.stderr
+    data = json.loads(record.read_text())
+    assert data["params_in_sync"] is False and data["first_grad_mismatch"] is None
+    first = data["first_param_mismatch"]
+    assert first["step"] == 2 and first["tensor"] == "0.weight" and first["index"] == 0
+    assert first["tensors"] == ["0.weight"] and first["elements_differing"] == 1
+    assert 0 < first["max_abs_diff"] < 1e-6
+    assert "params first differed at step 2" in result.stdout
 
 
 def test_scaling_summary_computes_efficiency(tmp_path):

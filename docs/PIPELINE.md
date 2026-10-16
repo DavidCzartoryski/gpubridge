@@ -34,7 +34,7 @@ order; the record lists each stage's rank, vendor and blocks.
 **Communication.** `PipelineStage` sends each microbatch's activations to the
 next stage and receives its gradient back with `dist.isend`/`irecv` on the
 default group. On `backend="gpubridge"` these are the backend's point-to-point
-operations ([TORCH_BACKEND.md](TORCH_BACKEND.md#point-to-point-cpu-only)):
+operations ([TORCH_BACKEND.md](TORCH_BACKEND.md#point-to-point)):
 native NCCL/RCCL within an island, host-staged across the bridge between
 islands, bit-exact either way. The stages' tensor shapes are given up front
 (static mode), so torch infers nothing over the network; the activations that
