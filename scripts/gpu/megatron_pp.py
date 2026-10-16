@@ -103,12 +103,14 @@ def main() -> int:
     topology = gpubridge.get_topology()
     device = topology.device
     torch.cuda.set_device(device)
-    config = TransformerConfig(
-        num_layers=args.layers, hidden_size=args.hidden, num_attention_heads=args.heads,
-        hidden_dropout=0.0, attention_dropout=0.0, use_cpu_initialization=True,
-        params_dtype=torch.float32, pipeline_dtype=torch.float32)
-
-    def gpt(first: bool, last: bool) -> GPTModel:
+    def gpt(first: bool, last: bool, stages: int) -> GPTModel:
+        # Megatron sizes each stage from the config's pipeline_model_parallel_size, not only
+        # from parallel_state's groups.
+        config = TransformerConfig(
+            num_layers=args.layers, hidden_size=args.hidden, num_attention_heads=args.heads,
+            hidden_dropout=0.0, attention_dropout=0.0, use_cpu_initialization=True,
+            params_dtype=torch.float32, pipeline_dtype=torch.float32,
+            pipeline_model_parallel_size=stages)
         return GPTModel(config=config, transformer_layer_spec=get_gpt_layer_local_spec(),
                         vocab_size=args.vocab, max_sequence_length=args.seq_len,
                         pre_process=first, post_process=last,
@@ -118,13 +120,13 @@ def main() -> int:
     ps.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
     model_parallel_cuda_manual_seed(args.seed)
     torch.manual_seed(args.seed)
-    full = gpt(True, True).state_dict()
+    full = gpt(True, True, 1).state_dict()
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(tensor_model_parallel_size=1,
                                  pipeline_model_parallel_size=args.pipeline)
     model_parallel_cuda_manual_seed(args.seed)
     first, last = ps.is_pipeline_first_stage(), ps.is_pipeline_last_stage()
-    model = gpt(first, last)
+    model = gpt(first, last, args.pipeline)
     layers = [layer.layer_number - 1 for layer in model.decoder.layers]  # 0-based, global
     model.load_state_dict(stage_weights(full, model.state_dict(), layers[0] if layers else 0))
     del full
@@ -141,7 +143,8 @@ def main() -> int:
 
         def loss(per_token: torch.Tensor):
             mean = per_token.float().mean()
-            return mean, {"loss": mean.detach()}
+            # A copy: Megatron divides the returned loss by the microbatches in place.
+            return mean, {"loss": mean.detach().clone()}
         return out, loss
 
     losses, step_s = [], []
@@ -169,6 +172,9 @@ def main() -> int:
     everyone = gather({"step_s": step_s, "losses": losses, "layers": layers,
                        "vendor": topology.vendor, "device": torch.cuda.get_device_name(device)})
     environments = gather(environment()) if args.json else []
+    held = sorted(layer for e in everyone for layer in e["layers"])
+    if held != list(range(args.layers)):
+        raise SystemExit(f"the stages hold layers {held}, not each of 0 to {args.layers - 1} once")
     losses_all = next(e["losses"] for e in everyone if e["losses"])
     steps = [max(times) for times in zip(*(e["step_s"] for e in everyone))]
     median_step = statistics.median(steps[args.warmup_steps:] or steps)
