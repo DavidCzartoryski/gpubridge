@@ -228,9 +228,9 @@ if [ "$STEPS_07" = pipeline ]; then
     finish
     exit
 fi
-# DDP with gpubridge.ddp_comm_hook on real NVIDIA + AMD ranks (item 22), TRAIN_DDP_REPEATS
-# times: a divergence that comes and goes needs many runs to count. Bridge compression
-# comes from the job's environment (GPUBRIDGE_BRIDGE_COMPRESSION, ..._KERNELS).
+# DDP with gpubridge.ddp_comm_hook on real NVIDIA + AMD ranks (item 22).
+# TRAIN_DDP_REPEATS times: a divergence that comes and goes needs many runs to count.
+# Bridge compression comes from the job's environment (GPUBRIDGE_BRIDGE_COMPRESSION, ..._KERNELS).
 if [ "$STEPS_07" != bench ]; then
     for ((i = 1; i <= TRAIN_DDP_REPEATS; i++)); do
         repeat=""
