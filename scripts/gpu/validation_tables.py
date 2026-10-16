@@ -128,6 +128,8 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
          [Step("multitcp_build"), Step(r"matrix_D-multitcp(-pinned|-1stream)?")]),
     36: ("Automatic stage balancing against even and hand-tuned splits",
          [Step(r"pp_(gpipe|1f1b)_(even|auto|[0-9]+(-[0-9]+)+)")]),
+    37: ("Megatron-Core's pipeline across vendors tracks one GPU",
+         [Step("megatron_pp2"), Step("megatron_pp1")]),
 }
 
 

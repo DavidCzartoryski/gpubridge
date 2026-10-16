@@ -238,6 +238,14 @@ hardware.
 
 ### Added
 
+- Megatron-Core's pipeline across vendors, experimental (docs/MEGATRON.md):
+  `scripts/gpu/megatron_pp.py` runs Megatron-Core 0.14's GPT in two stages with
+  its own 1F1B schedule through `backend="gpubridge"`, with no patch to
+  Megatron. Megatron's groups build on the gpubridge default group; the
+  configuration avoids Transformer Engine, Apex, the fused kernels and bf16.
+  Step 07's `STEPS_07=megatron` runs it on one V100, then on a V100 + MI50.
+  There: the two curves stay within 1.4e-4 over 200 steps, at 1.14x the V100's
+  tokens/s. HARDWARE_VALIDATION.md item 37 (#93).
 - One model's throughput, every way (docs/BENCHMARKS.md, "What mixing vendors
   costs, and whether it helps"). `llama-125m`, 500 steps, each setting run twice
   (spread at most 5.4%):
