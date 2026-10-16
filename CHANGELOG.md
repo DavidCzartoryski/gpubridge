@@ -244,7 +244,7 @@ hardware.
   Megatron. Megatron's groups build on the gpubridge default group; the
   configuration avoids Transformer Engine, Apex, the fused kernels and bf16.
   Step 07's `STEPS_07=megatron` runs it on one V100, then on a V100 + MI50.
-  There: the two curves stay within 1e-4 over 200 steps, at 1.14x the V100's
+  There: the two curves stay within 1.4e-4 over 200 steps, at 1.14x the V100's
   tokens/s. HARDWARE_VALIDATION.md item 37 (#93).
 - One model's throughput, every way (docs/BENCHMARKS.md, "What mixing vendors
   costs, and whether it helps"). `llama-125m`, 500 steps, each setting run twice

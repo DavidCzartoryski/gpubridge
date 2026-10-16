@@ -100,17 +100,20 @@ alone. Medians of steps 6 to 200.
   its `batch_isend_irecv` between the stages and its 1F1B schedule all ran
   through `backend="gpubridge"`.
 - **The two curves match.** They're identical to 1e-6 for the first 7 steps,
-  and never more than 1e-4 apart over the 200. The same weights at the start
+  and at most 1.3e-4 apart over the 200 (at step 21; 7e-7 on average over the last 50). The same weights at the start
   and the same data, summed in another order on other GPUs.
 - **The pair is 1.14x the V100 alone** (17,057 against 14,990 tokens/s).
   Its output layer is small (768 x 1,024), so an even split of the layers
   leaves the two stages' work closer to equal than with the kit's
   32,000-token model ([PIPELINE.md](PIPELINE.md)).
-- **The first try failed in a different way:** each stage built all 12 layers.
-  Megatron-Core 0.14 sizes a stage from the config's
-  `pipeline_model_parallel_size`, not only from its process groups.
-  `megatron_pp.py` now sets it, and stops if the stages don't hold each layer
-  exactly once.
+- **The first try had two bugs, both mine.**
+  - Each stage built all 12 layers: Megatron-Core 0.14 sizes a stage from the
+    config's `pipeline_model_parallel_size`, not only from its process groups.
+    `megatron_pp.py` now sets it, and stops if the stages don't hold each layer
+    exactly once.
+  - The record held each step's loss divided by the 4 microbatches: Megatron
+    divides the returned loss in place, and the record shared its memory. It
+    now copies it.
 - **Not tried:** more than two stages, data parallelism within each vendor
   (Zettabyte's DP=8 per side needs several GPUs per vendor, which Explorer's
   `gpu` and `sharing` partitions don't give one job), and the rest of the
