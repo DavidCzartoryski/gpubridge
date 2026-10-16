@@ -613,8 +613,10 @@ With multigpu access, `submit.sh train-multi` runs each model on one GPU, on
 split into two islands joined by the bridge (`train_bench_<model>_split`, a
 split test): what several GPUs per island cost through the bridge, against the
 same GPUs on NCCL alone. `submit.sh 07-multi` does the same across vendors
-(several NVIDIA GPUs, one island, and the AMD side). Pipeline-parallel training
-isn't in the kit yet.
+(several NVIDIA GPUs, one island, and the AMD side). With `STEPS_07=dp` or
+`pipeline`, `07-multi` runs the data-parallel or pipeline training instead, a
+rank per GPU; the pipeline puts one stage on each, so `PP_MICROBATCHES` must be
+at least the GPUs in all.
 Both models need BLAS on every GPU (the probe's `blas_available`):
 with a ROCm build whose rocBLAS lacks the GPU's kernels, its rank aborts at the
 first matmul, as the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
@@ -914,9 +916,18 @@ measurements.
    ```
 
    Each machine is one island of 8 (NCCL on one, RCCL on the other) and the
-   bridge joins the two leaders. Every launch is stopped after `KIT_TIMEOUT`
+   bridge joins the two leaders. Every launch is stopped after `STEP_TIMEOUT`
    seconds (1200 by default) and recorded as timed out, so a hung step costs
-   at most 20 minutes; 11 steps follow the preflight.
+   at most 20 minutes; 17 steps follow the preflight.
+
+   The data-parallel and pipeline runs (`DP_RUNS`, `PP_RUNS`) default to step
+   07's settings, sized for 1 + 1 GPUs: `llama-125m`, 500 steps, a global batch
+   of 8. For 8 + 8, give each GPU a few sequences and the pipeline a stage per
+   GPU: `DP_GLOBAL_BATCH=64`, and `DP_MODEL=llama-1b PP_MICROBATCHES=16` (20
+   blocks for 16 stages), or `PP_RUNS=""` to leave the pipeline out. To compare
+   loss curves, `DP_STEPS=1000`
+   ([COMPRESSION.md](COMPRESSION.md#training-with-compression)), with
+   `STEP_TIMEOUT` raised to fit.
 6. **Collect.** Each machine prints the `scp` line for its tarball. Copy both,
    then:
 
@@ -929,8 +940,11 @@ measurements.
    tarball of the machine that got rank 0, which writes them, as it writes the
    benchmarks' and FSDP2's. torchrun numbers the machines by their addresses
    (`LOCAL_ADDR`), not by role, so it can be either. Each tarball holds its own
-   machine's baseline (`train_bench_alone_<model>.json`). For the check's
-   verdict, see above.
+   machine's baseline (`train_bench_alone_<model>.json`). The same holds for
+   the data-parallel and pipeline records (`dp_<run>.json`, `pp_<schedule>.json`)
+   and their one-GPU baseline (`dp_single.json`, on each machine);
+   `scripts/gpu/dp_report.py` sets them side by side. For the check's verdict,
+   see above.
 7. **Stop billing.** Destroy both machines once the tarballs are copied; on
    some providers a powered-off GPU machine still bills.
 
@@ -939,8 +953,9 @@ work on 8+8 GPUs of current generations; what the bridge costs at each size on
 that network (the benchmark against the preflight's prediction); and whether
 16 GPUs across vendors train faster than each machine's 8 alone, for GPT-2
 small and ResNet-50 (`samples_per_s`, with the step split into compute, waiting
-for the slower machine and exposed communication). Pipeline-parallel training
-isn't in the kit yet; when it is, it becomes one more step here.
+for the slower machine and exposed communication); and for `llama.py`'s model,
+data-parallel training uncompressed and with bf16 and fp8 on the bridge, and
+pipeline training, against one GPU alone.
 
 ## Reading results
 

@@ -53,11 +53,12 @@ its own vendor. No GPUs? See [Simulation mode](#simulation-mode-no-gpus-needed).
 | --- | --- |
 | Collectives: `all_reduce`, `broadcast`, `all_gather_into_tensor`, `reduce_scatter_tensor`, `barrier` | tested on CPU · passed on a V100 + MI50, one GPU each, and in split tests (two processes on one NVIDIA or AMD GPU, labeled as two vendors) |
 | Async collectives (`async_op=True`) and a DDP comm hook | tested on CPU · passed on a V100 + MI50; DDP with the hook trained there with torch 2.9.1+rocm6.3 on the MI50 |
-| `torch.distributed` backend: DDP, FSDP2, HSDP through subgroups | experimental · tested on CPU · DDP and FSDP2 trained on a V100 + MI50 (torch 2.9.1+rocm6.3 on the MI50), FSDP2 bit for bit against a replay; HSDP hung there |
+| `torch.distributed` backend: DDP, FSDP2, HSDP through subgroups | experimental · tested on CPU · DDP and FSDP2 trained on a V100 + MI50 (torch 2.9.1+rocm6.3 on the MI50), FSDP2 bit for bit against a replay; HSDP passed there with torch 2.14.1 on the V100 (since #80) |
+| Point-to-point through the backend: `send`, `recv`, `isend`, `irecv`, `batch_isend_irecv` | experimental · tested on CPU · passed on a V100 + MI50 and on a V100 split test (commit 1c7d107), through the Gloo link; not yet the UCX lanes or native GPU batches |
 | Pipelined and sharded bridge policies | opt-in · tested on CPU · correct and benchmarked on a V100 + MI50 (one GPU each, so the sharded bridge had one link) |
 | UCX bridge transport (RDMA where available) | opt-in · tested on CPU over TCP · not yet on GPU or RDMA |
 | Multi-stream TCP bridge transport (Rust) | opt-in · tested on CPU over loopback TCP · not yet between two machines |
-| bf16 / fp8 bridge compression with Triton kernels | opt-in · kernels match the CPU reference on V100, H200 and MI50 (not with torch 2.9.1+rocm6.3's Triton on the MI50); benchmarked on a V100 + MI50 |
+| bf16 / fp8 bridge compression with Triton kernels | opt-in · kernels match the CPU reference on V100, H200 and MI50 (on the MI50 with Triton 3.8.0; torch 2.9.1+rocm6.3's own Triton 3.5.1 can't compile them); benchmarked on a V100 + MI50 |
 | GPU validation kit: Slurm job scripts, checks, benchmarks | every script runs end to end on CPU against a fake Slurm · run on Explorer: steps 01, 02, `amd`, 07, 08, the network checks and the training benchmarks; not the multi-GPU steps 03 to 06 |
 
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what each one still
@@ -480,13 +481,15 @@ dist.init_process_group(backend="gpubridge")   # instead of "nccl"
   collective. Single-vendor members run native-only (one NCCL/RCCL call);
   mixed members are bridged. See [HSDP on a mixed cluster](#hsdp-on-a-mixed-cluster)
   below. Tested in simulation only.
-- **Point-to-point (CPU only).** `send`, `recv` with an explicit source,
+- **Point-to-point.** `send`, `recv` with an explicit source,
   `isend`, `irecv` and `batch_isend_irecv` route within an island to its native
   group and across islands through a host-staged Gloo link. Call
   `dist.barrier()` on the world, and on a subgroup before its first P2P call,
   to finish collective setup. Cross-island tags match independently; repeated
   messages with the same tag, source and destination match in order. See
-  [P2P semantics and limits](docs/TORCH_BACKEND.md#point-to-point-cpu-only).
+  [P2P semantics and limits](docs/TORCH_BACKEND.md#point-to-point). Passed on
+  a V100 + MI50 and a V100 split test at commit 1c7d107 (HARDWARE_VALIDATION.md
+  item 32).
   For native GPU peers on torch 2.8, use `gpubridge.batch_isend_irecv(ops)`
   to provide the batch boundary torch does not pass to Python backends.
 - **Not supported**, refused with an error before any communication:

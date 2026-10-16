@@ -219,19 +219,12 @@ if [ "$STEPS_07" = all ]; then
 fi
 if [ "$STEPS_07" = dp ]; then
     for run in $DP_RUNS; do
-        mode=${run%%-*} compression='' extra=()
-        case $run in
-        ddp | fsdp2) ;;
-        ddp-bf16 | ddp-fp8) compression=${run#ddp-} ;;
-        ddp-speed) extra=(--shares speed) ;;
-        ddp-bucket-*) extra=(--bucket-mb "${run#ddp-bucket-}") ;;
-        *) die "DP_RUNS: unknown run '$run'" ;;
-        esac
-        GPUBRIDGE_BRIDGE_COMPRESSION=$compression step "dp_$run" mixed_torchrun "dp-$run" \
-            "$KIT_DIR/train_dp.py" --model "$DP_MODEL" --mode "$mode" --steps "$DP_STEPS" \
+        dp_run_options "$run"
+        GPUBRIDGE_BRIDGE_COMPRESSION=$DP_COMPRESSION step "dp_$run" mixed_torchrun "dp-$run" \
+            "$KIT_DIR/train_dp.py" --model "$DP_MODEL" --mode "$DP_MODE" --steps "$DP_STEPS" \
             --global-batch "$DP_GLOBAL_BATCH" --seq-len "$DP_SEQ" \
             --kernels-on-amd "$DP_KERNELS_ON_AMD" --json "$RESULTS/dp_$run.json" \
-            "${extra[@]+"${extra[@]}"}" "${dp_args[@]+"${dp_args[@]}"}"
+            "${DP_RUN_ARGS[@]+"${DP_RUN_ARGS[@]}"}" "${dp_args[@]+"${dp_args[@]}"}"
     done
     finish
     exit

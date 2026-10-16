@@ -193,7 +193,7 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   module; UCX copies bundled with some application modules have `ib`, none
   `cuda` or `rocm`. Details in
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md#rdma-between-the-node-types).
-- **A multi-stream TCP bridge prototype (#66, not merged), commit 23180fe of its
+- **A multi-stream TCP bridge prototype (#66), commit 23180fe of its
   branch**, step 08 with `MULTITCP_BRIDGE=1`, two jobs on a V100 + MI50: with
   pinned staging, a float32 all_reduce took 1.099 and 1.098 s at 1 GB against
   1.250 and 1.241 s on the pinned Gloo bridge, 0.88 times its time, and 1.07 and
@@ -202,7 +202,7 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   slower: torch's intra-op threads competing with the transport's network threads
   on 4-CPU jobs made each reduction 10 to 25 times slower, until it reduced on one
   thread. Details in
-  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype-not-merged).
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype).
 - **Triton 3.8.0 with torch 2.9.1+rocm6.3 on the AMD MI50 (gfx906), commit
   4e7f04e**: Triton from the default ROCm venv in front of `venv-rocm63`'s own
   (3.5.1), which can't compile the compression kernels for gfx906. The kit's
@@ -216,6 +216,19 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   PyTorch kernels. Communication alone fell to 346 and 362 ms from 485 and
   605. HSDP hung again in both. Details in
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md#fp8-with-triton-kernels-on-the-mi50).
+- **Point-to-point, HSDP and the kit on a V100 + MI50, commit 1c7d107** (V100:
+  torch 2.14.1+cu126, NCCL 2.29.3; MI50: torch 2.9.1+rocm6.3, RCCL 2.21.5, in
+  `venv-rocm63`). Point-to-point through `backend="gpubridge"` passed on GPUs:
+  `check_p2p` on the split test (one V100, job 11112711) and across vendors (job
+  11112713), and the GPU stream-order test in `gpu_tests` on the V100 and the
+  MI50. Across vendors, a message took about 2.8 to 3.4 ms one way from 1 KB to 1
+  MB, and moved 0.8 GB/s at 64 MB and up (1.0 GB/s with pinned staging), payload
+  intact at every size. HSDP through the backend passed with mixed torch releases
+  (`train_hsdp_backend`, `verify_hsdp_backend`; it hung before #80). `train_ddp`
+  ended with the ranks' parameters unequal, as in 1 of 7 earlier mixed runs (item
+  22). The MI50's compression-kernel steps failed on `venv-rocm63`'s Triton 3.5.1,
+  which can't compile for gfx906, and passed with the Triton 3.8.0 overlay (job
+  11113623: every step of the AMD node job, GPU tests 27 passed, 8 skipped).
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
@@ -251,6 +264,21 @@ hardware.
   steps): even 13,062 tokens/s, 8 + 4 15,577, 9 + 3 16,021; the automatic
   split chose 8 + 4 (15,559, 1.19x even), 3.0% below the best hand-tuned one.
   docs/PIPELINE.md, HARDWARE_VALIDATION.md item 36 (#90).
+- `examples/train_synthetic.py` (the kit's `train_ddp`) compares every rank's
+  gradients after the all_reduce and parameters after the optimizer step, bit for
+  bit, between steps, and records the first step each differed, in which tensors,
+  and by how much (`first_grad_mismatch`, `first_param_mismatch`). The parameter
+  verdict now comes from the bits; the earlier float64 checksum comparison stays
+  as `params_checksums_equal`.
+- The two-machine runner (`scripts/gpu/mixed/node.sh`) also trains `llama.py`'s
+  model: `train_dp.py` on one GPU of each machine alone (the baseline), then
+  step 07's data-parallel runs (`DP_RUNS`, default DDP uncompressed, bf16 and
+  fp8) and pipeline runs (`PP_RUNS`, GPipe and 1F1B) on both machines
+  together, with step 07's `DP_*` and `PP_*` settings. The run names are now
+  one shell function for both (`dp_run_options`). The runbook's 8+8 steps say
+  how to size them for 16 GPUs. Step 07's `07-multi` with `STEPS_07=dp` and
+  `pipeline` runs on the fake cluster with an NVIDIA island of two, and the
+  runner on two pretend machines and in two containers (#85).
 - Pipeline training across vendors: `scripts/gpu/train_pipeline.py` cuts
   `llama.py`'s model into contiguous stages, one per rank, and trains it with
   torch's GPipe or 1F1B through `backend="gpubridge"`'s point-to-point (or on a
