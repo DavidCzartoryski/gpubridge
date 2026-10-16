@@ -237,7 +237,7 @@ hardware.
   `submit.sh 07-nvidia-pair` and `07-amd-pair` run step 07's dp or pipeline
   runs on two GPUs of one type, one island (native NCCL or RCCL), for the
   same-vendor baselines. They're refused until `SAME_PARTITION_PAIRS_OK=1`
-  (#PRNUM).
+  (#92).
 - Automatic pipeline stage balancing: `gpubridge.balance`, an opt-in module
   nothing else imports. `profile_layers` times each layer's forward and
   backward on a device (CUDA or HIP events), with its output size, state and
