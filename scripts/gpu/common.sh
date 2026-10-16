@@ -50,6 +50,7 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-3}"
 # (coreutils timeout, where installed; 0 = none). It is above KIT_TIMEOUT, so a
 # stuck collective fails with its own error first. Slurm's --time caps each job.
 export STEP_TIMEOUT="${STEP_TIMEOUT:-1200}"
+JOB_STEP_TIMEOUT=$STEP_TIMEOUT  # the job's, for checks nested in a step with its own
 # NCCL/RCCL say which version, transport and interfaces they picked at INFO;
 # step sends it to files, so it costs nothing until a step fails.
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
@@ -371,7 +372,9 @@ needs_triton() {
 # triton_ready: step triton_check, once per TRITON_CHECK_LAUNCH; whether it passed.
 triton_ready() {
     if [ "$TRITON_CHECKED_WITH" != "$TRITON_CHECK_LAUNCH" ]; then
-        local failed_before=${#FAILED_STEPS[@]}
+        # Not a negative step's expectation or time limit: the check may run inside one.
+        local failed_before=${#FAILED_STEPS[@]} STEP_EXPECT=""
+        local -x STEP_TIMEOUT=$JOB_STEP_TIMEOUT
         # shellcheck disable=SC2086 # TRITON_CHECK_LAUNCH is a command prefix: split it
         step triton_check $TRITON_CHECK_LAUNCH "$KIT_DIR/triton_check.py"
         TRITON_CHECKED_WITH=$TRITON_CHECK_LAUNCH TRITON_CHECK_RESULT=ok

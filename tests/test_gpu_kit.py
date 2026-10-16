@@ -2636,6 +2636,27 @@ echo "RESULTS=$RESULTS"
     assert out.returncode == 0, out.stderr[-2000:]
     assert f"RESULTS={used}_job77" in out.stdout
     assert (used / "job.jsonl").read_text().count("started") == 1  # untouched
+    assert "import_check.py" in out.stdout  # and checks where gpubridge comes from
+
+
+@pytest.mark.parametrize("script,target,env", [
+    ("amd/run_all.sh", "amd_node", {}),
+    ("mixed/node.sh", "master", {"ROLE": "master", "MASTER_ADDR": "127.0.0.1",
+                                 "TORCH_FLAVOR": "system"}),
+])
+def test_the_scripts_for_other_machines_check_the_import_and_keep_old_folders(
+        script, target, env, tmp_path):
+    used = tmp_path / target
+    used.mkdir()
+    (used / "steps.jsonl").write_text("{}\n")
+    out = subprocess.run(["bash", str(KIT / script), "--dry-run"],
+                         env=clean_env(RESULTS_ROOT=str(tmp_path), TARGET=target, RUN_ID="r1",
+                                       SKIP_SETUP="1", VENV=str(tmp_path / "venv"),
+                                       GPUBRIDGE_REPO=str(REPO), **env),
+                         capture_output=True, text=True, timeout=120)
+    both = out.stdout + out.stderr
+    assert "import_check.py" in out.stdout, both[-2000:]
+    assert f"{used}_jobr1" in both and (used / "steps.jsonl").read_text() == "{}\n"
 
 
 def test_a_directory_of_wrappers_is_a_venv_the_kit_can_use(tmp_path):
@@ -2757,6 +2778,7 @@ step gpu_tests echo ran-gpu-tests
 step bench_compression_kernels echo ran-kernels
 GPUBRIDGE_BRIDGE_COMPRESSION=fp8 step dp_ddp-fp8 mixed_torchrun fp8
 step train_ddp echo ran-train
+echo "failed: ${FAILED_STEPS[*]}"
 """)
     assert checks == 1 and steps["triton_check"]["exit_code"] != 0  # checked once
     for name in ("gpu_tests", "bench_compression_kernels", "dp_ddp-fp8"):
@@ -2766,6 +2788,9 @@ step train_ddp echo ran-train
     assert "ran-gpu-tests" not in result.stdout and "ran-fp8" not in result.stdout
     assert steps["check"]["exit_code"] == 0 and steps["train_ddp"]["exit_code"] == 0
     assert "ran-train" in result.stdout  # the rest of the job goes on
+    failed_line = next(line for line in result.stdout.splitlines() if line.startswith("failed:"))
+    assert set(failed_line.split()[1:]) == {"triton_check", "gpu_tests",
+                                            "bench_compression_kernels", "dp_ddp-fp8"}
 
 
 def test_runners_whose_machines_decide_alone_never_skip_a_mixed_step(tmp_path):
@@ -2781,6 +2806,20 @@ step bench_compression_kernels echo ran-kernels
     assert steps["dp_ddp-fp8"]["exit_code"] == 0 and "not_run" not in steps["dp_ddp-fp8"]
     assert checks == 1 and "ran-kernels" not in result.stdout  # a local step still checks
     assert steps["bench_compression_kernels"]["not_run"].startswith("triton_check failed")
+
+
+def test_a_negative_steps_expectation_and_time_limit_stay_out_of_the_triton_check(tmp_path):
+    (tmp_path / "check-env").write_text("")
+    result, steps, checks = _gate(tmp_path, True, f"""
+mixed_torchrun() {{ echo "ran-$1 fired"; }}
+TRITON_CHECK_LAUNCH="env-check {tmp_path}/fake-python"
+env-check() {{ echo "timeout=$STEP_TIMEOUT expect=${{STEP_EXPECT:-}}" >>{tmp_path}/check-env; "$@"; }}
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 negative_step neg_fp8 7 fired mixed_torchrun fp8
+""", STEP_TIMEOUT="900")
+    assert checks == 1 and steps["triton_check"]["exit_code"] == 0
+    assert "result" not in steps["triton_check"]  # not "check did not fire"
+    assert (tmp_path / "check-env").read_text().split() == ["timeout=900", "expect="]
+    assert steps["neg_fp8"]["result"] == "expected failure confirmed"
 
 
 def test_steps_that_use_the_kernels_run_after_a_passing_check(tmp_path):

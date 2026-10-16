@@ -404,6 +404,12 @@ def test_step_07_mixed_hetjob(tmp_path):
     assert check["ok"] and check["split_test"] is None
     assert summary(out / "check_p2p")["ok"]
     assert (out / "train_ddp.json").exists() and (out / "thresholds.json").exists()
+    # Triton's check runs on both sides, once, before the first step that uses the kernels.
+    order = list(steps(out))
+    assert order.index("triton_check") == order.index("bench_compression_kernels") - 1, order
+    log = "\n".join(p.read_text() for p in (tmp_path / "work" / "logs").glob("*.out"))
+    check = [line for line in log.splitlines() if "step triton_check:" in line]
+    assert len(check) == 1 and "step triton_check: both @VENV@/bin/python" in check[0]
     bench = json.loads((out / "train_bench_tiny-gpt.json").read_text())
     assert bench["world_size"] == 2 and [r["vendor"] for r in bench["ranks"]] == ["nvidia", "amd"]
     # Every job step after the preflight runs with each side's chosen interface.
@@ -570,6 +576,10 @@ def test_step_08_matrix_on_the_mixed_pair(tmp_path):
     runs = sorted(p.parent.name for p in (out / "matrix").glob("*/bench.json"))
     assert runs == ["D-bf16", "D-default", "D-default-repeat", "D-fp8", "D-pinned",
                     "D-pipelined-4K", "D-sharded", "E"]
+    # Each run's compression reaches step, so Triton's check comes before the first compressed run.
+    order = list(steps(out))
+    first = min(order.index(f"matrix_{name}") for name in ("D-bf16", "D-fp8"))
+    assert "triton_check" in order[:first] and order.count("triton_check") == 1, order
 
     def bench(name):
         return json.loads((out / "matrix" / name / "bench.json").read_text())
