@@ -652,8 +652,10 @@ numbers come from that job's log.
 **The other training steps of these four jobs** (each job runs them all):
 
 - `train_ddp` (`examples/train_synthetic.py`, DDP with the comm hook):
-  **parameters diverged across ranks in the batch-16 job** (11090726); they
-  stayed in sync in the other three. Not yet investigated.
+  **the parameter check failed in the batch-16 job** (11090726); it passed in
+  the other three. That was the old float64-checksum check;
+  under the later bit-for-bit check, 24 of 24 runs stayed in sync, and it was
+  most likely the checksum's false alarm (HARDWARE_VALIDATION.md item 22).
 - `verify_fsdp2_backend`: parameters differed from the single-process replay
   in all four, against a bit-for-bit match without compression (above). fp8
   is lossy, so this check may not apply with compression on; whether it does
@@ -780,12 +782,14 @@ side in one job (11111037), 100 steps each:
   didn't run: with one GPU per vendor it would shard nothing.
 - **Every DDP run's parameters were identical on both GPUs at every check**
   (every 50 steps and the last), compressed runs included.
-- **Loss**: uncompressed DDP tracks one V100 about as closely as V100 runs
-  track each other over the last 100 of 1,000 steps, and so does FSDP2 over
-  steps 401 to 500, the last it ran (0.007 to 0.069 from the four V100 runs,
-  which are 0.024 to 0.093 apart there, still falling). Compressed DDP ends
-  0.02 to 0.03 above after 1,000 steps. The comparison, and why it needs
-  1,000 steps rather than 500, is in
+- **Loss**: uncompressed DDP tracks one V100 about as closely as V100 runs track
+  each other over the last 100 of 1,000 steps, and so does FSDP2 over steps 401
+  to 500, the last it ran (0.007 to 0.069 from the four V100 runs, which are
+  0.024 to 0.093 apart there, still falling). Compressed DDP ended 0.02 to 0.03
+  above after 1,000 steps in job 11111481; four later runs ended 0.033 to 6.92
+  above, each after a late drop (one `fp8` run still falling at step 1,000,
+  8.73 over its last 100 steps; HARDWARE_VALIDATION.md item 33). The
+  comparison, and why it needs 1,000 steps rather than 500, is in
   [COMPRESSION.md](COMPRESSION.md#training-with-compression).
 
 ## Which ROCm wheels can train on an MI50 (gfx906)

@@ -173,9 +173,10 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   366.849 against 315.8 (1.16x). From batch 16 on, the V100 waits longer for
   the MI50 each step (409 and 728 ms) than the exposed communication (258
   and 445 ms). Communication alone was 472 to 485 ms up to batch 16 and 605
-  ms at 32, not yet explained. In the same jobs `train_ddp`'s parameters
-  diverged across ranks once (11090726), FSDP2's bit-for-bit check differed
-  from its uncompressed single-process replay in all four, and HSDP hung
+  ms at 32, not yet explained. In the same jobs `train_ddp`'s old float64
+  checksum differed across ranks once (11090726; most likely a false alarm,
+  item 22), FSDP2's bit-for-bit check differed from its uncompressed
+  single-process replay in all four, and HSDP hung
   until its step timeout in all four. Details in
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md#fp8-on-the-bridge-and-larger-batches).
 - **RDMA between the node types, commit 1ac6fa9** (the network check with
@@ -221,14 +222,30 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   `venv-rocm63`). Point-to-point through `backend="gpubridge"` passed on GPUs:
   `check_p2p` on the split test (one V100, job 11112711) and across vendors (job
   11112713), and the GPU stream-order test in `gpu_tests` on the V100 and the
-  MI50. Across vendors, a message took about 2.8 to 3.4 ms one way from 1 KB to 1
-  MB, and moved 0.8 GB/s at 64 MB and up (1.0 GB/s with pinned staging), payload
-  intact at every size. HSDP through the backend passed with mixed torch releases
-  (`train_hsdp_backend`, `verify_hsdp_backend`; it hung before #80). `train_ddp`
-  ended with the ranks' parameters unequal, as in 1 of 7 earlier mixed runs (item
-  22). The MI50's compression-kernel steps failed on `venv-rocm63`'s Triton 3.5.1,
-  which can't compile for gfx906, and passed with the Triton 3.8.0 overlay (job
-  11113623: every step of the AMD node job, GPU tests 27 passed, 8 skipped).
+  MI50. Across vendors, a message took about 2.8 to 3.4 ms one way from 1 KB to
+  1 MB, and moved 0.8 GB/s at 64 MB and up (1.0 GB/s with pinned staging),
+  payload intact at every size. HSDP through the backend passed with mixed torch
+  releases (`train_hsdp_backend`, `verify_hsdp_backend`; it hung before #80).
+  `train_ddp`'s old float64 checksum differed, as in 1 of 7 earlier mixed runs
+  (most likely a false alarm; item 22). The MI50's compression-kernel steps
+  failed on `venv-rocm63`'s Triton 3.5.1, which can't compile for gfx906, and
+  passed with the Triton 3.8.0 overlay (job 11113623: every step of the AMD node
+  job, GPU tests 27 passed, 8 skipped).
+- **Items 22 and 33 on a V100 + MI50, commits 1659f4f, fe84663 and 48840ba**
+  (V100: torch 2.14.1+cu126; MI50: torch 2.9.1+rocm6.3 in `venv-rocm63`, with
+  the Triton 3.8.0 overlay for item 33's compressed runs). `train_ddp` passed
+  in 24 of 24 runs, 16 uncompressed and 8 fp8 with the PyTorch kernels, under
+  the bit-for-bit check (#88); the old float64 checksum differed in 4 of them
+  with identical parameters, so the two earlier failures were most likely its
+  false alarms (item 22). `train_dp.py` at 1,000 steps against eight one-V100
+  runs, by a rule fixed before the new runs (S = 0.0131, the widest gap between
+  two of those runs): uncompressed DDP passes; shares by speed and FSDP2 fail
+  by the rule, one run of two each outside S, both late to reach the plateau
+  exit (10-step mean loss below 2.0); bf16 and fp8 fail by the rule in all four
+  runs (2.51 S to 528 S), as a lossy mode is expected to against a measure of
+  uncompressed noise, and whether those gaps are acceptable is open. At 2,000
+  steps one of three one-V100 runs ended 25 S from the other two, so a
+  redesigned test is planned (item 33).
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
@@ -393,8 +410,9 @@ hardware.
   raising tokens/s; the bridge, about 4x the slower GPU's compute, looks like
   what sets the step. 5, 25 and 100 MB buckets within 3.5%. Uncompressed DDP
   ends as close to one V100 as V100 runs do to each other; bf16 and fp8 end
-  0.02 to 0.03 above, after a later drop off the loss plateau, about the gap
-  an uncompressed pipeline run left after a similarly late drop; these runs
+  0.02 to 0.03 above in job 11111481 (later runs: HARDWARE_VALIDATION.md item
+  33), after a later drop off the loss plateau, about the gap an uncompressed
+  pipeline run left after a similarly late drop; these runs
   can't separate compression's error from the drop's timing. Parameters
   identical on both GPUs at every check.
   docs/BENCHMARKS.md, and docs/COMPRESSION.md's "Training with compression"

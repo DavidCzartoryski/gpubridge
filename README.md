@@ -442,7 +442,8 @@ model.register_comm_hook(None, gpubridge.ddp_comm_hook)
   training loop.
 - If a bucket's all_reduce fails, `backward()` raises, and every later
   collective on that rank refuses to start.
-- Tested on CPU; not validated on GPUs (HARDWARE_VALIDATION.md item 22).
+- Tested on CPU, and on a V100 + MI50: the ranks' parameters stayed the same
+  bit for bit in 24 of 24 runs (HARDWARE_VALIDATION.md item 22).
 
 The hook covers DDP only. For FSDP2, or to change a training script only by
 its backend name and `import gpubridge`, use gpubridge as the backend instead
