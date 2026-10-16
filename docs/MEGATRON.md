@@ -100,8 +100,9 @@ alone. Medians of steps 6 to 200.
   its `batch_isend_irecv` between the stages and its 1F1B schedule all ran
   through `backend="gpubridge"`.
 - **The two curves match.** They're identical to 1e-6 for the first 7 steps,
-  and at most 1.3e-4 apart over the 200 (at step 21; 7e-7 on average over the last 50). The same weights at the start
-  and the same data, summed in another order on other GPUs.
+  and at most 1.3e-4 apart over the 200 (at step 21), 7e-7 on average over
+  the last 50. The same weights at the start and the same data, summed in
+  another order on other GPUs.
 - **The pair is 1.14x the V100 alone** (17,057 against 14,990 tokens/s).
   Its output layer is small (768 x 1,024), so an even split of the layers
   leaves the two stages' work closer to equal than with the kit's
