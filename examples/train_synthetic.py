@@ -8,6 +8,12 @@ with an async gpubridge.all_reduce. So the same script trains on NVIDIA, AMD
 or both at once. It reports throughput (samples/sec across all ranks) and
 checks that every rank ends with identical parameters.
 
+Between steps, outside the timed part, it also compares every rank's gradients
+(as DDP left them, after the all_reduce) and parameters (after the optimizer
+step), bit for bit. The record says the first step at which each differed, and
+by how much: gradients that differ point at the sync (the bridge, compression),
+gradients that match with parameters that differ point at the optimizer step.
+
 On CPU, in simulation mode:
 
     GPUBRIDGE_VENDOR=nvidia torchrun --nproc-per-node=2 examples/train_synthetic.py
@@ -49,6 +55,77 @@ def wait(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+_BITS = {2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def fingerprint(tensor: torch.Tensor) -> tuple[int, int]:
+    """Two integers that change if any bit of ``tensor`` changes.
+
+    The sums are over the raw bits as integers, so they wrap identically
+    whatever order a device adds them in: bit-identical tensors give the same
+    fingerprint on CUDA, ROCm or CPU. (A sum of the values themselves can differ
+    in its last bits between devices even for identical tensors.)
+    """
+    flat = tensor.detach().contiguous().reshape(-1)
+    bits = flat.view(_BITS[flat.element_size()]).to(torch.int64)
+    weights = torch.arange(1, bits.numel() + 1, device=bits.device, dtype=torch.int64)
+    return int(bits.sum()), int((bits * weights).sum())
+
+
+def first_mismatch(per_rank: list[list[tuple[int, int]]]) -> list[int]:
+    """The indices of the tensors whose fingerprint differs between ranks."""
+    return [i for i, prints in enumerate(zip(*per_rank)) if len(set(prints)) > 1]
+
+
+def largest_difference(names: list[str], per_rank: list[list[torch.Tensor]]) -> dict:
+    """The largest elementwise difference from rank 0 over the given tensors, and where."""
+    worst = {"max_abs_diff": 0.0, "tensor": None, "index": None, "rank": None,
+             "elements_differing": 0}
+    for i, name in enumerate(names):
+        ref = per_rank[0][i].double()
+        for rank, tensors in enumerate(per_rank[1:], start=1):
+            diff = (tensors[i].double() - ref).abs().reshape(-1)
+            worst["elements_differing"] += int((tensors[i] != per_rank[0][i]).sum())
+            value, index = (float(x) for x in diff.max(dim=0))
+            if value > worst["max_abs_diff"]:
+                worst.update(max_abs_diff=value, tensor=name, index=int(index), rank=rank)
+    return worst
+
+
+class SyncCheck:
+    """Per step, whether every rank holds the same gradients and parameters."""
+
+    def __init__(self, model: nn.Module, world: int, perturb_step: int | None = None) -> None:
+        self.named = [(n, p) for n, p in model.named_parameters()]
+        self.world = world
+        self.perturb_step = perturb_step
+        self.first: dict[str, dict | None] = {"grads": None, "params": None}
+
+    def _compare(self, what: str, step: int, tensors: list[torch.Tensor]) -> None:
+        mine = [fingerprint(t) for t in tensors]
+        everyone: list[list[tuple[int, int]] | None] = [None] * self.world
+        dist.all_gather_object(everyone, mine)
+        differing = first_mismatch(everyone)
+        if not differing or self.first[what] is not None:
+            return
+        # Only the first time: gather the differing tensors themselves for the size of it.
+        mine_cpu = [tensors[i].detach().cpu() for i in differing]
+        theirs: list[list[torch.Tensor] | None] = [None] * self.world
+        dist.all_gather_object(theirs, mine_cpu)
+        names = [self.named[i][0] for i in differing]
+        self.first[what] = {"step": step, "tensors": names,
+                            **largest_difference(names, theirs)}
+
+    def after_step(self, step: int, rank: int) -> None:
+        """Call after optimizer.step(): p.grad still holds this step's synced gradients."""
+        self._compare("grads", step, [p.grad for _, p in self.named])
+        if self.perturb_step == step and rank == self.world - 1:
+            with torch.no_grad():  # test hook: one parameter one ulp off on the last rank
+                p = self.named[0][1].reshape(-1)
+                p[0] = torch.nextafter(p[0], p[0] + 1)
+        self._compare("params", step, [p for _, p in self.named])
+
+
 def environment() -> dict:
     """This process's versions, GPUs and settings: the GPU kit's record when the
     kit is in this checkout (scripts/gpu/gpukit.py: allowlisted env vars, no
@@ -74,6 +151,7 @@ def main() -> None:
     parser.add_argument("--classes", type=int, default=16)
     parser.add_argument("--lr", type=float, default=0.2)
     parser.add_argument("--json", type=Path, help="rank 0 writes a result record here")
+    parser.add_argument("--perturb-step", type=int, help=argparse.SUPPRESS)  # tests only
     parser.add_argument("--timeout", type=float,
                         default=float(os.environ.get("KIT_TIMEOUT") or 600),
                         help="process-group timeout (s); default KIT_TIMEOUT, else 600")
@@ -101,6 +179,7 @@ def main() -> None:
         x = torch.randn(args.batch_size, args.dim, generator=data)
         batches.append((x.to(device), (x @ teacher).argmax(dim=1).to(device)))
 
+    check = SyncCheck(model.module, world, args.perturb_step)
     losses, step_times = [], []
     for step in range(args.warmup_steps + args.steps):
         x, y = batches[step % len(batches)]
@@ -114,14 +193,18 @@ def main() -> None:
         if step >= args.warmup_steps:
             step_times.append(time.perf_counter() - start)
         losses.append(loss.item())
+        check.after_step(step, rank)  # untimed: after the step's wait
 
     # Slowest rank sets the pace; every rank should hold identical parameters.
     elapsed = torch.tensor([sum(step_times)], dtype=torch.float64)
     dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    in_sync = check.first["params"] is None
+    # The check before the bit-for-bit one: the sum of each rank's parameters taken on
+    # its own device, which can differ in its last bits even for identical parameters.
     checksum = float(sum(p.detach().double().sum() for p in model.parameters()))
     checksums: list[float | None] = [None] * world
     dist.all_gather_object(checksums, checksum)
-    in_sync = all(c == checksums[0] for c in checksums)
+    checksums_equal = all(c == checksums[0] for c in checksums)
     samples_per_sec = world * args.batch_size * args.steps / float(elapsed)
     environments: list[dict | None] = [None] * world
     if args.json:
@@ -145,6 +228,10 @@ def main() -> None:
             "loss_first": round(losses[0], 4),
             "loss_last": round(losses[-1], 4),
             "params_in_sync": in_sync,
+            # Step numbers count the warm-up steps too. None: never differed.
+            "first_grad_mismatch": check.first["grads"],
+            "first_param_mismatch": check.first["params"],
+            "params_checksums_equal": checksums_equal,
             "warmup_steps": args.warmup_steps,
             "lr": args.lr,
             "timeout_s": args.timeout,
@@ -155,7 +242,14 @@ def main() -> None:
         if topology.split_test:
             result["warning"] = "SPLIT TEST: not a mixed-vendor result."
         print(f"{world} rank(s), {topology.run_kind}: {samples_per_sec:.1f} samples/sec, "
-              f"loss {losses[0]:.3f} -> {losses[-1]:.3f}, params in sync: {in_sync}")
+              f"loss {losses[0]:.3f} -> {losses[-1]:.3f}, params in sync: {in_sync}"
+              f" (float64 checksums equal: {checksums_equal})")
+        for what in ("grads", "params"):
+            if check.first[what]:
+                first = check.first[what]
+                print(f"{what} first differed at step {first['step']} "
+                      f"(in {len(first['tensors'])} tensors, {first['elements_differing']} "
+                      f"elements; largest {first['max_abs_diff']:.3g} in {first['tensor']})")
         if args.json:
             args.json.parent.mkdir(parents=True, exist_ok=True)
             args.json.write_text(json.dumps(result, indent=2, default=str))
