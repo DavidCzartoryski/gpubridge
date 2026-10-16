@@ -68,6 +68,9 @@ if [ "$SKIP_SETUP" != 1 ]; then
     step setup "$KIT_DIR/setup_env.sh" --flavor "$TORCH_FLAVOR" --venv "$VENV"
 fi
 activate_venv "$VENV"
+require_kit_import
+# Each machine runs its own Triton check, so mixed steps aren't skipped on one alone.
+TRITON_GATE_MIXED=0
 capture "$RESULTS/nvidia-smi.txt" nvidia-smi
 capture "$RESULTS/rocm-smi.txt" rocm-smi
 

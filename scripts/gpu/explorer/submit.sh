@@ -224,6 +224,8 @@ submit() {
     sbatch_job "${script%.sbatch}" "$script" "${REQUEST[@]}"
 }
 
+# amd_gate [building]: the AMD path's checks. "building" (setup-rocm) skips the
+# venv check: that job is what makes the venv.
 amd_gate() {
     if [ "$DRY_RUN" = 1 ]; then
         [ "$AMD_NODES_CONFIRMED" = 1 ] || log "dry-run only until step 00 confirms AMD GPUs" \
@@ -237,7 +239,7 @@ $RESULTS_ROOT/00_partitions/gpu-types.txt, then add AMD_NODES_CONFIRMED=1 to \
 $KIT_DIR/explorer/local.env (or set it in the environment)."
     [ -n "$GPU_TYPE_AMD" ] || die "set GPU_TYPE_AMD to the AMD GPUs' --gres type from \
 $RESULTS_ROOT/00_partitions/gpu-types.txt"
-    [ -x "$VENV_ROCM/bin/python" ] || die "no ROCm venv at $VENV_ROCM. The default is \
+    [ "${1:-}" = building ] || [ -x "$VENV_ROCM/bin/python" ] || die "no ROCm venv at $VENV_ROCM. The default is \
 the MI50 overlay (docs/GPU_VALIDATION_RUNBOOK.md, \"Choosing the ROCm build\"): build \
 venv-rocm (submit.sh setup-rocm) and venv-rocm63 (VENV_ROCM=\$WORK_DIR/venv-rocm63 \
 ROCM_TORCH_VERSION=2.9.1 ROCM_INDEX=rocm6.3 submit.sh setup-rocm), then run \
@@ -286,7 +288,7 @@ setup)
     setup_job setup-cuda "${REQUEST[@]}"
     ;;
 setup-rocm)
-    amd_gate
+    amd_gate building
     gpu_request "$PARTITION_AMD" "$AMD_TYPE" 1 1 "$TIME_SETUP"
     setup_job setup-rocm "${REQUEST[@]}"
     ;;

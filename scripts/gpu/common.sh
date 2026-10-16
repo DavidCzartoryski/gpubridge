@@ -262,7 +262,8 @@ step() {
     local name=$1
     shift
     : "${RESULTS:?set RESULTS before calling step}"
-    if [ "$name" != triton_check ] && needs_triton "$name" && ! triton_ready; then
+    if [ "$name" != triton_check ] && needs_triton "$name" &&
+        { [ "$TRITON_GATE_MIXED" != 0 ] || [ "${1:-}" != mixed_torchrun ]; } && ! triton_ready; then
         not_run "$name" "triton_check failed: Triton can't run gpubridge's compression" \
             "kernels on some side of this job (triton_check.log)"
         return 0
@@ -345,6 +346,10 @@ step() {
 TRITON_STEPS="${TRITON_STEPS:-gpu_tests bench_compression_kernels bench_compressed}"
 #: How to run triton_check.py: a command prefix (words), default this node's python.
 TRITON_CHECK_LAUNCH="${TRITON_CHECK_LAUNCH:-limited python}"
+#: 0: never skip a mixed_torchrun step. For runners whose machines each decide alone
+#: (mixed/node.sh): a step skipped on one machine and started on the other would leave
+#: the two a step apart for the rest of the run. Ungated, it fails on both together.
+TRITON_GATE_MIXED="${TRITON_GATE_MIXED:-1}"
 TRITON_CHECKED_WITH="" TRITON_CHECK_RESULT=""
 
 # needs_triton NAME: whether step NAME uses the kernels: one of TRITON_STEPS, or any
@@ -373,7 +378,7 @@ not_run() {
     local name=$1
     shift
     log "step $name not run: $*" 2>&1 | tee "$RESULTS/$name.log"
-    printf '{"step": "%s", "exit_code": 1, "seconds": 0, "log": "%s.log", "timed_out": false, "result": "not run: %s"}\n' \
+    printf '{"step": "%s", "exit_code": 1, "seconds": 0, "log": "%s.log", "timed_out": false, "not_run": "%s"}\n' \
         "$name" "$name" "$(json_string "$*")" >>"$RESULTS/steps.jsonl"
     FAILED_STEPS+=("$name")
 }
@@ -425,9 +430,14 @@ activate_venv() {
 # records (job.jsonl or steps.jsonl), so a run never writes into, or over,
 # another's folder. The id is SLURM_JOB_ID, else RUN_ID, else this shell's pid.
 fresh_results() {
-    local dir=$1
+    local dir=$1 base n=1
     if [ -e "$dir/job.jsonl" ] || [ -e "$dir/steps.jsonl" ]; then
-        dir="${dir}_job${SLURM_JOB_ID:-${RUN_ID:-$$}}"
+        base="${dir}_job${SLURM_JOB_ID:-${RUN_ID:-$$}}"
+        dir=$base
+        while [ -e "$dir/job.jsonl" ] || [ -e "$dir/steps.jsonl" ]; do
+            n=$((n + 1))
+            dir="${base}_$n"
+        done
         log "$1 already holds another run's records; this run's go to $dir"
     fi
     printf '%s\n' "$dir"

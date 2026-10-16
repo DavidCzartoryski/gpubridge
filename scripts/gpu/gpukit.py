@@ -165,10 +165,13 @@ def triton_check(index: int) -> dict[str, Any]:
 
     device = torch.device("cuda", index)
     x = torch.linspace(-3, 3, 4096, device=device)
-    payload = torch.empty(compression.payload_nbytes("bf16", x.numel()), dtype=torch.uint8,
-                          device=device)
-    try:
-        _compression_kernels.quantize("bf16", x, None, payload)
+    try:  # every kernel a compressed collective launches: quantize and dequantize, both modes
+        for mode in ("bf16", "fp8"):
+            payload = torch.empty(compression.payload_nbytes(mode, x.numel()), dtype=torch.uint8,
+                                  device=device)
+            _compression_kernels.quantize(mode, x, torch.zeros_like(x), payload)
+            _compression_kernels.dequantize_accumulate(mode, payload.view(1, -1),
+                                                       torch.zeros_like(x))
         torch.cuda.synchronize(device)
     except Exception as exc:  # a compiler error, as Triton reports it
         first = str(exc).strip().splitlines()[0] if str(exc).strip() else ""

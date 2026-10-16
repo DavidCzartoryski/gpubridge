@@ -2611,6 +2611,11 @@ def test_a_results_folder_with_records_gets_a_job_folder_of_its_own(tmp_path):
     assert out.returncode == 0, out.stderr
     assert out.stdout.split() == [str(fresh), f"{used}_job4242"]
     assert "already holds another run's records" in out.stderr
+    for taken in (f"{used}_jobgpubridge-mixed", f"{used}_jobgpubridge-mixed_2"):
+        Path(taken).mkdir()
+        (Path(taken) / "job.jsonl").write_text("{}\n")
+    again = _bash(f"source {KIT}/common.sh; fresh_results {used}", RUN_ID="gpubridge-mixed")
+    assert again.stdout.split() == [f"{used}_jobgpubridge-mixed_3"]  # a fixed RUN_ID's 4th run
 
 
 def test_job_setup_never_writes_into_another_runs_folder(tmp_path):
@@ -2657,6 +2662,38 @@ def test_probe_records_whether_triton_compiles_without_failing_on_it(compiles, m
                  if s["name"] == "triton_kernels")
     assert stage["ok"] is True and stage["compiles"] is compiles
     assert ("steps that use them won't run" in capsys.readouterr().err) is (compiles is False)
+
+
+@pytest.mark.parametrize("broken", [None, ("bf16", "quantize"), ("fp8", "dequantize")])
+def test_triton_check_runs_every_kernel_a_compressed_collective_uses(broken, monkeypatch):
+    import gpukit
+
+    import gpubridge
+    calls = []
+
+    def kernel(name):
+        def run(mode, *args):
+            calls.append((mode, name))
+            if (mode, name) == broken:
+                raise RuntimeError("PassManager::run failed\nmore")
+        return run
+
+    kernels = SimpleNamespace(quantize=kernel("quantize"),
+                              dequantize_accumulate=kernel("dequantize"))
+    monkeypatch.setitem(sys.modules, "triton", SimpleNamespace(__version__="3.5.1"))
+    monkeypatch.setitem(sys.modules, "gpubridge._compression_kernels", kernels)
+    monkeypatch.setattr(gpubridge, "_compression_kernels", kernels, raising=False)
+    cpu = torch.device("cpu")
+    monkeypatch.setattr(gpukit.torch, "device", lambda *a: cpu)
+    monkeypatch.setattr(gpukit.torch.cuda, "synchronize", lambda *a: None)
+    result = gpukit.triton_check(0)
+    if broken is None:
+        assert result == {"triton": "3.5.1", "compiles": True}
+        assert calls == [("bf16", "quantize"), ("bf16", "dequantize"),
+                         ("fp8", "quantize"), ("fp8", "dequantize")]
+    else:
+        assert result["compiles"] is False and calls[-1] == broken
+        assert result["error"] == "RuntimeError: PassManager::run failed"
 
 
 def _triton_check_module():
@@ -2720,11 +2757,27 @@ step train_ddp echo ran-train
 """)
     assert checks == 1 and steps["triton_check"]["exit_code"] != 0  # checked once
     for name in ("gpu_tests", "bench_compression_kernels", "dp_ddp-fp8"):
-        assert steps[name]["exit_code"] == 1 and steps[name]["result"].startswith("not run:")
+        assert steps[name]["exit_code"] == 1
+        assert steps[name]["not_run"].startswith("triton_check failed")
         assert f"ran-{name}" not in result.stdout
     assert "ran-gpu-tests" not in result.stdout and "ran-fp8" not in result.stdout
     assert steps["check"]["exit_code"] == 0 and steps["train_ddp"]["exit_code"] == 0
     assert "ran-train" in result.stdout  # the rest of the job goes on
+
+
+def test_runners_whose_machines_decide_alone_never_skip_a_mixed_step(tmp_path):
+    # mixed/node.sh: a step skipped on one machine only would leave the two a step apart.
+    result, steps, checks = _gate(tmp_path, False, """
+mixed_torchrun() { echo "ran-mixed $1"; }
+TRITON_GATE_MIXED=0
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 step dp_ddp-fp8 mixed_torchrun dp-ddp-fp8
+step bench_compressed mixed_torchrun bench-compressed
+step bench_compression_kernels echo ran-kernels
+""")
+    assert "ran-mixed dp-ddp-fp8" in result.stdout and "ran-mixed bench-compressed" in result.stdout
+    assert steps["dp_ddp-fp8"]["exit_code"] == 0 and "not_run" not in steps["dp_ddp-fp8"]
+    assert checks == 1 and "ran-kernels" not in result.stdout  # a local step still checks
+    assert steps["bench_compression_kernels"]["not_run"].startswith("triton_check failed")
 
 
 def test_steps_that_use_the_kernels_run_after_a_passing_check(tmp_path):
@@ -2766,6 +2819,20 @@ def test_the_amd_path_says_how_to_build_the_overlay_when_it_is_missing(tmp_path)
     assert result.returncode == 1
     assert f"no ROCm venv at {tmp_path}/venv-rocm63-triton38" in result.stderr
     assert "rocm_triton_overlay.sh" in result.stderr and "4242" not in result.stderr
+
+
+def test_setup_rocm_builds_its_venv_when_no_rocm_venv_exists_yet(tmp_path):
+    path = fake_command(tmp_path / "bin", "sbatch", "echo 4242\n")
+    for extra in ({}, {"VENV_ROCM": str(tmp_path / "venv-rocm63"), "ROCM_TORCH_VERSION": "2.9.1"}):
+        result = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), "setup-rocm"],
+                                env=clean_env(GPUBRIDGE_REPO=str(REPO), PATH=path,
+                                              AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
+                                              WORK_DIR=str(tmp_path), **extra),
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+        assert "4242" in result.stderr + result.stdout
+
+
 # ---- pipeline training: train_pipeline.py ------------------------------------------------
 
 def test_pipeline_puts_nvidia_stages_first_whatever_the_ranks():

@@ -238,7 +238,8 @@ class Report:
                 continue
             timed_out = step.get("timed_out") in (True, "true")
             self.counts["timed out" if timed_out else "failed"] += 1
-            why = "ran out of time" if timed_out else step.get("result") or f"exit {code}"
+            why = ("ran out of time" if timed_out else step.get("result")
+                   or (f"not run: {step['not_run']}" if step.get("not_run") else f"exit {code}"))
             log = inside(self.job.path, str(step.get("log", f"{name}.log")))
             self.problems.append((f"  {'TIMEOUT' if timed_out else 'FAIL'} {name}: {why}, "
                                   f"{step.get('seconds', '?')} s{again}{note}", tail(log)))
