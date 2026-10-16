@@ -74,6 +74,8 @@ END_TO_END = {
     "explorer/07_mixed_hetjob.sbatch": "test_step_07_mixed_hetjob, test_step_07_training_only, "
                                        "test_step_07_multi, test_step_07_data_parallel, "
                                        "test_step_07_pipeline, "
+                                       "test_step_07_pipeline_compares_splits, "
+                                       "test_step_07_refuses_bad_pipeline_splits, "
                                        "test_step_07_multi_trains_data_parallel_and_pipelined",
     "explorer/08_bench_matrix.sbatch": "test_step_08_*",
     "explorer/net_check.sbatch": "test_net_check_job",
@@ -506,6 +508,32 @@ def test_step_07_pipeline(tmp_path):
     assert runs["pp_gpipe"]["microbatches"] == 2 and len(runs["pp_gpipe"]["losses"]) == 4
 
 
+def test_step_07_pipeline_compares_splits(tmp_path):
+    code = sbatch(tmp_path, "--job-name=gpubridge-07_mixed_hetjob", "--nodes=1",
+                  "--gres=gpu:1", ":", "--nodes=1", "--gres=gpu:mi100:1",
+                  str(EXPLORER / "07_mixed_hetjob.sbatch"),
+                  FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
+                  FAKE_SLURM_HET_ENV_1="GPUBRIDGE_VENDOR=amd", STEPS_07="pipeline",
+                  PP_RUNS="1f1b", PP_SPLITS="even 3,1 auto", PP_MICROBATCHES="2",
+                  PP_ARGS="--probe-trials 1", **SMALL_DP)
+    out = tmp_path / "results" / "07_mixed_hetjob_pp"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    assert list(steps(out)) == ["probe", "preflight", "pp_1f1b_even", "pp_1f1b_3-1",
+                                "pp_1f1b_auto"]
+    runs = {p.stem: json.loads(p.read_text()) for p in out.glob("pp_*.json")}
+    assert runs["pp_1f1b_even"]["split"] == [2, 2] and runs["pp_1f1b_3-1"]["split"] == [3, 1]
+    assert runs["pp_1f1b_auto"]["split_rule"] == "auto" and runs["pp_1f1b_auto"]["balance"]
+
+
+@pytest.mark.parametrize("env, message", [
+    ({"PP_SPLITS": "even 7:5"}, "PP_SPLITS: '7:5' is not a split"),
+    ({"PP_SPLITS": "auto", "PP_ARGS": "--split 3,1"}, "in PP_SPLITS or in PP_ARGS, not both"),
+])
+def test_step_07_refuses_bad_pipeline_splits(tmp_path, env, message):
+    code = sbatch(tmp_path, "--job-name=gpubridge-07_mixed_hetjob", "--nodes=1",
+                  "--gres=gpu:1", ":", "--nodes=1", "--gres=gpu:mi100:1",
+                  str(EXPLORER / "07_mixed_hetjob.sbatch"), STEPS_07="pipeline", **env)
+    assert code != 0 and message in job_output(tmp_path)
 @pytest.mark.parametrize("mode, out_dir, record", [("dp", "07_mixed_hetjob_dp", "dp_ddp.json"),
                                                    ("pipeline", "07_mixed_hetjob_pp",
                                                     "pp_1f1b.json")])

@@ -254,6 +254,19 @@ hardware.
   instead. The AMD node job writes
   `job.jsonl` like the others, and a directory of wrapper scripts, such as
   `rocm_triton_overlay.sh`'s, works as `VENV` or `VENV_ROCM`.
+- Automatic pipeline stage balancing: `gpubridge.balance`, an opt-in module
+  nothing else imports. `profile_layers` times each layer's forward and
+  backward on a device (CUDA or HIP events), with its output size, state and
+  saved activations. `partition` picks the contiguous split whose slowest
+  stage, transfers across each boundary included, is fastest within each
+  device's memory: exact, by dynamic programming, and checked against brute
+  force with injected speeds, links and memory limits. `train_pipeline.py
+  --split auto` profiles every block on every stage's GPU and the links, and
+  trains bit for bit like the same split given by hand. Step 07's
+  `PP_SPLITS` runs several splits in one job. On a V100 + MI50 (1F1B, 500
+  steps): even 13,062 tokens/s, 8 + 4 15,577, 9 + 3 16,021; the automatic
+  split chose 8 + 4 (15,559, 1.19x even), 3.0% below the best hand-tuned one.
+  docs/PIPELINE.md, HARDWARE_VALIDATION.md item 36 (#90).
 - `examples/train_synthetic.py` (the kit's `train_ddp`) compares every rank's
   gradients after the all_reduce and parameters after the optimizer step, bit for
   bit, between steps, and records the first step each differed, in which tensors,
