@@ -458,16 +458,17 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     FSDP2 within 1e-4 of one process over 12 steps, fp8 within 0.05
     (`tests/test_gpu_kit.py`). On a V100 and an MI50 (Explorer, 1,000 steps,
     two runs per mode against eight one-V100 runs; the rule was fixed before
-    the runs, and by it S = 0.0131, the widest gap between two one-V100 runs,
-    which measures uncompressed run-to-run noise;
+    the new runs, and by it S = 0.0131, the widest gap between two one-V100
+    runs, which measures uncompressed run-to-run noise;
     [below](#items-22-and-33-2026-10-15-and-2026-10-16)): uncompressed DDP
     passes, at 0.32 S and 0.34 S. DDP with shares by speed and FSDP2 fail by
     the rule, one run of each outside S (1.30 S and 10.2 S); both reached the
     plateau exit (10-step mean loss below 2.0) late, at steps 655 and 893
     against 557 to 591 for nine of eleven one-V100 runs, which points at
     timing (inferred; untested at 2,000 steps). bf16 and fp8 fail by the rule,
-    all four runs outside S (2.51 S to 528 S): a lossy mode is expected to land outside a measure of
-    uncompressed noise, and whether these gaps are acceptable is open. The
+    all four runs outside S (2.51 S to 528 S): a lossy mode is expected to
+    land outside a measure of uncompressed noise, and whether these gaps are
+    acceptable is open. The
     ranks' parameters were bit-identical at every check in every DDP run,
     compressed or not; FSDP2's sharded parameters aren't compared. At 2,000
     steps one V100 alone also falls outside S against its own runs (one run
@@ -736,7 +737,7 @@ confirmed for them; and the new runs add the bit check's two gathers across
 ranks after every step, which the old runs didn't have (outside the timed
 step and outside backward).
 
-**Item 33.** The rule was fixed before these runs. d is the mean absolute
+**Item 33.** The rule was fixed before the new runs. d is the mean absolute
 difference of two runs' losses over their last 100 steps, the measure in
 docs/COMPRESSION.md. S is the largest d between any two one-V100 runs of
 1,000 steps. A mixed run is within S if the median of its d to the one-V100
@@ -746,14 +747,15 @@ finished and all of them are within S; if one isn't, it fails by the rule.
 Every run: `train_dp.py`, `llama-125m`, global batch 8 x 512 tokens, AdamW
 3e-4, seed 0.
 
-Eight one-V100 runs (11109239, 11109665, 11109872 and 11110316 with 1, 2, 4
-and 8 micro-batches, at dc47b6a; 11122896 to 11122899 with 1, at fe84663; the
-training scripts are the same at both) are 0.0033 to 0.0131 apart, so by the
-rule **S = 0.0131**. S measures how far uncompressed runs land from each other:
-the same mean gradient summed in another order, and run-to-run
-nondeterminism. A lossy mode adds its own error on top of that, so `bf16`
-and `fp8` are expected to land outside S; the rule is applied to them as
-written, and their gaps are given as multiples of S.
+Eight one-V100 runs (11109239, 11109665, 11109872 and 11110316 with 1, 2, 4 and
+8 micro-batches, at dc47b6a, though 11109239's probe recorded abd9d74, its
+parent; 11122896 to 11122899 with 1, at fe84663; the training scripts are the
+same at all three) are 0.0033 to 0.0131 apart, so by the rule **S = 0.0131**. S
+measures how far uncompressed runs land from each other: the same mean gradient
+summed in another order, and run-to-run nondeterminism. A lossy mode adds its
+own error on top of that, so `bf16` and `fp8` are expected to land outside S;
+the rule is applied to them as written, and their gaps are given as multiples of
+S.
 
 At 1,000 steps (the plateau exit is the first step, counted from 1, at which
 the mean loss of the last 10 steps is below 2.0):
@@ -800,10 +802,10 @@ Against that:
 - The compressed runs: 722 to 918, and `fp8` in 11139976 hadn't reached it by
   step 1,000 (8.73 over its last 100 steps).
 
-So each run outside S reached the plateau exit late, and a late one-V100 run
-closes its gap the same way. That points at timing rather than at something
-the bridge computes wrong, and at compression delaying the fall; both are
-inferred, not tested.
+So each run outside S reached the plateau exit late, or (`fp8` in 11139976) not
+by step 1,000, and a late one-V100 run closes its gap the same way. That points
+at timing rather than at something the bridge computes wrong, and at compression
+delaying the fall; both are inferred, not tested.
 
 **At 2,000 steps** (jobs at 48840ba, one run per mode): S stays 0.0131, and
 with one run per mode the rule gives no verdict at this length. The three

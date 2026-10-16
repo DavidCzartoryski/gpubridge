@@ -662,8 +662,9 @@ first matmul, as the other training steps do; see [Choosing the ROCm build](#cho
 
 ### Repeating train_ddp
 
-`train_ddp` (item 22) has ended with the ranks' parameters unequal in some mixed
-V100 + MI50 runs and not in others, so a rate needs many runs.
+`train_ddp` (item 22) had failed its parameter check in some mixed V100 + MI50
+runs and not in others: the old float64 checksum, most likely false alarms, as
+24 later runs under the bit-for-bit check showed. A rate needs many runs.
 `STEPS_07=ddp` makes step 07 run only the probe, the preflight and `train_ddp`, and
 `TRAIN_DDP_REPEATS=N` runs `train_ddp` N times in the job, as steps `train_ddp_1` to
 `train_ddp_N` (records `train_ddp_<i>.json`); one failing doesn't stop the rest.
