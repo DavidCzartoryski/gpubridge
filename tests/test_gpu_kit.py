@@ -30,6 +30,7 @@ import llama  # noqa: E402
 import preflight  # noqa: E402
 import summarize  # noqa: E402
 import train_bench  # noqa: E402
+import train_ddp_report  # noqa: E402
 import train_dp  # noqa: E402
 import train_pipeline  # noqa: E402
 import validation_tables  # noqa: E402
@@ -41,7 +42,8 @@ SHELL_SCRIPTS = sorted(
 FAKE_CLUSTER_SCRIPTS = sorted((REPO / "tests" / "fake_cluster").iterdir())
 FAKE_PROJECT = "/projects/example-lab"
 OWN_SETTINGS = ("PROJECT_DIR", "WORK_DIR", "VENV", "VENV_ROCM", "ROCM_INDEX", "ROCM_INDEX_URL",
-                "ROCM_TORCH_VERSION", "TORCH_VERSION", "TORCH_INDEX_URL")
+                "ROCM_TORCH_VERSION", "TORCH_VERSION", "TORCH_INDEX_URL", "STEPS_07",
+                "TRAIN_DDP_REPEATS")
 
 
 def clean_env(**extra: str) -> dict[str, str]:
@@ -518,6 +520,12 @@ TRAINING_07 = ["train_fsdp2_backend", "verify_fsdp2_backend", "train_hsdp_backen
     ({"STEPS_07": "training", "TRAIN_BENCH_BUCKETS": "12.5"},
      ["probe", "preflight", "train_ddp", "train_bench_gpt2-small_bucket12.5",
       "train_bench_resnet50_bucket12.5", *TRAINING_07]),
+    ({"STEPS_07": "ddp"}, ["probe", "preflight", "train_ddp"]),
+    ({"STEPS_07": "ddp", "TRAIN_DDP_REPEATS": "3"},
+     ["probe", "preflight", "train_ddp_1", "train_ddp_2", "train_ddp_3"]),
+    ({"STEPS_07": "training", "TRAIN_DDP_REPEATS": "2", "TRAIN_BENCH_MODELS": "resnet50"},
+     ["probe", "preflight", "train_ddp_1", "train_ddp_2", "train_bench_resnet50",
+      *TRAINING_07]),
 ])
 def test_mixed_hetjob_step_selection(env, expected):
     env = {"TRAIN_BENCH_MODELS": "gpt2-small resnet50", "TRAIN_BENCH_ARGS": "--steps 5",
@@ -538,8 +546,26 @@ def test_mixed_hetjob_step_selection(env, expected):
         assert not mb or line.count(f"--steps 5 --bucket-mb {mb} ") == 2, line
 
 
+@pytest.mark.parametrize("repeats, names", [
+    ("1", ["train_ddp"]), ("3", ["train_ddp_1", "train_ddp_2", "train_ddp_3"])])
+def test_mixed_hetjob_runs_each_train_ddp_repeat_under_its_own_name(repeats, names):
+    result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w",
+                     STEPS_07="ddp", TRAIN_DDP_REPEATS=repeats)
+    assert result.returncode == 0, result.stderr
+    runs = [line for line in result.stdout.splitlines() if "train_synthetic.py" in line]
+    # Each on both sides, with its own JSON and rendezvous; one run keeps the old names.
+    for name, line in zip(names, runs, strict=True):
+        assert line.count(f"/07_mixed_hetjob/{name}.json") == 2, line
+        tag = name.replace("train_ddp", "train").replace("_", "-")
+        assert line.count(f"--rdzv-id=local-{tag} ") == 2, line
+
+
 @pytest.mark.parametrize(("env", "message"), [
-    ({"STEPS_07": "hsdp"}, "STEPS_07 must be all, training, bench, dp or pipeline"),
+    ({"STEPS_07": "hsdp"}, "STEPS_07 must be all, training, ddp, bench, dp or pipeline"),
+    ({"TRAIN_DDP_REPEATS": "0"}, "a whole number from 1 to 999, not '0'"),
+    ({"TRAIN_DDP_REPEATS": "2.5"}, "a whole number from 1 to 999, not '2.5'"),
+    ({"TRAIN_DDP_REPEATS": "many"}, "a whole number from 1 to 999, not 'many'"),
+    ({"TRAIN_DDP_REPEATS": "1000"}, "a whole number from 1 to 999, not '1000'"),
     ({"TRAIN_BENCH_BUCKETS": "10 big"}, "TRAIN_BENCH_BUCKETS: 'big' is not a size in MB"),
     ({"TRAIN_BENCH_BUCKETS": "10", "TRAIN_BENCH_ARGS": "--steps 5 --bucket-mb 5"},
      "in TRAIN_BENCH_BUCKETS or in TRAIN_BENCH_ARGS, not both"),
@@ -548,6 +574,13 @@ def test_mixed_hetjob_refuses_unknown_step_settings(env, message):
     result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w", **env)
     assert result.returncode != 0 and message in result.stderr, result.stderr
     assert "srun" not in result.stdout
+
+
+def test_mixed_hetjob_says_when_train_ddp_repeats_go_unused():
+    used = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w", STEPS_07="dp",
+                   TRAIN_DDP_REPEATS="3")
+    assert "TRAIN_DDP_REPEATS does nothing with STEPS_07=dp" in used.stderr
+    assert "train_ddp" not in used.stdout
 
 
 def test_mixed_hetjob_runs_each_side_in_its_own_venv():
@@ -1171,6 +1204,117 @@ def test_training_demo_finds_the_step_a_parameter_diverges_and_blames_the_optimi
     assert "params first differed at step 2" in result.stdout
 
 
+def _ddp_record(in_sync=True, grads=None, params=None, checksums=True, envs=({}, {}),
+                kind="gpu-mixed", split=None):
+    """A train_synthetic.py record with only what train_ddp_report.py reads."""
+    return {"script": "examples/train_synthetic.py", "world_size": 2, "params_in_sync": in_sync,
+            "run": {"kind": kind, "split_test": split},
+            "first_grad_mismatch": grads, "first_param_mismatch": params,
+            "params_checksums_equal": checksums,
+            "environment": {"env": dict(envs[0])}, "environments": [{"env": dict(e)} for e in envs]}
+
+
+def _mismatch(step, diff, tensor):
+    return {"step": step, "tensors": [tensor], "max_abs_diff": diff, "tensor": tensor,
+            "index": 3, "rank": 1, "elements_differing": 1}
+
+
+def test_train_ddp_report_gives_each_run_a_verdict_and_counts_divergences(tmp_path):
+    a = tmp_path / "a" / "07_mixed_hetjob"
+    a.mkdir(parents=True)
+    # The job from scontrol's record: a heterogeneous job's first component.
+    (a / "slurm-job.txt").write_text("JobId=111 HetJobId=111 HetJobOffset=0 JobName=x\n"
+                                     "JobId=112 HetJobId=111 HetJobOffset=1 JobName=x\n")
+    (a / "steps.jsonl").write_text("".join(json.dumps({"step": name, "exit_code": code}) + "\n"
+                                           for name, code in [
+        ("probe", 1), ("train_ddp_1", 0), ("train_ddp_2", 1), ("train_ddp_3", 1),
+        ("train_ddp_10", 124)]))
+    (a / "train_ddp_1.json").write_text(json.dumps(_ddp_record()))
+    (a / "train_ddp_2.json").write_text(json.dumps(_ddp_record(
+        in_sync=False, grads=_mismatch(7, 2e-8, "0.weight"),
+        params=_mismatch(7, 3.5e-8, "2.weight"), checksums=False)))
+    (a / "train_ddp_3.json").write_text(json.dumps(_ddp_record(
+        in_sync=False, params=_mismatch(40, 1.2e-7, "4.bias"))))
+    b = tmp_path / "b" / "07_mixed_hetjob"
+    b.mkdir(parents=True)
+    fp8 = {"GPUBRIDGE_BRIDGE_COMPRESSION": "fp8", "SLURM_JOB_ID": "222"}
+    (b / "train_ddp.json").write_text(json.dumps(_ddp_record(
+        checksums=False, envs=(fp8, {**fp8, "GPUBRIDGE_COMPRESSION_KERNELS": "torch"}))))
+    # A record from before the bit-for-bit check: the checksums alone, which differed.
+    c = tmp_path / "c"
+    c.mkdir()
+    (c / "job.jsonl").write_text('{"event": "started", "job_id": "333"}\n')
+    old = _ddp_record(in_sync=False)
+    for key in ("first_grad_mismatch", "first_param_mismatch", "params_checksums_equal"):
+        del old[key]
+    old["run"] = {"kind": "split-test", "split_test": "alternate"}
+    (c / "train_ddp_split.json").write_text(json.dumps(old))
+    (c / "train_ddp_bench.json").write_text(json.dumps(_ddp_record()))  # not train_ddp's
+
+    found = train_ddp_report.rows([tmp_path / "a", tmp_path / "b", c])
+    assert [(r["folder"], r["job"], r["repeat"], r["verdict"]) for r in found] == [
+        ("a/07_mixed_hetjob", "111", "1", "in sync"),
+        ("a/07_mixed_hetjob", "111", "2", "gradients differ after all_reduce"),
+        ("a/07_mixed_hetjob", "111", "3", "parameters differ, gradients equal"),
+        ("a/07_mixed_hetjob", "111", "10", "no record (step exit 124)"),
+        ("b/07_mixed_hetjob", "222", "-", "old checksum only"),
+        ("c", "333", "split", "no per-step check")]
+    table = train_ddp_report.table(found).splitlines()
+    assert table[3] == ("| a/07_mixed_hetjob | 111 | 2 | gpu-mixed | none | auto | yes | 7 | 7 | "
+                        "no | 3.5e-08 in 2.weight | gradients differ after all_reduce |")
+    assert table[4].endswith("| yes | - | 40 | yes | 1.2e-07 in 4.bias | "
+                             "parameters differ, gradients equal |")
+    assert table[5].endswith("| - | - | - | - | - | - | - | - | no record (step exit 124) |")
+    assert ("| b/07_mixed_hetjob | 222 | - | gpu-mixed | fp8 | auto/torch | no | - | - | no | - |"
+            in table[6])
+    assert "| c | 333 | split | split-test, split test | none | auto | yes | - | - |" in table[7]
+    # One total per setting and kind of run; the split test's old record apart.
+    assert train_ddp_report.total(found).splitlines() == [
+        "bridge none, kernels auto, gpu-mixed: 2 of 3 diverged",
+        "bridge fp8, kernels auto/torch, gpu-mixed: 0 of 1 diverged",
+        "bridge none, kernels auto, split-test, split test (float64 checksums only, before the "
+        "per-step check): 1 of 1 diverged",
+        "1 train_ddp run(s) left no record"]
+    # Named twice (relative and absolute), a folder counts once.
+    twice = train_ddp_report.rows([b, Path(os.path.relpath(b))])
+    assert len(twice) == 1
+    assert train_ddp_report.main([str(a / "train_ddp_1.json")]) == 0
+    assert train_ddp_report.main([str(tmp_path / "nothing")]) == 1
+
+
+def test_train_ddp_report_reads_odd_records_without_crashing(tmp_path):
+    d = tmp_path / "07_mixed_hetjob"
+    d.mkdir()
+    # The job planned 6 repeats; its time ran out during the 5th.
+    (d / "job.jsonl").write_text('{"event": "started", "job_id": "9"}\n'
+                                 '{"event": "train_ddp_repeats", "job_id": "9", "planned": 6}\n')
+    (d / "steps.jsonl").write_text('{"step": "train_ddp_4", "exit_code": null}\n')
+    (d / "train_ddp_1.json").write_text("[1, 2]")  # not a record
+    (d / "train_ddp_2.json").write_text(json.dumps(_ddp_record(  # no max_abs_diff, no step
+        in_sync=False, params={"tensor": "0.weight"})))
+    (d / "train_ddp_3.json").write_text(json.dumps(_ddp_record(  # params first, grads later
+        in_sync=False, grads=_mismatch(30, 1e-8, "1.weight"),
+        params=_mismatch(3, 0.0, None))))
+    (d / "train_ddp_5.json").write_text(json.dumps(_ddp_record(  # grads only: rounded away
+        grads=_mismatch(9, 1e-12, "0.bias"))))
+    (d / "train_ddp_7.json").write_text(json.dumps(_ddp_record(in_sync=None)))
+    found = train_ddp_report.rows([tmp_path])
+    assert [(r["repeat"], r["verdict"]) for r in found] == [
+        ("1", "no record (unreadable)"),
+        ("2", "parameters differ, gradients equal"),
+        ("3", "parameters differ, gradients equal"),
+        ("4", "no record (step exit ?)"),
+        ("5", "gradients differed, parameters stayed in sync"),
+        ("6", "no record (never ran)"),
+        ("7", "in sync")]
+    assert found[1]["largest"] == "?" and found[1]["first_param_mismatch"] == "?"
+    assert found[2]["largest"] == "0 (signed zeros or NaNs)"
+    assert train_ddp_report.total(found).splitlines() == [
+        "bridge none, kernels auto, gpu-mixed: 2 of 3 diverged",
+        "1 record(s) without params_in_sync", "3 train_ddp run(s) left no record"]
+    print(train_ddp_report.table(found))  # renders every row
+
+
 def test_scaling_summary_computes_efficiency(tmp_path):
     for n, sps in [(1, 100.0), (2, 180.0), (4, 300.0)]:
         (tmp_path / f"train-n{n}.json").write_text(json.dumps({
@@ -1714,6 +1858,17 @@ def test_p2p_step_is_p2p_evidence(tmp_path, exit_code, expected):
     _job(tmp_path, "new", [("check_p2p", exit_code)], GPU_ENV, "cuda:0")
     row = next(row for row in validation_tables.build([tmp_path])["items"] if row["item"] == 32)
     assert row["verdict"] == expected
+
+
+def test_train_ddp_repeats_are_each_item_22_evidence(tmp_path):
+    _job(tmp_path, "07_mixed_hetjob", [("train_ddp_1", 0), ("train_ddp_2", 1), ("train_ddp_3", 0),
+                                       ("train_ddp_bench", 0)], GPU_ENV, "cuda:0")
+    _job(tmp_path, "amd_node", [("train_ddp_split", 0)], GPU_ENV, "cuda:0")
+    row = next(row for row in validation_tables.build([tmp_path])["items"] if row["item"] == 22)
+    assert row["verdict"] == "FAIL (1 of 4)"
+    assert [e["where"] for e in row["evidence"]] == [
+        "07_mixed_hetjob/train_ddp_1", "07_mixed_hetjob/train_ddp_2",
+        "07_mixed_hetjob/train_ddp_3", "amd_node/train_ddp_split"]
 
 
 def test_tables_from_a_results_tree(tmp_path):
