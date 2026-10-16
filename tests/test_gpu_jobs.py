@@ -62,6 +62,8 @@ END_TO_END = {
     "setup_env.sh": "test_setup_job_creates_the_cuda_venv",
     "bench_p2p.py": "test_gpu_kit.py: test_bench_p2p_*, test_step_02 and 07",
     "rocm_triton_overlay.sh": "test_gpu_kit.py: test_rocm_triton_overlay_*",
+    "megatron_pp.py": "test_gpu_kit.py: its tokens, weights and step 07's dry run (Megatron-Core's "
+                      "pipeline needs CUDA, so no run on CPU)",
     "explorer/submit.sh": "every test_step_*, and test_gpu_kit.py for 00",
     "explorer/job_env.sh": "sourced by every Explorer job",
     "explorer/00_partitions.sh": "test_gpu_kit.py: test_step_00_*",
