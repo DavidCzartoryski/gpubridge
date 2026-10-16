@@ -250,7 +250,7 @@ as of 2026-10-06; **verify each one**:
 | `PIPELINE_CHUNKS` | `1M 4M 16M 64M` | step 08's pipelined runs, one per `GPUBRIDGE_CHUNK_BYTES` |
 | `TRAIN_BENCH_MODELS`, `TRAIN_BENCH_ARGS` | `gpt2-small resnet50`, empty | `train_bench.py`'s models and extra flags, in step 07 and `train-nvidia`/`train-amd` |
 | `STEPS_07` | `all` | `training`: step 07 runs only the probe, the preflight and its training steps; `ddp`: only the probe, the preflight and `train_ddp`; `bench`: only the probe, the preflight and the `train_bench_<model>` steps (no `train_ddp`, FSDP2 or HSDP) |
-| `TRAIN_DDP_REPEATS` | `1` | step 07 runs `train_ddp` this many times, each its own step: `train_ddp_1` to `train_ddp_<N>` (step and JSON). `1`: once, as `train_ddp` (see [Repeating train_ddp](#repeating-train_ddp)) |
+| `TRAIN_DDP_REPEATS` | `1` | step 07 runs `train_ddp` this many times (1 to 999), each its own step: `train_ddp_1` to `train_ddp_<N>` (step and JSON). `1`: once, as `train_ddp` (see [Repeating train_ddp](#repeating-train_ddp)) |
 | `TRAIN_BENCH_BUCKETS` | empty | DDP bucket sizes in MB, e.g. `10 25 50 100`: step 07 runs each `train_bench_<model>` step once per size (`--bucket-mb`), named `train_bench_<model>_bucket<MB>` (step and JSON). Empty: once, at `train_bench.py`'s default (25) |
 
 Also check:
@@ -629,14 +629,22 @@ V100 + MI50 runs and not in others, so a rate needs many runs.
 `STEPS_07=ddp` makes step 07 run only the probe, the preflight and `train_ddp`, and
 `TRAIN_DDP_REPEATS=N` runs `train_ddp` N times in the job, as steps `train_ddp_1` to
 `train_ddp_N` (records `train_ddp_<i>.json`); one failing doesn't stop the rest.
-`TRAIN_DDP_REPEATS` works with `all` and `training` too. Bridge compression comes from
+`TRAIN_DDP_REPEATS` (1 to 999) works with `all` and `training` too; `bench`, `dp` and
+`pipeline` run no `train_ddp` and say so. Bridge compression comes from
 the environment at submit time: `submit.sh` submits with `--export=ALL`, so
 `GPUBRIDGE_BRIDGE_COMPRESSION` and `GPUBRIDGE_COMPRESSION_KERNELS` reach every rank on
 both sides, and each record's `environments` holds them. With `STEPS_07=ddp` nothing
-else in the job uses them. Each job into a folder of its own:
+else in the job uses them. Budget the job for a repeat that hangs: each launch is cut
+off after `STEP_TIMEOUT` seconds (default 1200), so give the job time for every repeat
+at that limit, or lower it. One `train_ddp` takes under a minute on a V100 + MI50, and a
+stuck collective fails by itself after `KIT_TIMEOUT` (300), so `KIT_TIMEOUT=120
+STEP_TIMEOUT=180` and 8 repeats fit in `TIME_07=00:30:00` even if every one hangs. A job
+whose time runs out anyway lists the repeats it planned but never ran (its `job.jsonl`
+records the plan). Each job into a folder of its own:
 
 ```bash
-export VENV_ROCM=$WORK_DIR/venv-rocm63 STEPS_07=ddp TRAIN_DDP_REPEATS=8 TIME_07=00:20:00
+export VENV_ROCM=$WORK_DIR/venv-rocm63 STEPS_07=ddp TRAIN_DDP_REPEATS=8 TIME_07=00:30:00 \
+    KIT_TIMEOUT=120 STEP_TIMEOUT=180
 RESULTS_ROOT=$PWD/results/explorer/ddp-none scripts/gpu/explorer/submit.sh 07
 GPUBRIDGE_BRIDGE_COMPRESSION=fp8 GPUBRIDGE_COMPRESSION_KERNELS=torch \
     RESULTS_ROOT=$PWD/results/explorer/ddp-fp8 scripts/gpu/explorer/submit.sh 07
@@ -648,8 +656,10 @@ the job, the repeat, compression and each rank's kernels, whether the parameters
 diverged, the first step at which the synced gradients and the parameters differed,
 whether the float64 checksums agreed, the largest difference and its tensor, and a
 verdict (in sync; gradients differ after all_reduce; parameters differ, gradients
-equal; old checksum only), then how many of the runs diverged. A `train_ddp` step
-that left no record is listed too.
+equal; gradients differed, parameters stayed in sync; old checksum only), then how many
+diverged, one line per compression, kernels and kind of run, with records from before
+the per-step check counted apart. A `train_ddp` that left no record, never ran, or
+whose record can't be read is listed too.
 
 ### Pipeline training across vendors
 

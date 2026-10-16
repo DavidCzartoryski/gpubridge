@@ -454,9 +454,12 @@ def test_step_07_ddp_repeats(tmp_path):
     assert report.returncode == 0, report.stderr
     rows = report.stdout.splitlines()[2:5]
     for i, row in enumerate(rows, start=1):
-        assert row.startswith(f"| results/07_mixed_hetjob | {job_id(tmp_path)} | {i} | fp8 | "
-                              "torch | no | - | - | yes | - | in sync |"), row
-    assert report.stdout.splitlines()[-1] == "0 of 3 diverged"
+        assert row.startswith(f"| results/07_mixed_hetjob | {job_id(tmp_path)} | {i} | "), row
+        assert row.endswith("| fp8 | torch | no | - | - | yes | - | in sync |"), row
+    assert report.stdout.splitlines()[-1].endswith(": 0 of 3 diverged")
+    events = [json.loads(line) for line in (out / "job.jsonl").read_text().splitlines()]
+    assert {"event": "train_ddp_repeats", "planned": 3}.items() <= next(
+        e for e in events if e["event"] == "train_ddp_repeats").items()
 
 
 

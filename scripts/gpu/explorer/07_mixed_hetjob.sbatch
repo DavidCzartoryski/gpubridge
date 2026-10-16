@@ -37,8 +37,12 @@ all | training | ddp | bench | dp | pipeline) ;;
 *) die "STEPS_07 must be all, training, ddp, bench, dp or pipeline" ;;
 esac
 TRAIN_DDP_REPEATS="${TRAIN_DDP_REPEATS:-1}"
-[[ $TRAIN_DDP_REPEATS =~ ^[1-9][0-9]*$ ]] ||
-    die "TRAIN_DDP_REPEATS must be a positive integer, not '$TRAIN_DDP_REPEATS'"
+[[ $TRAIN_DDP_REPEATS =~ ^[1-9][0-9]{0,2}$ ]] ||
+    die "TRAIN_DDP_REPEATS must be a whole number from 1 to 999, not '$TRAIN_DDP_REPEATS'"
+case $STEPS_07 in bench | dp | pipeline)
+    [ "$TRAIN_DDP_REPEATS" = 1 ] ||
+        log "TRAIN_DDP_REPEATS does nothing with STEPS_07=$STEPS_07: it runs no train_ddp" ;;
+esac
 # STEPS_07=dp: train_dp.py on llama.py's model, DP_STEPS steps of DP_GLOBAL_BATCH sequences
 # of DP_SEQ tokens, one run per name in DP_RUNS: ddp, ddp-bf16 and ddp-fp8 (DDP through
 # gpubridge.ddp_comm_hook, the bridge uncompressed or compressed), fsdp2 (FSDP2 through
@@ -247,6 +251,8 @@ fi
 # TRAIN_DDP_REPEATS times: a divergence that comes and goes needs many runs to count.
 # Bridge compression comes from the job's environment (GPUBRIDGE_BRIDGE_COMPRESSION, ..._KERNELS).
 if [ "$STEPS_07" != bench ]; then
+    # So train_ddp_report.py can list a repeat the job's time ran out before.
+    [ "$TRAIN_DDP_REPEATS" = 1 ] || job_event train_ddp_repeats "\"planned\": $TRAIN_DDP_REPEATS"
     for ((i = 1; i <= TRAIN_DDP_REPEATS; i++)); do
         repeat=""
         [ "$TRAIN_DDP_REPEATS" = 1 ] || repeat="_$i"
