@@ -6,7 +6,11 @@ Launched by torchrun, one process per stage. Stages go to the NVIDIA ranks first
 the AMD ones, each in rank order, whatever ranks the launcher handed out, so stage 0 is
 an NVIDIA GPU in a mixed job. Stage 0 holds the embedding and the first blocks, the last
 stage the last blocks, the final norm and the output layer; the split is even by
-default (``--split 6,6`` gives the blocks per stage, in stage order). Activations go forward
+default (``--split 6,6`` gives the blocks per stage, in stage order). ``--split auto``
+balances it: every rank times each block (and the embedding and output layer) on its own
+GPU, the links between neighbouring stages are timed, and gpubridge.balance picks the
+split whose slowest stage, transfers included, is fastest within each GPU's memory; the
+record keeps the profile, the links and the predicted stage times. Activations go forward
 and their gradients back with the backend's point-to-point sends and receives: native
 within an island, across the bridge between islands. Schedules: GPipe (``--schedule
 gpipe``) and 1F1B (``1f1b``), ``--microbatches`` microbatches of the global batch per
@@ -82,6 +86,17 @@ class Stage(nn.Module):
         if self.head is not None:
             x = self.head(self.norm(x))
         return x
+
+
+class Head(nn.Module):
+    """The final norm and output layer, as the last stage runs them."""
+
+    def __init__(self, model: llama.Llama):
+        super().__init__()
+        self.norm, self.head = model.norm, model.head
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.norm(x))
 
 
 def loss_fn(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -172,6 +187,58 @@ def hop_time(stage: int, order: list[int], activation: torch.Tensor, device: tor
     return out
 
 
+def auto_split(model: llama.Llama, order: list[int], me: int, device: torch.device,
+               tokens: torch.Tensor, hidden: torch.Tensor, schedule: str, microbatches: int,
+               trials: int) -> tuple[list[int], dict[str, Any]]:
+    """The split gpubridge.balance picks, and what it was picked from. Every rank profiles
+    every layer on its own device, one microbatch; the embedding's cost goes with the first
+    block, the output layer's with the last, as they share those blocks' stages. Each link
+    between neighbouring stages is timed with one microbatch's activations (hop_time), the
+    same either way. Each GPU's limit is 90% of its memory. Every rank computes the same
+    plan from the gathered numbers."""
+    from gpubridge import balance
+
+    costs = balance.profile_layers([model.embed, *model.blocks, Head(model)], tokens, device,
+                                   trials=trials)
+    hops = hop_time(me, order, hidden.clone(), device, trials)
+    limit = (0.9 * torch.cuda.get_device_properties(device).total_memory
+             if device.type == "cuda" else None)
+    everyone = gather({"costs": [vars(c) for c in costs], "hops": hops, "limit": limit})
+    stages, blocks = len(order), len(model.blocks)
+
+    def folded(rank: int, field: str) -> list[float]:
+        c = everyone[rank]["costs"]
+        values = [c[1 + i][field] if field != "ms" else c[1 + i]["forward_ms"]
+                  + c[1 + i]["backward_ms"] for i in range(blocks)]
+        for end, extra in ((0, c[0]), (blocks - 1, c[-1])):
+            values[end] += (extra["forward_ms"] + extra["backward_ms"] if field == "ms"
+                            else extra[field])
+        return values
+
+    layer_ms = [folded(r, "ms") for r in order]
+    boundary = [hidden.numel() * hidden.element_size()] * (blocks - 1)
+    link = [boundary[0] / statistics.median(everyone[r]["hops"]) / 1e3 if stages > 1 else 0
+            for r in order[1:]]  # bytes per ms
+    plan = balance.partition(layer_ms, boundary, link,
+                             state_bytes=folded(order[0], "state_bytes"),
+                             activation_bytes=folded(order[0], "activation_bytes"),
+                             in_flight=balance.in_flight(schedule, stages, microbatches),
+                             memory_bytes=[everyone[r]["limit"] for r in order])
+    even = even_split(blocks, stages)
+    even_ms = balance.evaluate(even, layer_ms, boundary, link)
+    return plan.split, {
+        "layer_ms_by_stage": [[round(t, 4) for t in row] for row in layer_ms],
+        "link_bytes_per_ms": [round(b, 1) for b in link],
+        "memory_limit_bytes": [everyone[r]["limit"] for r in order],
+        "predicted_stage_ms": [round(t, 3) for t in plan.stage_ms],
+        "even_split": even, "even_predicted_stage_ms": [round(t, 3) for t in even_ms],
+        "predicted_speedup_over_even": round(max(even_ms) / plan.bottleneck_ms, 4),
+        "cost_model": "per microbatch: a stage's blocks' forward and backward on its own GPU, "
+                      "plus 2 x activation bytes / link bandwidth at each boundary it shares; "
+                      "the slowest stage minimized (gpubridge.balance)",
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--model", choices=llama.MODELS, default="llama-125m")
@@ -184,7 +251,8 @@ def main() -> int:
                         help="steps left out of the median step time")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--split", help="blocks per stage, e.g. 6,6 (default: even)")
+    parser.add_argument("--split", help="blocks per stage, e.g. 6,6, or auto: balanced on the "
+                        "measured blocks and links (default: even)")
     parser.add_argument("--backend", choices=("gpubridge", "gloo"), default="gpubridge",
                         help="gloo: the same pipeline on a plain Gloo group (CPU reference)")
     parser.add_argument("--probe-trials", type=int, default=3,
@@ -208,29 +276,35 @@ def main() -> int:
     vendor = topology.vendor if topology is not None else "cpu"
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    split = ([int(n) for n in args.split.split(",")] if args.split
-             else even_split(config.blocks, world))
-    if len(split) != world or sum(split) != config.blocks or min(split) < 1:
-        raise SystemExit(f"--split {args.split}: need {world} positive counts adding up to "
-                         f"{config.blocks} blocks")
+    if args.split == "auto":
+        split = None
+    else:
+        split = ([int(n) for n in args.split.split(",")] if args.split
+                 else even_split(config.blocks, world))
+        if len(split) != world or sum(split) != config.blocks or min(split) < 1:
+            raise SystemExit(f"--split {args.split}: need {world} positive counts adding up "
+                             f"to {config.blocks} blocks")
     mismatch = release_mismatch(gather(torch.__version__))
     if mismatch:
         raise SystemExit(mismatch)
     order = stage_order(gather(vendor))
     me = order.index(rank)  # this rank's stage
     first, last = me == 0, me == world - 1
-    start = sum(split[:me])
     model = llama.build(args.model, seed=args.seed)  # every rank the same weights, on CPU
-    stage = Stage(model, start, start + split[me], first, last).to(device)
-    del model
-    parameters = sum(p.numel() for p in stage.parameters())
-
     micro = args.global_batch // args.microbatches
     tokens = torch.zeros(micro, args.seq_len, dtype=torch.int64, device=device)
     hidden = torch.zeros(micro, args.seq_len, config.width, device=device)
     logits = torch.zeros(micro, args.seq_len, config.vocab, device=device)
-    example = tokens if first else hidden
     x0, y0 = llama.global_batch(args.model, -1, micro, args.seq_len, args.seed)
+    balanced = None
+    if split is None:
+        split, balanced = auto_split(model, order, me, device, x0.contiguous(), hidden,
+                                     args.schedule, args.microbatches, args.probe_trials)
+    start = sum(split[:me])
+    stage = Stage(model, start, start + split[me], first, last).to(device)
+    del model
+    parameters = sum(p.numel() for p in stage.parameters())
+    example = tokens if first else hidden
     if first:
         example = x0.contiguous().to(device)
     compute = stage_compute(stage, example, y0.contiguous().to(device) if last else None,
@@ -305,6 +379,8 @@ def main() -> int:
             "microbatches": args.microbatches, "steps": args.steps,
             "warmup_steps": args.warmup_steps, "seed": args.seed, "lr": args.lr,
             "optimizer": f"AdamW(lr={args.lr})", "split": split,
+            "split_rule": "auto" if balanced else "given" if args.split else "even",
+            "balance": balanced,
             "ranks": stages, "losses": losses_all,  # full precision: compared bit for bit
             "step_ms": [ms(s) for s in steps], "median_step_ms": ms(median_step),
             "tokens_per_s": round(args.global_batch * args.seq_len / median_step, 1),

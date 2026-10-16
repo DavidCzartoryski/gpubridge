@@ -126,6 +126,8 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
          [Step(r"pp_(gpipe|1f1b)"), Step("dp_single")]),
     35: ("The multitcp bridge against the Gloo bridge",
          [Step("multitcp_build"), Step(r"matrix_D-multitcp(-pinned|-1stream)?")]),
+    36: ("Automatic stage balancing against even and hand-tuned splits",
+         [Step(r"pp_(gpipe|1f1b)_(even|auto|[0-9]+(-[0-9]+)+)")]),
 }
 
 
