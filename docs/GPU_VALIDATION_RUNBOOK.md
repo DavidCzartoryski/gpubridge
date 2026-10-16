@@ -245,7 +245,7 @@ as of 2026-10-06; **verify each one**:
 | `UCX_BRIDGE` | `0` | `1`: steps 05 and 07 also build the UCX bridge on each node (`python -m gpubridge.ucx build`) and run `check_ucx` and `bench_ucx` over `bridge="ucx"` (items 26 and 27; [RDMA_TRANSPORT.md](RDMA_TRANSPORT.md)). Needs UCX and a C++ compiler on the nodes, e.g. `MODULES=ucx` |
 | `PREFLIGHT_SECONDS` | `2` | seconds of raw TCP data each way per pair of interfaces in the preflight |
 | `TIME_NET`, `TIME_08`, `TIME_TRAIN` | 10, 40, 30 min | walltimes of the network check, the comparison matrix and the one-GPU training benchmark |
-| `SAME_PARTITION_PAIRS_OK` | `0` | `1` lets `08-nvidia-pair` and `08-amd-pair` submit: two GPUs of one type in one partition, once RC confirms that is within intended use |
+| `SAME_PARTITION_PAIRS_OK` | `0` | `1` lets `08-nvidia-pair`, `08-amd-pair`, `07-nvidia-pair` and `07-amd-pair` submit: two GPUs of one type in one partition, once RC confirms that is within intended use. The 07 pairs run step 07's `STEPS_07=dp` or `pipeline` on one island of two (native NCCL or RCCL), the same-vendor baselines in [BENCHMARKS.md](BENCHMARKS.md#what-mixing-vendors-costs-and-whether-it-helps) |
 | `PARTITION_PAIR_NVIDIA`, `PARTITION_PAIR_AMD` | `gpu`, `sharing` | where those pairs' two components go |
 | `PIPELINE_CHUNKS` | `1M 4M 16M 64M` | step 08's pipelined runs, one per `GPUBRIDGE_CHUNK_BYTES` |
 | `TRAIN_BENCH_MODELS`, `TRAIN_BENCH_ARGS` | `gpt2-small resnet50`, empty | `train_bench.py`'s models and extra flags, in step 07 and `train-nvidia`/`train-amd` |
