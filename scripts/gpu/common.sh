@@ -262,6 +262,11 @@ step() {
     local name=$1
     shift
     : "${RESULTS:?set RESULTS before calling step}"
+    if [ "$name" != triton_check ] && needs_triton "$name" && ! triton_ready; then
+        not_run "$name" "triton_check failed: Triton can't run gpubridge's compression" \
+            "kernels on some side of this job (triton_check.log)"
+        return 0
+    fi
     log "step $name: $(quote "$@")"
     if [ "$DRY_RUN" = 1 ]; then
         if declare -F "$1" >/dev/null; then
@@ -308,13 +313,12 @@ step() {
     printf '{"step": "%s", "exit_code": %d, "seconds": %d, "log": "%s.log", "timed_out": %s%s}\n' \
         "$name" "$code" "$(($(date +%s) - start))" "$name" "$timed_out" \
         "${result:+, \"result\": \"$result\"}" >>"$RESULTS/steps.jsonl"
-    if grep -q -E "gpubridge-kit: (import|triton) check failed" "$RESULTS/$name.log"; then
+    if grep -q -F "gpubridge-kit: import check failed" "$RESULTS/$name.log"; then
         # probe.py on some side of the job found that side's gpubridge isn't this
-        # checkout's (later steps would measure other code), or that its Triton can't
-        # compile the compression kernels for its GPU (later steps would fail on it).
+        # checkout's: every later step would measure other code.
         FAILED_STEPS+=("$name")
-        die "step $name: $(grep -o -m1 -E "gpubridge-kit: (import|triton) check failed" \
-            "$RESULTS/$name.log"); stopping before any other step. See $RESULTS/$name.log."
+        die "step $name: a rank imported gpubridge from outside this checkout; stopping" \
+            "before any other step. See $RESULTS/$name.log."
     fi
     if [ "$code" = 0 ]; then
         PASSED_STEPS+=("$name")
@@ -326,6 +330,52 @@ step() {
         printf '%s\n' "${own_tail:-(empty)}" | sed 's/^/    | /' >&2
     fi
     return 0
+}
+
+# ---- Triton kernels --------------------------------------------------------------
+# gpubridge compresses GPU tensors with Triton kernels when Triton is installed
+# (GPUBRIDGE_COMPRESSION_KERNELS=auto, the default) or forced (=triton). Where Triton
+# can't compile them (venv-rocm63's 3.5.1 on an MI50's gfx906), only the steps that use
+# them would fail. So before the first such step, step triton_check runs
+# triton_check.py once through TRITON_CHECK_LAUNCH (each side of a mixed job; the jobs
+# set it); if it fails, each such step is recorded as failed without running, and the
+# rest of the job goes on. Uncompressed steps never check.
+
+#: Steps that use the kernels whatever the compression setting.
+TRITON_STEPS="${TRITON_STEPS:-gpu_tests bench_compression_kernels bench_compressed}"
+#: How to run triton_check.py: a command prefix (words), default this node's python.
+TRITON_CHECK_LAUNCH="${TRITON_CHECK_LAUNCH:-limited python}"
+TRITON_CHECKED_WITH="" TRITON_CHECK_RESULT=""
+
+# needs_triton NAME: whether step NAME uses the kernels: one of TRITON_STEPS, or any
+# step run with GPUBRIDGE_BRIDGE_COMPRESSION set and the PyTorch kernels not forced.
+needs_triton() {
+    case " $TRITON_STEPS " in *" $1 "*) return 0 ;; esac
+    local compression=${GPUBRIDGE_BRIDGE_COMPRESSION:-} kernels
+    kernels=$(printf '%s' "${GPUBRIDGE_COMPRESSION_KERNELS:-auto}" | tr '[:upper:]' '[:lower:]')
+    [ -n "$compression" ] && [ "$compression" != none ] && [ "$kernels" != torch ]
+}
+
+# triton_ready: step triton_check, once per TRITON_CHECK_LAUNCH; whether it passed.
+triton_ready() {
+    if [ "$TRITON_CHECKED_WITH" != "$TRITON_CHECK_LAUNCH" ]; then
+        local failed_before=${#FAILED_STEPS[@]}
+        # shellcheck disable=SC2086 # TRITON_CHECK_LAUNCH is a command prefix: split it
+        step triton_check $TRITON_CHECK_LAUNCH "$KIT_DIR/triton_check.py"
+        TRITON_CHECKED_WITH=$TRITON_CHECK_LAUNCH TRITON_CHECK_RESULT=ok
+        [ "${#FAILED_STEPS[@]}" = "$failed_before" ] || TRITON_CHECK_RESULT=failed
+    fi
+    [ "$TRITON_CHECK_RESULT" = ok ]
+}
+
+# not_run NAME REASON...: record step NAME as failed without running it.
+not_run() {
+    local name=$1
+    shift
+    log "step $name not run: $*" 2>&1 | tee "$RESULTS/$name.log"
+    printf '{"step": "%s", "exit_code": 1, "seconds": 0, "log": "%s.log", "timed_out": false, "result": "not run: %s"}\n' \
+        "$name" "$name" "$(json_string "$*")" >>"$RESULTS/steps.jsonl"
+    FAILED_STEPS+=("$name")
 }
 
 # negative_step NAME SECONDS REGEX CMD...: a step whose CMD checks that something

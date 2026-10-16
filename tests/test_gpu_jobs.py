@@ -32,6 +32,8 @@ END_TO_END = {
     "common.sh": "sourced by every shell script below",
     "gpukit.py": "imported by check, bench, probe and device_map",
     "import_check.py": "every job below (job_setup, run_all.sh), and test_gpu_kit.py",
+    "triton_check.py": "test_step_02, 04, 07, test_amd_node_job (before the kernel steps), "
+                       "and test_gpu_kit.py",
     "check.py": "every job below, and test_gpu_kit.py",
     "bench_all_reduce.py": "test_step_03, 04, 05, 07, the node pair",
     "bench_compression.py": "test_step_04, 07, the node pair, test_amd_node_job",
@@ -469,8 +471,13 @@ def test_step_07_data_parallel(tmp_path):
                   DP_RUNS="ddp ddp-fp8 fsdp2 ddp-speed ddp-bucket-5", **SMALL_DP)
     out = tmp_path / "results" / "07_mixed_hetjob_dp"
     assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
-    assert list(steps(out)) == ["probe", "preflight", "dp_ddp", "dp_ddp-fp8", "dp_fsdp2",
-                                "dp_ddp-speed", "dp_ddp-bucket-5"]
+    # Triton's check before the first compressed run only, on the NVIDIA side (the AMD
+    # side runs the PyTorch kernels: DP_KERNELS_ON_AMD=torch).
+    assert list(steps(out)) == ["probe", "preflight", "dp_ddp", "triton_check", "dp_ddp-fp8",
+                                "dp_fsdp2", "dp_ddp-speed", "dp_ddp-bucket-5"]
+    log = "\n".join(p.read_text() for p in (tmp_path / "work" / "logs").glob("*.out"))
+    check = [line for line in log.splitlines() if "step triton_check:" in line]
+    assert check and "--het-group=0" in check[0] and "--het-group=1" not in check[0]
     runs = {p.stem: json.loads(p.read_text()) for p in out.glob("dp_*.json")}
     assert runs["dp_ddp-fp8"]["compression"] == "fp8" and runs["dp_ddp"]["compression"] == "none"
     assert [r["compression_kernels"] for r in runs["dp_ddp-fp8"]["ranks"]] == ["auto", "torch"]

@@ -386,6 +386,10 @@ def test_amd_nodes_confirmed_comes_from_local_env(tmp_path):
     local_env = tmp_path / "local.env"
     local_env.write_text("AMD_NODES_CONFIRMED=1\nGPU_TYPE_AMD=mi50\n")
     path = fake_command(tmp_path / "bin", "sbatch", "echo 4242\n")
+    overlay = tmp_path / "venv-rocm63-triton38" / "bin"  # the default ROCm venv
+    overlay.mkdir(parents=True)
+    (overlay / "python").write_text("#!/bin/sh\n")
+    (overlay / "python").chmod(0o755)
     result = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), "amd"],
                             env=clean_env(GPUBRIDGE_REPO=str(REPO), PATH=path,
                                           WORK_DIR=str(tmp_path),
@@ -568,8 +572,9 @@ def test_mixed_hetjob_runs_each_side_in_its_own_venv():
     assert "--hsdp 2 --json" in sruns[-2] and "--verify --hsdp 2" in sruns[-1]
     for line in sruns:
         nvidia, amd = line.split(" : ")
-        assert "/w/venv/bin/" in nvidia and "/w/venv-rocm/" not in nvidia
-        assert amd.startswith("--het-group=1 ") and "/w/venv-rocm/bin/" in amd
+        assert "/w/venv/bin/" in nvidia and "/w/venv-rocm" not in nvidia
+        # The MI50's default: the Triton overlay of venv-rocm63 (submit.sh).
+        assert amd.startswith("--het-group=1 ") and "/w/venv-rocm63-triton38/bin/" in amd
     assert "--role master" in sruns[1] and "--role worker" in sruns[1]
     assert "probe_nvidia" in sruns[0] and "probe_amd" in sruns[0]
     assert out.index("preflight.py") < out.index("torchrun")
@@ -2010,14 +2015,15 @@ def test_matrix_job_runs_every_policy_on_the_mixed_pair():
     assert "--ops flat-gloo" in runs["E"]
     for line in runs.values():
         nvidia, amd = line.split(" : ")
-        assert "/w/venv/bin/torchrun" in nvidia and "/w/venv-rocm/bin/torchrun" in amd
+        assert "/w/venv/bin/torchrun" in nvidia and "/w/venv-rocm63-triton38/bin/torchrun" in amd
         assert "--phases" in line or "flat-gloo" in line
         assert "--max-bytes 1G" in line
 
 
 @pytest.mark.parametrize(("pair", "names", "venv"),
                          [("nvidia-nvidia", ["A1", "A2", "C", "E-nvidia"], "/w/venv/"),
-                          ("amd-amd", ["B1", "B2", "C-amd", "E-amd"], "/w/venv-rocm/")])
+                          ("amd-amd", ["B1", "B2", "C-amd", "E-amd"],
+                           "/w/venv-rocm63-triton38/")])
 def test_matrix_job_runs_the_native_baselines_on_same_vendor_pairs(pair, names, venv):
     runs = _matrix_launches(pair)
     assert list(runs) == names
@@ -2501,8 +2507,7 @@ def _bash(script: str, **env: str) -> subprocess.CompletedProcess:
                           capture_output=True, text=True, timeout=60)
 
 
-@pytest.mark.parametrize("marker", ["gpubridge-kit: import check failed: elsewhere",
-                                    "gpubridge-kit: triton check failed: gfx906"])
+@pytest.mark.parametrize("marker", ["gpubridge-kit: import check failed: elsewhere"])
 def test_a_failed_probe_check_stops_the_job_before_the_next_step(marker, tmp_path):
     result = _bash(f"""
 source {KIT}/common.sh
@@ -2571,21 +2576,125 @@ def test_a_directory_of_wrappers_is_a_venv_the_kit_can_use(tmp_path):
     assert missing.returncode != 0 and "run setup first" in missing.stderr
 
 
-@pytest.mark.parametrize("compiles,forced,ok", [
-    (True, "auto", True), (None, "auto", True), (False, "auto", False),
-    (False, "triton", False), (False, "torch", True),
-])
-def test_probe_refuses_a_triton_that_cannot_compile_unless_torch_kernels_are_forced(
-        compiles, forced, ok, monkeypatch, tmp_path):
+@pytest.mark.parametrize("compiles", [True, None, False])
+def test_probe_records_whether_triton_compiles_without_failing_on_it(compiles, monkeypatch,
+                                                                      tmp_path, capsys):
+    # Only the steps that use the kernels check them (triton_check.py, common.sh).
     mi50 = fake_device(monkeypatch, name="AMD Instinct MI50", capability=(9, 0),
                        gcn="gfx906:sramecc+:xnack-", hip="6.3.42134", arch_list=["gfx906"])
     triton = {"triton": "3.5.1", "compiles": compiles,
               **({"error": "RuntimeError: PassManager::run failed"} if compiles is False else {})}
-    monkeypatch.setenv("GPUBRIDGE_COMPRESSION_KERNELS", forced)
-    assert run_probe(monkeypatch, tmp_path, [mi50], triton=triton) == (0 if ok else 1)
+    assert run_probe(monkeypatch, tmp_path, [mi50], triton=triton) == 0
     stage = next(s for s in json.loads((tmp_path / "probe.json").read_text())["stages"]
                  if s["name"] == "triton_kernels")
-    assert stage["ok"] is ok and stage["kernels_setting"] == forced
-    if not ok:
-        assert "gpubridge-kit: triton check failed" in stage["error"]
-        assert "gfx906" in stage["error"] and "rocm_triton_overlay.sh" in stage["error"]
+    assert stage["ok"] is True and stage["compiles"] is compiles
+    assert ("steps that use them won't run" in capsys.readouterr().err) is (compiles is False)
+
+
+def _triton_check_module():
+    sys.path.insert(0, str(KIT))
+    import triton_check
+    return triton_check
+
+
+@pytest.mark.parametrize("result,forced,ok", [
+    (None, "auto", True),                                        # no GPU: PyTorch ops on CPU
+    ({"triton": None, "compiles": None}, "auto", True),          # no Triton: PyTorch kernels
+    ({"triton": None, "compiles": None}, "triton", False),       # forced but not installed
+    ({"triton": "3.8.0", "compiles": True}, "auto", True),
+    ({"triton": "3.5.1", "compiles": False, "error": "x"}, "auto", False),
+    ({"triton": "3.5.1", "compiles": False, "error": "x"}, "triton", False),
+])
+def test_triton_check_says_whether_the_kernels_can_run(result, forced, ok):
+    problem = _triton_check_module().verdict(result, forced)
+    assert (problem is None) is ok
+    if result and result["compiles"] is False:
+        assert "rocm_triton_overlay.sh" in problem and "3.5.1" in problem
+
+
+def _gate(tmp_path: Path, check_passes: bool, body: str, **env: str):
+    """common.sh with a stand-in triton_check.py launcher that passes or fails."""
+    launcher = tmp_path / "fake-python"
+    launcher.write_text(f"#!/bin/sh\necho checked >>{tmp_path}/checks\nexit "
+                        f"{0 if check_passes else 1}\n")
+    launcher.chmod(0o755)
+    result = _bash(f"""
+source {KIT}/common.sh
+RESULTS={tmp_path}
+TRITON_CHECK_LAUNCH={launcher}
+{body}
+finish || true
+""", **env)
+    steps = [json.loads(line) for line in (tmp_path / "steps.jsonl").read_text().splitlines()]
+    checks = (tmp_path / "checks").read_text().count("checked") if (
+        tmp_path / "checks").exists() else 0
+    return result, {s["step"]: s for s in steps}, checks
+
+
+def test_uncompressed_steps_never_check_triton_and_run_even_where_it_would_fail(tmp_path):
+    result, steps, checks = _gate(tmp_path, False, """
+step train_ddp echo ran-train
+step check echo ran-check
+GPUBRIDGE_BRIDGE_COMPRESSION=none step bench echo ran-bench
+""")
+    assert checks == 0 and "triton_check" not in steps
+    assert all(steps[name]["exit_code"] == 0 for name in ("train_ddp", "check", "bench"))
+    assert "ran-train" in result.stdout and "ran-bench" in result.stdout
+
+
+def test_steps_that_use_the_kernels_are_not_run_when_the_check_fails(tmp_path):
+    result, steps, checks = _gate(tmp_path, False, """
+step check echo ran-check
+step gpu_tests echo ran-gpu-tests
+step bench_compression_kernels echo ran-kernels
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 step dp_ddp-fp8 echo ran-fp8
+step train_ddp echo ran-train
+""")
+    assert checks == 1 and steps["triton_check"]["exit_code"] != 0  # checked once
+    for name in ("gpu_tests", "bench_compression_kernels", "dp_ddp-fp8"):
+        assert steps[name]["exit_code"] == 1 and steps[name]["result"].startswith("not run:")
+        assert f"ran-{name}" not in result.stdout
+    assert "ran-gpu-tests" not in result.stdout and "ran-fp8" not in result.stdout
+    assert steps["check"]["exit_code"] == 0 and steps["train_ddp"]["exit_code"] == 0
+    assert "ran-train" in result.stdout  # the rest of the job goes on
+
+
+def test_steps_that_use_the_kernels_run_after_a_passing_check(tmp_path):
+    result, steps, checks = _gate(tmp_path, True, """
+step gpu_tests echo ran-gpu-tests
+GPUBRIDGE_BRIDGE_COMPRESSION=bf16 step bench_bf16 echo ran-bf16
+""")
+    assert checks == 1 and steps["triton_check"]["exit_code"] == 0
+    assert "ran-gpu-tests" in result.stdout and "ran-bf16" in result.stdout
+
+
+def test_forced_pytorch_kernels_need_no_triton_check_for_compressed_steps(tmp_path):
+    result, steps, checks = _gate(tmp_path, False, """
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 step dp_ddp-fp8 echo ran-fp8
+""", GPUBRIDGE_COMPRESSION_KERNELS="torch")
+    assert checks == 0 and "ran-fp8" in result.stdout
+
+
+def test_setup_rocm_builds_venv_rocm_unless_vENV_ROCM_names_another():
+    # Jobs default to the overlay; setup-rocm still builds a real venv.
+    default = dry_run(KIT / "explorer" / "setup.sbatch", USER="alice", TORCH_FLAVOR="rocm")
+    assert default.returncode == 0, default.stderr
+    assert f"{FAKE_PROJECT}/alice/gpubridge-gpu/venv-rocm " in default.stdout
+    assert "triton38" not in default.stdout
+    named = dry_run(KIT / "explorer" / "setup.sbatch", USER="alice", TORCH_FLAVOR="rocm",
+                    VENV_ROCM="/w/venv-rocm63", ROCM_TORCH_VERSION="2.9.1",
+                    ROCM_INDEX="rocm6.3")
+    assert named.returncode == 0, named.stderr
+    assert "/w/venv-rocm63 " in named.stdout and "torch==2.9.1+rocm6.3" in named.stdout
+
+
+def test_the_amd_path_says_how_to_build_the_overlay_when_it_is_missing(tmp_path):
+    path = fake_command(tmp_path / "bin", "sbatch", "echo 4242\n")
+    result = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), "amd"],
+                            env=clean_env(GPUBRIDGE_REPO=str(REPO), PATH=path,
+                                          AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
+                                          WORK_DIR=str(tmp_path)),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1
+    assert f"no ROCm venv at {tmp_path}/venv-rocm63-triton38" in result.stderr
+    assert "rocm_triton_overlay.sh" in result.stderr and "4242" not in result.stderr

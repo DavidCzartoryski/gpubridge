@@ -2,10 +2,11 @@
 
 Records gpubridge.probe(), every visible GPU and the PyTorch build, and checks
 that this build can run on these GPUs, that ``import gpubridge`` found
-this checkout's src (import_check.py), and that an installed Triton can compile
-gpubridge's compression kernels for them. Writes OUT/probe.json. If a check
+this checkout's src (import_check.py). It also records whether an installed
+Triton compiles gpubridge's compression kernels for the GPU, without failing on it:
+only steps that use them check (triton_check.py). Writes OUT/probe.json. If a check
 fails, it prints one line per failure on stderr, naming the check and its
-values, and exits 1. A failed import or Triton check also stops the job (common.sh).
+values, and exits 1. A failed import check also stops the job (common.sh).
 
     python scripts/gpu/probe.py --out results/explorer/01_probe
 """
@@ -19,8 +20,6 @@ from pathlib import Path
 
 from gpukit import Record, blas_check, triton_check
 from import_check import message as import_problem
-
-TRITON_MARKER = "gpubridge-kit: triton check failed"
 
 
 def main() -> int:
@@ -66,18 +65,14 @@ def main() -> int:
         if problem:
             entry["error"] = problem
     with rec.stage("triton_kernels") as entry:
-        forced = os.environ.get("GPUBRIDGE_COMPRESSION_KERNELS", "auto").strip().lower()
-        entry["kernels_setting"] = forced
+        # Informational: only steps that use the kernels check them (triton_check.py).
+        entry["kernels_setting"] = os.environ.get("GPUBRIDGE_COMPRESSION_KERNELS", "auto")
         entry.update(triton_check(0) if env["device_count"] else {"compiles": None})
-        # With the torch kernels forced, Triton is never used, so it may be broken.
-        entry["ok"] = entry["compiles"] is not False or forced == "torch"
-        if not entry["ok"]:
-            target = next((d["target"] for d in env["devices"] if isinstance(d, dict)), "?")
-            entry["error"] = (
-                f"{TRITON_MARKER}: Triton {entry['triton']} can't compile gpubridge's "
-                f"compression kernels for {target} ({entry['error']}). On an MI50, use the "
-                "overlay venv (scripts/gpu/rocm_triton_overlay.sh; VENV_ROCM=its directory), "
-                "or set GPUBRIDGE_COMPRESSION_KERNELS=torch to run without Triton.")
+        if entry["compiles"] is False:
+            print(f"note: Triton {entry['triton']} can't compile gpubridge's compression "
+                  f"kernels here ({entry['error']}); steps that use them won't run",
+                  file=sys.stderr)
+        entry["ok"] = True
     with rec.stage("blas") as entry:
         # Informational: gpubridge never needs BLAS, so this never fails the probe.
         if env["device_count"]:

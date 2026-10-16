@@ -228,11 +228,15 @@ hardware.
 - The GPU kit refuses runs whose records would mislead. Every job stops before
   its first step if `import gpubridge` isn't the running checkout's `src/`
   (`scripts/gpu/import_check.py`, and the probe on every side of a mixed job).
-  Jobs with a probe step stop after it if an installed Triton can't compile the
-  compression kernels for the GPU (its `triton_kernels` stage;
-  `GPUBRIDGE_COMPRESSION_KERNELS=torch` skips it). The probe records where gpubridge was imported from, its commit
-  and `PYTHONPATH`. A job whose results folder already holds another run's
-  records writes to `<step>_job<id>/` instead. The AMD node job writes
+  Steps that use the Triton compression kernels (`gpu_tests`, the kernel and
+  compressed benchmarks, compressed runs) first check that Triton compiles them
+  on each node (`scripts/gpu/triton_check.py`, once per job); where it can't,
+  those steps are recorded as not run and the rest of the job goes on. On
+  Explorer the default ROCm venv is the MI50's Triton overlay
+  (`venv-rocm63-triton38`). The probe records where gpubridge was imported from,
+  its commit, `PYTHONPATH`, and whether Triton compiles the kernels. A job whose
+  results folder already holds another run's records writes to `<step>_job<id>/`
+  instead. The AMD node job writes
   `job.jsonl` like the others, and a directory of wrapper scripts, such as
   `rocm_triton_overlay.sh`'s, works as `VENV` or `VENV_ROCM`.
 - `bridge="multitcp"`, an opt-in bridge transport over several TCP connections

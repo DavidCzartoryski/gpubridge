@@ -93,6 +93,10 @@ both() {
         : --het-group=1 --nodes=1 --ntasks-per-node=1 --kill-on-bad-exit=1 "${amd[@]}"
 }
 
+# Triton's check (common.sh), before the first step that uses the compression kernels:
+# on both nodes, each in its own venv.
+TRITON_CHECK_LAUNCH="both @VENV@/bin/python"
+
 # One torchrun per component; c10d rendezvous on the gpu node.
 mixed_torchrun() {
     local tag=$1
@@ -187,6 +191,10 @@ if [ "$STEPS_07" = all ]; then
         --write-thresholds "$RESULTS/thresholds.json"
 fi
 if [ "$STEPS_07" = dp ]; then
+    # With the PyTorch kernels on the AMD side, only the NVIDIA side runs Triton's.
+    if [ "$DP_KERNELS_ON_AMD" = torch ]; then
+        TRITON_CHECK_LAUNCH="limited srun --het-group=0 --nodes=1 --ntasks-per-node=1 $VENV/bin/python"
+    fi
     for run in $DP_RUNS; do
         mode=${run%%-*} compression='' extra=()
         case $run in

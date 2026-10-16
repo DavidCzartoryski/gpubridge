@@ -11,7 +11,9 @@ WORK_DIR="${WORK_DIR:-${PROJECT_DIR:+$PROJECT_DIR/${USER:-$(id -un)}/gpubridge-g
 [ -n "$WORK_DIR" ] || die "set PROJECT_DIR (e.g. /projects/<your-project>) or WORK_DIR," \
     "in the environment or in scripts/gpu/explorer/local.env; see submit.sh"
 VENV="${VENV:-$WORK_DIR/venv}"                       # CUDA build of torch
-VENV_ROCM="${VENV_ROCM:-$WORK_DIR/venv-rocm}"        # ROCm build (step 07)
+# ROCm: the venv setup-rocm builds, and the one jobs run in (submit.sh explains both).
+ROCM_SETUP_VENV="${ROCM_SETUP_VENV:-${VENV_ROCM:-$WORK_DIR/venv-rocm}}"
+VENV_ROCM="${VENV_ROCM:-$WORK_DIR/venv-rocm63-triton38}"
 RESULTS_ROOT="${RESULTS_ROOT:-$REPO_DIR/results/explorer}"
 MODULES="${MODULES:-}"                               # `module load` names, if any
 # Opt-in collective policies each check-and-bench step also runs (off by default
