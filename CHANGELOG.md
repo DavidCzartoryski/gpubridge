@@ -193,7 +193,7 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   module; UCX copies bundled with some application modules have `ib`, none
   `cuda` or `rocm`. Details in
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md#rdma-between-the-node-types).
-- **A multi-stream TCP bridge prototype (#66, not merged), commit 23180fe of its
+- **A multi-stream TCP bridge prototype (#66), commit 23180fe of its
   branch**, step 08 with `MULTITCP_BRIDGE=1`, two jobs on a V100 + MI50: with
   pinned staging, a float32 all_reduce took 1.099 and 1.098 s at 1 GB against
   1.250 and 1.241 s on the pinned Gloo bridge, 0.88 times its time, and 1.07 and
@@ -202,7 +202,7 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   slower: torch's intra-op threads competing with the transport's network threads
   on 4-CPU jobs made each reduction 10 to 25 times slower, until it reduced on one
   thread. Details in
-  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype-not-merged).
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype).
 - **Triton 3.8.0 with torch 2.9.1+rocm6.3 on the AMD MI50 (gfx906), commit
   4e7f04e**: Triton from the default ROCm venv in front of `venv-rocm63`'s own
   (3.5.1), which can't compile the compression kernels for gfx906. The kit's
@@ -216,6 +216,19 @@ release so far is an alpha. Numbers in parentheses are pull requests.
   PyTorch kernels. Communication alone fell to 346 and 362 ms from 485 and
   605. HSDP hung again in both. Details in
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md#fp8-with-triton-kernels-on-the-mi50).
+- **Point-to-point, HSDP and the kit on a V100 + MI50, commit 1c7d107** (V100:
+  torch 2.14.1+cu126, NCCL 2.29.3; MI50: torch 2.9.1+rocm6.3, RCCL 2.21.5, in
+  `venv-rocm63`). Point-to-point through `backend="gpubridge"` passed on GPUs:
+  `check_p2p` on the split test (one V100, job 11112711) and across vendors (job
+  11112713), and the GPU stream-order test in `gpu_tests` on the V100 and the
+  MI50. Across vendors, a message took about 2.8 to 3.4 ms one way from 1 KB to 1
+  MB, and moved 0.8 GB/s at 64 MB and up (1.0 GB/s with pinned staging), payload
+  intact at every size. HSDP through the backend passed with mixed torch releases
+  (`train_hsdp_backend`, `verify_hsdp_backend`; it hung before #80). `train_ddp`
+  ended with the ranks' parameters unequal, as in 1 of 7 earlier mixed runs (item
+  22). The MI50's compression-kernel steps failed on `venv-rocm63`'s Triton 3.5.1,
+  which can't compile for gfx906, and passed with the Triton 3.8.0 overlay (job
+  11113623: every step of the AMD node job, GPU tests 27 passed, 8 skipped).
 
 Everything else is **validated on CPU only**:
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what still needs real
@@ -231,6 +244,31 @@ hardware.
   and by how much (`first_grad_mismatch`, `first_param_mismatch`). The parameter
   verdict now comes from the bits; the earlier float64 checksum comparison stays
   as `params_checksums_equal`.
+- The two-machine runner (`scripts/gpu/mixed/node.sh`) also trains `llama.py`'s
+  model: `train_dp.py` on one GPU of each machine alone (the baseline), then
+  step 07's data-parallel runs (`DP_RUNS`, default DDP uncompressed, bf16 and
+  fp8) and pipeline runs (`PP_RUNS`, GPipe and 1F1B) on both machines
+  together, with step 07's `DP_*` and `PP_*` settings. The run names are now
+  one shell function for both (`dp_run_options`). The runbook's 8+8 steps say
+  how to size them for 16 GPUs. Step 07's `07-multi` with `STEPS_07=dp` and
+  `pipeline` runs on the fake cluster with an NVIDIA island of two, and the
+  runner on two pretend machines and in two containers (#85).
+- Pipeline training across vendors: `scripts/gpu/train_pipeline.py` cuts
+  `llama.py`'s model into contiguous stages, one per rank, and trains it with
+  torch's GPipe or 1F1B through `backend="gpubridge"`'s point-to-point (or on a
+  plain Gloo group, the reference). It records every step's loss and time,
+  each stage's compute alone, the time an activation takes to arrive from the
+  previous stage, and idle-time and bubble estimates. Step 07's
+  `STEPS_07=pipeline`; `dp_report.py` reads its records too;
+  docs/PIPELINE.md; HARDWARE_VALIDATION.md item 34. On CPU: bit for bit like
+  plain Gloo (2 stages, and 4 over 2 + 2 islands), within 1e-4 of one process,
+  on torch 2.8.0, 2.9.1 and 2.14.1. Every rank needs the same PyTorch release
+  (2.14.1's stage setup doesn't match 2.9.1's), checked up front, and 2.9's
+  int64 handshake goes as a float32, as in 2.14.1. On a V100 and an MI50
+  (Explorer, both on 2.9.1, 1,000 steps): 13,115 tokens/s with GPipe and
+  13,051 with 1F1B, 1.05x and 1.04x the V100 alone with the same 4
+  micro-batches; over the last 100 steps 1F1B is within the spread of four
+  one-V100 runs, GPipe 0.02 above it after a later drop (#81).
 - `bridge="multitcp"`, an opt-in bridge transport over several TCP connections
   per pair of leaders (`GPUBRIDGE_MULTITCP_STREAMS`, 4), from a small Rust
   library (`src/gpubridge/multitcp/crate`, standard library only, a C interface
@@ -292,8 +330,20 @@ hardware.
   across ranks; tokens/s and DDP's step split; batch shares by GPU speed with
   sample-weighted averaging), step 07's `STEPS_07=dp`, `submit.sh dp-baseline`
   and `scripts/gpu/dp_report.py` (the runs against the baseline, with the loss
-  curves as CSV and SVG). CPU only so far; HARDWARE_VALIDATION.md item 33
-  (#67).
+  curves as CSV and SVG); HARDWARE_VALIDATION.md item 33. On a V100 and an
+  MI50 (Explorer, `llama-125m`, 1,000 steps): 4,549 tokens/s uncompressed,
+  5,753 with bf16 and 9,523 with fp8 on the bridge (Triton kernels on both
+  GPUs), against 14,264 on the V100 alone; FSDP2 1,809. Shares by speed cut
+  the gap between the GPUs' compute alone from 78 to 9 ms a step without
+  raising tokens/s; the bridge, about 4x the slower GPU's compute, looks like
+  what sets the step. 5, 25 and 100 MB buckets within 3.5%. Uncompressed DDP
+  ends as close to one V100 as V100 runs do to each other; bf16 and fp8 end
+  0.02 to 0.03 above, after a later drop off the loss plateau, about the gap
+  an uncompressed pipeline run left after a similarly late drop; these runs
+  can't separate compression's error from the drop's timing. Parameters
+  identical on both GPUs at every check.
+  docs/BENCHMARKS.md, and docs/COMPRESSION.md's "Training with compression"
+  (#67, #84).
 - Host-staged UCX P2P for arbitrary island members, with independent
   directional lane workers and optional pinned/chunked staging. Tested on
   CPU over UCX TCP, including non-leaders and concurrent pairs; no GPU/RDMA

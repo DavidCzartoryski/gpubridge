@@ -14,7 +14,8 @@
 # TRAIN_BENCH_BUCKETS="10 25 50 100" runs each train_bench step once per DDP bucket
 # size (MB), each under its own name: train_bench_<model>_bucket<MB>.
 # STEPS_07=dp only the probe, the preflight and the data-parallel runs (DP_RUNS, below),
-# into 07_mixed_hetjob_dp/.
+# into 07_mixed_hetjob_dp/; STEPS_07=pipeline the pipeline runs (PP_RUNS), into
+# 07_mixed_hetjob_pp/.
 set -euo pipefail
 REPO="${GPUBRIDGE_REPO:?submit with scripts/gpu/explorer/submit.sh}"
 # shellcheck source=../common.sh
@@ -27,8 +28,11 @@ GPUS_AMD="${GPUS_MIXED_AMD:-1}"
 RDZV_PORT="${RDZV_PORT:-29500}"
 PREFLIGHT_PORT="${PREFLIGHT_PORT:-29501}"
 BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-1G}"
-STEPS_07="${STEPS_07:-all}"  # all, training, bench or dp
-case $STEPS_07 in all | training | bench | dp) ;; *) die "STEPS_07 must be all, training, bench or dp" ;; esac
+STEPS_07="${STEPS_07:-all}"  # all, training, bench, dp or pipeline
+case $STEPS_07 in
+all | training | bench | dp | pipeline) ;;
+*) die "STEPS_07 must be all, training, bench, dp or pipeline" ;;
+esac
 # STEPS_07=dp: train_dp.py on llama.py's model, DP_STEPS steps of DP_GLOBAL_BATCH sequences
 # of DP_SEQ tokens, one run per name in DP_RUNS: ddp, ddp-bf16 and ddp-fp8 (DDP through
 # gpubridge.ddp_comm_hook, the bridge uncompressed or compressed), fsdp2 (FSDP2 through
@@ -44,6 +48,13 @@ DP_RUNS="${DP_RUNS:-ddp ddp-bf16 ddp-fp8 fsdp2 ddp-speed ddp-bucket-5 ddp-bucket
 # auto with a Triton that can: VENV_ROCM=<rocm_triton_overlay.sh's venv> DP_KERNELS_ON_AMD=auto.
 DP_KERNELS_ON_AMD="${DP_KERNELS_ON_AMD:-torch}"
 read -ra dp_args <<<"${DP_ARGS:-}"
+# STEPS_07=pipeline: train_pipeline.py on the same model, steps, global batch and sequence
+# length (DP_*), stage 0 on the NVIDIA GPU and stage 1 on the AMD one, one run per
+# schedule in PP_RUNS (gpipe, 1f1b), PP_MICROBATCHES microbatches a step; PP_ARGS go to
+# every run (e.g. --split 7,5). Set against dp-baseline with DP_MICRO=PP_MICROBATCHES.
+PP_RUNS="${PP_RUNS:-gpipe 1f1b}"
+PP_MICROBATCHES="${PP_MICROBATCHES:-4}"
+read -ra pp_args <<<"${PP_ARGS:-}"
 TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS:-gpt2-small resnet50}"
 read -ra train_args <<<"${TRAIN_BENCH_ARGS:-}"
 TRAIN_BENCH_BUCKETS="${TRAIN_BENCH_BUCKETS:-}"  # DDP bucket sizes (MB); empty: train_bench.py's
@@ -103,6 +114,8 @@ mixed_torchrun() {
 
 if [ "$STEPS_07" = dp ]; then   # on the gpu node, with the CUDA venv
     job_setup 07_mixed_hetjob_dp
+elif [ "$STEPS_07" = pipeline ]; then
+    job_setup 07_mixed_hetjob_pp
 else
     job_setup 07_mixed_hetjob
 fi
@@ -188,19 +201,23 @@ if [ "$STEPS_07" = all ]; then
 fi
 if [ "$STEPS_07" = dp ]; then
     for run in $DP_RUNS; do
-        mode=${run%%-*} compression='' extra=()
-        case $run in
-        ddp | fsdp2) ;;
-        ddp-bf16 | ddp-fp8) compression=${run#ddp-} ;;
-        ddp-speed) extra=(--shares speed) ;;
-        ddp-bucket-*) extra=(--bucket-mb "${run#ddp-bucket-}") ;;
-        *) die "DP_RUNS: unknown run '$run'" ;;
-        esac
-        GPUBRIDGE_BRIDGE_COMPRESSION=$compression step "dp_$run" mixed_torchrun "dp-$run" \
-            "$KIT_DIR/train_dp.py" --model "$DP_MODEL" --mode "$mode" --steps "$DP_STEPS" \
+        dp_run_options "$run"
+        GPUBRIDGE_BRIDGE_COMPRESSION=$DP_COMPRESSION step "dp_$run" mixed_torchrun "dp-$run" \
+            "$KIT_DIR/train_dp.py" --model "$DP_MODEL" --mode "$DP_MODE" --steps "$DP_STEPS" \
             --global-batch "$DP_GLOBAL_BATCH" --seq-len "$DP_SEQ" \
             --kernels-on-amd "$DP_KERNELS_ON_AMD" --json "$RESULTS/dp_$run.json" \
-            "${extra[@]+"${extra[@]}"}" "${dp_args[@]+"${dp_args[@]}"}"
+            "${DP_RUN_ARGS[@]+"${DP_RUN_ARGS[@]}"}" "${dp_args[@]+"${dp_args[@]}"}"
+    done
+    finish
+    exit
+fi
+if [ "$STEPS_07" = pipeline ]; then
+    for schedule in $PP_RUNS; do
+        case $schedule in gpipe | 1f1b) ;; *) die "PP_RUNS: unknown schedule '$schedule'" ;; esac
+        step "pp_$schedule" mixed_torchrun "pp-$schedule" "$KIT_DIR/train_pipeline.py" \
+            --model "$DP_MODEL" --schedule "$schedule" --microbatches "$PP_MICROBATCHES" \
+            --steps "$DP_STEPS" --global-batch "$DP_GLOBAL_BATCH" --seq-len "$DP_SEQ" \
+            --json "$RESULTS/pp_$schedule.json" "${pp_args[@]+"${pp_args[@]}"}"
     done
     finish
     exit
