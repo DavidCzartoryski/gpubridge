@@ -431,9 +431,9 @@ run, the x A2 and x A1 columns are empty.
 | 1GB | D-default-repeat | 1.6 s | 0.6713 | - | - | 916.132 | 1596.9077 | 1.74x |
 | 1GB | E | 1.64 s | 0.656 | - | - | - | - | - |
 
-## A multi-stream TCP bridge (prototype, not merged)
+## A multi-stream TCP bridge (prototype)
 
-#66 is a prototype bridge transport, `bridge="multitcp"`: a small Rust library that
+#66 (merged, opt-in) is a prototype bridge transport, `bridge="multitcp"`: a small Rust library that
 carries each leader pair's traffic over several TCP connections (4 by default), with
 Python reducing each 4 MiB chunk as soon as it has arrived. Before any run, its gate
 was set: it stays only if, with pinned staging, the whole float32 all_reduce's median
