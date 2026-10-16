@@ -244,6 +244,12 @@ hardware.
   and by how much (`first_grad_mismatch`, `first_param_mismatch`). The parameter
   verdict now comes from the bits; the earlier float64 checksum comparison stays
   as `params_checksums_equal`.
+- Step 07 can repeat `train_ddp` (item 22) in one job: `STEPS_07=ddp` runs only
+  the probe, the preflight and `train_ddp`, and `TRAIN_DDP_REPEATS=N` runs it N
+  times, as steps `train_ddp_1` to `train_ddp_N`. Bridge compression comes from the
+  environment at submit time, as before. `scripts/gpu/train_ddp_report.py` lists
+  every `train_ddp` record with its verdict and counts the runs that diverged, and
+  the validation tables count each repeat as item 22's evidence. CPU-tested only.
 - The two-machine runner (`scripts/gpu/mixed/node.sh`) also trains `llama.py`'s
   model: `train_dp.py` on one GPU of each machine alone (the baseline), then
   step 07's data-parallel runs (`DP_RUNS`, default DDP uncompressed, bf16 and

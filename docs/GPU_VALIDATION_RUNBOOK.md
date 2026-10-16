@@ -249,7 +249,8 @@ as of 2026-10-06; **verify each one**:
 | `PARTITION_PAIR_NVIDIA`, `PARTITION_PAIR_AMD` | `gpu`, `sharing` | where those pairs' two components go |
 | `PIPELINE_CHUNKS` | `1M 4M 16M 64M` | step 08's pipelined runs, one per `GPUBRIDGE_CHUNK_BYTES` |
 | `TRAIN_BENCH_MODELS`, `TRAIN_BENCH_ARGS` | `gpt2-small resnet50`, empty | `train_bench.py`'s models and extra flags, in step 07 and `train-nvidia`/`train-amd` |
-| `STEPS_07` | `all` | `training`: step 07 runs only the probe, the preflight and its training steps; `bench`: only the probe, the preflight and the `train_bench_<model>` steps (no `train_ddp`, FSDP2 or HSDP) |
+| `STEPS_07` | `all` | `training`: step 07 runs only the probe, the preflight and its training steps; `ddp`: only the probe, the preflight and `train_ddp`; `bench`: only the probe, the preflight and the `train_bench_<model>` steps (no `train_ddp`, FSDP2 or HSDP) |
+| `TRAIN_DDP_REPEATS` | `1` | step 07 runs `train_ddp` this many times, each its own step: `train_ddp_1` to `train_ddp_<N>` (step and JSON). `1`: once, as `train_ddp` (see [Repeating train_ddp](#repeating-train_ddp)) |
 | `TRAIN_BENCH_BUCKETS` | empty | DDP bucket sizes in MB, e.g. `10 25 50 100`: step 07 runs each `train_bench_<model>` step once per size (`--bucket-mb`), named `train_bench_<model>_bucket<MB>` (step and JSON). Empty: once, at `train_bench.py`'s default (25) |
 
 Also check:
@@ -620,6 +621,35 @@ at least the GPUs in all.
 Both models need BLAS on every GPU (the probe's `blas_available`):
 with a ROCm build whose rocBLAS lacks the GPU's kernels, its rank aborts at the
 first matmul, as the other training steps do; see [Choosing the ROCm build](#choosing-the-rocm-build).
+
+### Repeating train_ddp
+
+`train_ddp` (item 22) has ended with the ranks' parameters unequal in some mixed
+V100 + MI50 runs and not in others, so a rate needs many runs.
+`STEPS_07=ddp` makes step 07 run only the probe, the preflight and `train_ddp`, and
+`TRAIN_DDP_REPEATS=N` runs `train_ddp` N times in the job, as steps `train_ddp_1` to
+`train_ddp_N` (records `train_ddp_<i>.json`); one failing doesn't stop the rest.
+`TRAIN_DDP_REPEATS` works with `all` and `training` too. Bridge compression comes from
+the environment at submit time: `submit.sh` submits with `--export=ALL`, so
+`GPUBRIDGE_BRIDGE_COMPRESSION` and `GPUBRIDGE_COMPRESSION_KERNELS` reach every rank on
+both sides, and each record's `environments` holds them. With `STEPS_07=ddp` nothing
+else in the job uses them. Each job into a folder of its own:
+
+```bash
+export VENV_ROCM=$WORK_DIR/venv-rocm63 STEPS_07=ddp TRAIN_DDP_REPEATS=8 TIME_07=00:20:00
+RESULTS_ROOT=$PWD/results/explorer/ddp-none scripts/gpu/explorer/submit.sh 07
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 GPUBRIDGE_COMPRESSION_KERNELS=torch \
+    RESULTS_ROOT=$PWD/results/explorer/ddp-fp8 scripts/gpu/explorer/submit.sh 07
+python scripts/gpu/train_ddp_report.py results/explorer/ddp-none results/explorer/ddp-fp8
+```
+
+[`train_ddp_report.py`](../scripts/gpu/train_ddp_report.py) prints a row per run:
+the job, the repeat, compression and each rank's kernels, whether the parameters
+diverged, the first step at which the synced gradients and the parameters differed,
+whether the float64 checksums agreed, the largest difference and its tensor, and a
+verdict (in sync; gradients differ after all_reduce; parameters differ, gradients
+equal; old checksum only), then how many of the runs diverged. A `train_ddp` step
+that left no record is listed too.
 
 ### Pipeline training across vendors
 

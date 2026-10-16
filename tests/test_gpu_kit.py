@@ -30,6 +30,7 @@ import llama  # noqa: E402
 import preflight  # noqa: E402
 import summarize  # noqa: E402
 import train_bench  # noqa: E402
+import train_ddp_report  # noqa: E402
 import train_dp  # noqa: E402
 import train_pipeline  # noqa: E402
 import validation_tables  # noqa: E402
@@ -514,6 +515,12 @@ TRAINING_07 = ["train_fsdp2_backend", "verify_fsdp2_backend", "train_hsdp_backen
     ({"STEPS_07": "training", "TRAIN_BENCH_BUCKETS": "12.5"},
      ["probe", "preflight", "train_ddp", "train_bench_gpt2-small_bucket12.5",
       "train_bench_resnet50_bucket12.5", *TRAINING_07]),
+    ({"STEPS_07": "ddp"}, ["probe", "preflight", "train_ddp"]),
+    ({"STEPS_07": "ddp", "TRAIN_DDP_REPEATS": "3"},
+     ["probe", "preflight", "train_ddp_1", "train_ddp_2", "train_ddp_3"]),
+    ({"STEPS_07": "training", "TRAIN_DDP_REPEATS": "2", "TRAIN_BENCH_MODELS": "resnet50"},
+     ["probe", "preflight", "train_ddp_1", "train_ddp_2", "train_bench_resnet50",
+      *TRAINING_07]),
 ])
 def test_mixed_hetjob_step_selection(env, expected):
     env = {"TRAIN_BENCH_MODELS": "gpt2-small resnet50", "TRAIN_BENCH_ARGS": "--steps 5",
@@ -534,8 +541,25 @@ def test_mixed_hetjob_step_selection(env, expected):
         assert not mb or line.count(f"--steps 5 --bucket-mb {mb} ") == 2, line
 
 
+@pytest.mark.parametrize("repeats, names", [
+    ("1", ["train_ddp"]), ("3", ["train_ddp_1", "train_ddp_2", "train_ddp_3"])])
+def test_mixed_hetjob_runs_each_train_ddp_repeat_under_its_own_name(repeats, names):
+    result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w",
+                     STEPS_07="ddp", TRAIN_DDP_REPEATS=repeats)
+    assert result.returncode == 0, result.stderr
+    runs = [line for line in result.stdout.splitlines() if "train_synthetic.py" in line]
+    # Each on both sides, with its own JSON and rendezvous; one run keeps the old names.
+    for name, line in zip(names, runs, strict=True):
+        assert line.count(f"/07_mixed_hetjob/{name}.json") == 2, line
+        tag = name.replace("train_ddp", "train").replace("_", "-")
+        assert line.count(f"--rdzv-id=local-{tag} ") == 2, line
+
+
 @pytest.mark.parametrize(("env", "message"), [
-    ({"STEPS_07": "hsdp"}, "STEPS_07 must be all, training, bench, dp or pipeline"),
+    ({"STEPS_07": "hsdp"}, "STEPS_07 must be all, training, ddp, bench, dp or pipeline"),
+    ({"TRAIN_DDP_REPEATS": "0"}, "TRAIN_DDP_REPEATS must be a positive integer, not '0'"),
+    ({"TRAIN_DDP_REPEATS": "2.5"}, "TRAIN_DDP_REPEATS must be a positive integer, not '2.5'"),
+    ({"TRAIN_DDP_REPEATS": "many"}, "TRAIN_DDP_REPEATS must be a positive integer, not 'many'"),
     ({"TRAIN_BENCH_BUCKETS": "10 big"}, "TRAIN_BENCH_BUCKETS: 'big' is not a size in MB"),
     ({"TRAIN_BENCH_BUCKETS": "10", "TRAIN_BENCH_ARGS": "--steps 5 --bucket-mb 5"},
      "in TRAIN_BENCH_BUCKETS or in TRAIN_BENCH_ARGS, not both"),
@@ -1166,6 +1190,73 @@ def test_training_demo_finds_the_step_a_parameter_diverges_and_blames_the_optimi
     assert "params first differed at step 2" in result.stdout
 
 
+def _ddp_record(in_sync=True, grads=None, params=None, checksums=True, envs=({}, {})):
+    """A train_synthetic.py record with only what train_ddp_report.py reads."""
+    return {"script": "examples/train_synthetic.py", "world_size": 2, "params_in_sync": in_sync,
+            "first_grad_mismatch": grads, "first_param_mismatch": params,
+            "params_checksums_equal": checksums,
+            "environment": {"env": dict(envs[0])}, "environments": [{"env": dict(e)} for e in envs]}
+
+
+def _mismatch(step, diff, tensor):
+    return {"step": step, "tensors": [tensor], "max_abs_diff": diff, "tensor": tensor,
+            "index": 3, "rank": 1, "elements_differing": 1}
+
+
+def test_train_ddp_report_gives_each_run_a_verdict_and_counts_divergences(tmp_path):
+    a = tmp_path / "a" / "07_mixed_hetjob"
+    a.mkdir(parents=True)
+    # The job from scontrol's record: a heterogeneous job's first component.
+    (a / "slurm-job.txt").write_text("JobId=111 HetJobId=111 HetJobOffset=0 JobName=x\n"
+                                     "JobId=112 HetJobId=111 HetJobOffset=1 JobName=x\n")
+    (a / "steps.jsonl").write_text("".join(json.dumps({"step": name, "exit_code": code}) + "\n"
+                                           for name, code in [
+        ("probe", 1), ("train_ddp_1", 0), ("train_ddp_2", 1), ("train_ddp_3", 1),
+        ("train_ddp_10", 124)]))
+    (a / "train_ddp_1.json").write_text(json.dumps(_ddp_record()))
+    (a / "train_ddp_2.json").write_text(json.dumps(_ddp_record(
+        in_sync=False, grads=_mismatch(7, 2e-8, "0.weight"),
+        params=_mismatch(7, 3.5e-8, "2.weight"), checksums=False)))
+    (a / "train_ddp_3.json").write_text(json.dumps(_ddp_record(
+        in_sync=False, params=_mismatch(40, 1.2e-7, "4.bias"))))
+    b = tmp_path / "b" / "07_mixed_hetjob"
+    b.mkdir(parents=True)
+    fp8 = {"GPUBRIDGE_BRIDGE_COMPRESSION": "fp8", "SLURM_JOB_ID": "222"}
+    (b / "train_ddp.json").write_text(json.dumps(_ddp_record(
+        checksums=False, envs=(fp8, {**fp8, "GPUBRIDGE_COMPRESSION_KERNELS": "torch"}))))
+    # A record from before the bit-for-bit check: the checksums alone, which differed.
+    c = tmp_path / "c"
+    c.mkdir()
+    (c / "job.jsonl").write_text('{"event": "started", "job_id": "333"}\n')
+    old = _ddp_record(in_sync=False)
+    for key in ("first_grad_mismatch", "first_param_mismatch", "params_checksums_equal"):
+        del old[key]
+    (c / "train_ddp_split.json").write_text(json.dumps(old))
+    (c / "train_ddp_bench.json").write_text(json.dumps(_ddp_record()))  # not train_ddp's
+
+    found = train_ddp_report.rows([tmp_path / "a", tmp_path / "b", c])
+    assert [(r["folder"], r["job"], r["repeat"], r["verdict"]) for r in found] == [
+        ("a/07_mixed_hetjob", "111", "1", "in sync"),
+        ("a/07_mixed_hetjob", "111", "2", "gradients differ after all_reduce"),
+        ("a/07_mixed_hetjob", "111", "3", "parameters differ, gradients equal"),
+        ("a/07_mixed_hetjob", "111", "10", "no record (step exit 124)"),
+        ("b/07_mixed_hetjob", "222", "-", "old checksum only"),
+        ("c", "333", "split", "no per-step check")]
+    table = train_ddp_report.table(found).splitlines()
+    assert table[3] == ("| a/07_mixed_hetjob | 111 | 2 | none | auto | yes | 7 | 7 | no | "
+                        "3.5e-08 in 2.weight | gradients differ after all_reduce |")
+    assert table[4].endswith("| yes | - | 40 | yes | 1.2e-07 in 4.bias | "
+                             "parameters differ, gradients equal |")
+    assert table[5].endswith("| - | - | - | - | - | - | - | no record (step exit 124) |")
+    assert "| b/07_mixed_hetjob | 222 | - | fp8 | auto/torch | no | - | - | no | - |" in table[6]
+    assert "| c | 333 | split | none | auto | yes | - | - | - | - |" in table[7]
+    assert train_ddp_report.total(found) == (
+        "3 of 5 diverged (1 older record(s) judged by their float64 checksums alone); "
+        "1 train_ddp step(s) left no record")
+    assert train_ddp_report.main([str(a / "train_ddp_1.json")]) == 0
+    assert train_ddp_report.main([str(tmp_path / "nothing")]) == 1
+
+
 def test_scaling_summary_computes_efficiency(tmp_path):
     for n, sps in [(1, 100.0), (2, 180.0), (4, 300.0)]:
         (tmp_path / f"train-n{n}.json").write_text(json.dumps({
@@ -1703,6 +1794,17 @@ def test_p2p_step_is_p2p_evidence(tmp_path, exit_code, expected):
     _job(tmp_path, "new", [("check_p2p", exit_code)], GPU_ENV, "cuda:0")
     row = next(row for row in validation_tables.build([tmp_path])["items"] if row["item"] == 32)
     assert row["verdict"] == expected
+
+
+def test_train_ddp_repeats_are_each_item_22_evidence(tmp_path):
+    _job(tmp_path, "07_mixed_hetjob", [("train_ddp_1", 0), ("train_ddp_2", 1), ("train_ddp_3", 0),
+                                       ("train_ddp_bench", 0)], GPU_ENV, "cuda:0")
+    _job(tmp_path, "amd_node", [("train_ddp_split", 0)], GPU_ENV, "cuda:0")
+    row = next(row for row in validation_tables.build([tmp_path])["items"] if row["item"] == 22)
+    assert row["verdict"] == "FAIL (1 of 4)"
+    assert [e["where"] for e in row["evidence"]] == [
+        "07_mixed_hetjob/train_ddp_1", "07_mixed_hetjob/train_ddp_2",
+        "07_mixed_hetjob/train_ddp_3", "amd_node/train_ddp_split"]
 
 
 def test_tables_from_a_results_tree(tmp_path):

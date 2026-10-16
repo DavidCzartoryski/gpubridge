@@ -10,7 +10,10 @@
 # 3 with real RCCL ranks, 8 between nodes. The benchmark times each island's
 # native all_reduce (NCCL, RCCL) in the same job as the bridged one (item 11).
 # STEPS_07=training runs only the probe, the preflight and the training steps;
-# STEPS_07=bench only the probe, the preflight and train_bench.py's steps.
+# STEPS_07=ddp only the probe, the preflight and train_ddp; STEPS_07=bench only the
+# probe, the preflight and train_bench.py's steps.
+# TRAIN_DDP_REPEATS=N runs train_ddp N times, each its own step: train_ddp_1 to
+# train_ddp_N, into train_ddp_<i>.json (1, the default: once, as train_ddp).
 # TRAIN_BENCH_BUCKETS="10 25 50 100" runs each train_bench step once per DDP bucket
 # size (MB), each under its own name: train_bench_<model>_bucket<MB>.
 # STEPS_07=dp only the probe, the preflight and the data-parallel runs (DP_RUNS, below),
@@ -28,11 +31,14 @@ GPUS_AMD="${GPUS_MIXED_AMD:-1}"
 RDZV_PORT="${RDZV_PORT:-29500}"
 PREFLIGHT_PORT="${PREFLIGHT_PORT:-29501}"
 BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-1G}"
-STEPS_07="${STEPS_07:-all}"  # all, training, bench, dp or pipeline
+STEPS_07="${STEPS_07:-all}"  # all, training, ddp, bench, dp or pipeline
 case $STEPS_07 in
-all | training | bench | dp | pipeline) ;;
-*) die "STEPS_07 must be all, training, bench, dp or pipeline" ;;
+all | training | ddp | bench | dp | pipeline) ;;
+*) die "STEPS_07 must be all, training, ddp, bench, dp or pipeline" ;;
 esac
+TRAIN_DDP_REPEATS="${TRAIN_DDP_REPEATS:-1}"
+[[ $TRAIN_DDP_REPEATS =~ ^[1-9][0-9]*$ ]] ||
+    die "TRAIN_DDP_REPEATS must be a positive integer, not '$TRAIN_DDP_REPEATS'"
 # STEPS_07=dp: train_dp.py on llama.py's model, DP_STEPS steps of DP_GLOBAL_BATCH sequences
 # of DP_SEQ tokens, one run per name in DP_RUNS: ddp, ddp-bf16 and ddp-fp8 (DDP through
 # gpubridge.ddp_comm_hook, the bridge uncompressed or compressed), fsdp2 (FSDP2 through
@@ -222,10 +228,20 @@ if [ "$STEPS_07" = pipeline ]; then
     finish
     exit
 fi
-# DDP with gpubridge.ddp_comm_hook on real NVIDIA + AMD ranks (item 22).
+# DDP with gpubridge.ddp_comm_hook on real NVIDIA + AMD ranks (item 22), TRAIN_DDP_REPEATS
+# times: a divergence that comes and goes needs many runs to count. Bridge compression
+# comes from the job's environment (GPUBRIDGE_BRIDGE_COMPRESSION, ..._KERNELS).
 if [ "$STEPS_07" != bench ]; then
-    step train_ddp mixed_torchrun train "$REPO_DIR/examples/train_synthetic.py" \
-        --json "$RESULTS/train_ddp.json"
+    for ((i = 1; i <= TRAIN_DDP_REPEATS; i++)); do
+        repeat=""
+        [ "$TRAIN_DDP_REPEATS" = 1 ] || repeat="_$i"
+        step "train_ddp$repeat" mixed_torchrun "train${repeat//_/-}" \
+            "$REPO_DIR/examples/train_synthetic.py" --json "$RESULTS/train_ddp$repeat.json"
+    done
+fi
+if [ "$STEPS_07" = ddp ]; then
+    finish
+    exit
 fi
 # train_bench MODEL [MB]: one train_bench.py run on both sides; with MB, at that DDP
 # bucket size, under its own step and JSON name.

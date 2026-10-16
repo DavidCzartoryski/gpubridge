@@ -39,6 +39,7 @@ END_TO_END = {
     "train_dp.py": "test_step_07_data_parallel, test_dp_baseline_job, test_gpu_kit.py",
     "llama.py": "imported by train_dp.py: the same tests",
     "dp_report.py": "test_step_07_data_parallel, test_gpu_kit.py",
+    "train_ddp_report.py": "test_step_07_ddp_repeats, test_gpu_kit.py",
     "train_pipeline.py": "test_step_07_pipeline, test_gpu_kit.py",
     "net_report.sh": "test_step_08_*, test_net_check_job",
     "rdma_report.sh": "test_net_check_job, test_rdma_report_keeps_paths_out_and_reads_all_of_nm",
@@ -69,6 +70,7 @@ END_TO_END = {
     "explorer/05_multinode.sbatch": "test_step_05_two_nodes",
     "explorer/06_scaling.sbatch": "test_step_06_scaling",
     "explorer/07_mixed_hetjob.sbatch": "test_step_07_mixed_hetjob, test_step_07_training_only, "
+                                       "test_step_07_ddp_repeats, "
                                        "test_step_07_multi, test_step_07_data_parallel, "
                                        "test_step_07_pipeline, "
                                        "test_step_07_multi_trains_data_parallel_and_pipelined",
@@ -418,6 +420,41 @@ def test_step_07_training_only(tmp_path):
     assert list(steps(out)) == ["probe", "preflight", "train_ddp", "train_bench_tiny-gpt",
                                 "train_fsdp2_backend", "verify_fsdp2_backend",
                                 "train_hsdp_backend", "verify_hsdp_backend"]
+
+
+def test_step_07_ddp_repeats(tmp_path):
+    # STEPS_07=ddp: train_ddp alone, TRAIN_DDP_REPEATS times, each its own step and record.
+    # Bridge compression and its kernels come from the job's environment (submit.sh's
+    # sbatch --export=ALL passes it on) and reach every rank of every repeat.
+    code = sbatch(tmp_path, "--job-name=gpubridge-07_mixed_hetjob", "--nodes=1",
+                  "--gres=gpu:1", ":", "--nodes=1", "--gres=gpu:mi100:1",
+                  str(EXPLORER / "07_mixed_hetjob.sbatch"),
+                  FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
+                  FAKE_SLURM_HET_ENV_1="GPUBRIDGE_VENDOR=amd", STEPS_07="ddp",
+                  TRAIN_DDP_REPEATS="3", GPUBRIDGE_BRIDGE_COMPRESSION="fp8",
+                  GPUBRIDGE_COMPRESSION_KERNELS="torch")
+    out = tmp_path / "results" / "07_mixed_hetjob"
+    assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
+    assert list(steps(out)) == ["probe", "preflight", "train_ddp_1", "train_ddp_2",
+                                "train_ddp_3"]
+    assert not (out / "train_ddp.json").exists()
+    for i in (1, 2, 3):
+        record = json.loads((out / f"train_ddp_{i}.json").read_text())
+        assert record["world_size"] == 2 and record["params_in_sync"] is True
+        envs = [e["env"] for e in record["environments"]]
+        assert [e["GPUBRIDGE_VENDOR"] for e in envs] == ["nvidia", "amd"]
+        assert [e["GPUBRIDGE_BRIDGE_COMPRESSION"] for e in envs] == ["fp8", "fp8"]
+        assert [e["GPUBRIDGE_COMPRESSION_KERNELS"] for e in envs] == ["torch", "torch"]
+    # train_ddp_report.py: a row per repeat, with this job's id, then the total.
+    report = subprocess.run([sys.executable, str(KIT / "train_ddp_report.py"),
+                             str(tmp_path / "results")], capture_output=True, text=True,
+                            timeout=60)
+    assert report.returncode == 0, report.stderr
+    rows = report.stdout.splitlines()[2:5]
+    for i, row in enumerate(rows, start=1):
+        assert row.startswith(f"| results/07_mixed_hetjob | {job_id(tmp_path)} | {i} | fp8 | "
+                              "torch | no | - | - | yes | - | in sync |"), row
+    assert report.stdout.splitlines()[-1] == "0 of 3 diverged"
 
 
 

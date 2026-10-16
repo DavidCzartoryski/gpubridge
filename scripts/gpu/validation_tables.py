@@ -105,7 +105,7 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
     21: ("More bridge links mean more cross-vendor bandwidth",
          [Step("bench_phases_sharded-bridge"), Step("bench_candidates")]),
     22: ("DDP with `gpubridge.ddp_comm_hook` trains correctly",
-         [Step(r"train_ddp(_split)?"), Step(r"train_n\d+")]),
+         [Step(r"train_ddp(_split|_\d+)?"), Step(r"train_n\d+")]),  # _<i>: TRAIN_DDP_REPEATS
     23: ("What `gpubridge.in_flight()` shows on GPUs", [stage("in_flight", GPU_KINDS)]),
     24: ("No island puts two ranks on one GPU", [Step("shared_gpu_check")]),
     25: ("Pinned staging for the default bridge", [Step("check_pinned"), Step("bench_pinned")]),
