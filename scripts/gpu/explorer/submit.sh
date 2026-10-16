@@ -289,6 +289,11 @@ setup)
     ;;
 setup-rocm)
     amd_gate building
+    if [ -x "$ROCM_SETUP_VENV/bin/python" ] && [ ! -e "$ROCM_SETUP_VENV/bin/activate" ]; then
+        die "$ROCM_SETUP_VENV is a directory of wrapper scripts (rocm_triton_overlay.sh's), \
+not a venv to build into: set ROCM_SETUP_VENV (or VENV_ROCM) to a real venv, e.g. \
+\$WORK_DIR/venv-rocm or \$WORK_DIR/venv-rocm63"
+    fi
     gpu_request "$PARTITION_AMD" "$AMD_TYPE" 1 1 "$TIME_SETUP"
     setup_job setup-rocm "${REQUEST[@]}"
     ;;

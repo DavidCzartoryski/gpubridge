@@ -2749,10 +2749,11 @@ GPUBRIDGE_BRIDGE_COMPRESSION=none step bench echo ran-bench
 
 def test_steps_that_use_the_kernels_are_not_run_when_the_check_fails(tmp_path):
     result, steps, checks = _gate(tmp_path, False, """
+mixed_torchrun() { echo "ran-$1"; }
 step check echo ran-check
 step gpu_tests echo ran-gpu-tests
 step bench_compression_kernels echo ran-kernels
-GPUBRIDGE_BRIDGE_COMPRESSION=fp8 step dp_ddp-fp8 echo ran-fp8
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 step dp_ddp-fp8 mixed_torchrun fp8
 step train_ddp echo ran-train
 """)
     assert checks == 1 and steps["triton_check"]["exit_code"] != 0  # checked once
@@ -2782,8 +2783,9 @@ step bench_compression_kernels echo ran-kernels
 
 def test_steps_that_use_the_kernels_run_after_a_passing_check(tmp_path):
     result, steps, checks = _gate(tmp_path, True, """
+mixed_torchrun() { echo "ran-$1"; }
+GPUBRIDGE_BRIDGE_COMPRESSION=bf16 step bench_bf16 mixed_torchrun bf16
 step gpu_tests echo ran-gpu-tests
-GPUBRIDGE_BRIDGE_COMPRESSION=bf16 step bench_bf16 echo ran-bf16
 """)
     assert checks == 1 and steps["triton_check"]["exit_code"] == 0
     assert "ran-gpu-tests" in result.stdout and "ran-bf16" in result.stdout
@@ -2791,9 +2793,27 @@ GPUBRIDGE_BRIDGE_COMPRESSION=bf16 step bench_bf16 echo ran-bf16
 
 def test_forced_pytorch_kernels_need_no_triton_check_for_compressed_steps(tmp_path):
     result, steps, checks = _gate(tmp_path, False, """
-GPUBRIDGE_BRIDGE_COMPRESSION=fp8 step dp_ddp-fp8 echo ran-fp8
+mixed_torchrun() { echo "ran-$1"; }
+GPUBRIDGE_BRIDGE_COMPRESSION=fp8 step dp_ddp-fp8 mixed_torchrun fp8
 """, GPUBRIDGE_COMPRESSION_KERNELS="torch")
     assert checks == 0 and "ran-fp8" in result.stdout
+
+
+def test_compression_exported_for_the_whole_job_gates_only_its_collectives(tmp_path):
+    # The runbook's overlay recipe exports GPUBRIDGE_BRIDGE_COMPRESSION for a whole job:
+    # the probe, the preflight and one-process runs must still run, checked or not.
+    result, steps, checks = _gate(tmp_path, False, """
+mixed_torchrun() { echo "ran-$1"; }
+step probe both @VENV@/bin/python probe.py
+step preflight echo ran-preflight
+step dp_single limited echo ran-single
+step matrix_D both env A=1 @VENV@/bin/torchrun x
+step train_ddp mixed_torchrun train
+""", GPUBRIDGE_BRIDGE_COMPRESSION="fp8")
+    assert checks == 1 and "ran-preflight" in result.stdout and "ran-single" in result.stdout
+    assert all("not_run" not in steps[name] for name in ("probe", "preflight", "dp_single"))
+    assert steps["matrix_D"]["not_run"] and steps["train_ddp"]["not_run"]
+    assert "ran-train" not in result.stdout
 
 
 def test_setup_rocm_builds_venv_rocm_unless_vENV_ROCM_names_another():
@@ -2831,6 +2851,18 @@ def test_setup_rocm_builds_its_venv_when_no_rocm_venv_exists_yet(tmp_path):
                                 capture_output=True, text=True, timeout=60)
         assert result.returncode == 0, result.stderr
         assert "4242" in result.stderr + result.stdout
+    overlay = tmp_path / "venv-rocm63-triton38" / "bin"
+    overlay.mkdir(parents=True)
+    (overlay / "python").write_text("#!/bin/sh\n")
+    (overlay / "python").chmod(0o755)
+    refused = subprocess.run(["bash", str(KIT / "explorer" / "submit.sh"), "setup-rocm"],
+                             env=clean_env(GPUBRIDGE_REPO=str(REPO), PATH=path,
+                                           AMD_NODES_CONFIRMED="1", GPU_TYPE_AMD="mi50",
+                                           WORK_DIR=str(tmp_path),
+                                           VENV_ROCM=str(overlay.parent)),
+                             capture_output=True, text=True, timeout=60)
+    assert refused.returncode == 1 and "wrapper scripts" in refused.stderr
+    assert "4242" not in refused.stderr + refused.stdout
 
 
 # ---- pipeline training: train_pipeline.py ------------------------------------------------

@@ -242,9 +242,11 @@ hardware.
   its first step if `import gpubridge` isn't the running checkout's `src/`
   (`scripts/gpu/import_check.py`, and the probe on every side of a mixed job).
   Steps that use the Triton compression kernels (`gpu_tests`, the kernel and
-  compressed benchmarks, compressed runs) first check that Triton compiles them
-  on each node (`scripts/gpu/triton_check.py`, once per job); where it can't,
-  those steps are recorded as not run and the rest of the job goes on. On
+  compressed benchmarks, compressed collective runs) first check that Triton
+  compiles and runs all four kernels on each node (`scripts/gpu/triton_check.py`,
+  once per job); where it can't, those steps are recorded as not run and the rest
+  of the job goes on (`mixed/node.sh`, whose machines decide alone, never skips a
+  mixed step). On
   Explorer the default ROCm venv is the MI50's Triton overlay
   (`venv-rocm63-triton38`). The probe records where gpubridge was imported from,
   its commit, `PYTHONPATH`, and whether Triton compiles the kernels. A job whose

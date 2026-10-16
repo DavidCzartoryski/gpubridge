@@ -321,7 +321,8 @@ nothing. It writes to `results/explorer/00_partitions/`:
 Job logs go to `$WORK_DIR/logs/`, and results to `results/explorer/<step>/`.
 A job never writes into another run's folder: if `results/explorer/<step>/`
 already holds a `job.jsonl` or `steps.jsonl`, its results go to
-`results/explorer/<step>_job<id>/` instead, and the log says so.
+`results/explorer/<step>_job<id>/` instead (`_2`, `_3` ... if that is taken too), and
+the log says so.
 
 A job stops before its first step if **`import gpubridge` isn't this checkout's
 `src/`** (`import_check.py`, and the probe on each side of a mixed job). The venvs
@@ -331,13 +332,18 @@ installs, or put this checkout's `src` first on `PYTHONPATH`. The probe records 
 gpubridge came from, its commit and `PYTHONPATH`.
 
 Steps that use gpubridge's Triton compression kernels check first that Triton can
-compile them on each node of the job (step `triton_check`, `triton_check.py`, once
-per job): `gpu_tests`, `bench_compression_kernels`, `bench_compressed`, and any run
-with `GPUBRIDGE_BRIDGE_COMPRESSION` set unless `GPUBRIDGE_COMPRESSION_KERNELS=torch`.
-If it fails, as `venv-rocm63`'s own Triton does on the MI50's gfx906, those steps are
-recorded as failed without running ("not run: triton_check failed") and the rest of
-the job goes on. Uncompressed steps never check. The probe records whether Triton
-compiles them, without failing on it.
+compile and run them (all four: quantize and dequantize, bf16 and fp8) on each node
+of the job (step `triton_check`, `triton_check.py`, once per job): `gpu_tests`,
+`bench_compression_kernels`, `bench_compressed`, and any torchrun launch with
+`GPUBRIDGE_BRIDGE_COMPRESSION` set unless `GPUBRIDGE_COMPRESSION_KERNELS=torch`. The
+probe, the preflight and one-process runs never check, even with compression
+exported for the whole job. If the check fails, as `venv-rocm63`'s own Triton does on
+the MI50's gfx906, those steps are recorded as failed without running (`"not_run"` in
+`steps.jsonl`) and the rest of the job goes on; `gpu_tests` is skipped as a whole,
+its Triton-free tests included, so use the overlay venv for it. The probe records
+whether Triton compiles the kernels, without failing on it. `mixed/node.sh` checks
+the import too, but never skips a mixed step: its two machines decide alone, so a
+compressed step runs on both and fails on both if either's Triton can't compile.
 
 Keep the raw results on the cluster: the step logs, stack dumps and NCCL logs
 aren't redacted (see [Reading results](#reading-results)). For review, paste
@@ -496,7 +502,8 @@ Nothing in either venv changes, nothing is copied, and no Python runs, so it is
 fine on a login node. On Explorer it is the default `VENV_ROCM`
 (`$WORK_DIR/venv-rocm63-triton38`) for every job with an AMD side; submit.sh stops
 with these commands if it is missing, and setup-rocm still builds `venv-rocm` unless
-`VENV_ROCM` names another venv:
+`VENV_ROCM` (or `ROCM_SETUP_VENV`) names another venv; it refuses to build into a
+directory of wrapper scripts such as the overlay:
 
 ```bash
 scripts/gpu/rocm_triton_overlay.sh $WORK_DIR/venv-rocm63 $WORK_DIR/venv-rocm \

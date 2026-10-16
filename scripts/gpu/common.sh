@@ -262,7 +262,7 @@ step() {
     local name=$1
     shift
     : "${RESULTS:?set RESULTS before calling step}"
-    if [ "$name" != triton_check ] && needs_triton "$name" &&
+    if [ "$name" != triton_check ] && needs_triton "$name" "$@" &&
         { [ "$TRITON_GATE_MIXED" != 0 ] || [ "${1:-}" != mixed_torchrun ]; } && ! triton_ready; then
         not_run "$name" "triton_check failed: Triton can't run gpubridge's compression" \
             "kernels on some side of this job (triton_check.log)"
@@ -352,13 +352,20 @@ TRITON_CHECK_LAUNCH="${TRITON_CHECK_LAUNCH:-limited python}"
 TRITON_GATE_MIXED="${TRITON_GATE_MIXED:-1}"
 TRITON_CHECKED_WITH="" TRITON_CHECK_RESULT=""
 
-# needs_triton NAME: whether step NAME uses the kernels: one of TRITON_STEPS, or any
-# step run with GPUBRIDGE_BRIDGE_COMPRESSION set and the PyTorch kernels not forced.
+# needs_triton NAME CMD...: whether step NAME uses the kernels: one of TRITON_STEPS, or
+# a torchrun launch (collectives) with GPUBRIDGE_BRIDGE_COMPRESSION set and the PyTorch
+# kernels not forced. Probes, preflights and one-process runs never use them, even with
+# compression exported for the whole job.
 needs_triton() {
-    case " $TRITON_STEPS " in *" $1 "*) return 0 ;; esac
-    local compression=${GPUBRIDGE_BRIDGE_COMPRESSION:-} kernels
+    local name=$1 arg compression=${GPUBRIDGE_BRIDGE_COMPRESSION:-} kernels
+    shift
+    case " $TRITON_STEPS " in *" $name "*) return 0 ;; esac
     kernels=$(printf '%s' "${GPUBRIDGE_COMPRESSION_KERNELS:-auto}" | tr '[:upper:]' '[:lower:]')
-    [ -n "$compression" ] && [ "$compression" != none ] && [ "$kernels" != torch ]
+    [ -n "$compression" ] && [ "$compression" != none ] && [ "$kernels" != torch ] || return 1
+    for arg in "$@"; do
+        case $arg in *torchrun*) return 0 ;; esac
+    done
+    return 1
 }
 
 # triton_ready: step triton_check, once per TRITON_CHECK_LAUNCH; whether it passed.

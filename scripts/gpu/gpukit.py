@@ -161,11 +161,13 @@ def triton_check(index: int) -> dict[str, Any]:
         import triton
     except ImportError:
         return {"triton": None, "compiles": None, "note": "Triton not installed: torch kernels"}
-    from gpubridge import _compression_kernels, compression
-
-    device = torch.device("cuda", index)
-    x = torch.linspace(-3, 3, 4096, device=device)
+    except Exception as exc:  # installed but broken: whatever the probe hits, it only records
+        return {"triton": "unknown", "compiles": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
     try:  # every kernel a compressed collective launches: quantize and dequantize, both modes
+        from gpubridge import _compression_kernels, compression
+
+        device = torch.device("cuda", index)
+        x = torch.linspace(-3, 3, 4096, device=device)
         for mode in ("bf16", "fp8"):
             payload = torch.empty(compression.payload_nbytes(mode, x.numel()), dtype=torch.uint8,
                                   device=device)
@@ -173,7 +175,7 @@ def triton_check(index: int) -> dict[str, Any]:
             _compression_kernels.dequantize_accumulate(mode, payload.view(1, -1),
                                                        torch.zeros_like(x))
         torch.cuda.synchronize(device)
-    except Exception as exc:  # a compiler error, as Triton reports it
+    except Exception as exc:  # a compiler error as Triton reports it, or anything else
         first = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
         return {"triton": triton.__version__, "compiles": False,
                 "error": f"{type(exc).__name__}: {first}"[:300]}
