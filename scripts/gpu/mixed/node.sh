@@ -10,8 +10,9 @@
 # WireGuard the alternative; see docs/GPU_VALIDATION_RUNBOOK.md. A preflight
 # check runs first and stops with a clear message if the machines can't talk,
 # before torchrun starts. Then the bridge check, the benchmarks, training through
-# the backend and training throughput; last, this machine's results are triaged
-# (triage.txt) and packed. Add --dry-run to only print commands.
+# the backend, training throughput, and data-parallel and pipeline training on a
+# LLaMA-style model; last, this machine's results are triaged (triage.txt) and
+# packed. Add --dry-run to only print commands.
 set -euo pipefail
 # shellcheck source=../common.sh
 source "$(dirname "$0")/../common.sh" "$@"
@@ -30,8 +31,22 @@ export TORCH_VERSION="${TORCH_VERSION:-2.14.1}"  # same release on both machines
 SKIP_SETUP="${SKIP_SETUP:-0}"
 WORK_DIR="${WORK_DIR:-$HOME/gpubridge-gpu}"
 BENCH_MAX_BYTES="${BENCH_MAX_BYTES:-256M}"  # the bridge crosses the internet: keep it modest
-TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS:-gpt2-small resnet50}"  # train_bench.py's; "" = none
+TRAIN_BENCH_MODELS="${TRAIN_BENCH_MODELS-gpt2-small resnet50}"  # train_bench.py's; "" = none
 TRAIN_BENCH_ARGS="${TRAIN_BENCH_ARGS:-}"  # extra train_bench.py arguments, e.g. "--steps 50"
+# Data-parallel and pipeline training (train_dp.py, train_pipeline.py), as in Explorer's
+# step 07 with STEPS_07=dp and pipeline. Every GPU gets one rank; the pipeline puts one
+# stage on each, so it needs at least as many microbatches and blocks as GPUs in all.
+DP_MODEL="${DP_MODEL:-llama-125m}"       # llama.py's model, for both
+DP_STEPS="${DP_STEPS:-500}"              # 1000 to compare loss curves (docs/COMPRESSION.md)
+DP_GLOBAL_BATCH="${DP_GLOBAL_BATCH:-8}"  # sequences per step, over every GPU
+DP_SEQ="${DP_SEQ:-512}"                  # tokens per sequence
+DP_MICRO="${DP_MICRO:-1}"                # the one-GPU baseline's micro-batches
+DP_RUNS="${DP_RUNS-ddp ddp-bf16 ddp-fp8}"  # step 07's run names; "" = none
+DP_KERNELS_ON_AMD="${DP_KERNELS_ON_AMD:-auto}"  # torch where Triton can't compile them
+DP_ARGS="${DP_ARGS:-}"                   # extra train_dp.py arguments
+PP_RUNS="${PP_RUNS-gpipe 1f1b}"          # schedules; "" = none
+PP_MICROBATCHES="${PP_MICROBATCHES:-4}"
+PP_ARGS="${PP_ARGS:-}"                   # extra train_pipeline.py arguments, e.g. "--split 7,5"
 RESULTS_ROOT="${RESULTS_ROOT:-$REPO_DIR/results}"
 # -------------------------------------------------------------------------------
 
@@ -114,6 +129,30 @@ for model in $TRAIN_BENCH_MODELS; do
     step "train_bench_$model" mixed_torchrun "train-bench-$model" "$KIT_DIR/train_bench.py" \
         --model "$model" --json "$RESULTS/train_bench_$model.json" \
         "${train_args[@]+"${train_args[@]}"}"
+done
+# Data-parallel and pipeline training on llama.py's model: first one GPU of this machine
+# alone with the same global batch and seed (the baseline both are set against), then both
+# machines together.
+read -ra dp_args <<<"$DP_ARGS"
+read -ra pp_args <<<"$PP_ARGS"
+dp_common=(--model "$DP_MODEL" --steps "$DP_STEPS" --global-batch "$DP_GLOBAL_BATCH"
+           --seq-len "$DP_SEQ")
+if [ -n "$DP_RUNS$PP_RUNS" ]; then
+    step dp_single limited python "$KIT_DIR/train_dp.py" --mode single "${dp_common[@]}" \
+        --micro "$DP_MICRO" --json "$RESULTS/dp_single.json" "${dp_args[@]+"${dp_args[@]}"}"
+fi
+for run in $DP_RUNS; do
+    dp_run_options "$run"
+    GPUBRIDGE_BRIDGE_COMPRESSION=$DP_COMPRESSION step "dp_$run" mixed_torchrun "dp-$run" \
+        "$KIT_DIR/train_dp.py" --mode "$DP_MODE" "${dp_common[@]}" \
+        --kernels-on-amd "$DP_KERNELS_ON_AMD" --json "$RESULTS/dp_$run.json" \
+        "${DP_RUN_ARGS[@]+"${DP_RUN_ARGS[@]}"}" "${dp_args[@]+"${dp_args[@]}"}"
+done
+for schedule in $PP_RUNS; do
+    case $schedule in gpipe | 1f1b) ;; *) die "PP_RUNS: unknown schedule '$schedule'" ;; esac
+    step "pp_$schedule" mixed_torchrun "pp-$schedule" "$KIT_DIR/train_pipeline.py" \
+        "${dp_common[@]}" --schedule "$schedule" --microbatches "$PP_MICROBATCHES" \
+        --json "$RESULTS/pp_$schedule.json" "${pp_args[@]+"${pp_args[@]}"}"
 done
 # This machine's half only: triage the other machine's tarball the same way.
 capture "$RESULTS/triage.txt" python "$KIT_DIR/triage.py" "$RESULTS"

@@ -122,6 +122,8 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
          [Step("check_p2p")]),
     33: ("Data-parallel training across vendors tracks one GPU, compressed or not",
          [Step(r"dp_(ddp|fsdp2)(-.+)?"), Step("dp_single")]),
+    34: ("Pipeline training across vendors tracks one GPU",
+         [Step(r"pp_(gpipe|1f1b)"), Step("dp_single")]),
     35: ("The multitcp bridge against the Gloo bridge",
          [Step("multitcp_build"), Step(r"matrix_D-multitcp(-pinned|-1stream)?")]),
 }

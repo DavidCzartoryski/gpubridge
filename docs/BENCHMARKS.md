@@ -20,6 +20,7 @@ intended use (see [Waiting on Research Computing](#waiting-on-research-computing
 | D | a V100 and an MI50 through gpubridge: every policy | ran |
 | E | the same two ranks as one flat Gloo group | ran |
 | Training | DDP with `gpubridge.ddp_comm_hook` on GPT-2 small and ResNet-50: each GPU alone, then both | ran: the V100 alone, the MI50 alone (torch 2.9.1+rocm6.3) and both together, uncompressed and with fp8 on the bridge (GPT-2 small at batches 4 to 32) |
+| Data-parallel training | `train_dp.py` on a LLaMA-style model: DDP uncompressed, bf16 and fp8, FSDP2, shares by speed, bucket sizes; one V100 alone | ran: [below](#data-parallel-training-on-a-llama-style-model) |
 
 ## Setup
 
@@ -430,9 +431,9 @@ run, the x A2 and x A1 columns are empty.
 | 1GB | D-default-repeat | 1.6 s | 0.6713 | - | - | 916.132 | 1596.9077 | 1.74x |
 | 1GB | E | 1.64 s | 0.656 | - | - | - | - | - |
 
-## A multi-stream TCP bridge (prototype, not merged)
+## A multi-stream TCP bridge (prototype)
 
-#66 is a prototype bridge transport, `bridge="multitcp"`: a small Rust library that
+#66 (merged, opt-in) is a prototype bridge transport, `bridge="multitcp"`: a small Rust library that
 carries each leader pair's traffic over several TCP connections (4 by default), with
 Python reducing each 4 MiB chunk as soon as it has arrived. Before any run, its gate
 was set: it stays only if, with pinned staging, the whole float32 all_reduce's median
@@ -631,6 +632,82 @@ preflight 1170 to 1174 MB/s each way, a 0.05 ms round trip, on
   bit-for-bit check differed from its uncompressed replay as in every fp8 run,
   and `train_hsdp_backend` hung (batch 16: until its timeout; batch 32: the job
   was cancelled during it).
+
+## Data-parallel training on a LLaMA-style model
+
+[`scripts/gpu/train_dp.py`](../scripts/gpu/train_dp.py) on `llama.py`'s
+`llama-125m` (134 M parameters, 536 MB of float32 gradients a step), a V100
+and an MI50 in step 07's heterogeneous job with `STEPS_07=dp`. The global batch
+is 8 sequences x 512 tokens, 4 per GPU unless a row says otherwise; AdamW 3e-4,
+seed 0. DDP runs through `gpubridge.ddp_comm_hook` with 25 MB buckets (14),
+FSDP2 through `backend="gpubridge"`; the default bridge policy over TCP on
+`internal.2137`, whose preflights measured 1159 to 1174 MB/s each way. The
+V100 ran torch 2.14.1+cu126, the MI50 2.9.1+rocm6.3; in the 1,000-step job the
+MI50's venv had Triton 3.8.0 in front (`venv-rocm63-triton38`,
+`scripts/gpu/rocm_triton_overlay.sh`), so the compression kernels ran as
+Triton on both GPUs. One V100 alone is `submit.sh dp-baseline`. Medians of
+the steps after the first 5; "exposed" is the median step less the slower
+GPU's compute alone, "hidden" the share of the bridge's time alone that isn't
+exposed, and "V100 waits" the slower GPU's compute alone less the V100's:
+estimates from each GPU's compute timed alone, as in `train_dp.py`, not waits
+measured during training.
+
+| Run | Steps | Tokens/s | Against the V100 alone | Step (ms) | MI50 compute | V100 waits (est.) | Bridge alone | Exposed (est.) | Hidden (est.) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| V100 alone | 1,000 | 14,264 | 1.00x | 287.1 | - | - | - | - | - |
+| V100 + MI50, DDP | 1,000 | 4,549 | 0.32x | 900.4 | 231.8 | 78.4 | 792.2 | 668.7 | 16% |
+| V100 + MI50, DDP, bf16 bridge | 1,000 | 5,753 | 0.40x | 711.9 | 231.8 | 77.5 | 627.7 | 480.2 | 24% |
+| V100 + MI50, DDP, fp8 bridge | 1,000 | 9,523 | 0.67x | 430.1 | 232.4 | 77.7 | 326.0 | 197.7 | 39% |
+| V100 + MI50, FSDP2 | 500 | 1,809 | 0.13x | 2,264.5 | - | - | - | - | - |
+
+Jobs: 11111481 (the three DDP runs), 11110598 (FSDP2), 11109239 (the V100).
+
+Shares, bucket sizes and fp8 with the PyTorch kernels on the MI50, side by
+side in one job (11111037), 100 steps each:
+
+| Run | Shares (V100 + MI50) | Buckets | Tokens/s | Step (ms) | V100 compute | MI50 compute | V100 waits (est.) | Bridge alone | Exposed (est.) | Hidden (est.) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| DDP | 4 + 4 | 14 x 25 MB | 4,391 | 932.8 | 153.5 | 231.3 | 77.8 | 836.6 | 701.5 | 16% |
+| DDP, shares by speed | 5 + 3 | 14 x 25 MB | 4,274 | 958.4 | 183.3 | 192.8 | 9.4 | 860.7 | 765.7 | 11% |
+| DDP | 4 + 4 | 50 x 5 MB | 4,278 | 957.4 | 153.8 | 240.4 | 86.7 | 873.2 | 717.0 | 18% |
+| DDP | 4 + 4 | 5 x 100 MB | 4,429 | 924.9 | 153.9 | 231.9 | 78.0 | 832.6 | 693.0 | 17% |
+| DDP, fp8 bridge, PyTorch kernels on the MI50 | 4 + 4 | 14 x 25 MB | 6,544 | 625.9 | 153.8 | 231.7 | 78.0 | 492.3 | 394.2 | 20% |
+
+- **Adding the MI50 lowers throughput in every data-parallel setting on this
+  link.** The best, DDP with fp8 on the bridge, reaches 0.67x the V100
+  alone. Each step sends 536 MB of gradients through a link of about
+  1.17 GB/s, and backward hides 16% of it uncompressed.
+- **Compression: bf16 is 1.26x uncompressed DDP's tokens/s and fp8 2.09x**
+  (5,753 and 9,523 against 4,549, one job). The bridge alone fell from 792
+  to 628 and 326 ms, and the share hidden rose to 24% and 39%. With the
+  PyTorch kernels on the MI50, fp8 was 1.49x (6,544 against 4,391, another
+  job), so Triton on the MI50 matters here as it did for GPT-2 above.
+- **Shares by speed even out the compute but don't raise throughput here.**
+  With 5 + 3 the two GPUs' compute alone differs by 9 ms a step instead of
+  78, but tokens/s fell 2.7%: in that run the bridge alone took 861 ms
+  against 837, and the share hidden fell from 16% to 11%. The bridge takes
+  about 4x the slower GPU's compute, so it, more than the compute gap, looks
+  like what sets the step here. Balancing may pay where compute is a larger
+  share (bigger batches, or a faster bridge), which these runs didn't
+  measure.
+- **Bucket size matters little**: 100 MB, 25 MB and 5 MB buckets ran within
+  3.5% of each other (4,429, 4,391 and 4,278 tokens/s), the 50 small buckets
+  slowest.
+- **FSDP2 is 0.40x DDP** (1,809 against 4,549 tokens/s, different jobs): each
+  step gathers the parameters through the bridge for the forward and again
+  for the backward, and scatters the gradients. At 500 steps it needed
+  1,205 s, more than the kit's default 20-minute step limit (`STEP_TIMEOUT`).
+  `train_dp.py` records no step split or parameter checks for FSDP2. HSDP
+  didn't run: with one GPU per vendor it would shard nothing.
+- **Every DDP run's parameters were identical on both GPUs at every check**
+  (every 50 steps and the last), compressed runs included.
+- **Loss**: uncompressed DDP tracks one V100 about as closely as V100 runs
+  track each other over the last 100 of 1,000 steps, and so does FSDP2 over
+  steps 401 to 500, the last it ran (0.007 to 0.069 from the four V100 runs,
+  which are 0.024 to 0.093 apart there, still falling). Compressed DDP ends
+  0.02 to 0.03 above after 1,000 steps. The comparison, and why it needs
+  1,000 steps rather than 500, is in
+  [COMPRESSION.md](COMPRESSION.md#training-with-compression).
 
 ## Which ROCm wheels can train on an MI50 (gfx906)
 
