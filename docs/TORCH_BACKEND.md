@@ -341,7 +341,7 @@ fully_shard(model, mesh=mesh)
    ranks would hang there until the group's timeout. Call `dist.barrier()`
    on the world group first.
 
-## Point-to-point (CPU only)
+## Point-to-point
 
 `dist.send`, `recv(src=...)`, `isend`, `irecv` and `batch_isend_irecv` use
 the group's `send` and `recv` methods. They accept one contiguous dense
@@ -349,6 +349,16 @@ tensor on CPU or on the rank's configured GPU. Finish setup with a world
 `dist.barrier()` first; a subgroup also needs its own first collective.
 P2P refuses before setup, because setup needs every member, even members
 that will not participate in the subsequent exchange.
+
+**On GPUs**, at commit 1c7d107, through the Gloo link (HARDWARE_VALIDATION.md
+item 32): `check.py --p2p-only` and the GPU test of stream order and storage
+passed on a V100 split test (job 11112711) and between a V100 and an MI50 (job
+11112713; torch 2.14.1+cu126 on the V100, 2.9.1+rocm6.3 on the MI50), and the
+GPU test passed on the MI50 alone (job 11113623). `bench_p2p.py` between the two
+measured about 2.8 to 3.4 ms one way from 1 KB to 1 MB, and 0.8 GB/s at 64 MB and
+up (1.0 GB/s with pinned staging), payload intact at every size. Those runs had
+one rank per island, so nothing went through a native group. The UCX lanes,
+chunked staging and native GPU batches below haven't run on GPUs.
 
 Within an island, the call goes straight to the native process group
 (NCCL/RCCL on GPU, Gloo in simulation). CPU tensors in a GPU job use Gloo.
