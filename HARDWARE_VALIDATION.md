@@ -524,7 +524,10 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     the V100; record tokens/s. *Status: Megatron's group setup on
     `backend="gpubridge"` and a `batch_isend_irecv` across its pipeline group
     work on CPU (checked by hand); Megatron's pipeline code needs CUDA, so no
-    CPU test. Not run on GPUs.* *Step:* `megatron_pp1` and `megatron_pp2` in
+    CPU test. On a V100 + MI50 (Explorer job 11117506, Megatron-Core 0.14.0,
+    200 steps): it runs, the two-stage loss curve stays within 1e-4 of one
+    stage on the V100 at every step, at 1.14x its tokens/s (docs/MEGATRON.md).*
+    *Step:* `megatron_pp1` and `megatron_pp2` in
     Explorer step 07 with `STEPS_07=megatron`.
 
 32. **Point-to-point across islands through the backend on GPUs.** `send`,

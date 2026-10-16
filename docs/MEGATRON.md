@@ -1,9 +1,10 @@
 # Megatron-Core's pipeline across vendors
 
-**Status: experimental.** Megatron-Core's own pipeline parallelism, with one
-stage on an NVIDIA GPU and one on an AMD GPU, through `backend="gpubridge"`.
-Nothing in Megatron is patched; this page lists what that takes and what
-doesn't work across vendors. Results: [below](#results-a-v100-and-an-mi50).
+**Status: experimental; runs on a V100 and an MI50.** Megatron-Core's own
+pipeline parallelism, with one stage on an NVIDIA GPU and one on an AMD GPU,
+through `backend="gpubridge"`. Nothing in Megatron is patched. This page lists
+what that takes and what isn't tried across vendors. Results:
+[below](#results-a-v100-and-an-mi50).
 
 ## How it fits together
 
@@ -77,4 +78,40 @@ to both runs (`--layers`, `--hidden`, `--heads`, `--vocab`, `--seq-len`,
 
 ## Results: a V100 and an MI50
 
-Not run yet.
+Explorer job 11117506, commit bc266c6 (clean on both ranks), Megatron-Core 0.14.0:
+- the V100 on torch 2.9.1+cu126, the MI50 on 2.9.1+rocm6.3;
+- a GPT of 12 layers, width 768, 12 heads, a 1,024-token vocabulary;
+- sequences of 512 tokens, 4 microbatches of 2 a step, AdamW 3e-4, seed 0, 200
+  steps, float32;
+- the bridge over TCP on `internal.2137` (preflight: 1152 to 1174 MB/s each
+  way).
+
+The baseline ran in the same job: Megatron with one pipeline stage, on the V100
+alone. Medians of steps 6 to 200.
+
+| Run | Layers | Tokens/s | Step (ms) | Loss, step 1 | Loss, step 200 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| V100 alone, one stage | 0 to 11 | 14,990 | 273.3 | 7.0886 | 1.5359 |
+| V100 + MI50, two stages, 1F1B | 0 to 5 on the V100, 6 to 11 on the MI50 | 17,057 | 240.1 | 7.0886 | 1.5359 |
+
+![Loss over 200 steps: Megatron-Core in one stage on a V100 and in two stages on a V100 + MI50](img/megatron-loss-v100-mi50.svg)
+
+- **It runs, with Megatron's own schedule and no patch.** Megatron's groups,
+  its `batch_isend_irecv` between the stages and its 1F1B schedule all ran
+  through `backend="gpubridge"`.
+- **The two curves match.** They're identical to 1e-6 for the first 7 steps,
+  and never more than 1e-4 apart over the 200. The same weights at the start
+  and the same data, summed in another order on other GPUs.
+- **The pair is 1.14x the V100 alone** (17,057 against 14,990 tokens/s).
+  Its output layer is small (768 x 1,024), so an even split of the layers
+  leaves the two stages' work closer to equal than with the kit's
+  32,000-token model ([PIPELINE.md](PIPELINE.md)).
+- **The first try failed in a different way:** each stage built all 12 layers.
+  Megatron-Core 0.14 sizes a stage from the config's
+  `pipeline_model_parallel_size`, not only from its process groups.
+  `megatron_pp.py` now sets it, and stops if the stages don't hold each layer
+  exactly once.
+- **Not tried:** more than two stages, data parallelism within each vendor
+  (Zettabyte's DP=8 per side needs several GPUs per vendor, which Explorer's
+  `gpu` and `sharing` partitions don't give one job), and the rest of the
+  table above.
