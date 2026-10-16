@@ -277,16 +277,17 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     `train_ddp` in Explorer steps 04 (split test) and 07 (mixed NVIDIA +
     AMD), `train_ddp_split` in `amd/run_all.sh`, and the single-island
     scaling runs in step 06. *On GPUs (V100 on torch 2.14.1+cu126, MI50 on
-    2.9.1+rocm6.3): no divergence in 24 mixed runs, 16 uncompressed and 8
-    with fp8 and the PyTorch kernels. The ranks' gradients and parameters
+    2.9.1+rocm6.3): passes. 0 of 24 mixed runs diverged, 16 uncompressed and
+    8 with fp8 and the PyTorch kernels: the ranks' gradients and parameters
     were the same bit for bit after every step
-    ([below](#items-22-and-33-2026-10-15-and-2026-10-16)). Two earlier runs
-    had failed: job 11090726 (commit 4e7f04e, fp8 with the PyTorch kernels)
-    and job 11112713 (commit 1c7d107, uncompressed). Both were judged by the
-    old check, a sum of each rank's parameters taken on its own GPU. That
-    check also flagged 4 of the 24 runs whose parameters were identical, so
-    the two failures were most likely the same false alarm (inferred: their
-    records hold only the sums).*
+    ([below](#items-22-and-33-2026-10-15-and-2026-10-16)). That bit check is
+    the step's verdict; the float64 checksum is kept beside it, for
+    information only. Two earlier runs had failed: job 11090726 (commit
+    4e7f04e, fp8 with the PyTorch kernels) and job 11112713 (commit 1c7d107,
+    uncompressed). Both were judged by the checksum alone, a sum of each
+    rank's parameters taken on its own GPU, which flagged 4 of the 24 runs
+    whose parameters were identical; so the two failures were most likely
+    its false alarms (inferred: their records hold only the sums).*
 23. **What `gpubridge.in_flight()` shows on GPUs.** It reflects the host: a
     thread is listed while it is inside a gpubridge call. NCCL and RCCL calls
     return once their work is queued, so on GPUs a non-leader whose island
@@ -468,8 +469,11 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     S to 528 S): a lossy mode is expected to land outside a measure of
     uncompressed noise, and whether these gaps are acceptable is open. The
     ranks' parameters were bit-identical at every check in every DDP run,
-    compressed or not; FSDP2's sharded parameters aren't compared. Bucket
-    sizes ran 100 steps each (docs/BENCHMARKS.md).* *Step:* `dp_*` in
+    compressed or not; FSDP2's sharded parameters aren't compared. One V100
+    alone also fails the rule against its own runs, so the planned next step
+    is a redesigned test: several seeds per mode, the end loss once every run
+    has left the plateau, and the steps and time to a target loss (below).
+    Bucket sizes ran 100 steps each (docs/BENCHMARKS.md).* *Step:* `dp_*` in
     Explorer step 07 with `STEPS_07=dp`, and `dp_single` in `submit.sh
     dp-baseline`.
 34. **Pipeline training across vendors tracks one GPU.** `train_pipeline.py`
@@ -636,7 +640,9 @@ Where the FAILs come from:
   The other `bench_compression_kernels` FAIL is the rocm6.3 Triton above.
 - **`train_ddp` (item 22)**: failed in step 07's first two runs, on the default
   ROCm wheel (a Gloo timeout in the first, cause unknown; the MI50 aborting in
-  rocBLAS in the second); passed with the MI50 on torch 2.9.1+rocm6.3.
+  rocBLAS in the second); passed with the MI50 on torch 2.9.1+rocm6.3. Item 22
+  now passes on GPUs: 24 of 24 later mixed runs, judged bit for bit
+  ([below](#items-22-and-33-2026-10-15-and-2026-10-16)).
 - **`train_fsdp2_backend`, `verify_fsdp2_backend` (item 30)**: failed in step
   07's second run (the same rocBLAS abort); passed with torch 2.9.1+rocm6.3,
   bit for bit against a single-process replay.
@@ -679,8 +685,9 @@ log, every job from the same checkout, with gpubridge imported from it:
 | 11113623 | AMD node | 2.9.1+rocm6.3, Triton 3.8.0 overlay | `venv-rocm63` + overlay | 11 of 11, `gpu_tests` 27 passed, 8 skipped | - |
 
 - **Items 31 and 32** pass on GPUs (their entries above).
-- **Item 22**: `train_ddp` failed its parameter check in job 11112713; most
-  likely a false alarm of that check ([below](#items-22-and-33-2026-10-15-and-2026-10-16)).
+- **Item 22**: `train_ddp` failed its parameter check in job 11112713, the
+  float64 checksum; most likely that check's false alarm. Item 22 passes on
+  GPUs under the bit-for-bit check ([below](#items-22-and-33-2026-10-15-and-2026-10-16)).
 - **Item 28 on the MI50** is an environment limit: `venv-rocm63`'s Triton
   (pytorch-triton-rocm 3.5.1) can't compile the compression kernels for
   gfx906, and the default ROCm venv's rocBLAS can't train on it. With Triton
@@ -700,7 +707,7 @@ the V100 side's log shows the import path): the V100 on torch 2.14.1+cu126, the
 MI50 on 2.9.1+rocm6.3 (`venv-rocm63`, or with Triton 3.8.0 in front of it where
 noted).
 
-**Item 22.** `train_synthetic.py` now compares every rank's gradients (after
+**Item 22 passes.** `train_synthetic.py` now compares every rank's gradients (after
 the all_reduce) and parameters (after the optimizer step) bit for bit after
 every step (#88), and keeps the old check beside it as
 `params_checksums_equal`: the float64 sum of each rank's parameters, taken on
@@ -713,9 +720,10 @@ its own GPU. With it, `train_ddp` on a V100 + MI50:
 | 11139551 | 48840ba | `fp8`, PyTorch kernels on both GPUs | 8 in one job | 8 | 1 |
 
 No run diverged: in all 24, the gradients and the parameters were the same
-bit for bit on both ranks after every step, uncompressed or `fp8`. The old
-check still reported a difference in 4 of them, with the parameters
-identical: the V100 and the MI50 each sum their own copy, and the float64
+bit for bit on both ranks after every step, uncompressed or `fp8`. That bit
+check is what passes or fails the step; the checksum is recorded for
+information only. It still reported a difference in 4 of the 24, with the
+parameters identical: the V100 and the MI50 each sum their own copy, and the float64
 totals can differ in the last bits. The two earlier failures, jobs 11090726
 and 11112713, were judged by that check alone (2 of 8 runs then, 4 of 24
 now), and the code on DDP's path, `ddp.py` and the compression codec, hasn't
@@ -814,14 +822,18 @@ where the earlier 1,000-step `fp8` run ended (job 11111481, 0.022 to 0.027
 from four one-V100 runs), so part of it may be `fp8`'s own error rather than
 timing; these runs can't separate the two (inferred).
 
-**Not tested, and what would test it.** The timing explanation for shares by
-speed and FSDP2 at 2,000 steps: no such runs yet. Shares by speed at 2,000
-steps fits one step-07 job on Explorer's `sharing` partition (about 40
-minutes; two jobs for two runs). FSDP2 doesn't: 1,000 steps took 46 to 48
-minutes and `sharing` stops a job at one hour, so there the test is more
-1,000-step runs, to see whether its late exits come at the one-V100 rate, or
-a partition with a longer limit. More one-V100 runs at 2,000 steps would
-also help: three, one of them slow, are a thin reference.
+**Not tested yet, and next.** The timing explanation for shares by speed and
+FSDP2 is untested at 2,000 steps: batch 4 ran neither. And one V100 alone
+fails this rule against its own runs (11141231, 25 S), so the rule measures
+when a run leaves the plateau as much as anything the bridge does. The
+planned next step is a redesigned test rather than more runs of this one:
+at least four seeds per mode, each with one-V100 runs of the same seed; the
+loss at the end, judged only once every run has left the plateau; and the
+steps and wall-clock time to a target loss, against uncompressed runs. For
+`bf16` and `fp8` the slower convergence is to be reported as a measured
+cost, not a pass or a fail. The MI50s are only in Explorer's `sharing`
+partition, whose one-hour limit bounds a mixed job: about 2,700 steps of DDP,
+but only about 1,150 of FSDP2.
 
 ### Network
 
