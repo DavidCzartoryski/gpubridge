@@ -557,15 +557,22 @@ local_torchrun() {
 # dp_run_options RUN: what a data-parallel run's name (step 07's and the mixed runner's
 # DP_RUNS) means for train_dp.py, in DP_MODE, DP_COMPRESSION (for
 # GPUBRIDGE_BRIDGE_COMPRESSION) and DP_RUN_ARGS: ddp and fsdp2; ddp-bf16 and ddp-fp8 (the
-# bridge compressed); ddp-speed (batch shares by each GPU's speed); ddp-bucket-<MB>
-# (DDP's bucket size).
+# bridge compressed); ddp-speed (batch shares by each GPU's speed); ddp-shares-<rows>
+# (the rows of the global batch per rank, in rank order, joined by dashes:
+# ddp-shares-5-3 is --shares 5,3; a -r<N> at the end only keeps repeats apart:
+# ddp-shares-5-3-r2); ddp-bucket-<MB> (DDP's bucket size).
 # shellcheck disable=SC2034  # the caller reads them
 dp_run_options() {
+    local rows='^([1-9][0-9]*(-[1-9][0-9]*)+)(-r[1-9][0-9]*)?$'
     DP_MODE=${1%%-*} DP_COMPRESSION='' DP_RUN_ARGS=()
     case $1 in
     ddp | fsdp2) ;;
     ddp-bf16 | ddp-fp8) DP_COMPRESSION=${1#ddp-} ;;
     ddp-speed) DP_RUN_ARGS=(--shares speed) ;;
+    ddp-shares-*)
+        [[ ${1#ddp-shares-} =~ $rows ]] ||
+            die "DP_RUNS: '$1' needs whole rows per rank joined by dashes, e.g. ddp-shares-5-3"
+        DP_RUN_ARGS=(--shares "${BASH_REMATCH[1]//-/,}") ;;
     ddp-bucket-*) DP_RUN_ARGS=(--bucket-mb "${1#ddp-bucket-}") ;;
     *) die "DP_RUNS: unknown run '$1'" ;;
     esac

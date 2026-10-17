@@ -577,6 +577,32 @@ def test_mixed_hetjob_refuses_unknown_step_settings(env, message):
     assert "srun" not in result.stdout
 
 
+def test_mixed_hetjob_sweeps_explicit_dp_shares_under_their_own_names():
+    result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w", STEPS_07="dp",
+                     DP_RUNS="ddp ddp-shares-5-3 ddp-shares-6-2 ddp-shares-5-3-r2")
+    assert result.returncode == 0, result.stderr
+    names = ["dp_ddp", "dp_ddp-shares-5-3", "dp_ddp-shares-6-2", "dp_ddp-shares-5-3-r2"]
+    assert passed_steps(result.stderr) == ["probe", "preflight", *names]
+    runs = [line for line in result.stdout.splitlines() if "train_dp.py" in line]
+    shares = [None, "5\\,3", "6\\,2", "5\\,3"]  # the dry run prints the comma escaped
+    for name, split, line in zip(names, shares, runs, strict=True):
+        # Each on both sides, with its own JSON and rendezvous, and its split if it has one.
+        assert line.count(f"/07_mixed_hetjob_dp/{name}.json") == 2, line
+        assert line.count(f"--rdzv-id=local-{name.replace('_', '-')} ") == 2, line
+        assert line.count("--shares") == (2 if split else 0), line
+        assert not split or line.count(f".json --shares {split} ") == 2, line
+
+
+@pytest.mark.parametrize("run", ["ddp-shares-5", "ddp-shares-5-0", "ddp-shares-5,3",
+                                 "ddp-shares-a-b", "ddp-shares-5-3-r", "ddp-shares-5-3-r0"])
+def test_mixed_hetjob_refuses_a_malformed_dp_split(run):
+    result = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w", STEPS_07="dp",
+                     DP_RUNS=run)
+    assert result.returncode != 0
+    assert f"DP_RUNS: '{run}' needs whole rows per rank joined by dashes" in result.stderr
+    assert "train_dp.py" not in result.stdout
+
+
 def test_mixed_hetjob_says_when_train_ddp_repeats_go_unused():
     used = dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", WORK_DIR="/w", STEPS_07="dp",
                    TRAIN_DDP_REPEATS="3")
