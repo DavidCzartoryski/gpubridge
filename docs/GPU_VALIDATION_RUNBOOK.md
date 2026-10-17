@@ -724,6 +724,7 @@ and one such run per name in `DP_RUNS`, into `07_mixed_hetjob_dp/`:
 | `ddp`, `ddp-bf16`, `ddp-fp8` | DDP with `gpubridge.ddp_comm_hook`, the bridge uncompressed, then compressed with error feedback |
 | `fsdp2` | FSDP2 through `backend="gpubridge"`: parameters sharded over both GPUs |
 | `ddp-speed` | each GPU's share of the batch in proportion to its measured speed, with sample-weighted averaging, so the update stays the whole batch's mean gradient |
+| `ddp-shares-<rows>` | the rows of the global batch each rank takes, in rank order, joined by dashes: `ddp-shares-5-3` is `--shares 5,3` (whole rows adding up to `DP_GLOBAL_BATCH`), with the same sample-weighted averaging; `-r<N>` at the end (`ddp-shares-5-3-r2`) only gives a repeat its own name, so one job can sweep the split |
 | `ddp-bucket-<MB>` | DDP's bucket size (25 MB in the others) |
 
 `submit.sh dp-baseline` runs the same model, global batch, sequence length, steps and

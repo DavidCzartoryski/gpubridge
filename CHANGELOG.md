@@ -255,6 +255,13 @@ hardware.
 
 ### Added
 
+- Step 07's and the two-machine runner's `DP_RUNS` take `ddp-shares-<rows>`: DDP
+  with the rows per rank as given, in rank order (`ddp-shares-5-3` runs
+  `train_dp.py --shares 5,3`), and `-r<N>` at the end to name a repeat
+  (`ddp-shares-5-3-r2`), so one job can sweep the split between a V100 and an
+  MI50 on the same pair of GPUs. `train_dp.py` already took `--shares 5,3`;
+  until now `DP_ARGS` was the only way in, and it gives every run of the job
+  the same split. Opt in; the default `DP_RUNS` is unchanged. CPU-tested only.
 - Megatron-Core's pipeline across vendors, experimental (docs/MEGATRON.md):
   `scripts/gpu/megatron_pp.py` runs Megatron-Core 0.14's GPT in two stages with
   its own 1F1B schedule through `backend="gpubridge"`, with no patch to
