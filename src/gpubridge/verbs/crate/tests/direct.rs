@@ -381,6 +381,39 @@ fn a_reallocated_address_gets_a_new_registration_and_the_stale_one_goes() {
     assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
 }
 
+#[test]
+fn a_receive_window_never_registers_a_reused_allocation_through_an_old_handle() {
+    for progress in [Progress::Latency, Progress::Balanced, Progress::Economy] {
+        for peer_memory in [false, true] {
+            let gpu = MockGpu::new();
+            if peer_memory {
+                gpu.set_dmabuf_unsupported(Some("test peer memory"));
+            }
+            let (fabric, a, b) = pair_with_progress(RNDV, &gpu, peer_memory, progress);
+            let va = gpu.alloc(0, 2 << 20);
+            let reg = b.register_device(0, va, 4096).unwrap();
+            let exports = gpu.exported();
+            gpu.realloc_same_address(va, 2 << 20);
+            gpu.write(va, &vec![0xA5; 4096]);
+            let error = b
+                .recv_registered(0, &reg, va as usize - reg.addr(), RNDV, 7)
+                .unwrap_err();
+            assert!(error.to_string().contains("allocation changed"), "{error}");
+            assert_eq!(
+                gpu.exported(),
+                exports,
+                "a new allocation was exported through an old handle"
+            );
+            assert_eq!(gpu.read(va, 4096), vec![0xA5; 4096]);
+            drop(reg);
+            a.close(LONG).unwrap();
+            b.close(LONG).unwrap();
+            assert_eq!(gpu.open_fds(), 0);
+            assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+        }
+    }
+}
+
 /// `data` registered as host memory of `ep` (owner `owner`), leaked for the test's
 /// lifetime so it outlives the registration.
 fn host(ep: &Endpoint, data: &[u8], owner: u64) -> gpubridge_verbs::Registered {

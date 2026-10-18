@@ -560,7 +560,8 @@ pub unsafe extern "C" fn gb_verbs_wait(
     })
 }
 
-/// The last error's text into `out` (truncated to fit).
+/// One operation's outcome as JSON: length, or -(needed + 1) if `out` is too small.
+/// Valid after a failed wait or abort, until close; a successful wait forgets its IDs.
 ///
 /// # Safety
 /// `h` from gb_verbs_create; `out` holds `size` bytes.

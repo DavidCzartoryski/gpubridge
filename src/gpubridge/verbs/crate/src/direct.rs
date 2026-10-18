@@ -85,7 +85,9 @@ impl Method {
 pub struct Registered {
     region: MemoryRegion,
     method: Method,
-    device: Option<i32>,
+    /// The original driver and allocation identity, also needed when a later receive
+    /// creates its uncached write window. A virtual address may already have been reused.
+    gpu: Option<(Arc<dyn GpuMemory>, Allocation)>,
 }
 
 impl Registered {
@@ -99,7 +101,7 @@ impl Registered {
 
     /// The device, for device memory.
     pub fn device(&self) -> Option<i32> {
-        self.device
+        self.gpu.as_ref().map(|(_, a)| a.device)
     }
 
     /// Whether the CPU can use the memory (host memory), so a message that has to come
@@ -395,7 +397,7 @@ impl Registrar {
                 Ok(Registered {
                     region,
                     method,
-                    device: Some(device),
+                    gpu: Some((driver, alloc)),
                 })
             }
             Err(Error::Unsupported(why)) if !reasons.is_empty() => Err(self.failed(why)),
@@ -487,7 +489,7 @@ impl Registrar {
         Ok(Registered {
             region,
             method: Method::Host,
-            device: None,
+            gpu: None,
         })
     }
 
@@ -505,6 +507,9 @@ impl Registrar {
             )));
         }
         let addr = reg.addr() + offset;
+        if reg.method == Method::PeerMemory {
+            self.window_allocation(reg, addr as u64)?;
+        }
         let made = match reg.method {
             Method::Host | Method::PeerMemory => {
                 // SAFETY: [addr, addr + len) lies inside `reg`, whose memory stays valid
@@ -540,15 +545,29 @@ impl Registrar {
         }
     }
 
-    fn expose_dmabuf(&self, reg: &Registered, addr: u64, len: u64) -> Result<MemoryRegion> {
-        let device = reg
-            .device
-            .ok_or_else(|| Error::invalid("a dma-buf without a device"))?;
-        let driver = lock(&self.gpu)
+    fn window_allocation(
+        &self,
+        reg: &Registered,
+        addr: u64,
+    ) -> Result<(Arc<dyn GpuMemory>, Allocation)> {
+        let (driver, original) = reg
+            .gpu
             .as_ref()
-            .map(|g| g.driver.clone())
-            .ok_or_else(|| Error::Unsupported("no GPU driver loaded".into()))?;
-        let alloc = driver.allocation(device, addr)?;
+            .ok_or_else(|| Error::invalid("device memory without its allocation identity"))?;
+        let current = driver.allocation(original.device, addr)?;
+        if current.buffer_id != original.buffer_id
+            || current.base != original.base
+            || current.size != original.size
+        {
+            return Err(Error::Busy(
+                "the GPU allocation changed before its receive window was created".into(),
+            ));
+        }
+        Ok((driver.clone(), current))
+    }
+
+    fn expose_dmabuf(&self, reg: &Registered, addr: u64, len: u64) -> Result<MemoryRegion> {
+        let (driver, alloc) = self.window_allocation(reg, addr)?;
         let page = page_size();
         let start = (addr - addr % page).max(alloc.base);
         let end = (addr + len)
