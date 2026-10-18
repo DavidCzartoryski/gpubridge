@@ -67,3 +67,31 @@ the rows above distinguish inherited evidence from checks rerun on this branch.
 Context audit reference: [HIP 6.3 memory implementation](https://github.com/ROCm/clr/blob/rocm-6.3.0/hipamd/src/hip_memory.cpp),
 `hipMemGetAddressRange` and `ihipPointerGetAttributes`. The transport does not query
 DEVICE_POINTER or RANGE_START_ADDR, whose implementation uses the current device.
+
+## Integration verification gate
+
+Implementation candidate: `24acdbd2fd9060ecef6c386e6343ff1bcf04c96f`.
+Native crate tree: `913a2995c87c885195053beff396377a86edef55` (unchanged from
+`58581ce`, where the final native Mac checks ran). With Rust 1.99.0, formatting,
+Clippy with `-D warnings` and all targets, with and without `test-fabric`, passed.
+Rust tests passed: **85** without `test-fabric`, **88** with it. These include
+the predecessor's waived-review regressions and the new policy/lifetime tests.
+Evidence: run `rr-int-20261018`, `evidence/g-core-final-{fmt,clippy,clippy-fabric,rust,rust-fabric}.log`.
+The final Python run passed **105 tests**: `tests/test_verbs.py`,
+`tests/test_verbs_gpu.py`, `tests/test_multitcp.py`, `tests/test_work_queue.py`
+and `tests/test_ddp.py` (`evidence/g-core-final-python.log`). GPU memory/streams
+are stood in on CPU in this suite; this is SOFTWARE-VERIFIED only.
+
+The single permitted Explorer session checked this exact candidate against
+rdma-core v57.0 (`18696ad67a90a8e36621570d8a006abc598b6a13`), nice 19, offline,
+one Cargo worker, no Python or device opening. `cargo check --all-targets
+--features ibverbs` was killed with **SIGKILL** during library-test metadata
+checking (exit 101). Clippy was skipped after the kill and scratch was removed.
+Evidence: `evidence/g-core-linux.log`, script/source archive and SHA-256 beside it.
+**The final native Linux Rust/Clippy gate is unsatisfied.** Neither a successful
+predecessor check nor mock tests establish it for this integration candidate.
+
+All hardware checks, actual Linux affinity execution and real GPU visibility/
+interoperability remain BLOCKED. No EMULATED or HARDWARE-VERIFIED claim is made.
+Independent review of these changes belongs to the coordinator; builder checks
+do not replace it, and the predecessor's confirming review remains waived.

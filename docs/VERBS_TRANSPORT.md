@@ -9,6 +9,14 @@ compiles and links against rdma-core's headers on Linux; the GPU driver calls ar
 checked against CUDA's, HIP's and ROCr's headers and loaded at run time. None of
 that is a transfer over a real or software RDMA device, or a byte of GPU memory.
 
+**Integration update (2026-10-18):** selectable native progress policies,
+operation-specific observations, allocation-window identity checks and bounded
+async submissions are implemented and tested in software. The final Linux
+all-target type-check was killed with SIGKILL on Explorer; Linux Clippy was not
+run after that kill. The native Linux validation gate remains **BLOCKED**, and
+all GPU/RDMA hardware gates remain BLOCKED. See the
+[capability matrix](VERBS_CAPABILITIES.md) for exact evidence and limits.
+
 The plan has three phases, each its own change:
 
 - **A1:** the binding, a C shim compiled against rdma-core's headers, owned
@@ -52,7 +60,7 @@ HARDWARE-VERIFIED: tested on RDMA hardware.
 | Failure is cancellation: once a wait reports a failure, nothing copies to or from the caller's plain memory | IMPLEMENTED, SOFTWARE-VERIFIED (mock: a peer breaks the protocol mid-message) |
 | Sends queued to a member that said goodbye fail at once with "member N closed its end of the bridge" | IMPLEMENTED, SOFTWARE-VERIFIED (mock) |
 | Remote write only through one receive's window: exactly its bytes, registered for it, deregistered once written; cached and send-side registrations local-only | IMPLEMENTED, SOFTWARE-VERIFIED (mock: writes before, after and past "written" fail, for host, dma-buf and peer memory); HARDWARE BLOCKED |
-| Fork safety checked at open (`ibv_is_fork_initialized`, `ibv_fork_init` before any registration, or a failure with the reason) | IMPLEMENTED, SOFTWARE-VERIFIED (mock statuses); the shim's part compiled with rdma-core v57.0 and reported `unneeded` on an Explorer login node (no device opened); `ibv.rs`'s part not compiled on Linux (BLOCKED, login-node limits) |
+| Fork safety checked at open (`ibv_is_fork_initialized`, `ibv_fork_init` before any registration, or a failure with the reason) | IMPLEMENTED, SOFTWARE-VERIFIED (mock statuses); predecessor native check/Clippy passed at `75922a0`; final integration Linux all-target check was killed with SIGKILL, so its native validation gate remains BLOCKED |
 | Device, port and GID selection | IMPLEMENTED, SOFTWARE-VERIFIED (mock devices) |
 | `bridge="verbs"`: every policy, compression, subgroups, async, bit for bit against `flat-gloo` | IMPLEMENTED, SOFTWARE-VERIFIED (the MOCK test fabric between processes, rendezvous on) |
 | GPU tensors, host-staged: a registered pinned buffer, copies on the caller's stream | IMPLEMENTED, SOFTWARE-VERIFIED (CPU tensors standing in, lazy copies); HARDWARE BLOCKED (item 39) |
