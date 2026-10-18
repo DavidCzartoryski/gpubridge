@@ -143,7 +143,7 @@ def endpoint_settings() -> dict[str, object]:
     rendezvous size, 256 KiB unless set)."""
     rndv = _number(RNDV_BYTES_ENV, size=True)
     return {
-        "progress": os.environ.get(PROGRESS_ENV, "").strip().lower() or "economy",
+        "progress": os.environ.get(PROGRESS_ENV, "").strip().lower() or None,
         "progress_cpu": _number(PROGRESS_CPU_ENV),
         "rndv_bytes": DEFAULT_RNDV_BYTES if rndv is None else rndv,
         "dmabuf": _flag(DMABUF_ENV),
