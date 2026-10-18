@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{ib_fabric, roce_gid};
+use common::{eventually, garbage, ib_fabric, roce_gid, RawMember};
 use gpubridge_verbs::{
     AsyncEvent, AsyncEventKind, Config, Endpoint, Fault, MockDevice, MockFabric, MockPort, Mtu,
     NodeId, PortState, WaitError, WcStatus,
@@ -416,6 +416,133 @@ fn a_peer_that_said_goodbye_left_its_messages_and_no_failure() {
     assert!(matches!(b.wait(&[r], LONG), Err(WaitError::Failed(e)) if e.contains("closed")));
     b.close(LONG).ok();
     assert!(fabric.violations().is_empty());
+}
+
+/// Member 1 breaks the protocol while member 0 is part-way through a plain send to
+/// member 2 and a plain receive from it. Once member 0's wait has reported the failure,
+/// nothing reads the send's buffer or writes the receive's again, though member 2's
+/// credits come back and its chunks keep arriving (docs: "Failure is cancellation").
+#[test]
+fn a_failure_cancels_plain_operations_so_nothing_touches_their_memory_after_it() {
+    let fabric = MockFabric::new();
+    let nodes: Vec<NodeId> = (1..=3)
+        .map(|lid| {
+            fabric.add_node(vec![MockDevice::new(
+                "mlx0",
+                vec![MockPort::infiniband(lid)],
+            )])
+        })
+        .collect();
+    // Nothing unexpected is buffered: a message nobody receives yet stays in its slots,
+    // so its sender runs out of credits part-way.
+    let config = Config {
+        unexpected_bytes: 0,
+        ..small()
+    };
+    let a = Endpoint::new(fabric.provider(nodes[0]), 3, 0, config.clone()).unwrap();
+    let c = Endpoint::new(fabric.provider(nodes[2]), 3, 2, config.clone()).unwrap();
+    let b = RawMember::new(&fabric, nodes[1], 3, 0, &config);
+    b.connect(&a.local_info(), 1);
+    a.connect(1, &b.info).unwrap();
+    a.connect(2, &c.local_info()).unwrap();
+    c.connect(0, &a.local_info()).unwrap();
+
+    // 0 -> 2: stalls after its credits' worth of chunks (2 holds them).
+    let payload = 256 - 48;
+    let outgoing = pattern(40 * payload, 1);
+    let s = send(&a, 2, &outgoing, 1);
+    eventually(LONG, "the send stalls on credits", || {
+        a.counters().credit_stalls > 0
+    });
+    // 2 -> 0: into a posted receive, each batch of chunks 200 ticks after the last.
+    fabric.inject(Fault::SendDelay {
+        node: nodes[2],
+        ticks: 200,
+    });
+    let mut incoming = vec![0u8; 40 * payload];
+    let r = recv(&a, 2, &mut incoming, 2);
+    let theirs = pattern(40 * payload, 2);
+    let t = send(&c, 0, &theirs, 2);
+    eventually(LONG, "the first chunks land", || {
+        a.counters().chunks_received > 0
+    });
+
+    // 1 sends a message without the protocol's magic number.
+    assert_eq!(b.send(&garbage()), WcStatus::Success);
+    for id in [s, r] {
+        match a.wait(&[id], LONG) {
+            Err(WaitError::Failed(e)) => assert!(e.contains("member 1 broke the protocol"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    let at_failure = a.counters();
+    let received_then = incoming.clone();
+    assert!(
+        at_failure.chunks_received < 40,
+        "the receive was part-way when it failed"
+    );
+
+    // 2 receives what 0 sent so far: its credits go back to 0, which (before this fix)
+    // copied the rest of the send's buffer into slots and sent it.
+    let mut drained = vec![0u8; outgoing.len()];
+    let u = recv(&c, 0, &mut drained, 1);
+    // And 2's chunks keep landing at 0 (each batch 200 ticks after the last).
+    eventually(LONG, "more of member 2's chunks arrive", || {
+        a.counters().chunks_received > at_failure.chunks_received
+    });
+    thread::sleep(Duration::from_millis(300));
+    let after = a.counters();
+    assert_eq!(after.chunks_sent, at_failure.chunks_sent, "no slot copies");
+    assert_eq!(
+        after.copied_bytes, at_failure.copied_bytes,
+        "no copies at all"
+    );
+    assert_eq!(after.credit_stalls, at_failure.credit_stalls);
+    assert!(a.telemetry().contains("\"state\":\"failed\""));
+    a.abort("test over");
+    c.abort("test over");
+    // Nothing more was written into the receive's buffer after the failure.
+    assert!(c.wait(&[t, u], Duration::from_millis(10)).is_err());
+    a.close(LONG).ok();
+    c.close(LONG).ok();
+    assert!(incoming == received_then);
+    drop(b);
+    assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+}
+
+/// Sends queued to a member, or part-way, fail as soon as it says goodbye, with that
+/// reason, rather than at their deadline.
+#[test]
+fn queued_sends_to_a_member_that_said_goodbye_fail_at_once_with_its_reason() {
+    let config = Config {
+        unexpected_bytes: 0,
+        ..small()
+    };
+    let (fabric, a, b) = pair(&config);
+    let first = pattern(20 * 208, 1);
+    let second = pattern(100, 2);
+    let s1 = send(&a, 1, &first, 1);
+    eventually(LONG, "the first send stalls on credits", || {
+        a.counters().credit_stalls > 0
+    });
+    let s2 = send(&a, 1, &second, 2);
+    let start = Instant::now();
+    b.close(LONG).ok();
+    for id in [s1, s2] {
+        match a.wait(&[id], Duration::from_secs(60)) {
+            Err(WaitError::Failed(e)) => {
+                assert!(e.contains("member 1 closed its end of the bridge"), "{e}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+    a.close(LONG).ok();
+    assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
 }
 
 #[test]

@@ -24,11 +24,22 @@
 //! after deregistering (`resources.rs`). What keeps the memory itself safe: a dma-buf
 //! import pins the exported memory for as long as it is registered, and the peer-memory
 //! module pins the GPU pages and revokes the registration if the allocation is freed;
-//! the device only touches a registration while work posted with it is outstanding or a
-//! peer holds a write grant for an outstanding receive (`endpoint.rs`).
+//! the device only touches a registration while work posted with it is outstanding
+//! (`endpoint.rs`).
 //!
 //! Host buffers are registered under an owner token the caller picks (its buffer's
 //! identity), and the caller invalidates it before freeing the buffer.
+//!
+//! **Remote writes.** Nothing cached is remotely writable: device and host registrations
+//! are made with local access only ([`CACHED_ACCESS`]), so a peer's key can't reach the
+//! neighbouring tensors a cached range covers, nor reach anything in a later call. A
+//! receive the peer RDMA WRITEs into gets its own window ([`Registrar::expose`]): a
+//! separate, uncached registration of exactly the receive's bytes with remote write,
+//! made for that receive, whose key only its write grant carries, and released once the
+//! peer's "written" message has arrived (or, if the receive failed, once the peer's queue
+//! pair is closed). The cost is one registration per such receive (a dma-buf export too,
+//! for dma-buf memory); memory windows (`ibv_bind_mw`) would make it cheaper and are not
+//! used.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -42,6 +53,11 @@ use crate::types::Access;
 
 /// Device registrations are rounded out to this, inside their allocation.
 pub const DEVICE_ROUND: u64 = 2 << 20;
+/// The access of every cached registration: the device may write it locally (a receive
+/// gathered into it), no peer may (see the module docs, "Remote writes").
+pub const CACHED_ACCESS: Access = Access::LOCAL_WRITE;
+/// The access of a receive's write window.
+pub const WINDOW_ACCESS: Access = Access::LOCAL_WRITE.union(Access::REMOTE_WRITE);
 
 /// How memory was registered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +121,23 @@ impl Registered {
     }
 }
 
+/// One receive's write window ([`Registrar::expose`]): a registration of exactly its
+/// bytes that peers may write, and the registration they lie in, kept until the window
+/// is deregistered.
+#[derive(Debug)]
+pub struct Window {
+    region: MemoryRegion,
+    _base: Registered,
+}
+
+impl Window {
+    /// The window's own region: its address is the receive's first byte, its length the
+    /// receive's, its remote key the one a write grant carries.
+    pub fn region(&self) -> &MemoryRegion {
+        &self.region
+    }
+}
+
 /// Which device paths may be tried, and the caches' bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectConfig {
@@ -145,6 +178,9 @@ struct Counts {
     host: u64,
     failures: u64,
     last_failure: Option<String>,
+    /// Write windows made, and their bytes.
+    windows: u64,
+    window_bytes: u64,
 }
 
 /// The GPU driver this registrar uses, once loaded.
@@ -157,6 +193,7 @@ struct Gpu {
 /// Registers device and host memory for one endpoint; see the module docs.
 pub struct Registrar {
     config: DirectConfig,
+    /// [`CACHED_ACCESS`]: what every cached registration is made with.
     access: Access,
     device_cache: MrCache,
     host_cache: MrCache,
@@ -179,12 +216,12 @@ impl DmabufCloser for Closer {
 }
 
 impl Registrar {
-    /// Registrations on `pd` with `access` (local write, plus remote write when peers may
-    /// write into them).
-    pub fn new(pd: &ProtectionDomain, access: Access, config: DirectConfig) -> Result<Registrar> {
+    /// Registrations on `pd`: cached ones with local access only, windows with remote
+    /// write ([`expose`](Registrar::expose)).
+    pub fn new(pd: &ProtectionDomain, config: DirectConfig) -> Result<Registrar> {
         Ok(Registrar {
             config,
-            access,
+            access: CACHED_ACCESS,
             device_cache: MrCache::new(pd.clone(), config.device_cache)?,
             host_cache: MrCache::new(pd.clone(), config.host_cache)?,
             gpu: Mutex::new(None),
@@ -453,6 +490,86 @@ impl Registrar {
         })
     }
 
+    /// A write window for one receive: exactly `len` bytes at `offset` of `reg`, in a
+    /// registration of their own with remote write, never cached (module docs, "Remote
+    /// writes"). Made the way `reg` was: `ibv_reg_mr` on the range for host and peer
+    /// memory; for a dma-buf, a fresh export of the pages around the range, registered
+    /// from the range's offset in it, so the region still starts and ends exactly there.
+    /// The window holds `reg`, so the memory stays valid for as long as it is registered.
+    pub fn expose(&self, reg: &Registered, offset: usize, len: usize) -> Result<Window> {
+        if len == 0 || offset.checked_add(len).map_or(true, |e| e > reg.len()) {
+            return Err(Error::invalid(format!(
+                "a window of {len} bytes at {offset} of a registration of {}",
+                reg.len()
+            )));
+        }
+        let addr = reg.addr() + offset;
+        let made = match reg.method {
+            Method::Host | Method::PeerMemory => {
+                // SAFETY: [addr, addr + len) lies inside `reg`, whose memory stays valid
+                // while a handle to it lives (host memory: register_host's contract; device
+                // memory: pinned by the peer-memory module for that registration), and the
+                // window holds such a handle until after its own region is deregistered
+                // (Window's fields drop in order).
+                unsafe {
+                    self.host_cache
+                        .pd()
+                        .register(addr as *mut u8, len, WINDOW_ACCESS)
+                }
+            }
+            Method::DmaBuf => self.expose_dmabuf(reg, addr as u64, len as u64),
+        };
+        match made {
+            Ok(region) => {
+                let mut c = lock(&self.counts);
+                c.windows += 1;
+                c.window_bytes += len as u64;
+                Ok(Window {
+                    region,
+                    _base: reg.clone(),
+                })
+            }
+            Err(e) => {
+                let why = self.failed(format!(
+                    "registering a write window of {len} bytes for a receive ({}): {e}",
+                    reg.method.name()
+                ));
+                Err(Error::Unsupported(why))
+            }
+        }
+    }
+
+    fn expose_dmabuf(&self, reg: &Registered, addr: u64, len: u64) -> Result<MemoryRegion> {
+        let device = reg
+            .device
+            .ok_or_else(|| Error::invalid("a dma-buf without a device"))?;
+        let driver = lock(&self.gpu)
+            .as_ref()
+            .map(|g| g.driver.clone())
+            .ok_or_else(|| Error::Unsupported("no GPU driver loaded".into()))?;
+        let alloc = driver.allocation(device, addr)?;
+        let page = page_size();
+        let start = (addr - addr % page).max(alloc.base);
+        let end = (addr + len)
+            .div_ceil(page)
+            .saturating_mul(page)
+            .min(alloc.end());
+        if addr + len > end {
+            return Err(Error::invalid(format!(
+                "{len} bytes at {addr:#x} run past their allocation"
+            )));
+        }
+        let (fd, offset) = driver.export_dmabuf(&alloc, start, end - start)?;
+        let fd = DmabufFd::new(fd, Arc::new(Closer(driver.clone())));
+        self.device_cache.pd().register_dmabuf(
+            fd,
+            offset + (addr - start),
+            len as usize,
+            addr,
+            WINDOW_ACCESS,
+        )
+    }
+
     /// Drops host registrations of `owner` (its buffer is being freed).
     pub fn invalidate_host(&self, owner: u64) -> Invalidated {
         self.host_cache.invalidate_owner(owner)
@@ -480,7 +597,9 @@ impl Registrar {
             o,
             "\"gpu_driver\":{},\"gpu_driver_error\":{},\"dmabuf_enabled\":{},\
              \"peer_memory_enabled\":{},\"registered\":{{\"dmabuf\":{},\"peer_memory\":{},\
-             \"host\":{}}},\"registration_failures\":{},\"last_registration_failure\":{},",
+             \"host\":{}}},\"cached_access\":\"local\",\"write_windows\":{},\
+             \"write_window_bytes\":{},\"registration_failures\":{},\
+             \"last_registration_failure\":{},",
             driver.as_deref().map_or("null".into(), json_str),
             lock(&self.load_error)
                 .as_deref()
@@ -490,6 +609,8 @@ impl Registrar {
             c.dmabuf,
             c.peer_memory,
             c.host,
+            c.windows,
+            c.window_bytes,
             c.failures,
             c.last_failure.as_deref().map_or("null".into(), json_str),
         );

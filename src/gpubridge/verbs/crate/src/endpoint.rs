@@ -37,7 +37,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::cache::Invalidated;
-use crate::direct::{json_str, DirectConfig, Registered, Registrar};
+use crate::direct::{json_str, DirectConfig, Registered, Registrar, Window};
 use crate::error::{Error, Result};
 use crate::gpu::{GpuMemory, PeerModules};
 use crate::protocol::{self, Header, Info, Kind, Selected, HEADER_BYTES, PROTOCOL_VERSION};
@@ -249,6 +249,10 @@ pub struct Counters {
     pub device_bytes: u64,
     /// Bytes copied by the CPU between caller memory and the slots.
     pub copied_bytes: u64,
+    /// Write windows (one per granted receive) deregistered once written, and kept until
+    /// their queue pair closes because their receive failed.
+    pub exposures_closed: u64,
+    pub exposures_retired: u64,
 }
 
 /// Where an arriving message goes.
@@ -333,6 +337,10 @@ struct Peer {
     /// in arrival order; while any is held, later ones queue behind it.
     held: VecDeque<(u32, Header)>,
     reposts: Vec<u32>,
+    /// Write windows of receives that failed (each holds the registration it lies in):
+    /// the peer may have been granted one and still be writing until this queue pair is
+    /// closed, so they are released only after that (or never, if it didn't drain).
+    retired: Vec<Window>,
 }
 
 /// How a send goes out.
@@ -386,10 +394,18 @@ struct Op {
     len: u64,
     kind: OpKind,
     done: bool,
+    /// Set once the operation failed, which cancels it ([`State::fail_op`]).
     error: Option<String>,
+    /// A receive the peer will RDMA WRITE into: the registration of exactly its bytes
+    /// with remote write, made for this one receive ([`Registrar::expose`]). Its key is
+    /// the one the write grant carries; it is deregistered once the "written" message
+    /// arrives, or kept until the queue pair is closed if the receive fails.
+    exposure: Option<Window>,
 }
 
 struct State {
+    /// Set once the endpoint failed: every operation is cancelled with it
+    /// ([`Shared::fail_endpoint`]).
     failed: Option<String>,
     closing: bool,
     peers: Vec<Option<Peer>>,
@@ -397,6 +413,8 @@ struct State {
     next_id: i64,
     unexpected: u64,
     counters: Counters,
+    /// Write windows to release once the lock is let go (deregistering can be slow).
+    release: Vec<Window>,
 }
 
 /// What the handshake and telemetry report about this end.
@@ -533,16 +551,14 @@ impl Endpoint {
             max_recv_sge: 1,
             max_inline_data: 0,
         };
-        // Peers may write only with rendezvous on, and then only into memory granted for
-        // one receive at a time (the queue pair's access is necessary, not sufficient:
-        // the region's key and bounds decide).
-        let (qp_access, reg_access) = if config.rndv_bytes > 0 {
-            (
-                Access::LOCAL_WRITE | Access::REMOTE_WRITE,
-                Access::LOCAL_WRITE | Access::REMOTE_WRITE,
-            )
+        // Peers may write only with rendezvous on, and then only through the window of
+        // one granted receive (the queue pair's access is necessary, not sufficient: the
+        // region's key and bounds decide). No other registration is remotely writable:
+        // not the slots, not the cached registrations of caller memory.
+        let qp_access = if config.rndv_bytes > 0 {
+            Access::LOCAL_WRITE | Access::REMOTE_WRITE
         } else {
-            (Access::NONE, Access::LOCAL_WRITE)
+            Access::NONE
         };
         let mut slots = Vec::new();
         let mut qpns = vec![0; members];
@@ -606,6 +622,7 @@ impl Endpoint {
                 complete: HashMap::new(),
                 held: VecDeque::new(),
                 reposts: Vec::new(),
+                retired: Vec::new(),
             });
         }
         let grh = attr.link_layer == LinkLayer::Ethernet || gid_index.is_some();
@@ -630,7 +647,7 @@ impl Endpoint {
             let m = p.member;
             peers_by_member[m] = Some(p);
         }
-        let registrar = Registrar::new(&pd, reg_access, config.direct)?;
+        let registrar = Registrar::new(&pd, config.direct)?;
         drop(pd);
         let shared = Arc::new(Shared {
             local: Local {
@@ -660,6 +677,7 @@ impl Endpoint {
                 next_id: 1,
                 unexpected: 0,
                 counters: Counters::default(),
+                release: Vec::new(),
             }),
             changed: Condvar::new(),
             stop: AtomicBool::new(false),
@@ -768,6 +786,14 @@ impl Endpoint {
                 )));
             }
         }
+        // A receive the rendezvous will have the peer write: exactly its bytes, registered
+        // with remote write for this receive alone (before the lock: registering is slow).
+        let exposure = match &mem {
+            Mem::Reg { reg, offset } if !send && rndv > 0 && len >= rndv => {
+                Some(s.registrar.expose(reg, *offset, len as usize)?)
+            }
+            _ => None,
+        };
         let mut st = lock(&s.state);
         if let Some(why) = &st.failed {
             return Err(Error::Busy(format!(
@@ -834,6 +860,7 @@ impl Endpoint {
                 kind,
                 done: false,
                 error: None,
+                exposure,
             },
         );
         if send {
@@ -855,7 +882,10 @@ impl Endpoint {
     /// # Safety
     ///
     /// `len` bytes at `ptr` must stay valid and unchanged until `wait` reports the
-    /// operation done, it fails, or [`abort`](Endpoint::abort) or `close` returns.
+    /// operation done, it fails, or [`abort`](Endpoint::abort) or `close` returns. A
+    /// failure cancels the operation (and every other one, the endpoint having failed)
+    /// under the lock every copy takes, so once `wait` has reported it nothing reads the
+    /// memory again.
     pub unsafe fn send(&self, member: usize, ptr: usize, len: u64, tag: u64) -> Result<i64> {
         self.post(member, Mem::Plain(ptr), len, tag, true)
     }
@@ -866,7 +896,9 @@ impl Endpoint {
     /// # Safety
     ///
     /// `len` bytes at `ptr` must stay valid, and not be used otherwise, until `wait`
-    /// reports the operation done, it fails, or `abort` or `close` returns.
+    /// reports the operation done, it fails, or `abort` or `close` returns. As for
+    /// [`send`](Endpoint::send), a failure is a cancellation: nothing writes the memory
+    /// after `wait` has reported it.
     pub unsafe fn recv(&self, member: usize, ptr: usize, len: u64, tag: u64) -> Result<i64> {
         self.post(member, Mem::Plain(ptr), len, tag, false)
     }
@@ -988,9 +1020,10 @@ impl Endpoint {
                         )))
                     }
                     Some(op) => {
-                        if let Some(e) = &op.error {
-                            let e = e.clone();
-                            st.failed.get_or_insert_with(|| e.clone());
+                        if let Some(e) = op.error.clone() {
+                            // One failed operation fails the endpoint, which cancels the
+                            // rest.
+                            s.fail_endpoint(&mut st, &e);
                             return Err(WaitError::Failed(e));
                         }
                         if !op.done {
@@ -1030,8 +1063,7 @@ impl Endpoint {
     pub fn abort(&self, why: &str) {
         let s = &self.shared;
         let mut st = lock(&s.state);
-        st.failed.get_or_insert_with(|| why.to_owned());
-        s.cancel_all(&mut st);
+        s.fail_endpoint(&mut st, why);
         for peer in st.peers.iter_mut().flatten() {
             let _ = peer.qp.to_error();
             peer.lost.get_or_insert_with(|| why.to_owned());
@@ -1082,8 +1114,7 @@ impl Endpoint {
                         .0;
                 }
             }
-            st.failed.get_or_insert_with(|| "closed".into());
-            s.cancel_all(&mut st);
+            s.fail_endpoint(&mut st, "closed");
             for peer in st.peers.iter_mut().flatten() {
                 let _ = peer.qp.to_error();
                 peer.lost.get_or_insert_with(|| "closed".into());
@@ -1107,9 +1138,16 @@ impl Endpoint {
         for peer in peers {
             // Whatever didn't drain is leaked with its slots (QueuePair::close).
             let left = deadline.saturating_duration_since(Instant::now());
-            if let Err(e) = peer.qp.close(left) {
-                if result.is_ok() {
-                    result = Err(e);
+            match peer.qp.close(left) {
+                // Closed: the peer can't write through a window it was granted any more.
+                Ok(()) => drop(peer.retired),
+                Err(e) => {
+                    // It may still be able to: keep those windows (and the memory they
+                    // lie in) registered for good.
+                    std::mem::forget(peer.retired);
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
                 }
             }
         }
@@ -1182,7 +1220,8 @@ impl Endpoint {
              \"batches_posted\":{},\"grants_sent\":{},\"go_sent\":{},\"grants_received\":{},\
              \"go_received\":{},\"writes_posted\":{},\"bytes_written\":{},\"fins_sent\":{},\
              \"fins_received\":{},\"host_registered_bytes\":{},\"device_bytes\":{},\
-             \"copied_bytes\":{},\"pending_operations\":{},\"peers\":[",
+             \"copied_bytes\":{},\"write_windows_closed\":{},\"write_windows_retired\":{},\
+             \"pending_operations\":{},\"peers\":[",
             c.sends,
             c.recvs,
             c.bytes_sent,
@@ -1211,6 +1250,8 @@ impl Endpoint {
             c.host_registered_bytes,
             c.device_bytes,
             c.copied_bytes,
+            c.exposures_closed,
+            c.exposures_retired,
             st.ops.len()
         );
         let mut first = true;
@@ -1276,11 +1317,44 @@ impl State {
         self.peers[member].as_mut().expect("a peer")
     }
 
+    /// Fails an operation, which cancels it: from here on nothing copies to or from its
+    /// memory (it leaves every queue, an arriving message for it is dropped, its posted
+    /// chunks no longer count for it), all under the endpoint lock that every copy takes.
     fn fail_op(&mut self, id: i64, why: &str) {
-        if let Some(op) = self.ops.get_mut(&id) {
-            if !op.done && op.error.is_none() {
-                op.error = Some(why.to_owned());
+        let Some(op) = self.ops.get_mut(&id) else {
+            return;
+        };
+        if op.done || op.error.is_some() {
+            return;
+        }
+        op.error = Some(why.to_owned());
+        let member = op.peer;
+        let Some(peer) = self.peers.get_mut(member).and_then(Option::as_mut) else {
+            return;
+        };
+        let exposure = op.exposure.take();
+        peer.sends.retain(|s| *s != id);
+        if peer.current == Some(id) {
+            peer.current = None;
+        }
+        peer.posted.retain(|_, r| *r != id);
+        peer.writing.retain(|_, r| *r != id);
+        peer.grants_out.retain(|r| *r != id);
+        for inc in peer.incoming.values_mut() {
+            if matches!(inc.dest, Dest::Op(o) if o == id) {
+                inc.dest = Dest::Discard;
             }
+        }
+        for u in peer.slot_use.iter_mut() {
+            if matches!(u, SlotUse::Data { op: Some(o) } if *o == id) {
+                *u = SlotUse::Data { op: None };
+            }
+        }
+        // A granted write window stays registered until the peer can't write any more
+        // (its queue pair is closed): see `Peer::retired`.
+        if let Some(window) = exposure {
+            peer.retired.push(window);
+            self.counters.exposures_retired += 1;
         }
     }
 }
@@ -1344,22 +1418,22 @@ impl Shared {
                     self.lose(&mut st, m, &why);
                 }
             }
-            None => {
-                st.failed.get_or_insert(why);
-                self.cancel_all(&mut st);
-            }
+            None => self.fail_endpoint(&mut st, &why),
         }
         self.changed.notify_all();
     }
 
     fn fail_all(&self, why: &str) {
         let mut st = lock(&self.state);
-        st.failed.get_or_insert_with(|| why.to_owned());
-        let ids: Vec<i64> = st.ops.keys().copied().collect();
-        for id in ids {
-            st.fail_op(id, why);
-        }
+        self.fail_endpoint(&mut st, why);
         self.changed.notify_all();
+    }
+
+    /// The endpoint failed: every operation is cancelled, and nothing is posted or
+    /// copied from here on ([`State::fail_op`], [`pump`](Shared::pump)).
+    fn fail_endpoint(&self, st: &mut State, why: &str) {
+        st.failed.get_or_insert_with(|| why.to_owned());
+        self.cancel_all(st);
     }
 
     /// Polls once and handles what came; returns how many.
@@ -1389,7 +1463,10 @@ impl Shared {
             self.repost(&mut st, m);
             self.pump(&mut st, m);
         }
+        let release = std::mem::take(&mut st.release);
+        drop(st);
         self.changed.notify_all();
+        drop(release);
         n
     }
 
@@ -1545,6 +1622,16 @@ impl Shared {
                     return;
                 }
                 op.done = op.error.is_none();
+                // The writes came before this message on the same RC queue pair, so they
+                // are complete: the peer can't write through the window any more, and it
+                // goes (deregistered once the lock is let go).
+                if let Some(window) = op.exposure.take() {
+                    st.release.push(window);
+                    st.counters.exposures_closed += 1;
+                }
+                let Some(op) = st.ops.get(&id) else {
+                    return;
+                };
                 let device = matches!(&op.mem, Mem::Reg { reg, .. } if !reg.cpu());
                 let len = op.len;
                 st.counters.bytes_received += len;
@@ -1568,9 +1655,18 @@ impl Shared {
                         .chain(peer.writing.drain())
                         .map(|(_, id)| id)
                         .collect();
+                    // And it takes nothing more: sends not yet (wholly) posted to it fail
+                    // now rather than at their deadline. Ones already posted complete as
+                    // the peer acknowledges them.
+                    let unsent: Vec<i64> =
+                        peer.current.iter().chain(&peer.sends).copied().collect();
                     let why =
                         format!("member {member} closed its end of the bridge before sending this");
                     for id in waiting {
+                        st.fail_op(id, &why);
+                    }
+                    let why = format!("member {member} closed its end of the bridge");
+                    for id in unsent {
                         st.fail_op(id, &why);
                     }
                 }
@@ -1613,10 +1709,7 @@ impl Shared {
     fn protocol_error(&self, st: &mut State, member: usize, why: &str) {
         st.failed.get_or_insert_with(|| why.to_owned());
         self.lose(st, member, why);
-        let ids: Vec<i64> = st.ops.keys().copied().collect();
-        for id in ids {
-            st.fail_op(id, why);
-        }
+        self.fail_endpoint(st, why);
     }
 
     /// The link to `member` is gone: fail what involves it and stop using it.
@@ -1713,9 +1806,17 @@ impl Shared {
             self.protocol_error(st, member, &why);
             return true;
         }
+        // A receive that failed (or an endpoint that did) was cancelled: State::fail_op
+        // and cancel_all turn its destination into Discard; this only makes sure.
+        if let Dest::Op(id) = inc.dest {
+            if st.failed.is_some() || st.ops.get(&id).map_or(true, |op| op.error.is_some()) {
+                inc.dest = Dest::Discard;
+            }
+        }
         let n = h.chunk_len as usize;
         let src = &peer.recv_slots[slot as usize];
         let mut registered = false;
+        let mut kept = true;
         let copied = match &mut inc.dest {
             Dest::Op(id) => match st.ops.get(id) {
                 Some(op) if n > 0 => match op.mem.cpu_addr() {
@@ -1723,9 +1824,11 @@ impl Shared {
                         registered = matches!(op.mem, Mem::Reg { .. });
                         // SAFETY: the op's memory holds op.len bytes (recv's contract, or
                         // the registration's, which the op holds) and offset + n <=
-                        // msg_len == op.len (checked by Header::decode and above); the op
-                        // isn't done or cancelled, so it is still valid, and the endpoint
-                        // lock is held.
+                        // msg_len == op.len (checked by Header::decode and above). The
+                        // op has no error and the endpoint hasn't failed (checked just
+                        // above, with the endpoint lock held, as it still is): a failure
+                        // cancels the op under this lock before anyone is told of it, so
+                        // the caller still keeps the memory valid.
                         let out = unsafe {
                             std::slice::from_raw_parts_mut((addr + h.offset as usize) as *mut u8, n)
                         };
@@ -1741,7 +1844,10 @@ impl Shared {
                 HEADER_BYTES,
                 &mut buf[h.offset as usize..h.offset as usize + n],
             ),
-            Dest::Discard => Ok(()),
+            Dest::Discard => {
+                kept = false;
+                Ok(())
+            }
         };
         if let Err(e) = copied {
             let why = format!("copying a chunk from member {member} failed: {e}");
@@ -1752,7 +1858,7 @@ impl Shared {
         st.counters.bytes_received += u64::from(h.chunk_len);
         if registered {
             st.counters.host_registered_bytes += u64::from(h.chunk_len);
-        } else {
+        } else if kept {
             st.counters.copied_bytes += u64::from(h.chunk_len);
         }
         let peer = st.peers[member].as_mut().expect("a peer");
@@ -1982,6 +2088,10 @@ impl Shared {
         let mut batch: Vec<Wr> = Vec::new();
         let mut bytes = 0;
         loop {
+            // A failed endpoint posts nothing more: its operations are cancelled.
+            if st.failed.is_some() {
+                break;
+            }
             let peer = st.peers[member].as_mut().expect("a peer");
             // A peer that said goodbye wants nothing more, credits included.
             if !peer.connected || peer.lost.is_some() || peer.bye_sent || peer.said_bye {
@@ -1995,6 +2105,14 @@ impl Shared {
                         self.protocol_error(st, member, &why);
                         return;
                     }
+                }
+            }
+            // Failing an operation takes it out of `current` (State::fail_op); this only
+            // makes sure.
+            if let Some(id) = st.peer(member).current {
+                if st.ops.get(&id).map_or(true, |op| op.error.is_some()) {
+                    st.peer(member).current = None;
+                    continue;
                 }
             }
             let peer = st.peers[member].as_mut().expect("a peer");
@@ -2081,15 +2199,20 @@ impl Shared {
             // A clear-to-send for the oldest receive that needs one.
             if let Some(rid) = peer.grants_out.pop_front() {
                 let grant = match st.ops.get(&rid) {
-                    Some(op) if !op.done && op.error.is_none() => match &op.mem {
-                        Mem::Reg { reg, offset } => (
+                    Some(op) if !op.done && op.error.is_none() => match (&op.mem, &op.exposure) {
+                        // The key of the receive's own window: exactly its bytes, nothing
+                        // around them, and only until its "written" message.
+                        (Mem::Reg { .. }, Some(window)) => (
                             Kind::Cts,
-                            reg.region().rkey(),
-                            (reg.addr() + offset) as u64,
+                            window.region().rkey(),
+                            window.region().addr() as u64,
                             op.tag,
                             op.len,
                         ),
-                        Mem::Plain(_) => (Kind::Go, 0, 0, op.tag, op.len),
+                        (Mem::Reg { .. }, None) => {
+                            unreachable!("post() exposes every registered rendezvous receive")
+                        }
+                        (Mem::Plain(_), _) => (Kind::Go, 0, 0, op.tag, op.len),
                     },
                     // Cancelled meanwhile.
                     _ => {
@@ -2169,9 +2292,12 @@ impl Shared {
                             Mem::Plain(ptr) => {
                                 if n > 0 {
                                     // SAFETY: the op's buffer holds op.len bytes and next + n
-                                    // <= op.len; the op is current, so not done or cancelled,
-                                    // and the caller keeps its memory valid until then (send's
-                                    // contract); the endpoint lock is held.
+                                    // <= op.len. The op is current and has no error (checked
+                                    // above, under the endpoint lock, which is held): it
+                                    // isn't done, and it hasn't failed or been cancelled,
+                                    // which State::fail_op does under this lock before any
+                                    // failure is reported. So the caller still keeps the
+                                    // memory valid (send's contract).
                                     let data = unsafe {
                                         std::slice::from_raw_parts(
                                             (ptr + *next as usize) as *const u8,
@@ -2213,7 +2339,8 @@ impl Shared {
                     match &op.mem {
                         Mem::Plain(ptr) => {
                             let n = (op.len - *next).min(u64::from(self.config.slot_bytes));
-                            // SAFETY: as for a chunk above.
+                            // SAFETY: as for a chunk above (current, no error, lock
+                            // held).
                             let data = unsafe {
                                 std::slice::from_raw_parts(
                                     (ptr + *next as usize) as *const u8,

@@ -31,7 +31,9 @@ mod types;
 mod uds;
 
 pub use cache::{CacheConfig, CacheKey, CacheStats, Invalidated, MrCache};
-pub use direct::{DirectConfig, Method, Registered, Registrar, DEVICE_ROUND};
+pub use direct::{
+    DirectConfig, Method, Registered, Registrar, Window, CACHED_ACCESS, DEVICE_ROUND, WINDOW_ACCESS,
+};
 pub use endpoint::{Config, Counters, Endpoint, WaitError, TICK, WRITE_CHUNK};
 pub use error::{Error, Result};
 pub use gpu::{Allocation, GpuMemory, MockGpu, PeerModules, Vendor};

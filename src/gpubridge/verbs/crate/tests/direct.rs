@@ -11,9 +11,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::ib_fabric;
+use common::{eventually, ib_fabric, RawMember};
+use gpubridge_verbs::protocol::Kind;
 use gpubridge_verbs::{
-    Call, Config, Endpoint, Fault, Method, MockFabric, MockGpu, NodeId, PeerModules, DEVICE_ROUND,
+    Access, Call, Config, Endpoint, Fault, Method, MockFabric, MockGpu, NodeId, PeerModules,
+    WcStatus, CACHED_ACCESS, DEVICE_ROUND,
 };
 
 const LONG: Duration = Duration::from_secs(20);
@@ -494,12 +496,163 @@ fn aborting_with_a_write_granted_keeps_the_registration_until_close() {
     assert_eq!(b.counters().grants_sent, 1);
     b.abort("deadline");
     assert!(b.wait(&[r], LONG).is_err());
-    // The failed receive still holds the registration (the peer may have been writing
-    // until the queue pair failed): the descriptor stays open until close.
-    assert_eq!(gpu.open_fds(), 1);
+    // The failed receive's write window (and the registration it lies in) stays
+    // registered (the peer may have been writing until the queue pair failed): both
+    // descriptors, the cached registration's and the window's, stay open until close.
+    assert_eq!(gpu.open_fds(), 2);
+    assert_eq!(b.counters().exposures_retired, 1);
     b.close(LONG).unwrap();
     a.close(LONG).unwrap();
     assert_eq!(gpu.open_fds(), 0);
     assert!(gpu.violations().is_empty(), "{:?}", gpu.violations());
     assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+}
+
+#[test]
+fn cached_registrations_are_never_remotely_writable() {
+    let gpu = MockGpu::new();
+    let (_fabric, a, _b) = pair(RNDV, &gpu, false);
+    let dev = gpu.alloc(0, 1 << 20);
+    let regs = [
+        a.register_device(0, dev, 1 << 20).unwrap(),
+        host(&a, &[0u8; 4096], 1),
+    ];
+    for reg in regs {
+        assert_eq!(reg.region().access(), CACHED_ACCESS, "{:?}", reg.method());
+        assert!(!reg.region().access().contains(Access::REMOTE_WRITE));
+    }
+    assert!(a.telemetry().contains("\"cached_access\":\"local\""));
+}
+
+/// A write grant from endpoint A (member 0) to a bare queue pair B (member 1) for a
+/// receive of `len` bytes at `at` into `kind` memory ("host", "dmabuf", "peer"), with
+/// `before` bytes of other data before it and after it in the same registration. Returns
+/// what B checks against.
+struct Granted {
+    fabric: Arc<MockFabric>,
+    gpu: MockGpu,
+    a: Endpoint,
+    b: RawMember,
+    recv: i64,
+    addr: u64,
+    key: u32,
+    len: u64,
+    /// Reads `n` bytes at `addr` of the receiving memory.
+    read: Reader,
+}
+
+type Reader = Box<dyn Fn(u64, usize) -> Vec<u8>>;
+
+fn granted(kind: &str) -> Granted {
+    let gpu = MockGpu::new();
+    let (fabric, na, nb) = ib_fabric();
+    let config = config(RNDV);
+    let a = Endpoint::new(fabric.provider(na), 2, 0, config.clone()).unwrap();
+    a.set_gpu(
+        Arc::new(gpu.clone()),
+        modules(&format!("granted-{kind}"), kind == "peer"),
+    );
+    if kind == "peer" {
+        gpu.set_dmabuf_unsupported(Some("not in this test"));
+    }
+    let b = RawMember::new(&fabric, nb, 2, 0, &config);
+    b.connect(&a.local_info(), 1);
+    a.connect(1, &b.info).unwrap();
+    let len = 2 * RNDV;
+    let total = 4 * RNDV as usize;
+    // The receive starts 1000 bytes in: neighbours on both sides share its registration.
+    let (reg, base, read): (_, u64, Reader) = if kind == "host" {
+        let buf: &'static mut [u8] = Box::leak(vec![0xAAu8; total].into_boxed_slice());
+        let ptr = buf.as_mut_ptr() as u64;
+        // SAFETY: leaked, valid for the process.
+        let reg = unsafe { a.register_host(ptr as usize, total, 7) }.unwrap();
+        let read = Box::new(|at: u64, n: usize| {
+            // SAFETY: inside the leaked buffer; read after the writes are complete.
+            unsafe { std::slice::from_raw_parts(at as *const u8, n) }.to_vec()
+        });
+        (reg, ptr, read)
+    } else {
+        let dev = gpu.alloc(0, total as u64);
+        gpu.write(dev, &vec![0xAAu8; total]);
+        let reg = a.register_device(0, dev, total as u64).unwrap();
+        let want = if kind == "peer" {
+            Method::PeerMemory
+        } else {
+            Method::DmaBuf
+        };
+        assert_eq!(reg.method(), want);
+        let g = gpu.clone();
+        (reg, dev, Box::new(move |at: u64, n: usize| g.read(at, n)))
+    };
+    let at = base + 1000;
+    let recv = a
+        .recv_registered(1, &reg, (at - reg.addr() as u64) as usize, len, 5)
+        .unwrap();
+    let h = b.receive(LONG);
+    assert_eq!(
+        (h.kind, h.tag, h.msg_len, h.offset),
+        (Kind::Cts, 5, len, at)
+    );
+    Granted {
+        fabric,
+        gpu,
+        a,
+        b,
+        recv,
+        addr: at,
+        key: h.key,
+        len,
+        read,
+    }
+}
+
+#[test]
+fn a_write_grant_reaches_exactly_the_receive_and_only_until_it_is_written() {
+    for kind in ["host", "dmabuf", "peer"] {
+        // The byte before the receive and the byte after it are out of the key's reach
+        // (each fault fails the queue pair, so each gets a fresh grant).
+        for (what, offset) in [("before", -1i64), ("after", 0)] {
+            let g = granted(kind);
+            let target = if offset < 0 {
+                g.addr - 1
+            } else {
+                g.addr + g.len
+            };
+            assert_eq!(
+                g.b.write(&[0x55], target, g.key),
+                WcStatus::RemAccessErr,
+                "{kind}: the byte {what} the receive"
+            );
+            assert_eq!((g.read)(target, 1), vec![0xAA], "{kind} {what}");
+            g.a.abort("test over");
+            g.a.close(LONG).ok();
+        }
+        // Inside, all of it, then "written": the receive completes, the neighbours are
+        // untouched, and the key reaches nothing any more.
+        let mut g = granted(kind);
+        let mrs = g.fabric.live(0).mrs;
+        let data = pattern(g.len as usize, 9);
+        assert_eq!(g.b.write(&data, g.addr, g.key), WcStatus::Success);
+        let fin = g.b.header(Kind::Fin, 5, g.len).encode();
+        assert_eq!(g.b.send(&fin), WcStatus::Success);
+        g.a.wait(&[g.recv], LONG).unwrap();
+        assert!((g.read)(g.addr, g.len as usize) == data, "{kind}");
+        assert_eq!((g.read)(g.addr - 1000, 1000), vec![0xAA; 1000], "{kind}");
+        assert_eq!((g.read)(g.addr + g.len, 1000), vec![0xAA; 1000], "{kind}");
+        eventually(LONG, "the window is deregistered", || {
+            g.fabric.live(0).mrs == mrs - 1
+        });
+        assert_eq!(g.a.counters().exposures_closed, 1);
+        assert_eq!(
+            g.b.write(&[0x55], g.addr, g.key),
+            WcStatus::RemAccessErr,
+            "{kind}: after \"written\""
+        );
+        let t = g.a.telemetry();
+        assert!(t.contains("\"write_windows\":1,"), "{t}");
+        assert!(t.contains("\"write_windows_closed\":1,"), "{t}");
+        g.a.close(LONG).ok();
+        assert!(g.gpu.violations().is_empty(), "{:?}", g.gpu.violations());
+        assert_eq!(g.gpu.open_fds(), 0, "{kind}");
+    }
 }

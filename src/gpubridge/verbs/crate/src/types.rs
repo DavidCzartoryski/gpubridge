@@ -36,6 +36,11 @@ impl Access {
         self.0 & other.0 == other.0
     }
 
+    /// `self | other`, in constants.
+    pub const fn union(self, other: Access) -> Access {
+        Access(self.0 | other.0)
+    }
+
     /// Remote write or read access needs local write too (verbs refuses it otherwise).
     pub(crate) fn validate(self) -> Result<()> {
         if (self.contains(Access::REMOTE_WRITE)) && !self.contains(Access::LOCAL_WRITE) {

@@ -1,12 +1,16 @@
-//! Two mock nodes with connected queue pairs.
+//! Two mock nodes with connected queue pairs, and a bare queue pair that poses as a bridge
+//! member.
 
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use gpubridge_verbs::protocol::{Header, Info, Kind, HEADER_BYTES, PROTOCOL_VERSION};
 use gpubridge_verbs::{
-    Access, Address, Completion, CompletionQueue, Context, Gid, GlobalRoute, InitAttr, MockDevice,
-    MockFabric, MockPort, Mtu, NodeId, ProtectionDomain, QpCaps, QueuePair, RtrAttr, RtsAttr,
+    Access, Address, Completion, CompletionQueue, Config, Context, Gid, GlobalRoute, InitAttr,
+    LinkLayer, MemoryRegion, MockDevice, MockFabric, MockPort, Mtu, NodeId, ProtectionDomain,
+    QpCaps, QueuePair, RemoteTarget, RtrAttr, RtsAttr, SendOp, SendRequest, Sge, WcStatus,
 };
 
 pub const PSN_A: u32 = 0x10;
@@ -160,4 +164,193 @@ pub fn wait(cq: &CompletionQueue, n: usize, polls: usize) -> Vec<Completion> {
         "{} of {n} completions after {polls} polls: {out:?}",
         out.len()
     );
+}
+
+/// A bare queue pair posing as member `index` of a bridge to one endpoint (InfiniBand
+/// device "mlx0" on its node): it sends whatever a test writes, including what no
+/// endpoint would, and reads what the endpoint sends it.
+pub struct RawMember {
+    pub side: Side,
+    recv_slots: Vec<MemoryRegion>,
+    slot_bytes: u32,
+    pub info: String,
+    psn: u32,
+    seq: u32,
+}
+
+impl RawMember {
+    /// A member of `members`, talking to member `peer` only, with `config`'s slot,
+    /// credit and rendezvous settings (the handshake compares them).
+    pub fn new(
+        fabric: &Arc<MockFabric>,
+        node: NodeId,
+        members: usize,
+        peer: usize,
+        config: &Config,
+    ) -> RawMember {
+        let recvs = config.credits + config.ctrl_credits;
+        let side = open(fabric, node, "mlx0", caps(64, recvs, 1));
+        let recv_slots: Vec<MemoryRegion> = (0..recvs)
+            .map(|_| {
+                side.pd
+                    .register_buffer(config.slot_bytes as usize, Access::LOCAL_WRITE)
+                    .unwrap()
+            })
+            .collect();
+        for (i, r) in recv_slots.iter().enumerate() {
+            side.qp
+                .post_recv(i as u64, &[Sge::new(r, 0, config.slot_bytes)])
+                .unwrap();
+        }
+        let port = side.ctx.query_port(1).unwrap();
+        let psn = 0x77;
+        let mut qpns = vec![0; members];
+        let mut psns = vec![0; members];
+        qpns[peer] = side.qp.qp_num();
+        psns[peer] = psn;
+        let info = Info {
+            version: PROTOCOL_VERSION,
+            link_layer: LinkLayer::InfiniBand,
+            lid: port.lid,
+            gid: side.ctx.query_gid(1, 0).unwrap().gid,
+            grh: false,
+            active_mtu: port.active_mtu,
+            slot_bytes: config.slot_bytes,
+            credits: config.credits,
+            ctrl_credits: config.ctrl_credits,
+            rndv: config.rndv_bytes,
+            qpns,
+            psns,
+            device: "mlx0".into(),
+            port: 1,
+        }
+        .encode();
+        RawMember {
+            side,
+            recv_slots,
+            slot_bytes: config.slot_bytes,
+            info,
+            psn,
+            seq: 0,
+        }
+    }
+
+    /// Connects to the endpoint (member `peer`'s handshake line `theirs`), as this
+    /// member `index`.
+    pub fn connect(&self, theirs: &str, index: usize) {
+        let info = Info::decode(theirs).unwrap();
+        self.side
+            .qp
+            .to_rtr(&RtrAttr {
+                dest_qp_num: info.qpns[index],
+                rq_psn: info.psns[index],
+                path_mtu: info.active_mtu,
+                max_dest_rd_atomic: 0,
+                min_rnr_timer: 12,
+                sl: 0,
+                address: Address::Ib {
+                    lid: info.lid,
+                    grh: None,
+                },
+            })
+            .unwrap();
+        self.side.qp.to_rts(&rts(self.psn, 7)).unwrap();
+    }
+
+    /// The next header this member would send, of `kind` (a sequence number of its own;
+    /// it never returns credits).
+    pub fn header(&mut self, kind: Kind, tag: u64, msg_len: u64) -> Header {
+        let h = Header {
+            kind,
+            seq: self.seq,
+            chunk_len: 0,
+            data_freed: 0,
+            ctrl_freed: 0,
+            key: 0,
+            tag,
+            msg_len,
+            offset: 0,
+        };
+        self.seq += 1;
+        h
+    }
+
+    /// SENDs `bytes` as one message and waits for its completion.
+    pub fn send(&self, bytes: &[u8]) -> WcStatus {
+        let buf = self
+            .side
+            .pd
+            .register_buffer(bytes.len().max(1), Access::NONE)
+            .unwrap();
+        buf.write(0, bytes).unwrap();
+        let sge = [Sge::new(&buf, 0, bytes.len() as u32)];
+        self.post(SendOp::Send, &sge)
+    }
+
+    /// RDMA WRITEs `data` to `addr` with `rkey` and waits for its completion.
+    pub fn write(&self, data: &[u8], addr: u64, rkey: u32) -> WcStatus {
+        let buf = self
+            .side
+            .pd
+            .register_buffer(data.len().max(1), Access::NONE)
+            .unwrap();
+        buf.write(0, data).unwrap();
+        let sge = [Sge::new(&buf, 0, data.len() as u32)];
+        self.post(SendOp::Write(RemoteTarget { addr, rkey }), &sge)
+    }
+
+    fn post(&self, op: SendOp, sges: &[Sge<'_>]) -> WcStatus {
+        self.side
+            .qp
+            .post_send(&SendRequest {
+                tag: 1 << 40,
+                op,
+                sges,
+            })
+            .unwrap();
+        loop {
+            let got = self.poll(Duration::from_secs(10));
+            if got.tag == 1 << 40 {
+                return got.status;
+            }
+        }
+    }
+
+    fn poll(&self, timeout: Duration) -> Completion {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(c) = self.side.cq.poll(1).unwrap().pop() {
+                return c;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "nothing completed in {timeout:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The next message the endpoint sent this member: its header (the slot isn't
+    /// reposted: tests read only a few).
+    pub fn receive(&self, timeout: Duration) -> Header {
+        let c = self.poll(timeout);
+        assert!(c.ok(), "{c:?}");
+        let mut raw = [0u8; HEADER_BYTES];
+        self.recv_slots[c.tag as usize].read(0, &mut raw).unwrap();
+        Header::decode(&raw, c.byte_len).unwrap()
+    }
+}
+
+/// A message every endpoint refuses: no magic number.
+pub fn garbage() -> Vec<u8> {
+    vec![0u8; HEADER_BYTES]
+}
+
+/// Waits up to `timeout` for `cond`.
+pub fn eventually(timeout: Duration, what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !cond() {
+        assert!(Instant::now() < deadline, "not within {timeout:?}: {what}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
