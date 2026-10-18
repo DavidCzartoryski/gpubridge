@@ -17,7 +17,7 @@ The plan has three phases, each its own change:
   a bounded registration cache, and a deterministic mock provider with
   injectable faults.
 - **A2:** a versioned reliable-connected (RC) wire protocol on top of
-  it (["Wire protocol"](#wire-protocol-version-1)), the endpoint selection rules,
+  it (["Wire protocol"](#wire-protocol-version-2)), the endpoint selection rules,
   completion channels and asynchronous events in the shim, a completion thread,
   the Python `BridgeTransport` as `bridge="verbs"` with telemetry, and the
   collective tests bit for bit against `flat-gloo` on a test-only fabric.
@@ -49,6 +49,10 @@ HARDWARE-VERIFIED: tested on RDMA hardware.
 | Wire protocol v2: handshake, chunking, credits, ordering, goodbye; rendezvous by write grant or "in chunks"; gathered sends from registered memory | IMPLEMENTED, SOFTWARE-VERIFIED (in-process mock; the test fabric carries RDMA WRITE too) |
 | Completion thread on a completion channel, asynchronous events | IMPLEMENTED, SOFTWARE-VERIFIED (the mocks' channels; the shim's `poll(2)` path is compiled only) |
 | Deadlines, completion errors, lost peers, teardown with work outstanding | IMPLEMENTED, SOFTWARE-VERIFIED |
+| Failure is cancellation: once a wait reports a failure, nothing copies to or from the caller's plain memory | IMPLEMENTED, SOFTWARE-VERIFIED (mock: a peer breaks the protocol mid-message) |
+| Sends queued to a member that said goodbye fail at once with "member N closed its end of the bridge" | IMPLEMENTED, SOFTWARE-VERIFIED (mock) |
+| Remote write only through one receive's window: exactly its bytes, registered for it, deregistered once written; cached and send-side registrations local-only | IMPLEMENTED, SOFTWARE-VERIFIED (mock: writes before, after and past "written" fail, for host, dma-buf and peer memory); HARDWARE BLOCKED |
+| Fork safety checked at open (`ibv_is_fork_initialized`, `ibv_fork_init` before any registration, or a failure with the reason) | IMPLEMENTED, SOFTWARE-VERIFIED (mock statuses); the shim's part compiled with rdma-core v57.0 and reported `unneeded` on an Explorer login node (no device opened); `ibv.rs`'s part not compiled on Linux (BLOCKED, login-node limits) |
 | Device, port and GID selection | IMPLEMENTED, SOFTWARE-VERIFIED (mock devices) |
 | `bridge="verbs"`: every policy, compression, subgroups, async, bit for bit against `flat-gloo` | IMPLEMENTED, SOFTWARE-VERIFIED (the MOCK test fabric between processes, rendezvous on) |
 | GPU tensors, host-staged: a registered pinned buffer, copies on the caller's stream | IMPLEMENTED, SOFTWARE-VERIFIED (CPU tensors standing in, lazy copies); HARDWARE BLOCKED (item 39) |
@@ -56,7 +60,7 @@ HARDWARE-VERIFIED: tested on RDMA hardware.
 | NVIDIA direct, peer memory (`ibv_reg_mr` on device memory with `nvidia_peermem`) | IMPLEMENTED (selection on a mock GPU; module detection on fixtures); HARDWARE BLOCKED (item 40) |
 | AMD direct, dma-buf (ROCr `hsa_amd_portable_export_dmabuf`) | IMPLEMENTED (calls checked against ROCm 6.3's headers; selection on a mock GPU); HARDWARE BLOCKED (item 41) |
 | Ordering: stream wait before the NIC touches GPU memory, flush after it wrote there, SYNC_MEMOPS, BUFFER_ID identity | IMPLEMENTED, SOFTWARE-VERIFIED (a recording fake endpoint); HARDWARE BLOCKED |
-| Direct or staged, with the reason, in telemetry; `GPUBRIDGE_VERBS_GPU_PATH=direct` fails rather than stage | IMPLEMENTED, SOFTWARE-VERIFIED (fake endpoint) |
+| Direct or staged, with the reason, in telemetry; `direct` only when nothing bounced (else `direct+bounce` with the bounced bytes); `GPUBRIDGE_VERBS_GPU_PATH=direct` fails rather than stage | IMPLEMENTED, SOFTWARE-VERIFIED (fake endpoint) |
 | Transport observations (`straggler.transport_observation/1` with `host`, `job`, `nic.pci_bus_id`) | IMPLEMENTED, SOFTWARE-VERIFIED (written on the MOCK test fabric, checked against the schema) |
 | Hardware kit: host verbs, GPU staged and direct, training, against Gloo and UCX | PREPARED, NOT RUN (`scripts/gpu/verbs_kit.py` ran on the MOCK fabric only; items 38 to 42) |
 | Any of the above on a software RDMA provider | not run: none available, and loading one needs privileges (EMULATED would need it) |
@@ -236,8 +240,11 @@ gathered from registered memory); a receive one (a slot). With rendezvous on
 registered memory, into memory the peer granted. No READ or atomic is posted.
 Without rendezvous the queue pairs grant no remote access (`qp_access_flags` 0)
 and no remote key exists; with it they grant remote write, and a remote key
-crosses the fabric only in a write grant, for memory registered for that one
-receive (it is never logged or reported). Several requests are posted as one
+crosses the fabric only in a write grant: the key of a **write window**, a
+registration of exactly that receive's bytes made for it alone and deregistered
+once it is written (never logged or reported). No other registration is remotely
+writable: not the slots, and not the cached registrations of caller memory, which
+are local-only. Several requests are posted as one
 chained list (one doorbell).
 
 **Guarantees this rests on (RC):** messages on one queue pair arrive once, in
@@ -292,7 +299,7 @@ way checks the data path.
 | Bytes | Field |
 | --- | --- |
 | 0-1 | magic `0x4256` |
-| 2 | protocol version (1) |
+| 2 | protocol version (2) |
 | 3 | kind: 1 data, 2 credit, 3 goodbye, 4 clear to write, 5 clear to send in chunks, 6 written |
 | 4-7 | sequence number of this message on this queue pair, from 0, wrapping |
 | 8-11 | payload bytes after the header (0 for credit and goodbye) |
@@ -329,7 +336,13 @@ the receive and cleared it:
   tag, length, address, key): the sender RDMA WRITEs the payload there (from its
   registered memory directly, or slot by slot from plain memory), then SENDs a
   **written** message (kind 6). The receive completes when that message is
-  polled, by which time RC has placed the writes before it.
+  polled, by which time RC has placed the writes before it. The key is the
+  receive's own write window (`Registrar::expose`): a separate, uncached
+  registration of `[address, address + length)` with remote write, made when the
+  receive is posted (for a dma-buf, from a fresh export of the pages around it)
+  and deregistered as soon as its "written" message is polled, so a write before,
+  after or past "written" fails with `REM_ACCESS_ERR` instead of landing in a
+  neighbouring tensor or a later call's memory.
 - into plain memory, with **clear to send in chunks** (kind 5): the message then
   goes as data chunks like any other.
 
@@ -387,17 +400,32 @@ that peer, or the whole endpoint when it names no queue pair. A lost peer is
 noticed when something is sent to it; a receive from a peer that died silently
 waits for its deadline.
 
+**Failure is cancellation.** An operation fails (a completion error, a lost or
+departed peer, a protocol error, a deadline the caller turns into `abort`) only
+by being cancelled, under the endpoint's lock, before anyone can be told: it
+leaves every queue, a chunk arriving for it is dropped, its posted chunks stop
+counting for it. A wait that sees a failed operation fails the endpoint, and a
+failed endpoint cancels every operation and posts nothing more (no chunks, no
+credits). So once `wait` has reported a failure, nothing copies to or from the
+caller's plain memory again, which is what `send`/`recv`'s contracts (Rust and C)
+promise; it no longer rests on the Python bridge calling `abort` first.
+
 **Registered memory and failures.** A receive granted a write that fails
-(deadline, lost peer, abort) stays in the endpoint's table, failed, holding its
-registration: the peer may have been writing until its queue pair reached the
-error state, so the registration (and the memory: the Python bridge keeps such
-tensors) is released only when the endpoint closes. Sends from registered memory
-hold their regions through their work requests, as slots do.
+(deadline, lost peer, abort) gives its write window to its peer's queue pair: the
+peer may have been writing until that queue pair reached the error state, so the
+window, and the registration it lies in, are deregistered only once the queue
+pair is closed (and never, if it didn't drain). Until then that peer can still
+write those bytes (only those), so the Python bridge keeps such tensors until the
+endpoint closes, and aborts on a failure, which moves every queue pair to the
+error state. Sends from registered memory hold their regions through their work
+requests, as slots do.
 
 **Teardown.** Closing first sends each connected peer a goodbye (best effort,
 up to a second for it to complete), so the peer takes what follows as a close,
 not a failure: messages that arrived before it stay receivable, receives that
-can no longer be met fail at once, sends to it are refused. Then every
+can no longer be met fail at once, new sends to it are refused, and sends queued
+to it or part-way fail at once with "member N closed its end of the bridge"
+(posted chunks still complete). Then every
 operation is cancelled under the endpoint's lock (from then on nothing reads
 or writes caller memory), every queue pair moves to the error state, the
 completion thread takes the flushed completions until none is outstanding or
@@ -478,14 +506,22 @@ its own, so ROCr's is used, as ROCm's headers document it.
   out again at the same address is a different owner, and its stale entry is
   dropped (or the registration refused while posted work still holds it, as the
   memory was freed too early). The cached range is rounded out to 2 MiB inside
-  the allocation, so tensors of one allocator segment share it. The cache is
+  the allocation, so tensors of one allocator segment share it; that is why it is
+  registered local-only, and a peer writes only through a receive's own window.
+- *Fork safety.* When an endpoint opens, before it registers anything, it asks
+  `ibv_is_fork_initialized` (looked up at run time; rdma-core 35 and later). If
+  the kernel keeps registered pages with the parent on `fork()` (Linux 5.13 and
+  later), nothing is done; otherwise, or when the library can't say, it calls
+  `ibv_fork_init`, and if that fails (memory was already registered elsewhere in
+  the process) it refuses to open, saying to set `RDMAV_FORK_SAFE=1`. Telemetry's
+  `fork_safety` says which. The cache is
   bounded (`GPUBRIDGE_VERBS_DEVICE_CACHE_BYTES`, 8 GiB, 256 entries; host 8 GiB,
   64 entries), evicting idle entries only.
 - *Holding a pointer is not holding the memory.* A dma-buf import pins the
   exported memory while registered; the peer-memory module pins GPU pages and
   revokes the registration if the allocation is freed. The NIC touches a
-  registration only while work posted with it is outstanding or a peer holds a
-  grant for a pending receive; the Python bridge holds the tensors until then
+  registration only while work posted with it is outstanding or a peer holds the
+  window of a pending receive in it; the Python bridge holds the tensors until then
   (and, after a failure, until the endpoint closes).
 - *Descriptors.* An exported dma-buf descriptor is owned by its region and closed
   exactly once, after `ibv_dereg_mr` returns; if registering fails it is closed at
@@ -505,7 +541,9 @@ the UCX bridge does it):
   GPU's flush runs (nothing where the GPU orders such writes itself);
 - a message below the rendezvous size can't be written into device memory: it
   arrives in a pinned bounce buffer and is copied to the GPU on the caller's
-  stream, after the wait and before the kernels that read it.
+  stream, after the wait and before the kernels that read it. The call is then
+  not `direct` but `direct+bounce`, its reason giving the bounced receives and
+  bytes (also in `last_gpu` and in the observations' `bounced_bytes`).
 
 ## Telemetry
 
@@ -515,17 +553,21 @@ whose name carries rdma-core's version, or `MOCK: ...`), `mock`, `library`
 (the crate's version), `device`, `port`, `link_layer`, `gid_index`, `gid_type`,
 `active_mtu`, `firmware`, `vendor_id`, `vendor_part_id`, `operations` (`RC
 SEND/RECV`, plus `RDMA WRITE (rendezvous)` when on), `rndv_bytes`, `gather`, the
-protocol settings, `state`, `failure`, counts (operations, bytes, chunks, control
+protocol settings, `fork_safety` (what the open found and did), `state`,
+`failure`, counts (operations, bytes, chunks, control
 messages, credit stalls, unexpected and held bytes, completions, errors,
 notifications, asynchronous events, batches, grants and "go"s sent and received,
 writes and their bytes, "written" messages, bytes moved in place from registered
-host and device memory, bytes the CPU copied), `direct` (the GPU driver and its
-version or why it didn't load, which methods are enabled, registrations by
-method, failures and the last reason, both caches' entries, bytes, hits, misses,
+host and device memory, bytes the CPU copied, write windows deregistered once
+written and kept after a failure), `direct` (the GPU driver and its version or why
+it didn't load, which methods are enabled, registrations by method,
+`cached_access` (`local`), write windows made and their bytes, failures and the
+last reason, both caches' entries, bytes, hits, misses,
 evictions, stale entries, invalidations, refusals), and per peer its queue pair
 number, path MTU, whether it said goodbye and why it was lost. The Python bridge
-adds `path` and `path_reason` of the last call, `last_gpu` (device, method,
-flush, stream waits and flushes), `paths`, `gpu_path_setting`, `gpus` (each GPU's
+adds `path` (`host`, `direct`, `direct+bounce`, `staged`) and `path_reason` of
+the last call, `last_gpu` (device, method, flush, stream waits and flushes,
+bounced receives and bytes), `paths`, `gpu_path_setting`, `gpus` (each GPU's
 direct-path support: driver, flush, capabilities or reason), operation counts by
 memory kind, and the observation emitter's counts. A remote key is never kept
 where telemetry reads, and the tests check no key-like name appears.
@@ -546,7 +588,8 @@ object per line:
 - `nic`: `device`, `port`, `gid_index`, `link_layer` (`InfiniBand` or
   `Ethernet`), `rate_gbps` and `pci_bus_id` (from `/sys/class/infiniband`, null
   where absent, as on the test fabric); `peer_nic` from the peer's handshake;
-- `path` (`direct` or `staged`) for GPU tensors; `step` when the caller sets
+- `path` (`direct`, `direct+bounce` or `staged`) for GPU tensors, and on a
+  `direct+bounce` call's receive records `bounced_bytes`; `step` when the caller sets
   `transport.step`; `collective` (the call's sequence number; unknown fields are
   ignored by the detector).
 
@@ -600,7 +643,10 @@ and cross-vendor (step 07) runs are separate records:
    bandwidth sweep, SHA-256 of every buffer on both sides, CPU time;
 3. `verbs_host`, `verbs_gpu_staged`, `verbs_gpu_direct`: the collectives on host
    tensors, then GPU tensors staged and direct, exactly against Gloo, each call's
-   path and reason recorded and required;
+   path, reason and bounced bytes recorded and the path required. `direct` means
+   nothing bounced (`direct+bounce` fails the step), so `verbs_gpu_direct` runs
+   with `GPUBRIDGE_VERBS_RNDV_BYTES=1`: every message by rendezvous, written in
+   place;
 4. `check_verbs`, `bench_verbs`: every check stage and the bridge-phase benchmark
    over `bridge="verbs"`, the Gloo and UCX bridges' runs in the same job as the
    matched references;
@@ -624,7 +670,12 @@ receive's deadline and abort (it never lands), a completion surfacing after an
 abort, a lost peer, a failed completion, a fatal device event, a port going
 down, closing with sends and receives outstanding (everything released, no
 violation), goodbye semantics, three members, mismatched versions, settings and
-link layers, the path MTU, and the selection rules.
+link layers, the path MTU, and the selection rules. With a bare queue pair as a
+member (`tests/common`): a peer breaking the protocol while another member's plain
+send and receive are part-way, after which nothing more is copied though credits
+come back and chunks keep arriving; sends queued to a member that said goodbye
+failing at once with its reason; and fork safety at open for each status and a
+failing `ibv_fork_init`, before any registration.
 
 Rust, registered memory on the in-process mock with a mock GPU (`tests/direct.rs`):
 dma-buf chosen first, peer memory when dma-buf is unsupported or its export
@@ -639,8 +690,11 @@ below the rendezvous size refused into it; every pairing of plain, registered
 host and device memory at a size spanning several slots; a waiting message
 holding up only its own tag; a grant of the wrong size failing both sides;
 receives into device memory refused with rendezvous off; aborting with a write
-granted keeping the registration until close; and telemetry with no key-like
-name. `gpu.rs`'s own tests: the peer-memory module found in sysfs or
+granted keeping the window and its registration until close; cached
+registrations local-only; a bare queue pair granted a write into host, dma-buf and
+peer memory failing to write the byte before or after the receive and, once its
+"written" message is in, anything at all (the window deregistered), the
+neighbours untouched; and telemetry with no key-like name. `gpu.rs`'s own tests: the peer-memory module found in sysfs or
 `/proc/modules` fixtures, a missing driver an `Unsupported` error, a mock
 reallocation getting a new buffer ID.
 
@@ -759,12 +813,23 @@ opens a device is ignored, and belongs on an allocated node:
   retry/RNR settings, RoCE GID choice, `IBVERBS_1.12`'s `ibv_reg_dmabuf_mr`, RDMA
   WRITE and its access checks on a real NIC, every GPU driver call, dma-buf import by
   the NIC's driver, and whether the flush rules are enough on each GPU.
-- **Remote write exposure.** With rendezvous on, a registered region keeps its
-  remote-write right while cached; the peer gets its key only in a grant for one
-  receive, but a buggy or hostile peer that kept a key could write into that region
-  later (memory the cache still maps, possibly holding another tensor by then). The
-  bridge trusts its peers, as RDMA jobs do; memory windows or deregistering after
-  each receive would close it at a cost.
+- **Remote write exposure that remains.** With rendezvous on, the queue pairs
+  allow remote write, and a granted peer can write any bytes into the receive's
+  window (exactly the receive's range) until its "written" message is polled; a
+  wrong grant of the right length bound by tag (a peer bug) still lands there. If
+  the receive fails, that peer can keep writing its window until its queue pair
+  is in the error state (the Python bridge aborts, which does that at once; a Rust
+  or C caller that doesn't must keep the memory until `abort` or `close`). No
+  cached or send-side registration is remotely writable. The bridge trusts its
+  peers, as RDMA jobs do.
+- **A registration per rendezvous receive.** Each window is an `ibv_reg_mr` (for
+  dma-buf memory, an export and `ibv_reg_dmabuf_mr` too) and a deregistration:
+  tens of microseconds or more per receive of at least `rndv_bytes`, not measured.
+  Type-2 memory windows bound per grant would be cheaper and are not used.
+- **`ibv_fork_init`'s cost.** Where the kernel isn't fork-safe, `ibv_fork_init`
+  marks every registered range's pages `MADV_DONTFORK`: a forked child (a
+  DataLoader worker) that touches other data on those pages faults. Kernels from
+  5.13 don't need it, and then it isn't called.
 - **Freed GPU memory under a cached registration.** The analysis that this is safe
   rests on dma-buf imports pinning the exported memory and on the peer-memory
   module revoking registrations; both are drivers' documented behaviour, not
@@ -779,4 +844,8 @@ opens a device is ignored, and belongs on an allocated node:
   path; peer loss is still noticed only when sending; messages buffered then held
   can stall pathological orderings until the deadline (A2's risks stand).
 - **Linux clippy** for this phase is BLOCKED (login-node limits), so lints of the
-  `ibverbs` cfg are checked only by A2's run and the CI job.
+  `ibverbs` cfg are checked only by A2's run and the CI job. Of the fork-safety
+  calls added after the review, the shim's compiled cleanly with gcc against
+  rdma-core v57.0 on an Explorer login node and reported that node fork-safe
+  (`unneeded`, kernel 5.14); `ibv.rs`'s were not compiled there (rustc was killed
+  twice: BLOCKED, login-node limits).

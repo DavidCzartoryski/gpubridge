@@ -149,6 +149,7 @@ def test_the_router_waits_for_the_stream_flushes_after_writes_and_bounces_small_
     assert order == ["sync", "flush", "sync"]
     finished = router.end()
     assert (finished.syncs, finished.flushes) == (2, 1)
+    assert (finished.bounced_ops, finished.bounced_bytes) == (1, 100)
     assert (router.in_place_ops, router.plain_ops, router.bounced_ops) == (4, 1, 1)
 
 
@@ -232,6 +233,77 @@ def test_direct_only_when_every_check_passes_and_registration_succeeds(monkeypat
     # An empty tensor has nothing to register.
     plan = _planner(FakeEndpoint(), monkeypatch)._plan(torch.ones(0), scratch_numel=0)
     assert (plan.path, plan.reason) == ("staged", "an empty tensor: nothing to register")
+
+
+class Records:
+    """Stands in for the observation emitter."""
+
+    def __init__(self) -> None:
+        self.records: list[dict] = []
+
+    def emit(self, record: dict) -> None:
+        observe.check_record(record)
+        self.records.append(record)
+
+    def stats(self) -> dict:
+        return {"emitted": len(self.records)}
+
+
+def test_direct_is_reported_only_when_nothing_bounced_else_the_split(monkeypatch):
+    endpoint = FakeEndpoint(rndv=1024)
+    planner = _planner(endpoint, monkeypatch)
+    planner.worker.bounce = lambda n: torch.zeros(n, dtype=torch.uint8)  # no pinned memory here
+    planner.emitter = Records()
+    tensor = torch.zeros(4096, dtype=torch.uint8)
+    base = tensor.data_ptr()
+
+    def call(*sizes):
+        endpoint.registrations = [Registration(1, 0, 0, "dmabuf")]
+        plan = planner._plan(tensor, scratch_numel=0)
+        assert plan.path == "direct"
+        plan.sync = lambda: None  # no CUDA stream here
+
+        def run(_):
+            router, at, ids = planner.worker, base, []
+            for n in sizes:
+                ids.append(router.recv(1, at, n, tag=len(ids)))
+                at += n
+            router.wait(ids, 0)
+
+        planner.emitter.records.clear()
+        planner._run("direct", plan, tensor, run)
+        return planner.last, planner.emitter.records
+
+    # Every receive at the rendezvous size or above: written in place, "direct".
+    last, records = call(2048, 1024)
+    assert (last["path"], last["path_reason"]) == ("direct", "registered by dmabuf")
+    assert (last["gpu"]["bounced_ops"], last["gpu"]["bounced_bytes"]) == (0, 0)
+    assert [r["path"] for r in records] == ["direct"]
+    assert "bounced_bytes" not in records[0]
+    # One below it came through a bounce buffer: "direct+bounce", and how much.
+    last, records = call(2048, 100, 28)
+    assert last["path"] == "direct+bounce"
+    assert last["path_reason"] == (
+        "registered by dmabuf; 128 bytes in 2 receives below the rendezvous size "
+        f"({vt.RNDV_BYTES_ENV}=1024) came through a pinned host bounce buffer")
+    assert (last["gpu"]["bounced_ops"], last["gpu"]["bounced_bytes"]) == (2, 128)
+    assert [(r["path"], r["bytes"], r["bounced_bytes"]) for r in records] == [
+        ("direct+bounce", 2176, 128)]
+    assert planner.paths == {"host": 0, "direct": 1, "direct+bounce": 1, "staged": 0}
+    t = planner.telemetry()
+    assert t["path"] == "direct+bounce" and t["last_gpu"]["bounced_bytes"] == 128
+
+
+def test_close_still_closes_the_endpoint_when_a_buffer_is_still_in_use(monkeypatch):
+    endpoint = FakeEndpoint()
+    endpoint.invalidate_host = lambda owner: 1  # still in use: HostBuffer.drop() raises
+    closed = []
+    endpoint.close = lambda timeout: closed.append(timeout) or True
+    planner = _planner(endpoint, monkeypatch)
+    planner._host_scratch.get(64)
+    planner.close()
+    assert closed, "the endpoint was closed anyway"
+    assert planner._host_scratch.buffer is not None, "the buffer was kept until then"
 
 
 def test_driver_support_is_checked_once_per_gpu(monkeypatch):

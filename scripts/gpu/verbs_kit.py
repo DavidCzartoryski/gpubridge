@@ -29,8 +29,13 @@ through torchrun's store.
 size on ``--memory host`` or ``gpu`` tensors, checked exactly against a Gloo
 all_reduce of the same integer-valued data. With ``--expect-path direct|staged`` every
 GPU call must have taken that path (``GPUBRIDGE_VERBS_GPU_PATH=direct`` makes a
-direct path that can't run fail loudly rather than stage). ``--bridge gloo`` or ``ucx``
-runs the same sizes as matched references (their records have no verbs telemetry).
+direct path that can't run fail loudly rather than stage). ``direct`` means nothing
+bounced: a call with any receive through a host bounce buffer (below
+``GPUBRIDGE_VERBS_RNDV_BYTES``) is ``direct+bounce``, which fails ``--expect-path
+direct``; every call records its bounced bytes, and the run their total
+(``bounced_bytes``). The direct step therefore runs with ``GPUBRIDGE_VERBS_RNDV_BYTES=1``,
+so every message goes by rendezvous. ``--bridge gloo`` or ``ucx`` runs the same sizes
+as matched references (their records have no verbs telemetry).
 
     torchrun --nnodes=2 --nproc-per-node=1 ... scripts/gpu/verbs_kit.py endpoint --out OUT
     GPUBRIDGE_VERBS_GPU_PATH=direct torchrun ... scripts/gpu/verbs_kit.py collectives \\
@@ -230,8 +235,22 @@ def collectives_mode(args, rank: int, world: int) -> dict:
     bridge = topology.bridge
     out = {"rank": rank, "host": socket.gethostname(), "bridge": args.bridge,
            "memory": args.memory, "leader": bridge is not None, "calls": [],
-           "mismatches": 0, "path_violations": 0}
+           "mismatches": 0, "path_violations": 0, "bounced_bytes": 0}
     tele0 = bridge.telemetry() if bridge is not None and hasattr(bridge, "telemetry") else None
+
+    def path_of(call: dict) -> None:
+        """The call's path and bounced bytes from the bridge; counts a violation when it
+        isn't --expect-path (direct+bounce isn't direct)."""
+        if bridge is None or not hasattr(bridge, "telemetry"):
+            return
+        t = bridge.telemetry()
+        gpu = t.get("last_gpu") or {}
+        call.update(path=t.get("path"), path_reason=t.get("path_reason"), last_gpu=gpu or None,
+                    bounced_bytes=gpu.get("bounced_bytes", 0))
+        out["bounced_bytes"] += call["bounced_bytes"]
+        if args.expect_path and args.memory == "gpu" and t.get("path") != args.expect_path:
+            out["path_violations"] += 1
+
     moved = 0
     with Window() as w:
         for n in sizes(args.max_bytes):
@@ -253,12 +272,7 @@ def collectives_mode(args, rank: int, world: int) -> dict:
             out["mismatches"] += not ok
             call = {"op": "all_reduce", "bytes": numel * 4, "seconds": elapsed, "exact": ok,
                     "sha256": sha(got.numpy())}
-            if bridge is not None and hasattr(bridge, "telemetry"):
-                t = bridge.telemetry()
-                call.update(path=t.get("path"), path_reason=t.get("path_reason"),
-                            last_gpu=t.get("last_gpu"))
-                if args.expect_path and args.memory == "gpu" and t.get("path") != args.expect_path:
-                    out["path_violations"] += 1
+            path_of(call)
             out["calls"].append(call)
             moved += numel * 4
             src = topology.world_size - 1
@@ -267,7 +281,9 @@ def collectives_mode(args, rank: int, world: int) -> dict:
             want = (torch.arange(numel, dtype=torch.float32) % 1024) + src + 1000 * src
             ok = bool(torch.equal(tensor.cpu(), want))
             out["mismatches"] += not ok
-            out["calls"].append({"op": "broadcast", "bytes": numel * 4, "exact": ok})
+            call = {"op": "broadcast", "bytes": numel * 4, "exact": ok}
+            path_of(call)
+            out["calls"].append(call)
     device_name = (tele0 or {}).get("device")
     out["window"] = w.record(moved, device_name)
     if bridge is not None and hasattr(bridge, "telemetry"):

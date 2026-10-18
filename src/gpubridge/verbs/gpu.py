@@ -79,6 +79,10 @@ class CallState:
     log: CallLog = field(default_factory=CallLog)
     syncs: int = 0
     flushes: int = 0
+    #: Receives into device memory that came through a host bounce buffer (below the
+    #: rendezvous size), and their bytes: a call with any isn't purely direct.
+    bounced_ops: int = 0
+    bounced_bytes: int = 0
 
 
 class Router:
@@ -157,10 +161,15 @@ class Router:
                 # Below the rendezvous size the message arrives in host slots: take it
                 # into a bounce buffer and copy it to the GPU on the caller's stream.
                 self.bounced_ops += 1
+                self.call.bounced_ops += 1
+                self.call.bounced_bytes += nbytes
                 bounce = self.bounce(nbytes)
                 op = self.endpoint.recv(member, bounce.data_ptr(), nbytes, tag)
                 start = pointer - span.view.data_ptr()
                 self.call.bounces[op] = (span.view[start:start + nbytes], bounce)
+                self._log(op, member, "recv", nbytes)
+                self.call.log.bounced(op, nbytes)
+                return op
         elif nbytes and (reg := self._host(pointer, nbytes)) is not None:
             self.in_place_ops += 1
             op = self.endpoint.recv_reg(member, reg, pointer, nbytes, tag)

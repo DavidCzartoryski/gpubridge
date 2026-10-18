@@ -115,11 +115,13 @@ if [ "$VERBS_BRIDGE" = 1 ]; then
         --out "$RESULTS/verbs_host" --max-bytes "$BENCH_MAX_BYTES" --require-no-tcp
     for path in staged direct; do
         export GPUBRIDGE_VERBS_GPU_PATH="$path"
+        # Direct means nothing bounced: every message by rendezvous, written in place.
+        if [ "$path" = direct ]; then export GPUBRIDGE_VERBS_RNDV_BYTES=1; fi
         step "verbs_gpu_$path" multinode "verbs-gpu-$path" "$KIT_DIR/verbs_kit.py" collectives \
             --memory gpu --expect-path "$path" --out "$RESULTS/verbs_gpu_$path" \
             --max-bytes "$BENCH_MAX_BYTES" --require-no-tcp
     done
-    unset GPUBRIDGE_VERBS_GPU_PATH
+    unset GPUBRIDGE_VERBS_GPU_PATH GPUBRIDGE_VERBS_RNDV_BYTES
     step check_verbs multinode check-verbs "$KIT_DIR/check.py" --out "$RESULTS/check_verbs" \
         --bridge verbs
     step summarize_verbs python "$KIT_DIR/summarize.py" "$RESULTS/check_verbs"

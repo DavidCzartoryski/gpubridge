@@ -14,7 +14,10 @@ which and why (``telemetry()["path"]``, ``["path_reason"]``):
 
 - **direct**: the tensor's memory is registered with the NIC (a dma-buf, else NVIDIA
   peer memory; :mod:`gpubridge.verbs.gpu`), sent and written in place, ordered against
-  the caller's stream and flushed before GPU work reads it;
+  the caller's stream and flushed before GPU work reads it. A receive below
+  ``GPUBRIDGE_VERBS_RNDV_BYTES`` can't be written in place: it comes through a pinned
+  bounce buffer, and a call with any such receive is **direct+bounce**, its reason
+  saying how many bytes (``last_gpu["bounced_bytes"]``);
 - **staged**: copied through a pinned host buffer registered with the NIC, on the
   caller's stream (``GPUBRIDGE_VERBS_GPU_PATH=staged`` forces it; ``direct`` refuses to
   stage and fails the call with the reason instead).
@@ -204,7 +207,7 @@ class VerbsTransport(TaggedBridge):
         self.peer_nics = peer_nics or {}
         #: The training step to put in observations, if the caller sets it.
         self.step: int | None = None
-        self.paths = {"host": 0, "direct": 0, "staged": 0}
+        self.paths = {"host": 0, "direct": 0, "direct+bounce": 0, "staged": 0}
         self.last: dict = {"path": None, "path_reason": None, "gpu": None}
         self._support: dict[int, Support] = {}
         self._drivers: dict[str, str] = {}
@@ -425,12 +428,20 @@ class VerbsTransport(TaggedBridge):
             if direct and status == "ok":
                 for span in plan.spans:
                     router.endpoint.release(span.registration)
+            reason = plan.reason if plan else None
+            if direct and call.bounced_bytes:
+                # Not purely direct: say so, and how much was staged.
+                path = "direct+bounce"
+                reason = (f"{reason}; {call.bounced_bytes} bytes in {call.bounced_ops} receives "
+                          f"below the rendezvous size ({RNDV_BYTES_ENV}={router.rndv}) came "
+                          "through a pinned host bounce buffer")
             self.paths[path] += 1
-            self.last = {"path": path, "path_reason": plan.reason if plan else None,
+            self.last = {"path": path, "path_reason": reason,
                          "gpu": None if plan is None else {
                              "device": plan.device, "method": plan.method,
                              "flush": plan.flush, "syncs": call.syncs,
-                             "flushes": call.flushes}}
+                             "flushes": call.flushes, "bounced_ops": call.bounced_ops,
+                             "bounced_bytes": call.bounced_bytes}}
             self._observe(call, path, status, error)
 
     def _observe(self, call, path: str, status: str, error: str | None) -> None:
@@ -451,8 +462,9 @@ class VerbsTransport(TaggedBridge):
         and its file), device, port, link layer, GID, MTUs, protocol version and
         operations, failure, counts (copied and in-place bytes, rendezvous messages), the
         registrations (``direct``); then the last call's ``path`` (``host``, ``direct``,
-        ``staged``) and ``path_reason``, per-path counts, each GPU's direct-path support
-        and the observation emitter's counts. Never a remote key."""
+        ``direct+bounce``, ``staged``) and ``path_reason``, ``last_gpu`` (with the call's
+        bounced receives), per-path counts, each GPU's direct-path support and the
+        observation emitter's counts. Never a remote key."""
         router = self.worker
         gpus = {str(i): {"direct": s.ok, "reason": s.reason or None, "driver": s.driver,
                          "flush": s.flush.method if s.flush else None,
@@ -481,9 +493,15 @@ class VerbsTransport(TaggedBridge):
         if healthy:
             # Between collectives nothing uses the staging buffers: drop their
             # registrations, then the buffers.
-            for staging in self._staging.values():
-                staging.close()
-            self._host_scratch.drop()
+            try:
+                for staging in self._staging.values():
+                    staging.close()
+                self._host_scratch.drop()
+            except verbs.TransportError as exc:
+                # Something still uses one: keep every buffer and close the endpoint as
+                # a failed one would be (below), so it is still closed.
+                verbs.log.warning("gpubridge: closing the verbs bridge: %s; keeping its "
+                                  "buffers until the endpoint has closed", exc)
         drained = self.worker.close(timeout=min(10.0, self.timeout))
         if not drained:
             # Still registered: never free any of it.

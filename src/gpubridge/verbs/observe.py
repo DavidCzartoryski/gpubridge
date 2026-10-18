@@ -207,12 +207,18 @@ class CallLog:
         self.bytes: dict[tuple[int, str], int] = {}
         self.ops: dict[int, tuple[int, str]] = {}
         self.done: dict[tuple[int, str], float] = {}
+        #: Bytes of those that went through a host bounce buffer (direct path only).
+        self.bounce: dict[tuple[int, str], int] = {}
 
     def posted(self, op: int, peer: int, direction: str, nbytes: int) -> None:
         key = (peer, direction)
         self.start.setdefault(key, time.monotonic())
         self.bytes[key] = self.bytes.get(key, 0) + nbytes
         self.ops[op] = key
+
+    def bounced(self, op: int, nbytes: int) -> None:
+        key = self.ops[op]
+        self.bounce[key] = self.bounce.get(key, 0) + nbytes
 
     def completed(self, ops) -> None:
         now = time.monotonic()
@@ -231,6 +237,8 @@ class CallLog:
                       "peer": members[peer], "peer_nic": peer_nics.get(peer),
                       "op": direction, "bytes": self.bytes[(peer, direction)],
                       "duration_s": max(0.0, end - start), "status": status}
+            if (peer, direction) in self.bounce:
+                record["bounced_bytes"] = self.bounce[(peer, direction)]
             if error is not None:
                 record["error"] = error
             out.append(record)
