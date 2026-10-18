@@ -68,6 +68,9 @@ HARDWARE-VERIFIED: tested on RDMA hardware.
 
 ## Bindings
 
+The integration audit's [capability matrix](VERBS_CAPABILITIES.md) maps these
+claims to implementation symbols, software checks and remaining hardware gates.
+
 What the transport needs from libibverbs: device listing and opening, port
 and GID queries (with the GID type, for RoCE v2), protection domains,
 completion queues, RC queue pairs and `ibv_modify_qp`, `ibv_reg_mr`, and for
