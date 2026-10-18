@@ -13,8 +13,11 @@
 //! posted: an infinite RNR retry) and acknowledges; the acknowledgement completes the
 //! send. A send whose peer node is gone, or whose destination queue pair doesn't exist
 //! or isn't connected back with matching PSNs, completes with `RetryExcErr`. Completion
-//! channels and notifications work as in verbs. There are no asynchronous events, RDMA
-//! writes or reads.
+//! channels and notifications work as in verbs. RDMA WRITEs land in the peer's memory
+//! in queue pair order with the sends (a write behind a send waiting for its receive
+//! waits too), only where the peer's queue pair grants remote writes and a region with
+//! that key and remote write access covers them (else the writer sees `RemAccessErr`).
+//! There are no asynchronous events, writes with immediate data, or reads.
 //!
 //! No thread blocks on a socket while holding the node's lock: every frame leaves through
 //! one sender thread's queue, so frames of one queue pair keep their order.
@@ -56,6 +59,13 @@ const ACK_OK: u8 = 0;
 const ACK_TOO_LONG: u8 = 1;
 /// No such queue pair, or not connected to the sender (the sender sees `RetryExcErr`).
 const ACK_NO_QP: u8 = 2;
+/// A write the target doesn't allow (the sender sees `RemAccessErr`).
+const ACK_ACCESS: u8 = 3;
+
+/// The kind byte of a data frame.
+const DATA_SEND: u8 = 0;
+const DATA_SEND_IMM: u8 = 1;
+const DATA_WRITE: u8 = 2;
 
 fn verbs(call: &'static str, errno: i32) -> Error {
     Error::Verbs { call, errno }
@@ -90,6 +100,8 @@ struct Arrived {
     seq: u64,
     src_lid: u16,
     imm: Option<u32>,
+    /// An RDMA WRITE to (address, key) rather than a send.
+    write: Option<(u64, u32)>,
     payload: Vec<u8>,
 }
 
@@ -107,6 +119,8 @@ struct Qp {
     unacked: VecDeque<Unacked>,
     rq: VecDeque<(u64, Vec<RawSge>)>,
     arrived: VecDeque<Arrived>,
+    /// The remote access it grants (from `Init`).
+    access: Access,
 }
 
 #[derive(Default)]
@@ -384,8 +398,12 @@ impl Shared {
     fn data(&self, from: u16, b: &[u8]) {
         let (src_qpn, dst_qpn, psn, seq) =
             (u32_at(b, 0), u32_at(b, 4), u32_at(b, 8), u64_at(b, 12));
-        let imm = (b[20] != 0).then(|| u32_at(b, 21));
-        let payload = b[25.min(b.len())..].to_vec();
+        let (imm, write, start) = match b[20] {
+            DATA_SEND_IMM => (Some(u32_at(b, 21)), None, 25),
+            DATA_WRITE if b.len() >= 33 => (None, Some((u64_at(b, 25), u32_at(b, 21))), 33),
+            _ => (None, None, 25),
+        };
+        let payload = b[start.min(b.len())..].to_vec();
         let mut st = lock(&self.state);
         let target = st.by_qpn.get(&dst_qpn).copied().filter(|h| {
             let q = &st.qps[h];
@@ -400,6 +418,7 @@ impl Shared {
             seq,
             src_lid: from,
             imm,
+            write,
             payload,
         });
         let acks = deliver(&mut st, qp);
@@ -426,6 +445,7 @@ impl Shared {
                         push(&mut st, cq, wr_id, qpn, WcStatus::Success, 0, None);
                     }
                     ACK_TOO_LONG => fail_head(&mut st, qp, WcStatus::RemInvReqErr),
+                    ACK_ACCESS => fail_head(&mut st, qp, WcStatus::RemAccessErr),
                     _ => fail_head(&mut st, qp, WcStatus::RetryExcErr),
                 }
             }
@@ -544,8 +564,42 @@ fn deliver(st: &mut State, qp: Handle) -> Vec<Outgoing> {
     let mut acks = Vec::new();
     loop {
         let q = st.qps.get_mut(&qp).unwrap();
-        if q.state == QpState::Err || q.arrived.is_empty() || q.rq.is_empty() {
+        let Some(front) = q.arrived.front() else {
             return acks;
+        };
+        if q.state == QpState::Err || (front.write.is_none() && q.rq.is_empty()) {
+            return acks;
+        }
+        if let Some((addr, key)) = front.write {
+            let msg = q.arrived.pop_front().unwrap();
+            let (pd, granted) = (q.pd, q.access.contains(Access::REMOTE_WRITE));
+            let peer_qpn = q.peer.map_or(0, |p| p.1);
+            let len = msg.payload.len() as u64;
+            let target = st.mrs.values().find(|m| {
+                m.pd == pd
+                    && m.lkey == key
+                    && m.access.contains(Access::REMOTE_WRITE)
+                    && addr >= m.addr
+                    && addr.checked_add(len).is_some_and(|e| e <= m.addr + m.len)
+            });
+            let status = match target {
+                Some(_) if granted => {
+                    // SAFETY: inside a registered, remotely writable region (checked
+                    // above), kept valid by Provider::reg_mr's contract; the payload is a
+                    // separate buffer.
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            msg.payload.as_ptr(),
+                            addr as usize as *mut u8,
+                            msg.payload.len(),
+                        )
+                    };
+                    ACK_OK
+                }
+                _ => ACK_ACCESS,
+            };
+            acks.push((msg.src_lid, ack_frame(peer_qpn, msg.seq, status)));
+            continue;
         }
         let msg = q.arrived.pop_front().unwrap();
         let (wr_id, sges) = q.rq.pop_front().unwrap();
@@ -853,6 +907,7 @@ impl Provider for UdsProvider {
                 unacked: VecDeque::new(),
                 rq: VecDeque::new(),
                 arrived: VecDeque::new(),
+                access: Access::NONE,
             },
         );
         st.by_qpn.insert(qpn, h);
@@ -870,6 +925,7 @@ impl Provider for UdsProvider {
         match transition {
             Transition::Init(a) if q.state == QpState::Reset && a.port == 1 => {
                 q.state = QpState::Init;
+                q.access = a.access;
             }
             Transition::Rtr { attr, .. } if q.state == QpState::Init => {
                 let Address::Ib { lid, .. } = attr.address else {
@@ -959,12 +1015,13 @@ impl Provider for UdsProvider {
     }
 
     fn post_send(&self, qp: Handle, wr_id: u64, op: &SendOp, sges: &[RawSge]) -> Result<()> {
-        let imm = match op {
-            SendOp::Send => None,
-            SendOp::SendWithImm(imm) => Some(*imm),
-            _ => {
+        let (imm, write) = match op {
+            SendOp::Send => (None, None),
+            SendOp::SendWithImm(imm) => (Some(*imm), None),
+            SendOp::Write(remote) => (None, Some(*remote)),
+            SendOp::WriteWithImm(..) => {
                 return Err(Error::Unsupported(
-                    "the test fabric has no RDMA writes".into(),
+                    "the test fabric has no RDMA writes with immediate data".into(),
                 ))
             }
         };
@@ -1000,8 +1057,21 @@ impl Provider for UdsProvider {
         b.extend_from_slice(&dst.to_le_bytes());
         b.extend_from_slice(&psn.to_le_bytes());
         b.extend_from_slice(&seq.to_le_bytes());
-        b.push(u8::from(imm.is_some()));
-        b.extend_from_slice(&imm.unwrap_or(0).to_le_bytes());
+        match write {
+            Some(remote) => {
+                b.push(DATA_WRITE);
+                b.extend_from_slice(&remote.rkey.to_le_bytes());
+                b.extend_from_slice(&remote.addr.to_le_bytes());
+            }
+            None => {
+                b.push(if imm.is_some() {
+                    DATA_SEND_IMM
+                } else {
+                    DATA_SEND
+                });
+                b.extend_from_slice(&imm.unwrap_or(0).to_le_bytes());
+            }
+        }
         b.extend_from_slice(&payload);
         // Queued while the lock is held, so this queue pair's frames keep their order.
         self.shared.queue(lid, frame(FRAME_DATA, &b));

@@ -1,0 +1,505 @@
+//! Registered memory on the mock fabric with a mock GPU (docs/VERBS_TRANSPORT.md, "GPU
+//! memory"): which direct path is chosen and why the others weren't, dma-buf descriptors
+//! and registrations released in the right order, stale registrations dropped when an
+//! address is reused, and the rendezvous moving device and host memory in place.
+//! SOFTWARE-VERIFIED only: no GPU, no RDMA device.
+
+mod common;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use common::ib_fabric;
+use gpubridge_verbs::{
+    Call, Config, Endpoint, Fault, Method, MockFabric, MockGpu, NodeId, PeerModules, DEVICE_ROUND,
+};
+
+const LONG: Duration = Duration::from_secs(20);
+const RNDV: u64 = 4096;
+
+fn config(rndv: u64) -> Config {
+    Config {
+        slot_bytes: 1024,
+        credits: 4,
+        ctrl_credits: 2,
+        send_slots: 4,
+        rndv_bytes: rndv,
+        ..Config::default()
+    }
+}
+
+fn endpoints(fabric: &Arc<MockFabric>, nodes: &[NodeId], config: &Config) -> Vec<Endpoint> {
+    let n = nodes.len();
+    let eps: Vec<Endpoint> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &node)| Endpoint::new(fabric.provider(node), n, i, config.clone()).unwrap())
+        .collect();
+    let infos: Vec<String> = eps.iter().map(Endpoint::local_info).collect();
+    for (i, ep) in eps.iter().enumerate() {
+        for (j, info) in infos.iter().enumerate() {
+            if i != j {
+                ep.connect(j, info).unwrap();
+            }
+        }
+    }
+    eps
+}
+
+/// A fixture root with (or without) a loaded `nvidia_peermem`.
+fn modules(name: &str, loaded: bool) -> PeerModules {
+    // One directory per call: tests run in parallel threads of one process.
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let dir: PathBuf = std::env::temp_dir().join(format!(
+        "gbv-direct-{name}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("proc")).unwrap();
+    std::fs::write(dir.join("proc/modules"), "mlx5_ib 1 0 - Live 0x0\n").unwrap();
+    if loaded {
+        std::fs::create_dir_all(dir.join("sys/module/nvidia_peermem")).unwrap();
+    }
+    PeerModules::at(dir)
+}
+
+fn pair(rndv: u64, gpu: &MockGpu, peer_module: bool) -> (Arc<MockFabric>, Endpoint, Endpoint) {
+    let (fabric, a, b) = ib_fabric();
+    let mut eps = endpoints(&fabric, &[a, b], &config(rndv));
+    let eb = eps.pop().unwrap();
+    let ea = eps.pop().unwrap();
+    for (i, ep) in [&ea, &eb].into_iter().enumerate() {
+        ep.set_gpu(
+            Arc::new(gpu.clone()),
+            modules(&format!("pair{i}-{peer_module}"), peer_module),
+        );
+    }
+    (fabric, ea, eb)
+}
+
+fn pattern(n: usize, seed: u8) -> Vec<u8> {
+    (0..n)
+        .map(|i| (i as u8).wrapping_mul(29).wrapping_add(seed))
+        .collect()
+}
+
+#[test]
+fn dmabuf_is_chosen_first_then_peer_memory_and_otherwise_every_reason_is_given() {
+    let gpu = MockGpu::new();
+    let (_fabric, a, _b) = pair(RNDV, &gpu, true);
+    let va = gpu.alloc(0, 8 << 20);
+    let r = a.register_device(0, va + 4096, 1 << 20).unwrap();
+    assert_eq!(r.method(), Method::DmaBuf);
+    assert!(!r.cpu() && r.region().is_dmabuf());
+    // Rounded out to 2 MiB inside the allocation: the whole first 2 MiB.
+    assert_eq!((r.addr() as u64, r.len() as u64), (va, DEVICE_ROUND));
+    let caps = a.gpu_capabilities(0);
+    assert!(caps.contains("\"dmabuf\":\"ok\""), "{caps}");
+    assert!(caps.contains("ok (nvidia_peermem)"), "{caps}");
+
+    // No dma-buf on the device: peer memory, since the module is loaded.
+    let gpu2 = MockGpu::new();
+    gpu2.set_dmabuf_unsupported(Some("CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED = 0"));
+    let (_f2, a2, _b2) = pair(RNDV, &gpu2, true);
+    let va2 = gpu2.alloc(0, 1 << 20);
+    let r2 = a2.register_device(0, va2, 4096).unwrap();
+    assert_eq!(r2.method(), Method::PeerMemory);
+    assert!(!r2.region().is_dmabuf());
+
+    // Neither: no dma-buf and no module. Both reasons, nothing registered.
+    let gpu3 = MockGpu::new();
+    gpu3.set_dmabuf_unsupported(Some("CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED = 0"));
+    let (_f3, a3, _b3) = pair(RNDV, &gpu3, false);
+    let va3 = gpu3.alloc(0, 1 << 20);
+    let why = a3.register_device(0, va3, 4096).unwrap_err();
+    assert!(
+        why.contains("dma-buf: CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED = 0"),
+        "{why}"
+    );
+    assert!(why.contains("peer memory: neither nvidia_peermem"), "{why}");
+    let t = a3.telemetry();
+    assert!(t.contains("\"registration_failures\":1"), "{t}");
+    assert!(
+        t.contains("\"last_registration_failure\":\"dma-buf:"),
+        "{t}"
+    );
+
+    // A failed export falls through to peer memory; a refused one by the driver too.
+    gpu.fail_exports(Some(
+        "cuMemGetHandleForAddressRange failed: CUDA_ERROR_NOT_SUPPORTED",
+    ));
+    let other = gpu.alloc(0, 1 << 20);
+    let r4 = a.register_device(0, other, 4096).unwrap();
+    assert_eq!(r4.method(), Method::PeerMemory);
+    gpu.fail_exports(None);
+
+    // Not device memory, another device's memory, past the allocation: refused, why.
+    assert!(a
+        .register_device(0, 0x1000, 64)
+        .unwrap_err()
+        .contains("not mock device memory"));
+    assert!(a.register_device(1, va, 64).unwrap_err().contains("not 1"));
+    assert!(a
+        .register_device(0, va + (8 << 20) - 10, 64)
+        .unwrap_err()
+        .contains("run past"));
+}
+
+#[test]
+fn settings_can_disable_each_path_and_no_driver_is_a_reason_too() {
+    let (fabric, na, nb) = ib_fabric();
+    let mut c = config(RNDV);
+    c.direct.dmabuf = false;
+    let eps = endpoints(&fabric, &[na, nb], &c);
+    let why = eps[0].register_device(0, 0x7e00_0000_0000, 64).unwrap_err();
+    assert!(why.contains("no GPU driver loaded"), "{why}");
+    let gpu = MockGpu::new();
+    eps[0].set_gpu(Arc::new(gpu.clone()), modules("settings", false));
+    let va = gpu.alloc(0, 1 << 20);
+    let why = eps[0].register_device(0, va, 64).unwrap_err();
+    assert!(why.contains("dma-buf: disabled by the settings"), "{why}");
+    assert!(eps[0]
+        .gpu_capabilities(0)
+        .contains("disabled by the settings"));
+}
+
+#[test]
+fn a_dmabuf_descriptor_is_closed_once_after_its_region_is_deregistered() {
+    let gpu = MockGpu::new();
+    let (fabric, a, b) = pair(RNDV, &gpu, false);
+    let va = gpu.alloc(0, 4 << 20);
+    let r = a.register_device(0, va, 1 << 20).unwrap();
+    assert_eq!(gpu.exported(), 1);
+    assert_eq!(gpu.open_fds(), 1);
+    // SYNC_MEMOPS once per new registration; a lookup inside it hits the cache.
+    assert_eq!(gpu.sync_memops(), vec![va]);
+    let again = a.register_device(0, va + 100, 1000).unwrap();
+    assert!(again.region().same(r.region()));
+    assert_eq!(gpu.exported(), 1);
+    assert_eq!(gpu.sync_memops().len(), 1);
+    drop(again);
+    drop(r);
+    // Still cached (idle): registered, descriptor open.
+    assert_eq!(gpu.open_fds(), 1);
+    a.close(LONG).unwrap();
+    b.close(LONG).unwrap();
+    // Closing the endpoint deregistered the region and then closed the descriptor.
+    assert_eq!(gpu.open_fds(), 0);
+    assert!(gpu.violations().is_empty(), "{:?}", gpu.violations());
+    assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+}
+
+#[test]
+fn a_failed_dmabuf_registration_closes_the_descriptor_at_once() {
+    let gpu = MockGpu::new();
+    let (fabric, na, nb) = ib_fabric();
+    let eps = endpoints(&fabric, &[na, nb], &config(RNDV));
+    eps[0].set_gpu(Arc::new(gpu.clone()), modules("failreg", false));
+    let va = gpu.alloc(0, 1 << 20);
+    fabric.inject(Fault::FailCall {
+        node: na,
+        call: Call::RegMr,
+        nth: 0,
+        errno: 12,
+    });
+    let why = eps[0].register_device(0, va, 4096).unwrap_err();
+    assert!(why.contains("ibv_reg_dmabuf_mr"), "{why}");
+    assert_eq!(gpu.exported(), 1);
+    assert_eq!(
+        gpu.open_fds(),
+        0,
+        "the descriptor of a failed registration is closed"
+    );
+    assert!(gpu.violations().is_empty(), "{:?}", gpu.violations());
+}
+
+#[test]
+fn a_reallocated_address_gets_a_new_registration_and_the_stale_one_goes() {
+    let gpu = MockGpu::new();
+    let (fabric, a, b) = pair(RNDV, &gpu, false);
+    let va = gpu.alloc(0, 2 << 20);
+    let first = a.register_device(0, va, 4096).unwrap();
+    // While posted work (or a caller) holds the old registration, the address can't be
+    // registered for the new allocation: it was freed too early.
+    let same = gpu.realloc_same_address(va, 2 << 20);
+    assert_eq!(same, va);
+    let why = a.register_device(0, va, 4096).unwrap_err();
+    assert!(why.contains("in use"), "{why}");
+    drop(first);
+    // Idle now: dropped as stale, a new export and registration for the new buffer ID.
+    let second = a.register_device(0, va, 4096).unwrap();
+    assert_eq!(gpu.exported(), 2);
+    assert_eq!(
+        gpu.open_fds(),
+        1,
+        "the stale registration's descriptor was closed"
+    );
+    let t = a.telemetry();
+    assert!(t.contains("\"stale\":1"), "{t}");
+    // The new registration carries data into the new allocation.
+    let data = pattern(RNDV as usize, 3);
+    let got = b
+        .send_registered(0, &host(&b, &data, 1), 0, data.len() as u64, 1)
+        .unwrap();
+    let put = a
+        .recv_registered(1, &second, 0, data.len() as u64, 1)
+        .unwrap();
+    b.wait(&[got], LONG).unwrap();
+    a.wait(&[put], LONG).unwrap();
+    assert_eq!(gpu.read(va, data.len()), data);
+    drop(second);
+    a.close(LONG).unwrap();
+    b.close(LONG).unwrap();
+    assert_eq!(gpu.open_fds(), 0);
+    assert!(gpu.violations().is_empty(), "{:?}", gpu.violations());
+    assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+}
+
+/// `data` registered as host memory of `ep` (owner `owner`), leaked for the test's
+/// lifetime so it outlives the registration.
+fn host(ep: &Endpoint, data: &[u8], owner: u64) -> gpubridge_verbs::Registered {
+    let buf: &'static mut [u8] = Box::leak(data.to_vec().into_boxed_slice());
+    // SAFETY: leaked, so valid for the rest of the process.
+    unsafe { ep.register_host(buf.as_mut_ptr() as usize, buf.len(), owner) }.unwrap()
+}
+
+#[test]
+fn device_memory_is_written_by_rdma_write_and_read_in_place_by_the_device() {
+    let gpu = MockGpu::new();
+    let (fabric, a, b) = pair(RNDV, &gpu, false);
+    let src = gpu.alloc(0, 4 << 20);
+    let dst = gpu.alloc(0, 4 << 20);
+    let sizes = [1usize, 100, 1000, RNDV as usize - 1, RNDV as usize, 3 << 20];
+    let mut offset = 0u64;
+    for (i, &n) in sizes.iter().enumerate() {
+        let data = pattern(n, i as u8);
+        gpu.write(src + offset, &data);
+        let s = a.register_device(0, src + offset, n as u64).unwrap();
+        let soff = (src + offset) as usize - s.addr();
+        let id_s = a.send_registered(1, &s, soff, n as u64, i as u64).unwrap();
+        let id_r = if n as u64 >= RNDV {
+            let r = b.register_device(0, dst + offset, n as u64).unwrap();
+            let roff = (dst + offset) as usize - r.addr();
+            b.recv_registered(0, &r, roff, n as u64, i as u64).unwrap()
+        } else {
+            // Below the rendezvous size a message comes in chunks: device memory can't
+            // take it, so the caller receives it into host memory (the transport then
+            // copies it to the GPU on its stream).
+            let r = b.register_device(0, dst + offset, n as u64).unwrap();
+            let roff = (dst + offset) as usize - r.addr();
+            let e = b
+                .recv_registered(0, &r, roff, n as u64, i as u64)
+                .unwrap_err();
+            assert!(e.to_string().contains("rndv_bytes"), "{e}");
+            let mut out = vec![0u8; n];
+            // SAFETY: waited for below, before `out` goes.
+            let id = unsafe { b.recv(0, out.as_mut_ptr() as usize, n as u64, i as u64) }.unwrap();
+            b.wait(&[id], LONG).unwrap();
+            assert_eq!(out, data, "size {n}");
+            gpu.write(dst + offset, &out);
+            id
+        };
+        a.wait(&[id_s], LONG).unwrap();
+        if n as u64 >= RNDV {
+            b.wait(&[id_r], LONG).unwrap();
+        }
+        assert_eq!(gpu.read(dst + offset, n), data, "size {n}");
+        offset += n as u64 + 64;
+    }
+    let (ca, cb) = (a.counters(), b.counters());
+    let big: u64 = sizes
+        .iter()
+        .filter(|&&n| n as u64 >= RNDV)
+        .map(|&n| n as u64)
+        .sum();
+    let all: u64 = sizes.iter().map(|&n| n as u64).sum();
+    assert_eq!(ca.device_bytes, all, "every send was read in place");
+    assert_eq!(
+        cb.device_bytes, big,
+        "every rendezvous receive was written in place"
+    );
+    assert_eq!(cb.grants_sent, 2);
+    assert_eq!(ca.grants_received, 2);
+    assert_eq!((ca.fins_sent, cb.fins_received), (2, 2));
+    assert_eq!(ca.writes_posted, 2, "one write each (below WRITE_CHUNK)");
+    assert_eq!(ca.copied_bytes, 0);
+    let t = a.telemetry();
+    for key in ["rkey", "lkey", "\"key\""] {
+        assert!(!t.contains(key), "{key} in {t}");
+    }
+    assert!(t.contains("RDMA WRITE (rendezvous)"), "{t}");
+    a.close(LONG).unwrap();
+    b.close(LONG).unwrap();
+    assert!(gpu.violations().is_empty(), "{:?}", gpu.violations());
+    assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+}
+
+#[test]
+fn every_pairing_of_plain_host_registered_and_device_memory_moves_the_same_bytes() {
+    let gpu = MockGpu::new();
+    let (fabric, a, b) = pair(RNDV, &gpu, true);
+    let n = 3 * 1024 + RNDV as usize; // several slots' worth
+    let kinds = ["plain", "host", "device"];
+    let mut tag = 0;
+    for send_kind in kinds {
+        for recv_kind in kinds {
+            tag += 1;
+            let data = pattern(n, tag as u8);
+            let mut plain_out = vec![0u8; n];
+            let dev_out = gpu.alloc(0, n as u64);
+            let host_out: &'static mut [u8] = Box::leak(vec![0u8; n].into_boxed_slice());
+            let host_out_ptr = host_out.as_mut_ptr();
+            let s = match send_kind {
+                "plain" => {
+                    // SAFETY: waited for below while `data` lives.
+                    unsafe { a.send(1, data.as_ptr() as usize, n as u64, tag) }.unwrap()
+                }
+                "host" => a
+                    .send_registered(1, &host(&a, &data, 1000 + tag), 0, n as u64, tag)
+                    .unwrap(),
+                _ => {
+                    let va = gpu.alloc(0, n as u64);
+                    gpu.write(va, &data);
+                    let r = a.register_device(0, va, n as u64).unwrap();
+                    a.send_registered(1, &r, (va as usize) - r.addr(), n as u64, tag)
+                        .unwrap()
+                }
+            };
+            let r = match recv_kind {
+                // SAFETY: waited for below while `plain_out` lives.
+                "plain" => {
+                    unsafe { b.recv(0, plain_out.as_mut_ptr() as usize, n as u64, tag) }.unwrap()
+                }
+                "host" => {
+                    // SAFETY: leaked above, valid for the process.
+                    let reg =
+                        unsafe { b.register_host(host_out_ptr as usize, n, 2000 + tag) }.unwrap();
+                    b.recv_registered(0, &reg, 0, n as u64, tag).unwrap()
+                }
+                _ => {
+                    let reg = b.register_device(0, dev_out, n as u64).unwrap();
+                    b.recv_registered(0, &reg, (dev_out as usize) - reg.addr(), n as u64, tag)
+                        .unwrap()
+                }
+            };
+            a.wait(&[s], LONG).unwrap();
+            b.wait(&[r], LONG).unwrap();
+            let got = match recv_kind {
+                "plain" => plain_out.clone(),
+                // SAFETY: the receive is done; nothing writes it any more.
+                "host" => unsafe { std::slice::from_raw_parts(host_out_ptr, n) }.to_vec(),
+                _ => gpu.read(dev_out, n),
+            };
+            assert!(got == data, "{send_kind} -> {recv_kind}");
+        }
+    }
+    let cb = b.counters();
+    // Plain receives are cleared "in chunks"; registered ones get write grants.
+    assert_eq!(cb.go_sent, 3);
+    assert_eq!(cb.grants_sent, 6);
+    a.close(LONG).unwrap();
+    b.close(LONG).unwrap();
+    assert!(gpu.violations().is_empty(), "{:?}", gpu.violations());
+    assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+}
+
+#[test]
+fn a_message_waiting_for_its_grant_holds_up_only_its_own_tag() {
+    let gpu = MockGpu::new();
+    let (fabric, a, b) = pair(RNDV, &gpu, false);
+    let big = pattern(2 * RNDV as usize, 1);
+    let big2 = pattern(2 * RNDV as usize, 2);
+    let small = pattern(64, 3);
+    // SAFETY (all three): waited for below while the data lives.
+    let s1 = unsafe { a.send(1, big.as_ptr() as usize, big.len() as u64, 7) }.unwrap();
+    let s2 = unsafe { a.send(1, big2.as_ptr() as usize, big2.len() as u64, 7) }.unwrap();
+    let s3 = unsafe { a.send(1, small.as_ptr() as usize, small.len() as u64, 8) }.unwrap();
+    // Tag 8 arrives although tag 7's messages wait for their receives.
+    let mut out_small = vec![0u8; 64];
+    // SAFETY: waited for below.
+    let r3 = unsafe { b.recv(0, out_small.as_mut_ptr() as usize, 64, 8) }.unwrap();
+    b.wait(&[r3], LONG).unwrap();
+    a.wait(&[s3], LONG).unwrap();
+    assert_eq!(out_small, small);
+    assert_eq!(a.counters().fins_sent + a.counters().grants_received, 0);
+    // Then tag 7, in order: the first message to the first receive.
+    let dev = gpu.alloc(0, 4 * RNDV);
+    let reg = b.register_device(0, dev, 4 * RNDV).unwrap();
+    let off = dev as usize - reg.addr();
+    let r1 = b
+        .recv_registered(0, &reg, off, big.len() as u64, 7)
+        .unwrap();
+    b.wait(&[r1], LONG).unwrap();
+    let r2 = b
+        .recv_registered(0, &reg, off + big.len(), big2.len() as u64, 7)
+        .unwrap();
+    b.wait(&[r2], LONG).unwrap();
+    a.wait(&[s1, s2], LONG).unwrap();
+    assert_eq!(gpu.read(dev, big.len()), big);
+    assert_eq!(gpu.read(dev + big.len() as u64, big2.len()), big2);
+    // Plain memory written by RDMA WRITE goes through slots, one write per slot.
+    assert_eq!(a.counters().writes_posted, 2 * (2 * RNDV).div_ceil(1024));
+    a.close(LONG).unwrap();
+    b.close(LONG).unwrap();
+    assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+}
+
+#[test]
+fn a_grant_of_the_wrong_size_and_receives_device_memory_cant_take_are_refused() {
+    let gpu = MockGpu::new();
+    let (_fabric, a, b) = pair(RNDV, &gpu, false);
+    let data = pattern(2 * RNDV as usize, 1);
+    // SAFETY: the endpoint fails (and is closed) before `data` goes.
+    let s = unsafe { a.send(1, data.as_ptr() as usize, data.len() as u64, 5) }.unwrap();
+    let dev = gpu.alloc(0, 4 * RNDV);
+    let reg = b.register_device(0, dev, 4 * RNDV).unwrap();
+    let r = b
+        .recv_registered(0, &reg, dev as usize - reg.addr(), 3 * RNDV, 5)
+        .unwrap();
+    let e = a.wait(&[s], LONG).unwrap_err();
+    assert!(
+        format!("{e:?}").contains("posted 12288 bytes for tag 0x5"),
+        "{e:?}"
+    );
+    assert!(b.wait(&[r], Duration::from_secs(2)).is_err());
+    a.close(LONG).ok();
+    b.close(LONG).ok();
+
+    // Without rendezvous, device memory can't be received at all.
+    let gpu2 = MockGpu::new();
+    let (_f2, a2, _b2) = pair(0, &gpu2, false);
+    let dev2 = gpu2.alloc(0, 1 << 20);
+    let reg2 = a2.register_device(0, dev2, 1 << 20).unwrap();
+    let e = a2.recv_registered(1, &reg2, 0, 1 << 20, 1).unwrap_err();
+    assert!(e.to_string().contains("rndv_bytes (0; 0 is off)"), "{e}");
+    let t = a2.telemetry();
+    assert!(t.contains("\"operations\":\"RC SEND/RECV\""), "{t}");
+}
+
+#[test]
+fn aborting_with_a_write_granted_keeps_the_registration_until_close() {
+    let gpu = MockGpu::new();
+    let (fabric, a, b) = pair(RNDV, &gpu, false);
+    let dev = gpu.alloc(0, 1 << 20);
+    let reg = b.register_device(0, dev, 1 << 20).unwrap();
+    let r = b
+        .recv_registered(0, &reg, dev as usize - reg.addr(), 2 * RNDV, 9)
+        .unwrap();
+    drop(reg);
+    // The grant went out (its completion polled), then the receiver gives up.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(b.counters().grants_sent, 1);
+    b.abort("deadline");
+    assert!(b.wait(&[r], LONG).is_err());
+    // The failed receive still holds the registration (the peer may have been writing
+    // until the queue pair failed): the descriptor stays open until close.
+    assert_eq!(gpu.open_fds(), 1);
+    b.close(LONG).unwrap();
+    a.close(LONG).unwrap();
+    assert_eq!(gpu.open_fds(), 0);
+    assert!(gpu.violations().is_empty(), "{:?}", gpu.violations());
+    assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+}

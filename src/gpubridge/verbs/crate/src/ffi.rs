@@ -4,12 +4,20 @@
 //!
 //! Every function catches panics. Errors are a negative return value and a message
 //! [`gb_verbs_last_error`] copies out.
+//!
+//! Registrations (`gb_verbs_reg_device`, `gb_verbs_reg_host`) come back as handles the
+//! caller passes to `gb_verbs_send_reg`/`gb_verbs_recv_reg` and gives back with
+//! `gb_verbs_release`; a handle keeps its registration from being evicted, and closing
+//! the endpoint releases what is left.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::direct::{Method, Registered};
 use crate::endpoint::{Config, Endpoint, WaitError};
 use crate::error::{Error, Result};
 use crate::protocol::PROTOCOL_VERSION;
@@ -22,11 +30,45 @@ const PEER_FAILED: c_int = -3;
 struct Handle {
     endpoint: Endpoint,
     last_error: Mutex<String>,
+    regions: Mutex<HashMap<u64, Registered>>,
+    next_region: AtomicU64,
 }
 
 impl Handle {
     fn set_error(&self, e: impl ToString) {
         *self.last_error.lock().unwrap_or_else(|p| p.into_inner()) = e.to_string();
+    }
+
+    /// Files `reg` under a new handle; writes the handle, the registration's address and
+    /// its length to `out[0..3]`.
+    ///
+    /// # Safety
+    /// `out` points to 3 writable u64s.
+    unsafe fn file(&self, reg: Registered, out: *mut u64) -> c_int {
+        if out.is_null() {
+            return FAILED as c_int;
+        }
+        let id = self.next_region.fetch_add(1, Ordering::Relaxed) + 1;
+        let (addr, len) = (reg.addr() as u64, reg.len() as u64);
+        self.regions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, reg);
+        // SAFETY: 3 writable u64s (the caller's contract).
+        unsafe {
+            *out = id;
+            *out.add(1) = addr;
+            *out.add(2) = len;
+        }
+        0
+    }
+
+    fn region(&self, id: u64) -> Option<Registered> {
+        self.regions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&id)
+            .cloned()
     }
 }
 
@@ -140,6 +182,8 @@ pub unsafe extern "C" fn gb_verbs_create(
             Ok(endpoint) => Box::into_raw(Box::new(Handle {
                 endpoint,
                 last_error: Mutex::new(String::new()),
+                regions: Mutex::new(HashMap::new()),
+                next_region: AtomicU64::new(0),
             })) as *mut c_void,
             Err(e) => {
                 write_c(&e.to_string(), error, error_size);
@@ -240,6 +284,239 @@ pub unsafe extern "C" fn gb_verbs_recv(
         let member = usize::try_from(member).unwrap_or(usize::MAX);
         // SAFETY: the caller keeps the memory valid as Endpoint::recv requires.
         match unsafe { h.endpoint.recv(member, data as usize, size as u64, tag) } {
+            Ok(id) => id,
+            Err(e) => {
+                h.set_error(e);
+                FAILED
+            }
+        }
+    })
+}
+
+/// The rendezvous threshold the endpoint was made with (0: off).
+///
+/// # Safety
+/// `h` from gb_verbs_create.
+#[no_mangle]
+pub unsafe extern "C" fn gb_verbs_rndv_bytes(h: *mut c_void) -> u64 {
+    guard(0, || {
+        // SAFETY: the caller's contract.
+        unsafe { handle(h) }.endpoint.rndv_bytes()
+    })
+}
+
+/// Loads the GPU driver for `vendor` (`cuda` or `rocm`) at run time: 0 with its
+/// description in `out`, or -1 (see gb_verbs_last_error).
+///
+/// # Safety
+/// `h` from gb_verbs_create; `vendor` NUL-terminated; `out` holds `size` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn gb_verbs_gpu_load(
+    h: *mut c_void,
+    vendor: *const c_char,
+    out: *mut c_char,
+    size: usize,
+) -> c_int {
+    guard(FAILED as c_int, || {
+        // SAFETY: the caller's contract.
+        let (h, vendor) = unsafe { (handle(h), CStr::from_ptr(vendor).to_string_lossy()) };
+        match h.endpoint.load_gpu(&vendor) {
+            Ok(text) => {
+                write_c(&text, out, size);
+                0
+            }
+            Err(e) => {
+                h.set_error(e);
+                FAILED as c_int
+            }
+        }
+    })
+}
+
+/// What the direct paths can do on `device`, JSON into `out`: its length, or -(needed + 1).
+///
+/// # Safety
+/// `h` from gb_verbs_create; `out` holds `size` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn gb_verbs_gpu_caps(
+    h: *mut c_void,
+    device: c_int,
+    out: *mut c_char,
+    size: usize,
+) -> i64 {
+    guard(FAILED, || {
+        // SAFETY: the caller's contract.
+        let text = unsafe { handle(h) }.endpoint.gpu_capabilities(device);
+        if write_c(&text, out, size) {
+            text.len() as i64
+        } else {
+            -(text.len() as i64 + 1)
+        }
+    })
+}
+
+/// Registers `len` bytes of device memory at `ptr` on `device` directly (dma-buf, then
+/// peer memory): 0 with `out[0..3]` = handle, registration address, registration length
+/// and `method` = 1 (dma-buf) or 2 (peer memory); or -1 with every reason in
+/// gb_verbs_last_error (the caller stages instead).
+///
+/// # Safety
+/// `h` from gb_verbs_create; `out` holds 3 u64s; `method` null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn gb_verbs_reg_device(
+    h: *mut c_void,
+    device: c_int,
+    ptr: u64,
+    len: u64,
+    out: *mut u64,
+    method: *mut c_int,
+) -> c_int {
+    guard(FAILED as c_int, || {
+        // SAFETY: the caller's contract.
+        let h = unsafe { handle(h) };
+        match h.endpoint.register_device(device, ptr, len) {
+            Ok(reg) => {
+                if !method.is_null() {
+                    let m = if reg.method() == Method::DmaBuf { 1 } else { 2 };
+                    // SAFETY: writable (the caller's contract).
+                    unsafe { *method = m };
+                }
+                // SAFETY: out holds 3 u64s (the caller's contract).
+                unsafe { h.file(reg, out) }
+            }
+            Err(why) => {
+                h.set_error(why);
+                FAILED as c_int
+            }
+        }
+    })
+}
+
+/// Registers `len` bytes of host memory at `ptr`, identified by the caller as `owner`:
+/// 0 with `out[0..3]` as for gb_verbs_reg_device, or -1.
+///
+/// # Safety
+/// `h` from gb_verbs_create; `out` holds 3 u64s. The memory stays valid until the caller
+/// has called gb_verbs_invalidate_host for `owner`, released every handle to it and every
+/// operation on it is done, failed, or the endpoint closed.
+#[no_mangle]
+pub unsafe extern "C" fn gb_verbs_reg_host(
+    h: *mut c_void,
+    ptr: *mut c_void,
+    len: usize,
+    owner: u64,
+    out: *mut u64,
+) -> c_int {
+    guard(FAILED as c_int, || {
+        // SAFETY: the caller's contract.
+        let h = unsafe { handle(h) };
+        // SAFETY: the caller keeps the memory valid as Endpoint::register_host requires.
+        match unsafe { h.endpoint.register_host(ptr as usize, len, owner) } {
+            // SAFETY: out holds 3 u64s.
+            Ok(reg) => unsafe { h.file(reg, out) },
+            Err(e) => {
+                h.set_error(e);
+                FAILED as c_int
+            }
+        }
+    })
+}
+
+/// Gives back a registration handle: 0, or -1 for an unknown one.
+///
+/// # Safety
+/// `h` from gb_verbs_create.
+#[no_mangle]
+pub unsafe extern "C" fn gb_verbs_release(h: *mut c_void, region: u64) -> c_int {
+    guard(FAILED as c_int, || {
+        // SAFETY: the caller's contract.
+        let h = unsafe { handle(h) };
+        let gone = h
+            .regions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&region);
+        if gone.is_some() {
+            0
+        } else {
+            FAILED as c_int
+        }
+    })
+}
+
+/// Drops the host registrations of `owner`: how many of them were still in use (they
+/// stay registered until that use ends).
+///
+/// # Safety
+/// `h` from gb_verbs_create.
+#[no_mangle]
+pub unsafe extern "C" fn gb_verbs_invalidate_host(h: *mut c_void, owner: u64) -> c_int {
+    guard(FAILED as c_int, || {
+        // SAFETY: the caller's contract.
+        let h = unsafe { handle(h) };
+        h.endpoint.invalidate_host(owner).in_use as c_int
+    })
+}
+
+/// As gb_verbs_send, from `size` bytes at `offset` of registration `region`.
+///
+/// # Safety
+/// `h` from gb_verbs_create; the memory unchanged until the operation finishes.
+#[no_mangle]
+pub unsafe extern "C" fn gb_verbs_send_reg(
+    h: *mut c_void,
+    member: c_int,
+    region: u64,
+    offset: u64,
+    size: u64,
+    tag: u64,
+) -> i64 {
+    guard(FAILED, || {
+        // SAFETY: the caller's contract.
+        let h = unsafe { handle(h) };
+        let member = usize::try_from(member).unwrap_or(usize::MAX);
+        let Some(reg) = h.region(region) else {
+            h.set_error(format!("no registration {region}"));
+            return FAILED;
+        };
+        match h
+            .endpoint
+            .send_registered(member, &reg, offset as usize, size, tag)
+        {
+            Ok(id) => id,
+            Err(e) => {
+                h.set_error(e);
+                FAILED
+            }
+        }
+    })
+}
+
+/// As gb_verbs_recv, into `size` bytes at `offset` of registration `region`.
+///
+/// # Safety
+/// `h` from gb_verbs_create; nothing else uses the memory until the operation finishes.
+#[no_mangle]
+pub unsafe extern "C" fn gb_verbs_recv_reg(
+    h: *mut c_void,
+    member: c_int,
+    region: u64,
+    offset: u64,
+    size: u64,
+    tag: u64,
+) -> i64 {
+    guard(FAILED, || {
+        // SAFETY: the caller's contract.
+        let h = unsafe { handle(h) };
+        let member = usize::try_from(member).unwrap_or(usize::MAX);
+        let Some(reg) = h.region(region) else {
+            h.set_error(format!("no registration {region}"));
+            return FAILED;
+        };
+        match h
+            .endpoint
+            .recv_registered(member, &reg, offset as usize, size, tag)
+        {
             Ok(id) => id,
             Err(e) => {
                 h.set_error(e);

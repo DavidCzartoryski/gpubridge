@@ -35,9 +35,13 @@ fn small() -> Config {
 }
 
 fn pair(dir: &Path) -> (Endpoint, Endpoint) {
+    pair_with(dir, small())
+}
+
+fn pair_with(dir: &Path, config: Config) -> (Endpoint, Endpoint) {
     let make = |i| {
         let p: Arc<dyn Provider> = Arc::new(UdsProvider::open(dir).unwrap());
-        Endpoint::new(p, 2, i, small()).unwrap()
+        Endpoint::new(p, 2, i, config.clone()).unwrap()
     };
     let (a, b) = (make(0), make(1));
     a.connect(1, &b.local_info()).unwrap();
@@ -110,5 +114,43 @@ fn a_peer_that_failed_or_left_fails_sends_to_it() {
     let e = unsafe { a.send(1, data.as_ptr() as usize, 8, 1) }.unwrap_err();
     assert!(e.to_string().contains("closed its end"), "{e}");
     a.close(LONG).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rendezvous_writes_into_registered_host_memory_across_nodes() {
+    let dir = fabric_dir();
+    let (a, b) = pair_with(
+        &dir,
+        Config {
+            rndv_bytes: 1024,
+            ..small()
+        },
+    );
+    let data: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let target: &'static mut [u8] = Box::leak(vec![0u8; data.len()].into_boxed_slice());
+    let target_ptr = target.as_mut_ptr();
+    // SAFETY: leaked, valid for the process.
+    let reg = unsafe { b.register_host(target_ptr as usize, data.len(), 1) }.unwrap();
+    let r = b.recv_registered(0, &reg, 0, data.len() as u64, 3).unwrap();
+    // SAFETY: `data` outlives the registration (dropped below, before close) and the send.
+    let src = unsafe { a.register_host(data.as_ptr() as usize, data.len(), 2) }.unwrap();
+    let s = a.send_registered(1, &src, 0, data.len() as u64, 3).unwrap();
+    // A plain receive under rendezvous is cleared to come in chunks.
+    let mut out = vec![0u8; 4096];
+    // SAFETY: `out` and `data` outlive the waits below.
+    let r2 = unsafe { b.recv(0, out.as_mut_ptr() as usize, 4096, 4) }.unwrap();
+    let s2 = unsafe { a.send(1, data.as_ptr() as usize, 4096, 4) }.unwrap();
+    a.wait(&[s, s2], LONG).unwrap();
+    b.wait(&[r, r2], LONG).unwrap();
+    // SAFETY: the receive is done.
+    assert!(unsafe { std::slice::from_raw_parts(target_ptr, data.len()) } == &data[..]);
+    assert_eq!(out, data[..4096]);
+    let (ca, cb) = (a.counters(), b.counters());
+    assert_eq!((cb.grants_sent, cb.go_sent, ca.fins_sent), (1, 1, 1));
+    assert_eq!(ca.bytes_written, data.len() as u64);
+    drop((reg, src));
+    a.close(LONG).unwrap();
+    b.close(LONG).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
