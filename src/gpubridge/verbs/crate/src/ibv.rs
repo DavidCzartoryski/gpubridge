@@ -1001,11 +1001,29 @@ impl Provider for IbvProvider {
 mod tests {
     use super::*;
 
-    // These two call into the linked shim and libibverbs but open no device.
+    // These call into the linked shim and libibverbs but open no device.
 
     #[test]
     fn the_shim_was_compiled_with_these_layouts() {
         check_layouts().unwrap();
+    }
+
+    #[test]
+    fn batches_respect_the_shims_limits() {
+        assert_eq!(
+            batches([1usize; 130].into_iter()),
+            [(0, 64), (64, 64), (128, 2)]
+        );
+        // 16 entries each: 16 requests fill GBV_MAX_BATCH_SGE.
+        assert_eq!(batches([16usize; 20].into_iter()), [(0, 16), (16, 4)]);
+        assert!(batches(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn the_libibverbs_file_is_found_without_opening_a_device() {
+        // dladdr on a function of the loaded library: no device, no ibv_get_device_list.
+        let path = library_path().expect("libibverbs is loaded");
+        assert!(path.contains("libibverbs.so.1"), "{path}");
     }
 
     #[test]
