@@ -1,0 +1,25 @@
+[package]
+name = "gpubridge-verbs"
+version = "0.1.0"
+edition = "2021"
+# offset_of! (the shim's layout checks) needs 1.77; Explorer's nodes have 1.88 from the
+# OS packages.
+rust-version = "1.77"
+description = "Owned libibverbs resources and a mock provider for gpubridge's raw-verbs bridge (docs/VERBS_TRANSPORT.md)"
+license = "MIT"
+publish = false
+build = "build.rs"
+
+# std only, so it builds offline on a cluster node with a Rust toolchain and a C compiler.
+[dependencies]
+
+[features]
+# The libibverbs provider: compiles shim/gbverbs.c against rdma-core's headers and links
+# libibverbs.so.1. Without it, only the mock provider is built (any OS, no headers).
+ibverbs = []
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3

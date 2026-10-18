@@ -17,3 +17,5 @@ results/explorer/
 # target directory; cargo run in the crate itself writes here).
 src/gpubridge/multitcp/crate/target/
 results/mixed_containers/
+# The verbs crate's build output (cargo run in the crate writes here).
+src/gpubridge/verbs/crate/target/
