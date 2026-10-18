@@ -353,6 +353,12 @@ queued collectives one at a time, in order. A synchronous collective first
 waits for every queued one, so collectives always run in program order: the
 same order on every rank.
 
+At most 1024 collectives may wait in that queue (`GPUBRIDGE_ASYNC_QUEUE`, a
+positive integer set before the worker starts), plus the running call. If it is
+full, submission raises without enqueueing the new call. Wait for accepted work
+before retrying, keeping collective order identical on every rank. This bounds
+queued tensor references; tensor bytes still need an application memory budget.
+
 ```python
 work = gpubridge.all_reduce(grad, op=gpubridge.ReduceOp.AVG, async_op=True)
 ...                                  # queue more GPU work; don't touch grad

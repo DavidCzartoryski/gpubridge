@@ -665,6 +665,13 @@ raw GID; any key-like field name at any depth is refused before queueing.
 
 ## The Python bridge
 
+The shared async worker's submission queue is bounded to 1024 waiting collectives
+per rank, plus the running call (`GPUBRIDGE_ASYNC_QUEUE`, a positive integer read
+when the worker starts). Overflow raises before enqueueing the new call; it does
+not discard accepted work. Wait for accepted work before retrying, preserving the
+same collective order on every rank. The limit bounds queue entries/tensor
+references, not tensor bytes; users must budget outstanding tensor memory too.
+
 `bridge="verbs"` (`src/gpubridge/verbs/transport.py`), opt-in; the default
 stays Gloo, and UCX and multitcp are unchanged. `device_tensors` is True: GPU
 leaders hand GPU tensors straight to it, and it moves them direct or staged
