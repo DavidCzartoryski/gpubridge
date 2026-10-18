@@ -322,16 +322,26 @@ struct QpRec {
     rts: Option<RtsAttr>,
     sq: VecDeque<SendJob>,
     rq: VecDeque<RecvJob>,
+    /// The remote access the queue pair grants (its `Init` attributes).
+    access: Access,
 }
 
 struct MrRec {
     node: NodeId,
     pd: Handle,
+    /// The address work requests use for its first byte (the virtual address, or a
+    /// dma-buf region's iova, or a mock device address).
     addr: u64,
+    /// Where that byte is in this process (the same as `addr` for host memory).
+    host: u64,
     len: u64,
     lkey: u32,
     rkey: u32,
     access: Access,
+    /// The mock dma-buf a region imports.
+    dmabuf: Option<i32>,
+    /// Keeps mock device memory alive while registered (as pinning does).
+    _keep: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl MrRec {
@@ -340,6 +350,11 @@ impl MrRec {
             && addr
                 .checked_add(len)
                 .is_some_and(|e| e <= self.addr + self.len)
+    }
+
+    /// The host address of `addr` (inside the region).
+    fn host_of(&self, addr: u64) -> *mut u8 {
+        (self.host + (addr - self.addr)) as usize as *mut u8
     }
 }
 
@@ -763,10 +778,11 @@ impl Fabric {
             data.resize(start + sge.len as usize, 0);
             // SAFETY: the range lies inside a registered region (checked above), and a
             // provider's caller keeps registered memory valid until it is deregistered
-            // (Provider::reg_mr's contract); it is still registered here.
+            // (Provider::reg_mr's contract), or the region keeps mock device memory alive;
+            // it is still registered here.
             unsafe {
                 ptr::copy_nonoverlapping(
-                    sge.addr as usize as *const u8,
+                    mr.host_of(sge.addr),
                     data.as_mut_ptr().add(start),
                     sge.len as usize,
                 )
@@ -788,21 +804,22 @@ impl Fabric {
         if (data.len() as u64) > room {
             return Err(true);
         }
+        let mut targets = Vec::with_capacity(sges.len());
         for sge in sges {
             let mr = self.find_mr(node, pd, sge.lkey, false).ok_or(false)?;
             if !mr.covers(sge.addr, u64::from(sge.len)) || !mr.access.contains(Access::LOCAL_WRITE)
             {
                 return Err(false);
             }
+            targets.push(mr.host_of(sge.addr));
         }
         let mut done = 0;
-        for sge in sges {
+        for (sge, target) in sges.iter().zip(targets) {
             let n = (data.len() - done).min(sge.len as usize);
             // SAFETY: inside a registered, locally writable region (checked above), kept
-            // valid by Provider::reg_mr's contract; `data` is a separate buffer.
-            unsafe {
-                ptr::copy_nonoverlapping(data.as_ptr().add(done), sge.addr as usize as *mut u8, n)
-            };
+            // valid by Provider::reg_mr's contract or by the region; `data` is a separate
+            // buffer.
+            unsafe { ptr::copy_nonoverlapping(data.as_ptr().add(done), target, n) };
             done += n;
         }
         Ok(())
@@ -876,22 +893,24 @@ impl Fabric {
             return false;
         }
         if let SendOp::Write(remote) | SendOp::WriteWithImm(remote, _) = op {
-            let target_ok = self
+            // The responder's queue pair must grant remote writes, and the region too.
+            let qp_ok = self.qps[&target].access.contains(Access::REMOTE_WRITE);
+            let target_host = self
                 .find_mr(t_node, t_pd, remote.rkey, true)
-                .is_some_and(|mr| {
-                    mr.access.contains(Access::REMOTE_WRITE)
+                .filter(|mr| {
+                    qp_ok
+                        && mr.access.contains(Access::REMOTE_WRITE)
                         && mr.covers(remote.addr, u64::from(len))
-                });
-            if !target_ok {
+                })
+                .map(|mr| mr.host_of(remote.addr));
+            let Some(target_host) = target_host else {
                 self.finish_send(src, WcStatus::RemAccessErr, 0);
                 return true;
-            }
-            // SAFETY: inside the peer's registered, remotely writable region (checked
-            // above), kept valid by Provider::reg_mr's contract; `data` is a separate
-            // buffer.
-            unsafe {
-                ptr::copy_nonoverlapping(data.as_ptr(), remote.addr as usize as *mut u8, data.len())
             };
+            // SAFETY: inside the peer's registered, remotely writable region (checked
+            // above), kept valid by Provider::reg_mr's contract or by the region; `data` is
+            // a separate buffer.
+            unsafe { ptr::copy_nonoverlapping(data.as_ptr(), target_host, data.len()) };
         }
         if consumes_recv {
             let recv = self
@@ -1303,6 +1322,7 @@ impl Provider for MockProvider {
                 rts: None,
                 sq: VecDeque::new(),
                 rq: VecDeque::new(),
+                access: Access::NONE,
             },
         );
         f.log(self.node, Call::CreateQp, h);
@@ -1328,6 +1348,7 @@ impl Provider for MockProvider {
                 let q = f.qps.get_mut(&qp).unwrap();
                 q.state = QpState::Init;
                 q.port = attr.port;
+                q.access = attr.access;
             }
             Transition::Rtr { port, attr } => {
                 let p = f.port(ctx, *port).ok_or_else(bad)?;
@@ -1417,6 +1438,12 @@ impl Provider for MockProvider {
         if count >= limits.max_mr as usize {
             return Err(verbs(Call::RegMr, ENOMEM));
         }
+        // A mock GPU's device address registers as peer memory would: the pages behind
+        // it, kept while registered.
+        let (host, keep) = match crate::gpu::mock_import_va(addr as usize as u64, len as u64) {
+            Some(import) => (import.host, Some(import.keep)),
+            None => (addr as usize as u64, None),
+        };
         let h = f.handle();
         let key = f.next_key;
         f.next_key += 1;
@@ -1427,10 +1454,13 @@ impl Provider for MockProvider {
                 node: self.node,
                 pd,
                 addr: addr as usize as u64,
+                host,
                 len: len as u64,
                 lkey,
                 rkey,
                 access,
+                dmabuf: None,
+                _keep: keep,
             },
         );
         f.log(self.node, Call::RegMr, h);
@@ -1441,18 +1471,57 @@ impl Provider for MockProvider {
         })
     }
 
+    /// Imports a [`MockGpu`](crate::MockGpu)'s dma-buf: any other descriptor fails, as a
+    /// descriptor that isn't a dma-buf does in the kernel.
     fn reg_dmabuf_mr(
         &self,
-        _pd: Handle,
-        _offset: u64,
-        _len: usize,
-        _iova: u64,
-        _fd: i32,
-        _access: Access,
+        pd: Handle,
+        offset: u64,
+        len: usize,
+        iova: u64,
+        fd: i32,
+        access: Access,
     ) -> Result<MrKeys> {
-        Err(Error::Unsupported(
-            "the mock provider has no dma-buf memory".into(),
-        ))
+        let mut f = self.enter(Call::RegMr)?;
+        let ctx = f
+            .pds
+            .get(&pd)
+            .ok_or_else(|| verbs(Call::RegMr, EINVAL))?
+            .ctx;
+        let limits = f.device(ctx).limits;
+        if len == 0 || len as u64 > limits.max_mr_size || iova == 0 {
+            return Err(verbs(Call::RegMr, EINVAL));
+        }
+        if access.contains(Access::REMOTE_WRITE) && !access.contains(Access::LOCAL_WRITE) {
+            return Err(verbs(Call::RegMr, EINVAL));
+        }
+        let import = crate::gpu::mock_import_dmabuf(fd, offset, len as u64)
+            .ok_or_else(|| verbs(Call::RegMr, EINVAL))?;
+        let h = f.handle();
+        let key = f.next_key;
+        f.next_key += 1;
+        let (lkey, rkey) = (0x1000 + key, 0x8000_0000 | key);
+        f.mrs.insert(
+            h,
+            MrRec {
+                node: self.node,
+                pd,
+                addr: iova,
+                host: import.host,
+                len: len as u64,
+                lkey,
+                rkey,
+                access,
+                dmabuf: Some(fd),
+                _keep: Some(import.keep),
+            },
+        );
+        f.log(self.node, Call::RegMr, h);
+        Ok(MrKeys {
+            handle: h,
+            lkey,
+            rkey,
+        })
     }
 
     fn dereg_mr(&self, mr: Handle) -> Result<()> {
@@ -1481,6 +1550,9 @@ impl Provider for MockProvider {
             f.violations.push(format!(
                 "memory region #{mr} deregistered while {users} work requests use it"
             ));
+        }
+        if let Some(fd) = rec.dmabuf {
+            crate::gpu::mock_release_dmabuf(fd);
         }
         f.log(self.node, Call::DeregMr, mr);
         Ok(())

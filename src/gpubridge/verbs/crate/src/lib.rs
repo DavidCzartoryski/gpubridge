@@ -15,9 +15,11 @@
 //! memory path (phase A3). Nothing here has run on RDMA hardware.
 
 mod cache;
+mod direct;
 mod endpoint;
 mod error;
 mod ffi;
+pub mod gpu;
 #[cfg(feature = "ibverbs")]
 mod ibv;
 mod mock;
@@ -29,8 +31,10 @@ mod types;
 mod uds;
 
 pub use cache::{CacheConfig, CacheKey, CacheStats, Invalidated, MrCache};
-pub use endpoint::{Config, Counters, Endpoint, WaitError, TICK};
+pub use direct::{DirectConfig, Method, Registered, Registrar, DEVICE_ROUND};
+pub use endpoint::{Config, Counters, Endpoint, WaitError, TICK, WRITE_CHUNK};
 pub use error::{Error, Result};
+pub use gpu::{Allocation, GpuMemory, MockGpu, PeerModules, Vendor};
 #[cfg(feature = "ibverbs")]
 pub use ibv::{check_layouts, library_path, wc_status_text, IbvProvider};
 pub use mock::{
@@ -38,8 +42,8 @@ pub use mock::{
 };
 pub use provider::{BatchResult, Handle, MrKeys, Provider, QpCreated};
 pub use resources::{
-    CompletionChannel, CompletionQueue, Context, MemoryRegion, ProtectionDomain, QueuePair,
-    SendRequest, Sge, StatsSnapshot, DEFAULT_DRAIN_TIMEOUT,
+    CompletionChannel, CompletionQueue, Context, DmabufCloser, DmabufFd, MemoryRegion,
+    ProtectionDomain, QueuePair, SendRequest, Sge, StatsSnapshot, DEFAULT_DRAIN_TIMEOUT,
 };
 pub use types::{
     Access, Address, AsyncEvent, AsyncEventKind, Completion, DeviceAttr, Events, Gid, GidEntry,

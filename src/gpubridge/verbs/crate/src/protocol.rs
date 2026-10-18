@@ -1,10 +1,15 @@
-//! The verbs bridge's wire protocol, version 1 (docs/VERBS_TRANSPORT.md, "Wire
+//! The verbs bridge's wire protocol, version 2 (docs/VERBS_TRANSPORT.md, "Wire
 //! protocol"): the message header, the handshake text the members exchange through the
 //! c10d store, and how a member picks its device, port and GID.
 //!
 //! Every message is one RC SEND of at most `slot` bytes: a [`HEADER_BYTES`]-byte header,
-//! then up to `slot - HEADER_BYTES` bytes of payload. Nothing else crosses the fabric (no
-//! RDMA WRITE or READ), so no memory is remotely accessible and no remote key exists.
+//! then up to `slot - HEADER_BYTES` bytes of payload. With rendezvous on (`rndv` bytes in
+//! the handshake, the same on every member), a message of at least `rndv` bytes waits for
+//! the receiver's clear-to-send: either a write grant (address, length and the remote key
+//! of memory registered for that one receive), after which the sender RDMA WRITEs the
+//! payload there and SENDs a "written" message, or "send it eagerly", after which it goes
+//! in chunks like any other. Remote keys cross the fabric only in write grants; they are
+//! never logged, printed or reported.
 
 use std::fmt::Write as _;
 
@@ -16,7 +21,7 @@ use crate::resources::Context;
 use crate::types::{Gid, GidType, LinkLayer, Mtu, PortAttr, PortState};
 
 /// Bumped whenever the header, the handshake or the rules of either change.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const HEADER_BYTES: usize = 48;
 /// "VB", little-endian, at the start of every header.
 const MAGIC: u16 = 0x4256;
@@ -29,6 +34,14 @@ pub enum Kind {
     Credit,
     /// The sender is closing: it sends nothing after this.
     Bye,
+    /// Clear to send, by RDMA WRITE: the receiver posted a receive for `tag` of
+    /// `msg_len` bytes into memory at `offset` (an address) that `key` grants writes to.
+    Cts,
+    /// Clear to send, in chunks: the receiver posted a receive for `tag` of `msg_len`
+    /// bytes into memory the peer can't write.
+    Go,
+    /// The payload of `tag` (`msg_len` bytes) has been written into the granted memory.
+    Fin,
 }
 
 impl Kind {
@@ -37,6 +50,9 @@ impl Kind {
             Kind::Data => 1,
             Kind::Credit => 2,
             Kind::Bye => 3,
+            Kind::Cts => 4,
+            Kind::Go => 5,
+            Kind::Fin => 6,
         }
     }
 
@@ -45,8 +61,17 @@ impl Kind {
             1 => Kind::Data,
             2 => Kind::Credit,
             3 => Kind::Bye,
+            4 => Kind::Cts,
+            5 => Kind::Go,
+            6 => Kind::Fin,
             _ => return None,
         })
+    }
+
+    /// Whether it takes one of the peer's data receives (and so a data credit): data and
+    /// the rendezvous messages. Credit and goodbye messages take control receives.
+    pub fn data_class(self) -> bool {
+        !matches!(self, Kind::Credit | Kind::Bye)
     }
 }
 
@@ -56,25 +81,43 @@ impl Kind {
 /// | --- | --- |
 /// | 0-1 | magic `0x4256` |
 /// | 2 | protocol version |
-/// | 3 | kind (1 data, 2 credit, 3 bye) |
+/// | 3 | kind (1 data, 2 credit, 3 bye, 4 clear to write, 5 clear to send, 6 written) |
 /// | 4-7 | sequence number of this message on this queue pair (from 0, wrapping) |
 /// | 8-11 | payload bytes in this message |
 /// | 12-15 | data receives the sender has reposted for its peer, cumulative (wrapping) |
 /// | 16-19 | control receives the sender has reposted for its peer, cumulative (wrapping) |
-/// | 20-23 | zero |
+/// | 20-23 | clear to write: the remote key of the granted memory; else zero |
 /// | 24-31 | tag |
 /// | 32-39 | the whole message's length in bytes |
-/// | 40-47 | this chunk's offset in the message |
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// | 40-47 | data: this chunk's offset in the message; clear to write: the address |
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     pub kind: Kind,
     pub seq: u32,
     pub chunk_len: u32,
     pub data_freed: u32,
     pub ctrl_freed: u32,
+    /// A write grant's remote key (clear to write only). Never printed: `Debug` leaves
+    /// it out.
+    pub key: u32,
     pub tag: u64,
     pub msg_len: u64,
     pub offset: u64,
+}
+
+impl std::fmt::Debug for Header {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Header")
+            .field("kind", &self.kind)
+            .field("seq", &self.seq)
+            .field("chunk_len", &self.chunk_len)
+            .field("data_freed", &self.data_freed)
+            .field("ctrl_freed", &self.ctrl_freed)
+            .field("tag", &self.tag)
+            .field("msg_len", &self.msg_len)
+            .field("offset", &self.offset)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Header {
@@ -87,6 +130,7 @@ impl Header {
         b[8..12].copy_from_slice(&self.chunk_len.to_le_bytes());
         b[12..16].copy_from_slice(&self.data_freed.to_le_bytes());
         b[16..20].copy_from_slice(&self.ctrl_freed.to_le_bytes());
+        b[20..24].copy_from_slice(&self.key.to_le_bytes());
         b[24..32].copy_from_slice(&self.tag.to_le_bytes());
         b[32..40].copy_from_slice(&self.msg_len.to_le_bytes());
         b[40..48].copy_from_slice(&self.offset.to_le_bytes());
@@ -113,6 +157,7 @@ impl Header {
             chunk_len: u32_at(8),
             data_freed: u32_at(12),
             ctrl_freed: u32_at(16),
+            key: u32_at(20),
             tag: u64_at(24),
             msg_len: u64_at(32),
             offset: u64_at(40),
@@ -125,6 +170,15 @@ impl Header {
         }
         if kind != Kind::Data && h.chunk_len != 0 {
             return Err("a control message with a payload".into());
+        }
+        if kind != Kind::Cts && h.key != 0 {
+            return Err("a remote key outside a write grant".into());
+        }
+        if kind == Kind::Cts && h.offset == 0 {
+            return Err("a write grant without an address".into());
+        }
+        if matches!(kind, Kind::Cts | Kind::Go | Kind::Fin) && h.msg_len == 0 {
+            return Err("a rendezvous for an empty message".into());
         }
         let end = h.offset.checked_add(u64::from(h.chunk_len));
         if kind == Kind::Data && end.map_or(true, |e| e > h.msg_len) {
@@ -154,6 +208,8 @@ pub struct Info {
     pub slot_bytes: u32,
     pub credits: u32,
     pub ctrl_credits: u32,
+    /// Messages of at least this many bytes go by rendezvous; 0: none do.
+    pub rndv: u64,
     /// The queue pair number this member uses for each member, by member index (0 for
     /// itself).
     pub qpns: Vec<u32>,
@@ -208,8 +264,8 @@ impl Info {
     /// `gbverbs <version>;key=value;...`. Readers ignore keys they don't know.
     pub fn encode(&self) -> String {
         format!(
-            "gbverbs {};ll={};lid={};gid={};grh={};mtu={};slot={};credits={};ctrl={};qpn={};\
-             psn={};dev={};port={}",
+            "gbverbs {};ll={};lid={};gid={};grh={};mtu={};slot={};credits={};ctrl={};rndv={};\
+             qpn={};psn={};dev={};port={}",
             self.version,
             link_name(self.link_layer),
             self.lid,
@@ -219,6 +275,7 @@ impl Info {
             self.slot_bytes,
             self.credits,
             self.ctrl_credits,
+            self.rndv,
             list(&self.qpns),
             list(&self.psns),
             self.device,
@@ -285,6 +342,7 @@ impl Info {
             slot_bytes: small("slot", u64::from(u32::MAX))? as u32,
             credits: small("credits", u64::from(u32::MAX))? as u32,
             ctrl_credits: small("ctrl", u64::from(u32::MAX))? as u32,
+            rndv: num("rndv")?,
             qpns: nums("qpn")?,
             psns: nums("psn")?,
             device: get("dev")?.to_owned(),
@@ -306,11 +364,11 @@ impl Info {
                 link_text(theirs.link_layer)
             )));
         }
-        let settings = |i: &Info| (i.slot_bytes, i.credits, i.ctrl_credits);
+        let settings = |i: &Info| (i.slot_bytes, i.credits, i.ctrl_credits, i.rndv);
         if settings(theirs) != settings(self) {
             return Err(Error::invalid(format!(
-                "message slot, credits and control credits are {:?} here but {:?} on member \
-                 {member}; use the same settings on every leader",
+                "message slot, credits, control credits and rendezvous bytes are {:?} here but \
+                 {:?} on member {member}; use the same settings on every leader",
                 settings(self),
                 settings(theirs)
             )));
@@ -523,6 +581,7 @@ mod tests {
             chunk_len: 100,
             data_freed: u32::MAX,
             ctrl_freed: 3,
+            key: 0,
             tag: 0xdead_beef_0000_0001,
             msg_len: 1 << 40,
             offset: (1 << 40) - 100,
@@ -538,11 +597,11 @@ mod tests {
         let mut bad = b;
         bad[0] ^= 1;
         assert!(Header::decode(&bad, 148).unwrap_err().contains("magic"));
-        let mut v2 = b;
-        v2[2] = 2;
-        assert!(Header::decode(&v2, 148)
+        let mut v1 = b;
+        v1[2] = 1;
+        assert!(Header::decode(&v1, 148)
             .unwrap_err()
-            .contains("protocol version 2"));
+            .contains("protocol version 1"));
         let past_end = Header {
             offset: (1 << 40) - 99,
             ..h
@@ -557,6 +616,44 @@ mod tests {
             Header::decode(&credit.encode(), HEADER_BYTES as u32).unwrap(),
             credit
         );
+        // A write grant round-trips, and its key never shows in Debug output.
+        let grant = Header {
+            kind: Kind::Cts,
+            chunk_len: 0,
+            key: 0x1234_5678,
+            msg_len: 4096,
+            offset: 0x7f00_0000_1000,
+            ..h
+        };
+        let n = HEADER_BYTES as u32;
+        assert_eq!(Header::decode(&grant.encode(), n).unwrap(), grant);
+        let shown = format!("{grant:?}");
+        assert!(
+            !shown.contains("key") && !shown.contains("305419896"),
+            "{shown}"
+        );
+        // A key outside a grant, a grant without an address, an empty rendezvous: refused.
+        let stray = Header {
+            kind: Kind::Fin,
+            ..grant
+        };
+        assert!(Header::decode(&stray.encode(), n)
+            .unwrap_err()
+            .contains("remote key"));
+        let nowhere = Header { offset: 0, ..grant };
+        assert!(Header::decode(&nowhere.encode(), n)
+            .unwrap_err()
+            .contains("address"));
+        let empty = Header {
+            kind: Kind::Go,
+            key: 0,
+            msg_len: 0,
+            ..grant
+        };
+        assert!(Header::decode(&empty.encode(), n)
+            .unwrap_err()
+            .contains("empty"));
+        assert!(Kind::Fin.data_class() && Kind::Cts.data_class() && !Kind::Bye.data_class());
     }
 
     #[test]
@@ -571,6 +668,7 @@ mod tests {
             slot_bytes: 65536,
             credits: 32,
             ctrl_credits: 4,
+            rndv: 1 << 16,
             qpns: vec![0, 0x101],
             psns: vec![0, 0xabcdef],
             device: "roce0".into(),
@@ -581,8 +679,8 @@ mod tests {
         assert_eq!(Info::decode(&text).unwrap(), info);
         // Unknown keys are ignored.
         assert_eq!(Info::decode(&format!("{text};future=1")).unwrap(), info);
-        let newer = text.replacen("gbverbs 1;", "gbverbs 2;", 1);
-        assert!(Info::decode(&newer).unwrap_err().contains("protocol 2"));
+        let older = text.replacen("gbverbs 2;", "gbverbs 1;", 1);
+        assert!(Info::decode(&older).unwrap_err().contains("protocol 1"));
         assert!(Info::decode("hello").is_err());
     }
 

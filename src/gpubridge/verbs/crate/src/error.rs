@@ -24,6 +24,8 @@ pub enum Error {
     DrainTimeout { qp_num: u32, outstanding: usize },
     /// The provider can't do this (the mock provider and dma-buf, for example).
     Unsupported(String),
+    /// A GPU driver call failed (CUDA driver API, HIP or ROCr), with its message.
+    Gpu(String),
 }
 
 impl Error {
@@ -66,6 +68,7 @@ impl fmt::Display for Error {
                  drain deadline; their memory regions are leaked, not released"
             ),
             Error::Unsupported(text) => write!(f, "unsupported: {text}"),
+            Error::Gpu(text) => write!(f, "GPU driver: {text}"),
         }
     }
 }

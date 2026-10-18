@@ -142,11 +142,44 @@ impl MrCache {
     /// [`invalidate_owner`]: MrCache::invalidate_owner
     /// [`invalidate_range`]: MrCache::invalidate_range
     pub unsafe fn get(&self, key: CacheKey) -> Result<MemoryRegion> {
+        let pd = self.pd.clone();
+        // SAFETY: the caller keeps the allocation valid until it is invalidated and every
+        // handle to the registration is gone (this function's contract); the registration
+        // is released no sooner than that.
+        self.get_with(key, key, move || unsafe {
+            pd.register(key.addr as *mut u8, key.len, key.access)
+        })
+    }
+
+    /// As [`get`](MrCache::get) for `want`, registering a miss as `cover` (a range of the
+    /// same owner and access that contains `want`, often rounded out so later lookups
+    /// nearby hit) with `register`, which must register exactly `cover`'s range with its
+    /// access on this cache's protection domain: how device memory gets in, through a
+    /// dma-buf or peer memory.
+    ///
+    /// Safe itself: whether the memory stays valid is `register`'s business (a dma-buf
+    /// registration pins it; an `unsafe` registration's caller promises it, as for `get`).
+    pub fn get_with(
+        &self,
+        want: CacheKey,
+        cover: CacheKey,
+        register: impl FnOnce() -> Result<MemoryRegion>,
+    ) -> Result<MemoryRegion> {
+        let key = want;
         if key.len == 0 {
             return Err(Error::invalid("a memory region can't be empty"));
         }
-        if key.addr.checked_add(key.len).is_none() {
+        if key.addr.checked_add(key.len).is_none() || cover.addr.checked_add(cover.len).is_none() {
             return Err(Error::invalid("address range overflows"));
+        }
+        if cover.owner != want.owner
+            || cover.access != want.access
+            || cover.addr > want.addr
+            || want.end() > cover.end()
+        {
+            return Err(Error::invalid(
+                "a cache entry's registered range must contain what was asked for",
+            ));
         }
         let mut st = self.lock();
         st.clock += 1;
@@ -166,6 +199,7 @@ impl MrCache {
         // Another owner's entries over this memory: that allocation was freed. If one is
         // still in use, it was freed too early (see the contract): refuse rather than
         // register the same pages for two owners.
+        let key = cover;
         let stale = |k: &CacheKey| k.owner != key.owner && k.overlaps(key.addr, key.len);
         if let Some(busy) = st.entries.iter().find(|e| stale(&e.key) && !e.idle()) {
             let owner = busy.key.owner;
@@ -211,10 +245,16 @@ impl MrCache {
                 }
             }
         }
-        // SAFETY: the caller keeps the allocation valid until it is invalidated and every
-        // handle to the registration is gone (this function's contract); the registration
-        // is released no sooner than that.
-        let region = unsafe { self.pd.register(key.addr as *mut u8, key.len, key.access) }?;
+        let region = register()?;
+        if region.addr() != key.addr || region.len() != key.len {
+            return Err(Error::invalid(format!(
+                "a registration of {} bytes at {:#x} for a cache entry of {} at {:#x}",
+                region.len(),
+                region.addr(),
+                key.len,
+                key.addr
+            )));
+        }
         st.stats.registrations += 1;
         st.bytes += key.len;
         st.entries.push(CacheEntry {
@@ -288,5 +328,10 @@ impl MrCache {
 
     pub fn config(&self) -> CacheConfig {
         self.config
+    }
+
+    /// The protection domain the cache registers on.
+    pub fn pd(&self) -> &ProtectionDomain {
+        &self.pd
     }
 }

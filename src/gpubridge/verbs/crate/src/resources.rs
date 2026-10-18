@@ -18,6 +18,11 @@
 //! destroyed. If that drain runs out of time, the requests' regions are leaked on purpose
 //! (never deregistered, their buffers never freed) and `close` returns
 //! [`Error::DrainTimeout`].
+//!
+//! **A dma-buf region owns its file descriptor.** [`ProtectionDomain::register_dmabuf`]
+//! takes a [`DmabufFd`] (exported by the GPU driver) and keeps it until the region is
+//! deregistered; it is closed exactly once, after `dereg_mr` returns, or never if
+//! deregistering fails (the region is leaked then, as for an owned buffer).
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::collections::hash_map::Entry;
@@ -384,6 +389,40 @@ impl ProtectionDomain {
         ))
     }
 
+    /// Registers `len` bytes at `offset` of the dma-buf `fd` (device memory a GPU driver
+    /// exported), addressed by work requests as `iova`. The region keeps `fd` and closes
+    /// it once deregistered; if registering fails, `fd` is closed now.
+    ///
+    /// Safe: the kernel pins the exported memory for the registration (the exporter keeps
+    /// it allocated while the dma-buf is imported), so nothing the device does through
+    /// the region can reach memory that was freed and reused.
+    pub fn register_dmabuf(
+        &self,
+        fd: DmabufFd,
+        offset: u64,
+        len: usize,
+        iova: u64,
+        access: Access,
+    ) -> Result<MemoryRegion> {
+        self.check_region(len, access)?;
+        if iova == 0 {
+            return Err(Error::invalid("a dma-buf region needs a nonzero address"));
+        }
+        let keys = self.inner.ctx.provider.reg_dmabuf_mr(
+            self.inner.handle,
+            offset,
+            len,
+            iova,
+            fd.raw(),
+            access,
+        )?;
+        let mut region = MemoryRegion::new(&self.inner, keys, iova as usize, len, access, None);
+        Arc::get_mut(&mut region.inner)
+            .expect("a new region has one handle")
+            .dmabuf = Some(fd);
+        Ok(region)
+    }
+
     /// A reliable-connected queue pair in the `Reset` state. Both completion queues must
     /// have room for all of its work (`max_send_wr` on `send_cq`, `max_recv_wr` on
     /// `recv_cq`) on top of other queue pairs': a completion queue that overflows breaks
@@ -499,6 +538,44 @@ impl Drop for OwnedBuffer {
     }
 }
 
+/// Closes the dma-buf file descriptors one exporter handed out (the CUDA driver's are
+/// plain descriptors; ROCr's go back through `hsa_amd_portable_close_dmabuf`).
+pub trait DmabufCloser: Send + Sync {
+    fn close_dmabuf(&self, fd: i32) -> Result<()>;
+}
+
+/// A dma-buf file descriptor someone exported for this process: closed exactly once,
+/// when this is dropped (a region holding it drops it only after deregistering).
+pub struct DmabufFd {
+    fd: i32,
+    closer: Arc<dyn DmabufCloser>,
+}
+
+impl DmabufFd {
+    /// Takes ownership of `fd`, which `closer` closes.
+    pub fn new(fd: i32, closer: Arc<dyn DmabufCloser>) -> DmabufFd {
+        DmabufFd { fd, closer }
+    }
+
+    pub fn raw(&self) -> i32 {
+        self.fd
+    }
+}
+
+impl Drop for DmabufFd {
+    fn drop(&mut self) {
+        // Nothing to do on failure: the descriptor is gone either way, and the kernel
+        // keeps the dma-buf alive for as long as a registration imports it.
+        let _ = self.closer.close_dmabuf(self.fd);
+    }
+}
+
+impl std::fmt::Debug for DmabufFd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DmabufFd({})", self.fd)
+    }
+}
+
 struct MrInner {
     pd: Arc<PdInner>,
     handle: Handle,
@@ -511,6 +588,8 @@ struct MrInner {
     /// lock to count one, and so do copies in and out of an owned buffer.
     inflight: Mutex<u64>,
     owned: Option<OwnedBuffer>,
+    /// The dma-buf a device-memory region imports; closed after deregistering.
+    dmabuf: Option<DmabufFd>,
 }
 
 impl Drop for MrInner {
@@ -526,8 +605,11 @@ impl Drop for MrInner {
             if let Some(buffer) = self.owned.take() {
                 mem::forget(buffer);
             }
+            if let Some(fd) = self.dmabuf.take() {
+                mem::forget(fd);
+            }
         }
-        // `owned` (if any) is freed after this, once deregistered.
+        // `owned` (if any) is freed and `dmabuf` closed after this, once deregistered.
     }
 }
 
@@ -558,6 +640,7 @@ impl MemoryRegion {
                 access,
                 inflight: Mutex::new(0),
                 owned,
+                dmabuf: None,
             }),
         }
     }
@@ -589,6 +672,12 @@ impl MemoryRegion {
     /// Whether the region owns its buffer (from `register_buffer`).
     pub fn owns_buffer(&self) -> bool {
         self.inner.owned.is_some()
+    }
+
+    /// Whether the region imports a dma-buf (`register_dmabuf`): device memory the CPU
+    /// can't read or write through its address.
+    pub fn is_dmabuf(&self) -> bool {
+        self.inner.dmabuf.is_some()
     }
 
     /// Posted work requests that reference this region and haven't completed.
@@ -668,8 +757,8 @@ impl std::fmt::Debug for MemoryRegion {
         f.debug_struct("MemoryRegion")
             .field("addr", &format_args!("{:#x}", self.inner.addr))
             .field("len", &self.inner.len)
-            .field("lkey", &format_args!("{:#x}", self.inner.lkey))
             .field("access", &self.inner.access)
+            .field("dmabuf", &self.inner.dmabuf.is_some())
             .finish()
     }
 }

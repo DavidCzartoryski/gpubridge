@@ -453,9 +453,9 @@ fn mismatched_ends_are_refused_at_connect() {
     let (fabric, a, b) = ib_fabric();
     let ea = Endpoint::new(fabric.provider(a), 2, 0, small()).unwrap();
     let eb = Endpoint::new(fabric.provider(b), 2, 1, small()).unwrap();
-    let newer = eb.local_info().replacen("gbverbs 1;", "gbverbs 2;", 1);
-    let e = ea.connect(1, &newer).unwrap_err().to_string();
-    assert!(e.contains("protocol 2, this side 1"), "{e}");
+    let older = eb.local_info().replacen("gbverbs 2;", "gbverbs 1;", 1);
+    let e = ea.connect(1, &older).unwrap_err().to_string();
+    assert!(e.contains("protocol 1, this side 2"), "{e}");
     // Different settings.
     let ec = Endpoint::new(
         fabric.provider(b),

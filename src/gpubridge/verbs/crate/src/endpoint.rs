@@ -2,15 +2,25 @@
 //! protocol"): an RC queue pair to every other member, tagged messages over them with
 //! credits, and a completion thread.
 //!
-//! **Memory.** The device only ever reads and writes this endpoint's own registered
-//! slots: a message is copied from the caller's memory into a send slot and sent; it
-//! arrives in a receive slot and is copied into the caller's memory (or, if no receive is
-//! posted for it yet, into a bounded heap buffer). The caller's memory is never
-//! registered, so nothing the device does can touch it, and a queue pair that never
-//! drains can only leak this endpoint's slots. Every copy into or out of the caller's
-//! memory happens with the endpoint's lock held, and [`Endpoint::abort`] cancels every
-//! operation under that lock: once it returns, nothing reads or writes caller memory
-//! again.
+//! **Memory.** Two kinds of caller memory. Plain caller memory ([`Endpoint::send`],
+//! [`Endpoint::recv`]) is never registered: a message is copied from it into a send slot
+//! and sent; it arrives in a receive slot and is copied into it (or, if no receive is
+//! posted for it yet, into a bounded heap buffer). Every such copy happens with the
+//! endpoint's lock held, and [`Endpoint::abort`] cancels every operation under that lock:
+//! once it returns, nothing reads or writes that memory again. Registered memory
+//! ([`Registered`], from [`Endpoint::register_device`] or [`Endpoint::register_host`];
+//! [`Endpoint::send_registered`], [`Endpoint::recv_registered`]) is read and written by
+//! the device in place: a send gathers its payload from it, and with rendezvous on a
+//! receive grants the peer an RDMA WRITE into it (docs: "Wire protocol"). That memory is
+//! the registration's to keep valid; a queue pair that never drains leaks the
+//! registrations its work holds, never releases them early.
+//!
+//! **Rendezvous** (`rndv_bytes` > 0, the same on every member). A message of at least
+//! `rndv_bytes` bytes waits until its receiver posts the receive and clears it: with a
+//! write grant when the receive is into registered memory (the sender WRITEs the payload
+//! there, then SENDs a "written" message, which completes the receive), or "send it in
+//! chunks" otherwise. Waiting messages don't hold up others to the same peer, except
+//! later ones with the same tag.
 //!
 //! **Threads.** The caller's thread posts (and copies what fits into free slots). The
 //! completion thread blocks on the completion channel (`poll(2)` on its descriptor and
@@ -26,21 +36,27 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::cache::Invalidated;
+use crate::direct::{json_str, DirectConfig, Registered, Registrar};
 use crate::error::{Error, Result};
+use crate::gpu::{GpuMemory, PeerModules};
 use crate::protocol::{self, Header, Info, Kind, Selected, HEADER_BYTES, PROTOCOL_VERSION};
 use crate::provider::Provider;
 use crate::resources::{
-    CompletionChannel, CompletionQueue, MemoryRegion, ProtectionDomain, QueuePair, SendRequest, Sge,
+    CompletionChannel, CompletionQueue, MemoryRegion, QueuePair, SendRequest, Sge,
 };
 use crate::types::{
-    Access, Address, Completion, GlobalRoute, InitAttr, LinkLayer, Mtu, QpCaps, RtrAttr, RtsAttr,
-    SendOp, WcStatus,
+    Access, Address, Completion, GlobalRoute, InitAttr, LinkLayer, Mtu, QpCaps, RemoteTarget,
+    RtrAttr, RtsAttr, SendOp, WcStatus,
 };
 
 /// How long the completion thread blocks at most before it checks whether to stop.
 pub const TICK: Duration = Duration::from_millis(100);
 /// Completions taken per poll.
 const POLL_BATCH: usize = 64;
+/// The most one RDMA WRITE from registered memory carries (below the 2 GiB message limit
+/// of common devices).
+pub const WRITE_CHUNK: u64 = 1 << 30;
 
 /// What [`Endpoint::wait`] found when it didn't succeed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +93,11 @@ pub struct Config {
     pub retry_cnt: u8,
     pub service_level: u8,
     pub traffic_class: u8,
+    /// Messages of at least this many bytes go by rendezvous (docs: "Wire protocol");
+    /// 0: none do, and peers get no write access at all.
+    pub rndv_bytes: u64,
+    /// Which device paths registrations may use, and the registration caches' bounds.
+    pub direct: DirectConfig,
 }
 
 impl Default for Config {
@@ -95,6 +116,8 @@ impl Default for Config {
             retry_cnt: 7,
             service_level: 0,
             traffic_class: 0,
+            rndv_bytes: 0,
+            direct: DirectConfig::default(),
         }
     }
 }
@@ -109,6 +132,11 @@ impl Config {
                 .ok_or_else(|| Error::invalid(format!("setting without '=': {line:?}")))?;
             let bad = || Error::invalid(format!("bad value for {key}: {value:?}"));
             let n = || value.parse::<u64>().map_err(|_| bad());
+            let flag = || match value {
+                "0" => Ok(false),
+                "1" => Ok(true),
+                _ => Err(bad()),
+            };
             match key {
                 "device" => c.device = (!value.is_empty()).then(|| value.to_owned()),
                 "port" => c.port = Some(u8::try_from(n()?).map_err(|_| bad())?),
@@ -123,8 +151,15 @@ impl Config {
                 "retry_cnt" => c.retry_cnt = u8::try_from(n()?).map_err(|_| bad())?,
                 "service_level" => c.service_level = u8::try_from(n()?).map_err(|_| bad())?,
                 "traffic_class" => c.traffic_class = u8::try_from(n()?).map_err(|_| bad())?,
+                "rndv_bytes" => c.rndv_bytes = n()?,
+                "dmabuf" => c.direct.dmabuf = flag()?,
+                "peer_memory" => c.direct.peer_memory = flag()?,
+                "device_cache_entries" => c.direct.device_cache.max_entries = n()? as usize,
+                "device_cache_bytes" => c.direct.device_cache.max_bytes = n()? as usize,
+                "host_cache_entries" => c.direct.host_cache.max_entries = n()? as usize,
+                "host_cache_bytes" => c.direct.host_cache.max_bytes = n()? as usize,
                 // The C interface's own keys (which provider), handled there.
-                "provider" | "fabric_dir" => {}
+                "provider" | "fabric_dir" | "gpu" => {}
                 _ => return Err(Error::invalid(format!("unknown setting {key:?}"))),
             }
         }
@@ -151,6 +186,16 @@ impl Config {
         }
         if self.max_pending == 0 {
             return Err(Error::invalid("max_pending must be positive"));
+        }
+        for (name, cache) in [
+            ("device cache", self.direct.device_cache),
+            ("host cache", self.direct.host_cache),
+        ] {
+            if cache.max_entries == 0 || cache.max_bytes == 0 {
+                return Err(Error::invalid(format!(
+                    "the {name} needs room for at least one entry and byte"
+                )));
+            }
         }
         if self.timeout_exp > 31 || self.retry_cnt > 7 || self.service_level > 15 {
             return Err(Error::invalid(
@@ -187,6 +232,23 @@ pub struct Counters {
     pub notifications: u64,
     pub async_events: u64,
     pub batches_posted: u64,
+    /// Clear-to-send messages sent: write grants and "send in chunks".
+    pub grants_sent: u64,
+    pub go_sent: u64,
+    /// Clear-to-send messages received.
+    pub grants_received: u64,
+    pub go_received: u64,
+    /// RDMA WRITEs posted and their bytes; "written" messages sent and received.
+    pub writes_posted: u64,
+    pub bytes_written: u64,
+    pub fins_sent: u64,
+    pub fins_received: u64,
+    /// Bytes the device read from or wrote to registered memory in place (sends gathered
+    /// from it, writes from it, receives written into it), by kind.
+    pub host_registered_bytes: u64,
+    pub device_bytes: u64,
+    /// Bytes copied by the CPU between caller memory and the slots.
+    pub copied_bytes: u64,
 }
 
 /// Where an arriving message goes.
@@ -208,8 +270,22 @@ struct Incoming {
 #[derive(Clone, Copy)]
 enum SlotUse {
     Free,
-    Data { op: Option<i64> },
+    /// A chunk, an RDMA WRITE or a "written" message of a send operation.
+    Data {
+        op: Option<i64>,
+    },
+    /// A credit or goodbye message.
     Control,
+    /// A clear-to-send message.
+    Grant,
+}
+
+/// What a receiver cleared one message to be sent as.
+#[derive(Clone, Copy)]
+struct Grant {
+    len: u64,
+    /// RDMA WRITE to this address with this key; None: in chunks.
+    write: Option<(u64, u32)>,
 }
 
 struct Peer {
@@ -238,8 +314,16 @@ struct Peer {
     bye_pending: bool,
     bye_sent: bool,
     stalled: bool,
-    /// Send operations, in order; the front one is being chunked.
+    /// Send operations not started, in order.
     sends: VecDeque<i64>,
+    /// The send operation being posted (chunks, or writes and then its "written").
+    current: Option<i64>,
+    /// Clear-to-send messages received and not yet taken by a send, by tag, in order.
+    grants: HashMap<u64, VecDeque<Grant>>,
+    /// Receive operations whose clear-to-send message is still to go out, in order.
+    grants_out: VecDeque<i64>,
+    /// Receives granted a write, waiting for the "written" message, by tag.
+    writing: HashMap<u64, i64>,
     /// Receives posted and not yet matched to an arriving message, by tag.
     posted: HashMap<u64, i64>,
     incoming: HashMap<u64, Incoming>,
@@ -251,20 +335,54 @@ struct Peer {
     reposts: Vec<u32>,
 }
 
+/// How a send goes out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Waiting for the receiver's clear-to-send (rendezvous).
+    Waiting,
+    /// In chunks through the peer's receive slots.
+    Chunks,
+    /// RDMA WRITEs to the granted address, then a "written" message.
+    Write { addr: u64, key: u32 },
+}
+
 enum OpKind {
     Send {
+        mode: Mode,
+        /// Payload bytes posted so far.
         next: u64,
+        /// Work requests posted, and completed.
         posted: u64,
         acked: u64,
+        /// Work requests in all (chunks; or writes plus the "written" message).
         chunks: u64,
     },
     Recv,
 }
 
+/// An operation's memory.
+enum Mem {
+    /// Caller memory, copied through the slots by the CPU.
+    Plain(usize),
+    /// A registration the device reads or writes in place, from `offset`.
+    Reg { reg: Registered, offset: usize },
+}
+
+impl Mem {
+    /// Where the CPU may copy to or from, if it may.
+    fn cpu_addr(&self) -> Option<usize> {
+        match self {
+            Mem::Plain(p) => Some(*p),
+            Mem::Reg { reg, offset } if reg.cpu() => Some(reg.addr() + offset),
+            Mem::Reg { .. } => None,
+        }
+    }
+}
+
 struct Op {
     peer: usize,
     tag: u64,
-    ptr: usize,
+    mem: Mem,
     len: u64,
     kind: OpKind,
     done: bool,
@@ -300,9 +418,12 @@ struct Shared {
     index: usize,
     members: usize,
     local: Local,
-    /// Every queue pair and slot holds it too; kept here as the seam where phase A3
-    /// registers device memory for direct transfers.
-    _pd: ProtectionDomain,
+    /// Registrations of caller memory (device and host), on the endpoint's protection
+    /// domain. Dropped after the queue pairs are closed.
+    registrar: Registrar,
+    /// Whether work requests may carry two scatter-gather entries (a header from a slot
+    /// and a payload from registered memory).
+    gather: bool,
     cq: CompletionQueue,
     channel: CompletionChannel,
     state: Mutex<State>,
@@ -404,23 +525,34 @@ impl Endpoint {
         let pd = ctx.alloc_pd()?;
         let channel = ctx.create_channel()?;
         let cq = ctx.create_cq_on(depth, &channel)?;
+        let gather = dev.max_sge >= 2;
         let caps = QpCaps {
             max_send_wr: config.send_slots,
             max_recv_wr: config.credits + config.ctrl_credits,
-            max_send_sge: 1,
+            max_send_sge: if gather { 2 } else { 1 },
             max_recv_sge: 1,
             max_inline_data: 0,
+        };
+        // Peers may write only with rendezvous on, and then only into memory granted for
+        // one receive at a time (the queue pair's access is necessary, not sufficient:
+        // the region's key and bounds decide).
+        let (qp_access, reg_access) = if config.rndv_bytes > 0 {
+            (
+                Access::LOCAL_WRITE | Access::REMOTE_WRITE,
+                Access::LOCAL_WRITE | Access::REMOTE_WRITE,
+            )
+        } else {
+            (Access::NONE, Access::LOCAL_WRITE)
         };
         let mut slots = Vec::new();
         let mut qpns = vec![0; members];
         let mut psns = vec![0; members];
         for member in (0..members).filter(|m| *m != index) {
             let qp = pd.create_qp(&cq, &cq, caps)?;
-            // No remote access: this protocol only sends.
             qp.to_init(&InitAttr {
                 port,
                 pkey_index: 0,
-                access: Access::NONE,
+                access: qp_access,
             })?;
             let size = config.slot_bytes as usize;
             let send_slots = (0..config.send_slots)
@@ -465,6 +597,10 @@ impl Endpoint {
                 bye_sent: false,
                 stalled: false,
                 sends: VecDeque::new(),
+                current: None,
+                grants: HashMap::new(),
+                grants_out: VecDeque::new(),
+                writing: HashMap::new(),
                 posted: HashMap::new(),
                 incoming: HashMap::new(),
                 complete: HashMap::new(),
@@ -483,6 +619,7 @@ impl Endpoint {
             slot_bytes: config.slot_bytes,
             credits: config.credits,
             ctrl_credits: config.ctrl_credits,
+            rndv: config.rndv_bytes,
             qpns,
             psns,
             device: ctx.name().to_owned(),
@@ -493,6 +630,8 @@ impl Endpoint {
             let m = p.member;
             peers_by_member[m] = Some(p);
         }
+        let registrar = Registrar::new(&pd, reg_access, config.direct)?;
+        drop(pd);
         let shared = Arc::new(Shared {
             local: Local {
                 info,
@@ -509,7 +648,8 @@ impl Endpoint {
             config,
             index,
             members,
-            _pd: pd,
+            registrar,
+            gather,
             cq,
             channel,
             state: Mutex::new(State {
@@ -600,8 +740,34 @@ impl Endpoint {
         Ok(())
     }
 
-    fn post(&self, member: usize, ptr: usize, len: u64, tag: u64, send: bool) -> Result<i64> {
+    fn post(&self, member: usize, mem: Mem, len: u64, tag: u64, send: bool) -> Result<i64> {
         let s = &self.shared;
+        let rndv = s.config.rndv_bytes;
+        if let Mem::Reg { reg, offset } = &mem {
+            if offset
+                .checked_add(len as usize)
+                .map_or(true, |e| e > reg.len())
+            {
+                return Err(Error::invalid(format!(
+                    "{len} bytes at {offset} outside a registration of {}",
+                    reg.len()
+                )));
+            }
+            if !reg.cpu() && !send && (rndv == 0 || len < rndv) {
+                return Err(Error::invalid(format!(
+                    "a receive of {len} bytes into device memory: only messages of at least \
+                     rndv_bytes ({rndv}; 0 is off) are written into registered memory, smaller \
+                     ones arrive in host slots"
+                )));
+            }
+            if !s.gather && len > 0 && !(rndv > 0 && len >= rndv) {
+                return Err(Error::Unsupported(format!(
+                    "{} allows one scatter-gather entry per request, so registered memory can't \
+                     be sent in chunks",
+                    s.local.device
+                )));
+            }
+        }
         let mut st = lock(&s.state);
         if let Some(why) = &st.failed {
             return Err(Error::Busy(format!(
@@ -617,7 +783,7 @@ impl Endpoint {
                 limit: s.config.max_pending as u32,
             });
         }
-        if len > 0 && ptr == 0 {
+        if len > 0 && matches!(mem, Mem::Plain(0)) {
             return Err(Error::invalid("a null buffer"));
         }
         let peer = st
@@ -633,7 +799,7 @@ impl Endpoint {
         if let (Some(why), false) = (&peer.lost, buffered) {
             return Err(Error::Busy(format!("member {member}: {why}")));
         }
-        if !send && peer.posted.contains_key(&tag) {
+        if !send && (peer.posted.contains_key(&tag) || peer.writing.contains_key(&tag)) {
             return Err(Error::invalid(format!(
                 "a receive from member {member} with tag {tag:#x} is already posted"
             )));
@@ -647,7 +813,9 @@ impl Endpoint {
         st.next_id += 1;
         let payload = s.config.payload();
         let kind = if send {
+            let waiting = rndv > 0 && len >= rndv;
             OpKind::Send {
+                mode: if waiting { Mode::Waiting } else { Mode::Chunks },
                 next: 0,
                 posted: 0,
                 acked: 0,
@@ -661,7 +829,7 @@ impl Endpoint {
             Op {
                 peer: member,
                 tag,
-                ptr,
+                mem,
                 len,
                 kind,
                 done: false,
@@ -689,7 +857,7 @@ impl Endpoint {
     /// `len` bytes at `ptr` must stay valid and unchanged until `wait` reports the
     /// operation done, it fails, or [`abort`](Endpoint::abort) or `close` returns.
     pub unsafe fn send(&self, member: usize, ptr: usize, len: u64, tag: u64) -> Result<i64> {
-        self.post(member, ptr, len, tag, true)
+        self.post(member, Mem::Plain(ptr), len, tag, true)
     }
 
     /// Receives the message `member` sends with `tag` into `len` bytes at `ptr` (it must
@@ -700,7 +868,107 @@ impl Endpoint {
     /// `len` bytes at `ptr` must stay valid, and not be used otherwise, until `wait`
     /// reports the operation done, it fails, or `abort` or `close` returns.
     pub unsafe fn recv(&self, member: usize, ptr: usize, len: u64, tag: u64) -> Result<i64> {
-        self.post(member, ptr, len, tag, false)
+        self.post(member, Mem::Plain(ptr), len, tag, false)
+    }
+
+    /// Sends `len` bytes at `offset` of the registration `reg` to `member` with `tag`:
+    /// the device reads them in place (gathered after a header from a slot, or by RDMA
+    /// WRITE). The memory must not change until the operation is done.
+    pub fn send_registered(
+        &self,
+        member: usize,
+        reg: &Registered,
+        offset: usize,
+        len: u64,
+        tag: u64,
+    ) -> Result<i64> {
+        let mem = Mem::Reg {
+            reg: reg.clone(),
+            offset,
+        };
+        self.post(member, mem, len, tag, true)
+    }
+
+    /// Receives the message `member` sends with `tag` into `len` bytes at `offset` of
+    /// `reg`. With rendezvous on and a message of at least `rndv_bytes`, the peer writes
+    /// it there by RDMA WRITE; a smaller one (host memory only) is copied out of a slot.
+    /// For device memory, completion means the write has completed with respect to this
+    /// endpoint (its "written" message, sent after the writes on the same RC queue pair,
+    /// was polled); making it visible to GPU work is the caller's flush (docs: "GPU
+    /// memory").
+    pub fn recv_registered(
+        &self,
+        member: usize,
+        reg: &Registered,
+        offset: usize,
+        len: u64,
+        tag: u64,
+    ) -> Result<i64> {
+        let mem = Mem::Reg {
+            reg: reg.clone(),
+            offset,
+        };
+        self.post(member, mem, len, tag, false)
+    }
+
+    /// Uses `driver` for device memory, and `modules` to look for the peer-memory module.
+    pub fn set_gpu(&self, driver: Arc<dyn GpuMemory>, modules: PeerModules) {
+        self.shared.registrar.set_gpu(driver, modules);
+    }
+
+    /// Loads the GPU driver for `vendor` (`cuda` or `rocm`) at run time; its description,
+    /// or why it can't be used (remembered for the reasons registrations give).
+    pub fn load_gpu(&self, vendor: &str) -> Result<String> {
+        match crate::gpu::load(vendor) {
+            Ok(driver) => {
+                let text = driver.describe();
+                self.set_gpu(driver, PeerModules::system());
+                Ok(text)
+            }
+            Err(e) => {
+                self.shared.registrar.set_gpu_error(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// What each device path can do on `device`, as JSON (see
+    /// [`Registrar::capabilities`]).
+    pub fn gpu_capabilities(&self, device: i32) -> String {
+        self.shared.registrar.capabilities(device)
+    }
+
+    /// A direct registration of `len` bytes of device memory at `ptr` on `device` (a
+    /// dma-buf or peer memory, whichever passes its checks first; docs: "GPU memory"), or
+    /// every reason why not, for the caller to stage instead and say so.
+    pub fn register_device(
+        &self,
+        device: i32,
+        ptr: u64,
+        len: u64,
+    ) -> std::result::Result<Registered, String> {
+        self.shared.registrar.register_device(device, ptr, len)
+    }
+
+    /// Registers `len` bytes of host memory at `ptr` that the caller identifies as `owner`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Registrar::register_host`]: valid until `owner` is invalidated and every
+    /// handle to the registration (and work posted with it) is gone.
+    pub unsafe fn register_host(&self, ptr: usize, len: usize, owner: u64) -> Result<Registered> {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.shared.registrar.register_host(ptr, len, owner) }
+    }
+
+    /// Drops the host registrations of `owner` (it is about to be freed).
+    pub fn invalidate_host(&self, owner: u64) -> Invalidated {
+        self.shared.registrar.invalidate_host(owner)
+    }
+
+    /// The setting messages go by rendezvous from (0: never).
+    pub fn rndv_bytes(&self) -> u64 {
+        self.shared.config.rndv_bytes
     }
 
     /// Waits until every operation in `ids` is done (and forgets them), one fails, the
@@ -848,36 +1116,25 @@ impl Endpoint {
         result
     }
 
-    /// Telemetry as one JSON object (docs/VERBS_TRANSPORT.md, "Telemetry"). No remote
-    /// keys exist in this protocol, so none can appear here.
+    /// Telemetry as one JSON object (docs/VERBS_TRANSPORT.md, "Telemetry"). Remote keys
+    /// only ever cross the fabric in write grants; none is kept where this reads, so none
+    /// can appear here.
     pub fn telemetry(&self) -> String {
         let s = &self.shared;
         let l = &s.local;
+        let direct = s.registrar.telemetry();
         let st = lock(&s.state);
         let c = &st.counters;
         let mut o = String::from("{");
-        let q = |v: &str| {
-            let mut out = String::from("\"");
-            for ch in v.chars() {
-                match ch {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    c if (c as u32) < 0x20 => {
-                        let _ = write!(out, "\\u{:04x}", c as u32);
-                    }
-                    c => out.push(c),
-                }
-            }
-            out.push('"');
-            out
-        };
+        let q = |v: &str| json_str(v);
         let _ = write!(
             o,
             "\"protocol\":{PROTOCOL_VERSION},\"provider\":{},\"mock\":{},\"library\":{},\
              \"device\":{},\"port\":{},\"link_layer\":{},\"gid_index\":{},\"gid_type\":{},\
              \"active_mtu\":{},\"firmware\":{},\"vendor_id\":{},\"vendor_part_id\":{},\
-             \"path\":\"host\",\"operations\":\"RC SEND/RECV\",\"slot_bytes\":{},\
-             \"credits\":{},\"ctrl_credits\":{},\"send_slots\":{},\"members\":{},\"index\":{},",
+             \"operations\":{},\"rndv_bytes\":{},\"gather\":{},\"slot_bytes\":{},\
+             \"credits\":{},\"ctrl_credits\":{},\"send_slots\":{},\"members\":{},\"index\":{},\
+             \"direct\":{direct},",
             q(&l.provider),
             l.mock,
             q(&format!("gpubridge-verbs {}", env!("CARGO_PKG_VERSION"))),
@@ -890,6 +1147,13 @@ impl Endpoint {
             q(&l.fw_ver),
             l.vendor.0,
             l.vendor.1,
+            q(if s.config.rndv_bytes > 0 {
+                "RC SEND/RECV, RDMA WRITE (rendezvous)"
+            } else {
+                "RC SEND/RECV"
+            }),
+            s.config.rndv_bytes,
+            s.gather,
             s.config.slot_bytes,
             s.config.credits,
             s.config.ctrl_credits,
@@ -915,7 +1179,10 @@ impl Endpoint {
              \"control_received\":{},\"credit_stalls\":{},\"unexpected_bytes\":{},\
              \"unexpected_peak\":{},\"held_chunks\":{},\"completions\":{},\
              \"completion_errors\":{},\"notifications\":{},\"async_events\":{},\
-             \"batches_posted\":{},\"pending_operations\":{},\"peers\":[",
+             \"batches_posted\":{},\"grants_sent\":{},\"go_sent\":{},\"grants_received\":{},\
+             \"go_received\":{},\"writes_posted\":{},\"bytes_written\":{},\"fins_sent\":{},\
+             \"fins_received\":{},\"host_registered_bytes\":{},\"device_bytes\":{},\
+             \"copied_bytes\":{},\"pending_operations\":{},\"peers\":[",
             c.sends,
             c.recvs,
             c.bytes_sent,
@@ -933,6 +1200,17 @@ impl Endpoint {
             c.notifications,
             c.async_events,
             c.batches_posted,
+            c.grants_sent,
+            c.go_sent,
+            c.grants_received,
+            c.go_received,
+            c.writes_posted,
+            c.bytes_written,
+            c.fins_sent,
+            c.fins_received,
+            c.host_registered_bytes,
+            c.device_bytes,
+            c.copied_bytes,
             st.ops.len()
         );
         let mut first = true;
@@ -975,6 +1253,21 @@ impl Endpoint {
 impl Drop for Endpoint {
     fn drop(&mut self) {
         let _ = self.shutdown(Duration::from_secs(10));
+    }
+}
+
+impl Peer {
+    /// Drops every operation queued, posted, granted or in progress with this peer (they
+    /// stay in the operation table, failed or cancelled, holding their registrations
+    /// until waited for or the endpoint goes: a peer granted a write may still be writing
+    /// until its queue pair is in the error state).
+    fn forget_work(&mut self) {
+        self.sends.clear();
+        self.current = None;
+        self.posted.clear();
+        self.writing.clear();
+        self.grants.clear();
+        self.grants_out.clear();
     }
 }
 
@@ -1211,6 +1504,56 @@ impl Shared {
                 peer.data_freed = peer.data_freed.wrapping_add(1);
                 peer.reposts.push(slot);
             }
+            Kind::Cts | Kind::Go => {
+                if header.kind == Kind::Cts {
+                    st.counters.grants_received += 1;
+                } else {
+                    st.counters.go_received += 1;
+                }
+                let peer = st.peer(member);
+                peer.data_freed = peer.data_freed.wrapping_add(1);
+                peer.reposts.push(slot);
+                let write = (header.kind == Kind::Cts).then_some((header.offset, header.key));
+                peer.grants.entry(header.tag).or_default().push_back(Grant {
+                    len: header.msg_len,
+                    write,
+                });
+            }
+            Kind::Fin => {
+                st.counters.fins_received += 1;
+                let peer = st.peer(member);
+                peer.data_freed = peer.data_freed.wrapping_add(1);
+                peer.reposts.push(slot);
+                let Some(id) = peer.writing.remove(&header.tag) else {
+                    let why = format!(
+                        "member {member} broke the protocol: a \"written\" message for tag {:#x}, \
+                         which this member granted no write for",
+                        header.tag
+                    );
+                    self.protocol_error(st, member, &why);
+                    return;
+                };
+                let Some(op) = st.ops.get_mut(&id) else {
+                    return;
+                };
+                if op.len != header.msg_len {
+                    let why = format!(
+                        "member {member} wrote {} bytes for tag {:#x}, granted {}",
+                        header.msg_len, header.tag, op.len
+                    );
+                    self.protocol_error(st, member, &why);
+                    return;
+                }
+                op.done = op.error.is_none();
+                let device = matches!(&op.mem, Mem::Reg { reg, .. } if !reg.cpu());
+                let len = op.len;
+                st.counters.bytes_received += len;
+                if device {
+                    st.counters.device_bytes += len;
+                } else {
+                    st.counters.host_registered_bytes += len;
+                }
+            }
             Kind::Credit | Kind::Bye => {
                 st.counters.control_received += 1;
                 let peer = st.peer(member);
@@ -1219,7 +1562,12 @@ impl Shared {
                 if header.kind == Kind::Bye {
                     peer.said_bye = true;
                     // Nothing more comes from it: receives it can't still meet fail.
-                    let waiting: Vec<i64> = peer.posted.drain().map(|(_, id)| id).collect();
+                    let waiting: Vec<i64> = peer
+                        .posted
+                        .drain()
+                        .chain(peer.writing.drain())
+                        .map(|(_, id)| id)
+                        .collect();
                     let why =
                         format!("member {member} closed its end of the bridge before sending this");
                     for id in waiting {
@@ -1284,8 +1632,7 @@ impl Shared {
         }
         let peer = st.peer(member);
         peer.lost.get_or_insert_with(|| why.to_owned());
-        peer.sends.clear();
-        peer.posted.clear();
+        peer.forget_work();
         let _ = peer.qp.to_error();
     }
 
@@ -1297,8 +1644,7 @@ impl Shared {
             st.fail_op(id, &why);
         }
         for peer in st.peers.iter_mut().flatten() {
-            peer.sends.clear();
-            peer.posted.clear();
+            peer.forget_work();
             for inc in peer.incoming.values_mut() {
                 if matches!(inc.dest, Dest::Op(_)) {
                     inc.dest = Dest::Discard;
@@ -1369,18 +1715,26 @@ impl Shared {
         }
         let n = h.chunk_len as usize;
         let src = &peer.recv_slots[slot as usize];
+        let mut registered = false;
         let copied = match &mut inc.dest {
             Dest::Op(id) => match st.ops.get(id) {
-                Some(op) if n > 0 => {
-                    // SAFETY: the op's buffer holds op.len bytes (send/recv's contract)
-                    // and offset + n <= msg_len == op.len (checked by Header::decode and
-                    // above); the op isn't done or cancelled, so the caller still keeps it
-                    // valid, and the endpoint lock is held.
-                    let out = unsafe {
-                        std::slice::from_raw_parts_mut((op.ptr + h.offset as usize) as *mut u8, n)
-                    };
-                    src.read(HEADER_BYTES, out)
-                }
+                Some(op) if n > 0 => match op.mem.cpu_addr() {
+                    Some(addr) => {
+                        registered = matches!(op.mem, Mem::Reg { .. });
+                        // SAFETY: the op's memory holds op.len bytes (recv's contract, or
+                        // the registration's, which the op holds) and offset + n <=
+                        // msg_len == op.len (checked by Header::decode and above); the op
+                        // isn't done or cancelled, so it is still valid, and the endpoint
+                        // lock is held.
+                        let out = unsafe {
+                            std::slice::from_raw_parts_mut((addr + h.offset as usize) as *mut u8, n)
+                        };
+                        src.read(HEADER_BYTES, out)
+                    }
+                    // Device memory is only ever written by RDMA WRITE (post() refuses
+                    // receives into it that could arrive in chunks).
+                    None => Err(Error::invalid("a chunk for device memory")),
+                },
                 _ => Ok(()),
             },
             Dest::Buffer(buf) => src.read(
@@ -1396,6 +1750,11 @@ impl Shared {
         }
         inc.received += u64::from(h.chunk_len);
         st.counters.bytes_received += u64::from(h.chunk_len);
+        if registered {
+            st.counters.host_registered_bytes += u64::from(h.chunk_len);
+        } else {
+            st.counters.copied_bytes += u64::from(h.chunk_len);
+        }
         let peer = st.peers[member].as_mut().expect("a peer");
         let inc = &peer.incoming[&h.tag];
         if inc.received == inc.msg_len {
@@ -1415,9 +1774,9 @@ impl Shared {
 
     /// A receive operation was posted: meet it from what already arrived if possible.
     fn match_recv(&self, st: &mut State, member: usize, id: i64) {
-        let (tag, len, ptr) = {
+        let (tag, len, cpu) = {
             let op = &st.ops[&id];
-            (op.tag, op.len, op.ptr)
+            (op.tag, op.len, op.mem.cpu_addr())
         };
         let peer = st.peer(member);
         let whole = peer.complete.get_mut(&tag).and_then(VecDeque::pop_front);
@@ -1435,9 +1794,18 @@ impl Shared {
                 return;
             }
             if len > 0 {
-                // SAFETY: the op's buffer holds len bytes (recv's contract), still valid:
-                // it was just posted and the endpoint lock is held.
+                let Some(ptr) = cpu else {
+                    let why = format!(
+                        "member {member} sent tag {tag:#x} in chunks where device memory waits"
+                    );
+                    self.protocol_error(st, member, &why);
+                    return;
+                };
+                // SAFETY: the op's memory holds len bytes (recv's contract, or the
+                // registration's), still valid: it was just posted and the endpoint lock
+                // is held.
                 unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, buf.len()) };
+                st.counters.copied_bytes += len;
             }
             st.ops.get_mut(&id).expect("posted").done = true;
         } else if let Some(inc) = peer.incoming.get_mut(&tag) {
@@ -1450,6 +1818,13 @@ impl Shared {
                     self.protocol_error(st, member, &why);
                     return;
                 }
+                let Some(ptr) = cpu else {
+                    let why = format!(
+                        "member {member} sent tag {tag:#x} in chunks where device memory waits"
+                    );
+                    self.protocol_error(st, member, &why);
+                    return;
+                };
                 let have = inc.received as usize;
                 if have > 0 {
                     // SAFETY: as above; have <= msg_len == len.
@@ -1458,19 +1833,42 @@ impl Shared {
                 let freed = buf.len() as u64;
                 inc.dest = Dest::Op(id);
                 st.unexpected -= freed;
+                st.counters.copied_bytes += have as u64;
             } else {
                 // Another receive is already taking this message: this one waits for the
                 // next with the same tag.
-                peer.posted.insert(tag, id);
+                self.defer_recv(st, member, id);
             }
         } else if peer.said_bye {
             let why = format!("member {member} closed its end of the bridge before sending this");
             st.fail_op(id, &why);
         } else {
-            peer.posted.insert(tag, id);
+            self.defer_recv(st, member, id);
         }
         self.release_held(st, member);
         self.repost(st, member);
+    }
+
+    /// A receive nothing has arrived for yet: posted for chunks, or, for a message the
+    /// rendezvous covers, cleared to be sent (a write grant into registered memory, or
+    /// "in chunks" into plain memory).
+    fn defer_recv(&self, st: &mut State, member: usize, id: i64) {
+        let rndv = self.config.rndv_bytes;
+        let (tag, len, registered) = {
+            let op = &st.ops[&id];
+            (op.tag, op.len, matches!(op.mem, Mem::Reg { .. }))
+        };
+        let peer = st.peer(member);
+        if rndv > 0 && len >= rndv {
+            if registered {
+                peer.writing.insert(tag, id);
+            } else {
+                peer.posted.insert(tag, id);
+            }
+            peer.grants_out.push_back(id);
+        } else {
+            peer.posted.insert(tag, id);
+        }
     }
 
     /// Places held chunks, oldest first, while they fit.
@@ -1512,14 +1910,76 @@ impl Shared {
         }
     }
 
-    /// Sends what slots and credits allow to `member`: control messages first, then the
-    /// front send operation's next chunks. One batch post.
+    /// Takes the next send to `member` that may start: the first queued one that isn't
+    /// waiting for a clear-to-send, and that no earlier queued send has the same tag as
+    /// (messages with one tag go in order). Binds a waiting one to its clear-to-send.
+    fn next_send(&self, st: &mut State, member: usize) -> std::result::Result<Option<i64>, String> {
+        let State { peers, ops, .. } = st;
+        let peer = peers[member].as_mut().expect("a peer");
+        let mut seen = std::collections::HashSet::new();
+        let mut pick = None;
+        peer.sends
+            .retain(|id| ops.get(id).is_some_and(|op| op.error.is_none()));
+        for (i, id) in peer.sends.iter().enumerate() {
+            let op = &ops[id];
+            if !seen.insert(op.tag) {
+                continue;
+            }
+            let waiting = matches!(
+                op.kind,
+                OpKind::Send {
+                    mode: Mode::Waiting,
+                    ..
+                }
+            );
+            if !waiting || peer.grants.get(&op.tag).is_some_and(|g| !g.is_empty()) {
+                pick = Some(i);
+                break;
+            }
+        }
+        let Some(i) = pick else {
+            return Ok(None);
+        };
+        let id = peer.sends.remove(i).expect("picked");
+        let op = ops.get_mut(&id).expect("queued");
+        let OpKind::Send { mode, chunks, .. } = &mut op.kind else {
+            unreachable!("only sends are queued")
+        };
+        if *mode == Mode::Waiting {
+            let queue = peer.grants.get_mut(&op.tag).expect("granted");
+            let grant = queue.pop_front().expect("granted");
+            if queue.is_empty() {
+                peer.grants.remove(&op.tag);
+            }
+            if grant.len != op.len {
+                return Err(format!(
+                    "member {member} posted {} bytes for tag {:#x}; this member sends {}",
+                    grant.len, op.tag, op.len
+                ));
+            }
+            match grant.write {
+                Some((addr, key)) => {
+                    let piece = match op.mem {
+                        Mem::Plain(_) => u64::from(self.config.slot_bytes),
+                        Mem::Reg { .. } => WRITE_CHUNK,
+                    };
+                    *mode = Mode::Write { addr, key };
+                    *chunks = op.len.div_ceil(piece) + 1;
+                }
+                None => *mode = Mode::Chunks,
+            }
+        }
+        Ok(Some(id))
+    }
+
+    /// Sends what slots and credits allow to `member`: control messages first, then
+    /// clear-to-send messages, then the current send's next chunks (or writes, then its
+    /// "written" message). One batch post.
     fn pump(&self, st: &mut State, member: usize) {
         let cfg = &self.config;
         let payload = cfg.payload();
         let threshold = (cfg.credits / 2).max(1);
-        // (slot, bytes to send from it)
-        let mut batch: Vec<(u32, u32)> = Vec::new();
+        let mut batch: Vec<Wr> = Vec::new();
         let mut bytes = 0;
         loop {
             let peer = st.peers[member].as_mut().expect("a peer");
@@ -1527,6 +1987,17 @@ impl Shared {
             if !peer.connected || peer.lost.is_some() || peer.bye_sent || peer.said_bye {
                 break;
             }
+            if peer.current.is_none() {
+                match self.next_send(st, member) {
+                    Ok(next) => st.peer(member).current = next,
+                    Err(e) => {
+                        let why = format!("member {member} broke the protocol: {e}");
+                        self.protocol_error(st, member, &why);
+                        return;
+                    }
+                }
+            }
+            let peer = st.peers[member].as_mut().expect("a peer");
             let data_avail = cfg
                 .credits
                 .wrapping_sub(peer.data_sent.wrapping_sub(peer.data_returned));
@@ -1534,9 +2005,23 @@ impl Shared {
                 .ctrl_credits
                 .wrapping_sub(peer.ctrl_sent.wrapping_sub(peer.ctrl_returned));
             let owed = peer.data_freed.wrapping_sub(peer.data_reported);
-            let front = peer.sends.front().copied();
-            let need_credit = owed >= threshold && (front.is_none() || data_avail == 0);
-            let need_bye = peer.bye_pending && front.is_none();
+            // The next data-class work request, and whether it takes a data credit (an
+            // RDMA WRITE takes none: it consumes no receive).
+            let next_needs_credit = if !peer.grants_out.is_empty() {
+                Some(true)
+            } else {
+                peer.current.map(|id| match &st.ops[&id].kind {
+                    OpKind::Send {
+                        mode: Mode::Write { .. },
+                        next,
+                        ..
+                    } => *next >= st.ops[&id].len,
+                    _ => true,
+                })
+            };
+            let has_data = next_needs_credit.is_some();
+            let need_credit = owed >= threshold && (!has_data || data_avail == 0);
+            let need_bye = peer.bye_pending && !has_data && peer.sends.is_empty();
             if (need_credit || need_bye) && ctrl_avail > 0 {
                 let Some(slot) = peer.free_send.pop() else {
                     break;
@@ -1548,6 +2033,7 @@ impl Shared {
                     chunk_len: 0,
                     data_freed: peer.data_freed,
                     ctrl_freed: peer.ctrl_freed,
+                    key: 0,
                     tag: 0,
                     msg_len: 0,
                     offset: 0,
@@ -1566,17 +2052,20 @@ impl Shared {
                 if kind == Kind::Bye {
                     peer.bye_sent = true;
                 }
-                batch.push((slot, HEADER_BYTES as u32));
+                batch.push(Wr::Send {
+                    slot,
+                    len: HEADER_BYTES as u32,
+                });
                 st.counters.control_sent += 1;
                 if kind == Kind::Bye {
                     break;
                 }
                 continue;
             }
-            let Some(id) = front else {
+            let Some(needs_credit) = next_needs_credit else {
                 break;
             };
-            if data_avail == 0 {
+            if needs_credit && data_avail == 0 {
                 if !peer.stalled {
                     peer.stalled = true;
                     st.counters.credit_stalls += 1;
@@ -1586,59 +2075,227 @@ impl Shared {
             let Some(slot) = peer.free_send.pop() else {
                 break;
             };
-            peer.stalled = false;
-            let op = st.ops.get_mut(&id).expect("a queued send");
+            if needs_credit {
+                peer.stalled = false;
+            }
+            // A clear-to-send for the oldest receive that needs one.
+            if let Some(rid) = peer.grants_out.pop_front() {
+                let grant = match st.ops.get(&rid) {
+                    Some(op) if !op.done && op.error.is_none() => match &op.mem {
+                        Mem::Reg { reg, offset } => (
+                            Kind::Cts,
+                            reg.region().rkey(),
+                            (reg.addr() + offset) as u64,
+                            op.tag,
+                            op.len,
+                        ),
+                        Mem::Plain(_) => (Kind::Go, 0, 0, op.tag, op.len),
+                    },
+                    // Cancelled meanwhile.
+                    _ => {
+                        st.peer(member).free_send.push(slot);
+                        continue;
+                    }
+                };
+                let (kind, key, addr, tag, len) = grant;
+                let peer = st.peers[member].as_mut().expect("a peer");
+                let h = Header {
+                    kind,
+                    seq: peer.send_seq,
+                    chunk_len: 0,
+                    data_freed: peer.data_freed,
+                    ctrl_freed: peer.ctrl_freed,
+                    key,
+                    tag,
+                    msg_len: len,
+                    offset: addr,
+                };
+                if let Err(e) = peer.send_slots[slot as usize].write(0, &h.encode()) {
+                    peer.free_send.push(slot);
+                    let why = format!("member {member}: filling a send slot failed: {e}");
+                    self.lose(st, member, &why);
+                    return;
+                }
+                peer.send_seq = peer.send_seq.wrapping_add(1);
+                peer.data_reported = peer.data_freed;
+                peer.data_sent = peer.data_sent.wrapping_add(1);
+                peer.slot_use[slot as usize] = SlotUse::Grant;
+                batch.push(Wr::Send {
+                    slot,
+                    len: HEADER_BYTES as u32,
+                });
+                if kind == Kind::Cts {
+                    st.counters.grants_sent += 1;
+                } else {
+                    st.counters.go_sent += 1;
+                }
+                continue;
+            }
+            let id = peer.current.expect("data to send");
+            let (seq, data_freed, ctrl_freed) = (peer.send_seq, peer.data_freed, peer.ctrl_freed);
+            let slot_region = peer.send_slots[slot as usize].clone();
+            let op = st.ops.get_mut(&id).expect("the current send");
             let OpKind::Send {
+                mode,
                 next,
                 posted,
                 chunks,
                 ..
             } = &mut op.kind
             else {
-                unreachable!("only sends are queued")
+                unreachable!("only sends are current")
             };
-            let n = (op.len - *next).min(payload);
-            let peer = st.peers[member].as_mut().expect("a peer");
-            let h = Header {
-                kind: Kind::Data,
-                seq: peer.send_seq,
-                chunk_len: n as u32,
-                data_freed: peer.data_freed,
-                ctrl_freed: peer.ctrl_freed,
+            let header = |kind: Kind, chunk_len: u32, offset: u64| Header {
+                kind,
+                seq,
+                chunk_len,
+                data_freed,
+                ctrl_freed,
+                key: 0,
                 tag: op.tag,
                 msg_len: op.len,
-                offset: *next,
+                offset,
             };
-            let region = &peer.send_slots[slot as usize];
-            let mut written = region.write(0, &h.encode());
-            if written.is_ok() && n > 0 {
-                // SAFETY: the op's buffer holds op.len bytes and next + n <= op.len; the
-                // op is queued, so not done or cancelled, and the caller keeps its memory
-                // valid until then (send's contract); the endpoint lock is held.
-                let data = unsafe {
-                    std::slice::from_raw_parts((op.ptr + *next as usize) as *const u8, n as usize)
-                };
-                written = region.write(HEADER_BYTES, data);
-            }
-            if let Err(e) = written {
-                peer.free_send.push(slot);
-                let why = format!("member {member}: filling a send slot failed: {e}");
-                self.lose(st, member, &why);
-                return;
-            }
+            // What this request is: (the request, payload bytes, takes a receive, kind
+            // of memory the device reads in place: None for a copy).
+            let made: Result<(Wr, u64, bool, Option<bool>)> = match *mode {
+                Mode::Waiting => unreachable!("a send is current only once cleared"),
+                Mode::Chunks => {
+                    let n = (op.len - *next).min(payload);
+                    let h = header(Kind::Data, n as u32, *next);
+                    slot_region
+                        .write(0, &h.encode())
+                        .and_then(|()| match &op.mem {
+                            Mem::Plain(ptr) => {
+                                if n > 0 {
+                                    // SAFETY: the op's buffer holds op.len bytes and next + n
+                                    // <= op.len; the op is current, so not done or cancelled,
+                                    // and the caller keeps its memory valid until then (send's
+                                    // contract); the endpoint lock is held.
+                                    let data = unsafe {
+                                        std::slice::from_raw_parts(
+                                            (ptr + *next as usize) as *const u8,
+                                            n as usize,
+                                        )
+                                    };
+                                    slot_region.write(HEADER_BYTES, data)?;
+                                }
+                                let len = HEADER_BYTES as u32 + n as u32;
+                                Ok((Wr::Send { slot, len }, n, true, None))
+                            }
+                            Mem::Reg { .. } if n == 0 => Ok((
+                                Wr::Send {
+                                    slot,
+                                    len: HEADER_BYTES as u32,
+                                },
+                                0,
+                                true,
+                                None,
+                            )),
+                            Mem::Reg { reg, offset } => Ok((
+                                Wr::Gather {
+                                    slot,
+                                    region: reg.region().clone(),
+                                    off: offset + *next as usize,
+                                    n: n as u32,
+                                },
+                                n,
+                                true,
+                                Some(reg.cpu()),
+                            )),
+                        })
+                }
+                Mode::Write { addr, key } if *next < op.len => {
+                    let remote = RemoteTarget {
+                        addr: addr + *next,
+                        rkey: key,
+                    };
+                    match &op.mem {
+                        Mem::Plain(ptr) => {
+                            let n = (op.len - *next).min(u64::from(self.config.slot_bytes));
+                            // SAFETY: as for a chunk above.
+                            let data = unsafe {
+                                std::slice::from_raw_parts(
+                                    (ptr + *next as usize) as *const u8,
+                                    n as usize,
+                                )
+                            };
+                            slot_region.write(0, data).map(|()| {
+                                let wr = Wr::Write {
+                                    slot,
+                                    local: None,
+                                    off: 0,
+                                    n: n as u32,
+                                    remote,
+                                };
+                                (wr, n, false, None)
+                            })
+                        }
+                        Mem::Reg { reg, offset } => {
+                            let n = (op.len - *next).min(WRITE_CHUNK);
+                            let wr = Wr::Write {
+                                slot,
+                                local: Some(reg.region().clone()),
+                                off: offset + *next as usize,
+                                n: n as u32,
+                                remote,
+                            };
+                            Ok((wr, n, false, Some(reg.cpu())))
+                        }
+                    }
+                }
+                Mode::Write { .. } => {
+                    let h = header(Kind::Fin, 0, 0);
+                    slot_region.write(0, &h.encode()).map(|()| {
+                        let wr = Wr::Send {
+                            slot,
+                            len: HEADER_BYTES as u32,
+                        };
+                        (wr, 0, true, None)
+                    })
+                }
+            };
+            let (wr, n, takes_receive, in_place) = match made {
+                Ok(m) => m,
+                Err(e) => {
+                    st.peer(member).free_send.push(slot);
+                    let why = format!("member {member}: filling a send slot failed: {e}");
+                    self.lose(st, member, &why);
+                    return;
+                }
+            };
+            let is_fin = matches!(*mode, Mode::Write { .. }) && takes_receive;
+            let is_write = matches!(wr, Wr::Write { .. });
             *next += n;
             *posted += 1;
             let finished = *posted == *chunks;
             bytes += n;
-            peer.send_seq = peer.send_seq.wrapping_add(1);
-            peer.data_reported = peer.data_freed;
-            peer.data_sent = peer.data_sent.wrapping_add(1);
+            let c = &mut st.counters;
+            match in_place {
+                Some(true) => c.host_registered_bytes += n,
+                Some(false) => c.device_bytes += n,
+                None if n > 0 => c.copied_bytes += n,
+                None => {}
+            }
+            if is_write {
+                c.writes_posted += 1;
+                c.bytes_written += n;
+            } else if is_fin {
+                c.fins_sent += 1;
+            } else {
+                c.chunks_sent += 1;
+            }
+            let peer = st.peers[member].as_mut().expect("a peer");
+            if takes_receive {
+                peer.send_seq = peer.send_seq.wrapping_add(1);
+                peer.data_reported = peer.data_freed;
+                peer.data_sent = peer.data_sent.wrapping_add(1);
+            }
             peer.slot_use[slot as usize] = SlotUse::Data { op: Some(id) };
             if finished {
-                peer.sends.pop_front();
+                peer.current = None;
             }
-            batch.push((slot, HEADER_BYTES as u32 + n as u32));
-            st.counters.chunks_sent += 1;
+            batch.push(wr);
         }
         if batch.is_empty() {
             return;
@@ -1646,16 +2303,41 @@ impl Shared {
         st.counters.bytes_sent += bytes;
         st.counters.batches_posted += 1;
         let peer = st.peers[member].as_mut().expect("a peer");
-        let sges: Vec<[Sge<'_>; 1]> = batch
+        let sges: Vec<Vec<Sge<'_>>> = batch
             .iter()
-            .map(|&(s, l)| [Sge::new(&peer.send_slots[s as usize], 0, l)])
+            .map(|w| match w {
+                Wr::Send { slot, len } => vec![Sge::new(&peer.send_slots[*slot as usize], 0, *len)],
+                Wr::Gather {
+                    slot,
+                    region,
+                    off,
+                    n,
+                } => vec![
+                    Sge::new(&peer.send_slots[*slot as usize], 0, HEADER_BYTES as u32),
+                    Sge::new(region, *off, *n),
+                ],
+                Wr::Write {
+                    slot,
+                    local,
+                    off,
+                    n,
+                    ..
+                } => vec![Sge::new(
+                    local.as_ref().unwrap_or(&peer.send_slots[*slot as usize]),
+                    *off,
+                    *n,
+                )],
+            })
             .collect();
         let reqs: Vec<SendRequest<'_>> = batch
             .iter()
             .zip(&sges)
-            .map(|(&(s, _), sge)| SendRequest {
-                tag: slot_tag(member, false, s),
-                op: SendOp::Send,
+            .map(|(w, sge)| SendRequest {
+                tag: slot_tag(member, false, w.slot()),
+                op: match w {
+                    Wr::Write { remote, .. } => SendOp::Write(*remote),
+                    _ => SendOp::Send,
+                },
                 sges: &sge[..],
             })
             .collect();
@@ -1667,6 +2349,35 @@ impl Shared {
             // its slot marked. The link is never used again either way.
             let why = format!("member {member}: posting sends failed: {e}");
             self.lose(st, member, &why);
+        }
+    }
+}
+
+/// One work request a pump posts.
+enum Wr {
+    /// A SEND of `len` bytes from a slot.
+    Send { slot: u32, len: u32 },
+    /// A SEND of the slot's header followed by `n` bytes at `off` of `region`.
+    Gather {
+        slot: u32,
+        region: MemoryRegion,
+        off: usize,
+        n: u32,
+    },
+    /// An RDMA WRITE of `n` bytes at `off` of `local` (None: the slot) to `remote`.
+    Write {
+        slot: u32,
+        local: Option<MemoryRegion>,
+        off: usize,
+        n: u32,
+        remote: RemoteTarget,
+    },
+}
+
+impl Wr {
+    fn slot(&self) -> u32 {
+        match self {
+            Wr::Send { slot, .. } | Wr::Gather { slot, .. } | Wr::Write { slot, .. } => *slot,
         }
     }
 }
