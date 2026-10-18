@@ -11,9 +11,15 @@
 //! ([`Registered`], from [`Endpoint::register_device`] or [`Endpoint::register_host`];
 //! [`Endpoint::send_registered`], [`Endpoint::recv_registered`]) is read and written by
 //! the device in place: a send gathers its payload from it, and with rendezvous on a
-//! receive grants the peer an RDMA WRITE into it (docs: "Wire protocol"). That memory is
-//! the registration's to keep valid; a queue pair that never drains leaks the
-//! registrations its work holds, never releases them early.
+//! receive grants the peer an RDMA WRITE into it, through a window registered for exactly
+//! that receive (docs: "Wire protocol"). That memory is the registration's to keep valid;
+//! a queue pair that never drains leaks the registrations its work holds, never releases
+//! them early.
+//!
+//! **Failure is cancellation.** An operation fails only by being cancelled under the
+//! endpoint's lock ([`State::fail_op`]), and a failed endpoint cancels them all and posts
+//! nothing more, before any wait can report it: nothing copies to or from plain caller
+//! memory after a failure has been reported.
 //!
 //! **Rendezvous** (`rndv_bytes` > 0, the same on every member). A message of at least
 //! `rndv_bytes` bytes waits until its receiver posts the receive and clears it: with a
@@ -959,7 +965,9 @@ impl Endpoint {
 
     /// Receives the message `member` sends with `tag` into `len` bytes at `offset` of
     /// `reg`. With rendezvous on and a message of at least `rndv_bytes`, the peer writes
-    /// it there by RDMA WRITE; a smaller one (host memory only) is copied out of a slot.
+    /// it there by RDMA WRITE, through a window registered now for exactly those bytes
+    /// (deregistered once written); a smaller one (host memory only) is copied out of a
+    /// slot.
     /// For device memory, completion means the write has completed with respect to this
     /// endpoint (its "written" message, sent after the writes on the same RC queue pair,
     /// was polled); making it visible to GPU work is the caller's flush (docs: "GPU

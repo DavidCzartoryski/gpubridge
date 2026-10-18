@@ -624,8 +624,11 @@ pub unsafe extern "C" fn gb_verbs_abort(h: *mut c_void, why: *const c_char) -> c
     })
 }
 
-/// Closes and frees the endpoint: 0, or 1 if work didn't drain within `timeout` and its
-/// slots were leaked (never the caller's memory), with the reason in `error`.
+/// Closes and frees the endpoint: 0, or 1 if work didn't drain within `timeout`, with the
+/// reason in `error`. Then that work was leaked rather than released: its slots, and any
+/// registration of the caller's memory it held (a registered send or receive, a write
+/// window), stay registered for good, so the caller must never free that memory. Plain
+/// caller memory is never held.
 ///
 /// # Safety
 /// `h` from gb_verbs_create, not used again afterwards; `error` holds `error_size` bytes.

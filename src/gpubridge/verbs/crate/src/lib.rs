@@ -1,7 +1,8 @@
-//! The foundation of gpubridge's raw-verbs bridge (docs/VERBS_TRANSPORT.md): owned
-//! libibverbs resources over a [`Provider`], the queue pair state machine, work tracking
-//! that keeps memory registered while the device can use it, a bounded registration cache,
-//! and a deterministic mock provider.
+//! gpubridge's raw-verbs bridge (docs/VERBS_TRANSPORT.md): owned libibverbs resources over
+//! a [`Provider`], the queue pair state machine, work tracking that keeps memory registered
+//! while the device can use it, a bounded registration cache, the bridge's RC wire protocol
+//! (version 2, with an RDMA WRITE rendezvous) and its endpoint, GPU memory registration,
+//! the C interface the Python bridge loads, and deterministic mock providers.
 //!
 //! - [`Context`], [`ProtectionDomain`], [`CompletionQueue`], [`QueuePair`] and
 //!   [`MemoryRegion`] own their verbs resources and release them in a correct order
@@ -10,9 +11,14 @@
 //! - [`MockFabric`] / [`MockProvider`]: an in-process fabric with injectable faults.
 //! - [`IbvProvider`] (feature `ibverbs`, Linux): libibverbs through a C shim compiled
 //!   against rdma-core's headers.
+//! - [`Endpoint`] (`endpoint.rs`, [`protocol`]): one member's end of the bridge, an RC
+//!   queue pair to every other member, credits, a completion thread, and the
+//!   rendezvous; the `gb_verbs_*` C functions (`ffi.rs`) are what `gpubridge.verbs`
+//!   calls.
+//! - [`Registrar`] (`direct.rs`, [`gpu`]): device memory through dma-buf or peer memory,
+//!   host buffers, and each rendezvous receive's write window.
 //!
-//! There is no wire protocol here and nothing Python calls yet (phase A2), and no GPU
-//! memory path (phase A3). Nothing here has run on RDMA hardware.
+//! Nothing here has run on RDMA hardware or a GPU.
 
 mod cache;
 mod direct;
