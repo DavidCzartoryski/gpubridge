@@ -1391,18 +1391,30 @@ impl QueuePair {
     /// posted (their ids are lost to the caller, but their completions still release
     /// their memory) and the error is returned.
     pub fn post_sends(&self, requests: &[SendRequest<'_>]) -> Result<Vec<WorkId>> {
+        self.post_sends_partial(requests).map_err(|(_, e)| e)
+    }
+
+    /// Endpoint use: retain the posted prefix length so only the operations containing
+    /// rejected WRs are blamed; wholly posted operations are collateral cancellation.
+    pub(crate) fn post_sends_partial(
+        &self,
+        requests: &[SendRequest<'_>],
+    ) -> std::result::Result<Vec<WorkId>, (usize, Error)> {
         let mut rt = lock(&self.st);
-        self.require(&mut rt, QpState::Rts, "post a send")?;
+        self.require(&mut rt, QpState::Rts, "post a send")
+            .map_err(|e| (0, e))?;
         let raw: Vec<Vec<RawSge>> = requests
             .iter()
             .map(|r| self.raw_sges(r.sges, self.caps.max_send_sge, false))
-            .collect::<Result<_>>()?;
+            .collect::<Result<_>>()
+            .map_err(|e| (0, e))?;
         Self::reserve_n(
             &self.shared.sends,
             self.caps.max_send_wr,
             requests.len(),
             "send",
-        )?;
+        )
+        .map_err(|e| (0, e))?;
         let first = self
             .next_wr
             .fetch_add(requests.len() as u64, Ordering::Relaxed);
@@ -1434,7 +1446,7 @@ impl QueuePair {
             for i in posted..requests.len() {
                 drop(self.send_cq.untrack(self.shared.qp_num, first + i as u64));
             }
-            return Err(e);
+            return Err((posted, e));
         }
         Ok((0..requests.len() as u64)
             .map(|i| WorkId(first + i))

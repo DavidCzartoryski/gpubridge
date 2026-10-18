@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use common::{eventually, ib_fabric};
 use gpubridge_verbs::{
-    Access, AsyncEvent, AsyncEventKind, Config, Context, Endpoint, Fault, InitAttr, MockFabric,
-    Progress, SendOp, SendRequest, Sge, WaitError, WcStatus,
+    Access, AsyncEvent, AsyncEventKind, Call, Config, Context, Endpoint, Fault, InitAttr,
+    MockFabric, Progress, SendOp, SendRequest, Sge, WaitError, WcStatus,
 };
 
 const POLICIES: [Progress; 3] = [Progress::Latency, Progress::Balanced, Progress::Economy];
@@ -176,6 +176,41 @@ fn every_policy_refuses_queued_sends_to_a_disconnected_peer_without_a_deadline_w
             "{policy:?}: {:?}",
             f.violations()
         );
+    }
+}
+
+#[test]
+fn every_policy_attributes_a_native_post_failure_to_its_send() {
+    for policy in POLICIES {
+        for rejected in [0, 1] {
+            let (f, a, b) = pair(policy);
+            let mut out = [0u8; 4];
+            let r = recv(&a, 1, &mut out, 88);
+            f.inject(Fault::FailCall {
+                node: 0,
+                call: Call::PostSend,
+                nth: rejected,
+                errno: 5,
+            });
+            let data = vec![1; 2048];
+            let s = send(&a, 1, &data, 99);
+            assert!(matches!(a.wait(&[s, r], LONG), Err(WaitError::Failed(_))));
+            let cause = a.operation_outcome(s);
+            assert!(cause.contains("\"status\":\"error\""), "{cause}");
+            assert!(cause.contains("posting sends failed"), "{cause}");
+            assert!(
+                cause.contains("\"wc_status\":null"),
+                "no WC exists for a rejected post"
+            );
+            assert!(a.operation_outcome(r).contains("\"status\":\"cancelled\""));
+            a.close(LONG).unwrap();
+            b.close(LONG).unwrap();
+            assert!(
+                f.violations().is_empty(),
+                "{policy:?}: {:?}",
+                f.violations()
+            );
+        }
     }
 }
 

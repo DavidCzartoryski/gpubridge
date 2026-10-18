@@ -641,7 +641,8 @@ MOCK/test-fabric records always carry `synthetic: true`. When an operation's own
 work completion fails, its record has `status: error` and `wc_status` using the
 stable libibverbs spelling (for example `IBV_WC_RETRY_EXC_ERR`). Other unfinished
 operations cancelled by that failure or a local abort have `status: cancelled`;
-operations already completed remain `ok`. A timeout marks outstanding operations
+operations already completed remain `ok`. A native timeout return code (never
+an error-message substring) marks outstanding operations
 `timeout`. Aggregating a peer/direction gives an error precedence over cancellation,
 and cancellation over success. Receive-slot/control failures that cannot be
 attributed to a user operation remain endpoint diagnostics; no invented operation

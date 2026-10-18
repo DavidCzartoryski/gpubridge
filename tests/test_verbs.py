@@ -345,8 +345,9 @@ def _check_deadline(topology):
         bridge.timeout = 1.0
         tensor = torch.ones(10)
         start = time.monotonic()
-        with pytest.raises(verbs.TransportError, match=r"timed out: \d+ of \d+ operation"):
+        with pytest.raises(verbs.TransportError, match=r"timed out: \d+ of \d+ operation") as failure:
             bridge.all_reduce(tensor)  # the other leader never joins
+        assert failure.value.timed_out is True
         assert time.monotonic() - start < 10
         with pytest.raises(verbs.TransportError, match="already failed"):
             bridge.all_reduce(tensor)

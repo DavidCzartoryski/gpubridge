@@ -554,7 +554,8 @@ def test_forced_direct_refusal_is_a_pre_transfer_diagnostic_without_observations
 
 
 @needs_library
-def test_native_local_abort_is_emitted_as_cancelled(monkeypatch, tmp_path):
+@pytest.mark.parametrize("reason", ["local teardown", "job timed out elsewhere; local teardown"])
+def test_native_local_abort_is_emitted_as_cancelled(monkeypatch, tmp_path, reason):
     fabric = tempfile.mkdtemp(prefix="gbvf-abort-", dir="/tmp")
     monkeypatch.setenv(verbs.TEST_FABRIC_ENV, fabric)
     a = verbs.Endpoint(2, 0, {})
@@ -568,7 +569,7 @@ def test_native_local_abort_is_emitted_as_cancelled(monkeypatch, tmp_path):
 
         def run(t):
             op = planner.worker.recv(1, t.data_ptr(), 32, 777)
-            a.abort("local teardown")
+            a.abort(reason)
             planner.worker.wait([op], 0)
 
         with pytest.raises(verbs.TransportError):

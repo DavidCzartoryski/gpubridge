@@ -62,6 +62,9 @@ class Unavailable(RuntimeError):
 class TransportError(RuntimeError):
     """A send, receive or connection failed or timed out."""
 
+    #: Set from the native return code, never inferred from an error message.
+    timed_out = False
+
 
 def _sources() -> list[Path]:
     return sorted([CRATE / "Cargo.toml", CRATE / "Cargo.lock", CRATE / "build.rs",
@@ -272,7 +275,9 @@ class Endpoint:
             text = self._error()
             self.failed = f"verbs bridge {text}" if result == TIMED_OUT else \
                 f"verbs bridge failed: {text}"
-            raise TransportError(self.failed)
+            error = TransportError(self.failed)
+            error.timed_out = result == TIMED_OUT
+            raise error
         return result
 
     def _usable(self) -> None:

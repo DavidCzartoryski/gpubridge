@@ -2649,13 +2649,23 @@ impl Shared {
                 sges: &sge[..],
             })
             .collect();
-        let result = peer.qp.post_sends(&reqs);
+        let result = peer.qp.post_sends_partial(&reqs);
         drop(reqs);
         drop(sges);
-        if let Err(e) = result {
+        if let Err((posted, e)) = result {
             // What was posted completes (flushed) and frees its slot; what wasn't keeps
             // its slot marked. The link is never used again either way.
             let why = format!("member {member}: posting sends failed: {e}");
+            let ids: Vec<i64> = batch[posted..]
+                .iter()
+                .filter_map(|w| match st.peer(member).slot_use[w.slot() as usize] {
+                    SlotUse::Data { op: Some(id) } => Some(id),
+                    _ => None,
+                })
+                .collect();
+            for id in ids {
+                st.fail_op(id, &why);
+            }
             self.lose(st, member, &why);
         }
     }

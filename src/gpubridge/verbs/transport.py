@@ -419,7 +419,7 @@ class VerbsTransport(TaggedBridge):
             self._guarded(lambda: run(tensor))
         except BaseException as exc:
             text = str(exc)
-            status = "timeout" if "timed out" in text else "error"
+            status = "timeout" if getattr(exc, "timed_out", False) else "error"
             error = f"{type(exc).__name__}: {text}"[:500]
             # The library may hold this memory registered (a peer granted a write) until
             # the endpoint closes.

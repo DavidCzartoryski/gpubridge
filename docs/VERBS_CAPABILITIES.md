@@ -54,6 +54,12 @@ traffic moved. F7 (peer rate/PCI/host advertisement) is an optional enhancement;
 the base wire handshake carries only device, port and link layer. Never infer
 peer identity from a matching NIC name on separate hosts.
 
+Native batch-post errors also retain the provider's posted-prefix length through
+`QueuePair::post_sends_partial`: only operations with rejected WRs receive the post
+error; collateral work is cancelled. `tests/progress.rs:every_policy_attributes_a_native_post_failure_to_its_send`
+tests native post failure under all policies, without inventing a WC for a post
+that never succeeded.
+
 Evidence for this integration run belongs under the run's `evidence/` directory;
 the rows above distinguish inherited evidence from checks rerun on this branch.
 
