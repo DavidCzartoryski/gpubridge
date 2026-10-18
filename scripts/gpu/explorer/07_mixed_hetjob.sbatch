@@ -57,8 +57,10 @@ fi
 # STEPS_07=dp: train_dp.py on llama.py's model, DP_STEPS steps of DP_GLOBAL_BATCH sequences
 # of DP_SEQ tokens, one run per name in DP_RUNS: ddp, ddp-bf16 and ddp-fp8 (DDP through
 # gpubridge.ddp_comm_hook, the bridge uncompressed or compressed), fsdp2 (FSDP2 through
-# the backend), ddp-speed (batch shares by each GPU's speed), ddp-bucket-<MB> (DDP's
-# bucket size). Set against dp_baseline.sbatch's run on one V100 (submit.sh dp-baseline).
+# the backend), ddp-speed (batch shares by each GPU's speed), ddp-shares-<rows> (the rows
+# per rank as given, e.g. ddp-shares-5-3; -r<N> at the end tells repeats apart: a sweep of
+# splits in one job), ddp-bucket-<MB> (DDP's bucket size). Set against
+# dp_baseline.sbatch's run on one V100 (submit.sh dp-baseline).
 DP_MODEL="${DP_MODEL:-llama-125m}"
 DP_STEPS="${DP_STEPS:-500}"
 DP_GLOBAL_BATCH="${DP_GLOBAL_BATCH:-8}"

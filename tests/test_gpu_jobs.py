@@ -524,13 +524,13 @@ def test_step_07_data_parallel(tmp_path):
                   str(EXPLORER / "07_mixed_hetjob.sbatch"),
                   FAKE_SLURM_HET_ENV_0="GPUBRIDGE_VENDOR=nvidia",
                   FAKE_SLURM_HET_ENV_1="GPUBRIDGE_VENDOR=amd", STEPS_07="dp",
-                  DP_RUNS="ddp ddp-fp8 fsdp2 ddp-speed ddp-bucket-5", **SMALL_DP)
+                  DP_RUNS="ddp ddp-fp8 fsdp2 ddp-speed ddp-shares-3-1 ddp-bucket-5", **SMALL_DP)
     out = tmp_path / "results" / "07_mixed_hetjob_dp"
     assert code == 1 and failed(out) == {"probe"}, job_output(tmp_path)  # no GPU here
     # Triton's check before the first compressed run only, on the NVIDIA side (the AMD
     # side runs the PyTorch kernels: DP_KERNELS_ON_AMD=torch).
     assert list(steps(out)) == ["probe", "preflight", "dp_ddp", "triton_check", "dp_ddp-fp8",
-                                "dp_fsdp2", "dp_ddp-speed", "dp_ddp-bucket-5"]
+                                "dp_fsdp2", "dp_ddp-speed", "dp_ddp-shares-3-1", "dp_ddp-bucket-5"]
     log = "\n".join(p.read_text() for p in (tmp_path / "work" / "logs").glob("*.out"))
     check = [line for line in log.splitlines() if "step triton_check:" in line]
     assert check and "--het-group=0" in check[0] and "--het-group=1" not in check[0]
@@ -539,6 +539,8 @@ def test_step_07_data_parallel(tmp_path):
     assert [r["compression_kernels"] for r in runs["dp_ddp-fp8"]["ranks"]] == ["auto", "torch"]
     assert runs["dp_fsdp2"]["mode"] == "fsdp2" and runs["dp_ddp-bucket-5"]["bucket_mb"] == 5.0
     assert runs["dp_ddp-speed"]["shares_rule"] == "speed"
+    assert runs["dp_ddp-shares-3-1"]["shares_rule"] == "3,1"
+    assert [r["share"] for r in runs["dp_ddp-shares-3-1"]["ranks"]] == [3, 1]
     assert {r["world_size"] for r in runs.values()} == {2}
 
 
