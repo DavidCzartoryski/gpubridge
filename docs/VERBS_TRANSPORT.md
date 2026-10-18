@@ -60,7 +60,7 @@ Checked on 2026-10-18 (crates.io and GitHub):
 | --- | --- | --- | --- | --- |
 | Release | 0.9.2 / 0.3.2+55.0, 2025-03-08; master moved on (rdma-core 65.0, edition 2024) unreleased | 0.4.3, 2026-06-04 / 0.2.6, 2026-10-10 | 0.3.0 / 0.5.0, 2023-02-01; no pushes since 2023 | ours |
 | License | MIT or Apache-2.0 | MPL-2.0 / MIT | MIT / GPL-3.0 | MIT, the repo's |
-| MSRV | 1.82 (0.3.2); 1.85 on master | not declared | not declared | the crate's `rust-version` |
+| MSRV | 1.82 (0.3.2); 1.85 on master | not declared | not declared | 1.77 (`offset_of!`, for the layout checks) |
 | Build | vendors rdma-core 55.0 as a submodule, runs cmake on it, runs bindgen (libclang) | builds a static "mummy" libibverbs + mlx5 with cmake that loads the real providers at run time; bindgen | bindgen + pkg-config against installed headers | a C compiler and the headers; no build dependencies |
 | Static inlines | re-implemented in Rust through bindgen's layout of the vendored header (`ops.post_send`, `ops.poll_cq`) | written by hand case by case ("inline function and nested structure are not handled properly", its README) | bindgen + hand-written inlines | compiled from the real header |
 | `ibv_reg_dmabuf_mr` | not in 0.9.2; master has an mlx5 "data direct" method only | yes | no | yes |
@@ -84,11 +84,12 @@ rdma-core's real headers and linked dynamically to `libibverbs.so.1`. Why:
   SONAME (`-l:libibverbs.so.1`), so it builds on nodes with the runtime but
   no `-devel` package (Explorer's login node: rdma-core 57.0, no headers) and
   runs against whatever providers the node has. libibverbs keeps its ABI
-  within SONAME 1 with versioned symbols; the newest the shim needs are
-  `ibv_reg_dmabuf_mr` (`IBVERBS_1.12`, rdma-core 34) and `_ibv_query_gid_ex`
-  (`IBVERBS_1.11`, rdma-core 32). The headers should be the installed
-  release's (here rdma-core v57.0); an older runtime fails at load time with a
-  missing symbol version, not at run time.
+  within SONAME 1 with versioned symbols. The built library needs
+  `IBVERBS_1.1`, `1.8` (`ibv_reg_mr_iova2`, which the header's `ibv_reg_mr`
+  calls), `1.11` (`_ibv_query_gid_ex`) and `1.12` (`ibv_reg_dmabuf_mr`)
+  (`readelf -V`). The headers should be the installed release's (here
+  rdma-core v57.0); a runtime too old for them fails at load time with a
+  missing symbol version, not later.
 - **Builds offline with the repo's toolchain.** Like the multitcp crate, it
   uses the standard library only (`build.rs` runs the C compiler and `ar`
   itself rather than through the `cc` crate), so `cargo build --offline`
@@ -194,13 +195,35 @@ release, from rdma-core's own tag, give the same ABI:
 git clone --depth 1 --branch v57.0 https://github.com/linux-rdma/rdma-core
 mkdir -p inc/infiniband inc/rdma
 cp rdma-core/libibverbs/verbs.h rdma-core/libibverbs/verbs_api.h \
-   rdma-core/libibverbs/tm_types.h inc/infiniband/
+   rdma-core/libibverbs/tm_types.h \
+   rdma-core/kernel-headers/rdma/ib_user_ioctl_verbs.h inc/infiniband/
 cp rdma-core/kernel-headers/rdma/*.h inc/rdma/
 GPUBRIDGE_VERBS_INCLUDE_DIR=$PWD/inc cargo test --features ibverbs \
     --manifest-path src/gpubridge/verbs/crate/Cargo.toml
 ```
 
 The tests that run there use the mock provider. The libibverbs provider's
-own tests that need no device (layouts, status strings) run too; those that
-open a device are ignored unless `GPUBRIDGE_VERBS_DEVICE` names one, and
-belong on an allocated node.
+own tests that need no device (layouts, status strings) run too; the one that
+opens a device is ignored, and belongs on an allocated node:
+`GPUBRIDGE_VERBS_DEVICE=mlx5_0 cargo test --features ibverbs -- --ignored`.
+
+## Results so far
+
+- **macOS (mock provider only):** `cargo fmt --check`, `cargo clippy
+  --all-targets -D warnings` and `cargo test` pass: 33 tests.
+- **Linux build (2026-10-18), Explorer's login node:** Rocky Linux 9.7,
+  x86_64, rdma-core 57.0 runtime without headers, gcc 11.5, Rust 1.99.0,
+  against rdma-core's v57.0 tag (18696ad) headers. `cargo test` and `cargo
+  test --features ibverbs` pass (33 mock tests; with the feature also the
+  two libibverbs tests that open nothing, and the device test ignored);
+  `clippy --features ibverbs -D warnings` is clean; the shim compiles with
+  no warnings under `-Wall -Wextra`. The release library's dynamic section
+  needs `libibverbs.so.1`, `ldd` resolves it to the system library, and
+  `ibv_post_send`, `ibv_post_recv` and `ibv_poll_cq` appear nowhere among
+  the shim's undefined symbols: they were compiled inline from the header.
+  This is build evidence, not a transfer: nothing opened the node's device.
+- **CI:** a `verbs crate` job runs the same on GitHub's Ubuntu runners against
+  Ubuntu's rdma-core headers (added with this change; it hasn't run yet).
+- Nothing has run over a software RDMA provider or RDMA hardware. That needs
+  an allocated node with a usable device and a peer on the same fabric, and
+  waits for A2's transfer path.

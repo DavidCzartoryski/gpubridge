@@ -230,13 +230,39 @@ jobs:
       - run: python -m gpubridge.multitcp build && python -m gpubridge.multitcp info
       - run: pytest tests/test_multitcp.py -rs
 
+  verbs:
+    # The raw-verbs crate (docs/VERBS_TRANSPORT.md): formatted, linted and tested on its
+    # mock provider, then built with the libibverbs provider against Ubuntu's rdma-core
+    # headers. Its tests there check the shim's layouts and call libibverbs without
+    # opening a device (the runners have none to use).
+    name: verbs crate
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: src/gpubridge/verbs/crate
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup component add rustfmt clippy && cargo --version
+      - run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libibverbs-dev
+      - run: |
+          cargo clippy --all-targets --features ibverbs -- -D warnings
+          cargo test --features ibverbs
+
   ci-ok:
     # The one check for main's ruleset to require: it passes only if every job above
     # succeeded or was skipped, and fails if any failed or was cancelled. `if:
     # always()` makes it report even then. Skipped counts only when changes found a
     # docs-only change: only the heavy jobs skip, and only then.
     name: ci-ok
-    needs: [changes, docs, tests-310, tests-312, pytest-310, pytest-312, ucx, multitcp]
+    needs: [changes, docs, tests-310, tests-312, pytest-310, pytest-312, ucx, multitcp, verbs]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
