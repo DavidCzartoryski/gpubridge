@@ -8,18 +8,128 @@ mod common;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
 use common::{eventually, ib_fabric, RawMember};
 use gpubridge_verbs::protocol::Kind;
 use gpubridge_verbs::{
-    Access, Call, Config, Endpoint, Fault, Method, MockFabric, MockGpu, NodeId, PeerModules,
-    WcStatus, CACHED_ACCESS, DEVICE_ROUND,
+    Access, Allocation, Call, Config, DmabufCloser, Endpoint, Error, Fault, GpuMemory, Method,
+    MockFabric, MockGpu, NodeId, PeerModules, Result, Vendor, WcStatus, CACHED_ACCESS,
+    DEVICE_ROUND,
 };
 
 const LONG: Duration = Duration::from_secs(20);
 const RNDV: u64 = 4096;
+
+#[derive(Debug)]
+struct PreparingGpu {
+    gpu: MockGpu,
+    gates: Option<(Barrier, Barrier)>,
+    calls: AtomicUsize,
+    reject_first: bool,
+}
+
+impl DmabufCloser for PreparingGpu {
+    fn close_dmabuf(&self, fd: i32) -> Result<()> {
+        self.gpu.close_dmabuf(fd)
+    }
+}
+
+impl GpuMemory for PreparingGpu {
+    fn vendor(&self) -> Vendor {
+        self.gpu.vendor()
+    }
+    fn describe(&self) -> String {
+        self.gpu.describe()
+    }
+    fn allocation(&self, device: i32, ptr: u64) -> Result<Allocation> {
+        self.gpu.allocation(device, ptr)
+    }
+    fn dmabuf_support(&self, device: i32) -> std::result::Result<(), String> {
+        self.gpu.dmabuf_support(device)
+    }
+    fn export_dmabuf(&self, a: &Allocation, start: u64, len: u64) -> Result<(i32, u64)> {
+        self.gpu.export_dmabuf(a, start, len)
+    }
+    fn peer_memory_support(&self, device: i32) -> std::result::Result<(), String> {
+        self.gpu.peer_memory_support(device)
+    }
+    fn prepare(&self, a: &Allocation, start: u64) -> Result<()> {
+        let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        if first {
+            if let Some((entered, release)) = &self.gates {
+                entered.wait();
+                release.wait();
+            }
+            if self.reject_first {
+                return Err(Error::Gpu("injected SYNC_MEMOPS failure".into()));
+            }
+        }
+        self.gpu.prepare(a, start)
+    }
+}
+
+#[test]
+fn a_registration_is_not_published_before_its_gpu_preparation_finishes() {
+    let gpu = MockGpu::new();
+    let (_fabric, a, _b) = pair(RNDV, &gpu, false);
+    let va = gpu.alloc(0, 1 << 20);
+    let driver = Arc::new(PreparingGpu {
+        gpu: gpu.clone(),
+        gates: Some((Barrier::new(2), Barrier::new(2))),
+        calls: AtomicUsize::new(0),
+        reject_first: false,
+    });
+    a.set_gpu(driver.clone(), modules("preparation-race", false));
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| a.register_device(0, va, 4096));
+        let (entered, release) = driver.gates.as_ref().unwrap();
+        entered.wait();
+        let (tx, rx) = mpsc::channel();
+        let endpoint = &a;
+        let second = scope.spawn(move || {
+            let result = endpoint.register_device(0, va, 4096);
+            tx.send(()).unwrap();
+            result
+        });
+        let early = rx.recv_timeout(Duration::from_millis(50));
+        // Release before asserting, so a failing regression cannot strand a thread.
+        release.wait();
+        let r1 = first.join().unwrap().unwrap();
+        let r2 = second.join().unwrap().unwrap();
+        assert!(
+            early.is_err(),
+            "a cache hit escaped before preparation finished"
+        );
+        assert!(r1.region().same(r2.region()));
+    });
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn failed_gpu_preparation_is_not_cached_and_closes_its_export_once() {
+    let gpu = MockGpu::new();
+    let (_fabric, a, _b) = pair(RNDV, &gpu, false);
+    let va = gpu.alloc(0, 1 << 20);
+    let driver = Arc::new(PreparingGpu {
+        gpu: gpu.clone(),
+        gates: None,
+        calls: AtomicUsize::new(0),
+        reject_first: true,
+    });
+    a.set_gpu(driver.clone(), modules("preparation-failure", false));
+    assert!(a
+        .register_device(0, va, 4096)
+        .unwrap_err()
+        .contains("SYNC_MEMOPS failure"));
+    assert_eq!(gpu.open_fds(), 0);
+    let r = a.register_device(0, va, 4096).unwrap();
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(gpu.exported(), 2);
+    assert_eq!(gpu.open_fds(), 1);
+    drop(r);
+}
 
 fn config(rndv: u64) -> Config {
     Config {

@@ -351,23 +351,32 @@ impl Registrar {
         let mut reasons: Vec<String> = Vec::new();
         let mut used = None;
         let got = self.device_cache.get_with(want, cover, || {
-            match self.try_dmabuf(&driver, &caps, &alloc, start, end - start) {
+            let region = match self.try_dmabuf(&driver, &caps, &alloc, start, end - start) {
                 Ok(region) => {
                     used = Some(Method::DmaBuf);
-                    return Ok(region);
-                }
-                Err(why) => reasons.push(format!("dma-buf: {why}")),
-            }
-            match self.try_peer(&driver, &caps, &alloc, start, end - start) {
-                Ok(region) => {
-                    used = Some(Method::PeerMemory);
-                    Ok(region)
+                    region
                 }
                 Err(why) => {
-                    reasons.push(format!("peer memory: {why}"));
-                    Err(Error::Unsupported(reasons.join("; ")))
+                    reasons.push(format!("dma-buf: {why}"));
+                    match self.try_peer(&driver, &caps, &alloc, start, end - start) {
+                        Ok(region) => {
+                            used = Some(Method::PeerMemory);
+                            region
+                        }
+                        Err(why) => {
+                            reasons.push(format!("peer memory: {why}"));
+                            return Err(Error::Unsupported(reasons.join("; ")));
+                        }
+                    }
                 }
-            }
+            };
+            // Preparation is part of creating the entry, under the cache lock: another
+            // caller must not hit a published MR before SYNC_MEMOPS has succeeded.
+            // A failure drops the unpublished region (and its descriptor) immediately.
+            driver.prepare(&alloc, start).map_err(|e| {
+                Error::Gpu(format!("registered, but preparing the memory failed: {e}"))
+            })?;
+            Ok(region)
         });
         match got {
             Ok(region) => {
@@ -377,14 +386,6 @@ impl Registrar {
                     Method::PeerMemory
                 };
                 if let Some(m) = used {
-                    // A new registration: the driver's per-registration step (SYNC_MEMOPS).
-                    if let Err(e) = driver.prepare(&alloc, start) {
-                        self.device_cache.invalidate_owner(alloc.buffer_id);
-                        return Err(self.failed(format!(
-                            "{}: registered, but preparing the memory failed: {e}",
-                            m.name()
-                        )));
-                    }
                     let mut c = lock(&self.counts);
                     match m {
                         Method::DmaBuf => c.dmabuf += 1,
