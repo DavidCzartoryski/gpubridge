@@ -1,12 +1,13 @@
 # A raw-verbs bridge transport in Rust
 
-**Status: phases A1 and A2. `bridge="verbs"` exists, opt-in, for host tensors.
-Not validated on RDMA hardware or GPUs.** Everything above the provider (the
-owned resources, the wire protocol, the completion thread, the Python bridge) is
-tested against mock providers: an in-process fabric, and a test-only fabric
-between processes. The libibverbs provider compiles and links against
-rdma-core's headers on Linux. None of that is a transfer over a real or
-software RDMA device.
+**Status: phases A1 to A3. `bridge="verbs"` exists, opt-in, for host and GPU
+tensors. Not validated on RDMA hardware or GPUs.** Everything above the provider
+(the owned resources, the wire protocol, the completion thread, the registrations,
+the Python bridge) is tested against mock providers: an in-process fabric with a
+mock GPU, and a test-only fabric between processes. The libibverbs provider
+compiles and links against rdma-core's headers on Linux; the GPU driver calls are
+checked against CUDA's, HIP's and ROCr's headers and loaded at run time. None of
+that is a transfer over a real or software RDMA device, or a byte of GPU memory.
 
 The plan has three phases, each its own change:
 
@@ -15,14 +16,17 @@ The plan has three phases, each its own change:
   pair, memory region) with their release order, the queue pair state machine,
   a bounded registration cache, and a deterministic mock provider with
   injectable faults.
-- **A2, this one:** a versioned reliable-connected (RC) wire protocol on top of
+- **A2:** a versioned reliable-connected (RC) wire protocol on top of
   it (["Wire protocol"](#wire-protocol-version-1)), the endpoint selection rules,
   completion channels and asynchronous events in the shim, a completion thread,
   the Python `BridgeTransport` as `bridge="verbs"` with telemetry, and the
   collective tests bit for bit against `flat-gloo` on a test-only fabric.
-- **A3:** the host-staged GPU path, the NVIDIA peer-memory and AMD dma-buf
-  registration paths behind capability checks, the detector's
-  transport-observation emission, and the hardware test commands.
+- **A3, this one:** registered caller memory and an RDMA WRITE rendezvous (wire
+  protocol version 2); the host-staged GPU path; the NVIDIA dma-buf and peer-memory
+  and the AMD dma-buf registration paths behind run-time capability checks
+  (["GPU memory"](#gpu-memory)); the detector's transport observations
+  (["Transport observations"](#transport-observations)); and the hardware kit
+  (["Hardware kit"](#hardware-kit)).
 
 Nothing here inherits a validation claim from the UCX transport
 ([RDMA_TRANSPORT.md](RDMA_TRANSPORT.md), CPU and TCP only) or from the
@@ -41,15 +45,22 @@ HARDWARE-VERIFIED: tested on RDMA hardware.
 | Owned resources, release order, cleanup after a failed setup | IMPLEMENTED, SOFTWARE-VERIFIED |
 | Queue pair state machine, IB (LID) and RoCE (GID) addressing checks | IMPLEMENTED, SOFTWARE-VERIFIED |
 | Work tracking: no deregistration while work is outstanding, drain before release | IMPLEMENTED, SOFTWARE-VERIFIED |
-| Bounded registration cache | IMPLEMENTED, SOFTWARE-VERIFIED (unused by A2, which registers no caller memory) |
-| Wire protocol v1: handshake, chunking, credits, ordering, goodbye | IMPLEMENTED, SOFTWARE-VERIFIED |
+| Bounded registration cache, keyed by allocation identity (buffer ID or owner token) | IMPLEMENTED, SOFTWARE-VERIFIED (mock GPU: invalidation when an address is reused) |
+| Wire protocol v2: handshake, chunking, credits, ordering, goodbye; rendezvous by write grant or "in chunks"; gathered sends from registered memory | IMPLEMENTED, SOFTWARE-VERIFIED (in-process mock; the test fabric carries RDMA WRITE too) |
 | Completion thread on a completion channel, asynchronous events | IMPLEMENTED, SOFTWARE-VERIFIED (the mocks' channels; the shim's `poll(2)` path is compiled only) |
 | Deadlines, completion errors, lost peers, teardown with work outstanding | IMPLEMENTED, SOFTWARE-VERIFIED |
 | Device, port and GID selection | IMPLEMENTED, SOFTWARE-VERIFIED (mock devices) |
-| `bridge="verbs"`: every policy, compression, subgroups, async, bit for bit against `flat-gloo` | IMPLEMENTED, SOFTWARE-VERIFIED (the MOCK test fabric between processes) |
+| `bridge="verbs"`: every policy, compression, subgroups, async, bit for bit against `flat-gloo` | IMPLEMENTED, SOFTWARE-VERIFIED (the MOCK test fabric between processes, rendezvous on) |
+| GPU tensors, host-staged: a registered pinned buffer, copies on the caller's stream | IMPLEMENTED, SOFTWARE-VERIFIED (CPU tensors standing in, lazy copies); HARDWARE BLOCKED (item 39) |
+| NVIDIA direct, dma-buf (`cuMemGetHandleForAddressRange`, `ibv_reg_dmabuf_mr`) | IMPLEMENTED (selection, descriptor lifetime and reuse on a mock GPU); HARDWARE BLOCKED (item 40) |
+| NVIDIA direct, peer memory (`ibv_reg_mr` on device memory with `nvidia_peermem`) | IMPLEMENTED (selection on a mock GPU; module detection on fixtures); HARDWARE BLOCKED (item 40) |
+| AMD direct, dma-buf (ROCr `hsa_amd_portable_export_dmabuf`) | IMPLEMENTED (calls checked against ROCm 6.3's headers; selection on a mock GPU); HARDWARE BLOCKED (item 41) |
+| Ordering: stream wait before the NIC touches GPU memory, flush after it wrote there, SYNC_MEMOPS, BUFFER_ID identity | IMPLEMENTED, SOFTWARE-VERIFIED (a recording fake endpoint); HARDWARE BLOCKED |
+| Direct or staged, with the reason, in telemetry; `GPUBRIDGE_VERBS_GPU_PATH=direct` fails rather than stage | IMPLEMENTED, SOFTWARE-VERIFIED (fake endpoint) |
+| Transport observations (`straggler.transport_observation/1` with `host`, `job`, `nic.pci_bus_id`) | IMPLEMENTED, SOFTWARE-VERIFIED (written on the MOCK test fabric, checked against the schema) |
+| Hardware kit: host verbs, GPU staged and direct, training, against Gloo and UCX | PREPARED, NOT RUN (`scripts/gpu/verbs_kit.py` ran on the MOCK fabric only; items 38 to 42) |
 | Any of the above on a software RDMA provider | not run: none available, and loading one needs privileges (EMULATED would need it) |
-| Any of the above on RDMA hardware | BLOCKED: hardware/authorization. Needs two allocated nodes with an RDMA device each on one fabric, permission to open the devices from a job, the library built there, and kit steps (phase A3). HARDWARE_VALIDATION.md item 38 |
-| GPU memory (staged, NVIDIA peer memory, AMD dma-buf) | not started (A3) |
+| Any of the above on RDMA hardware or GPUs | BLOCKED: hardware/authorization. Needs allocated GPU nodes with an RDMA NIC each on one fabric, permission to open the devices from a job, dma-buf support or `nvidia_peermem` (NVIDIA), ROCm dma-buf support (AMD), the library built there, and project authorization. HARDWARE_VALIDATION.md items 38 to 42 |
 
 ## Bindings
 
@@ -107,7 +118,7 @@ rdma-core's real headers and linked dynamically to `libibverbs.so.1`. Why:
   fixes the bindings to rdma-core 55.0's header.
 - **Coverage.** The shim wraps exactly what the transport uses, including
   `ibv_reg_dmabuf_mr` and `ibv_query_gid_ex`, which the released `ibverbs`
-  crate lacks. `sideway` has them, but brings MPL-2.0, a statically linked
+  crate lacks (A3 registers GPU memory through `ibv_reg_dmabuf_mr`). `sideway` has them, but brings MPL-2.0, a statically linked
   copy of rdma-core's providers and nine other crates.
 - **Cost.** About 400 lines of C to keep correct, each wrapper a direct call.
   Adding a verb is a C function and its Rust declaration. If a maintained
@@ -165,6 +176,11 @@ which variable to set.
   created for fails with `QueueFull` rather than overrunning it, and a queue
   pair can only be created on completion queues with room for all its work.
 - `MrCache` (`cache.rs`): the registration cache.
+- `gpu.rs`: the GPU drivers, loaded at run time (`CudaDriver`, `RocmDriver`), the
+  peer-memory module probe, and `MockGpu` for tests (["GPU memory"](#gpu-memory)).
+- `Registrar` (`direct.rs`): registers device memory (dma-buf, then peer memory,
+  with the reasons when neither works) and the caller's host buffers, each through
+  its own bounded `MrCache`.
 - `Endpoint` (`endpoint.rs`): one bridge member's end of the wire protocol,
   over any provider; `protocol.rs` has the header, the handshake line and the
   endpoint selection; `ffi.rs` the C interface Python loads (`gb_verbs_*`).
@@ -182,8 +198,10 @@ refused while work is outstanding (verbs would discard it without
 completions).
 
 **The registration cache.** Keyed by the allocation's identity: address,
-length, access flags and an owner token the caller supplies (an allocation
-generation, so the same address handed out again is a different key).
+length, access flags and an owner token (for device memory the driver's buffer
+ID; for host buffers a token the caller supplies), so the same address handed
+out again is a different key. A lookup may register more than it asks for (a
+covering range: device memory is rounded out to 2 MiB inside its allocation).
 Bounded by entries and by bytes, evicting the least recently used idle
 entry. A lookup inside a cached registration of the same allocation reuses
 it. Registering an allocation drops cached entries of other owners that
@@ -201,51 +219,66 @@ buffers, in the endpoint's copies between its slots and the caller's memory
 (`Endpoint::send` and `recv` are `unsafe fn`: the caller keeps the memory valid
 until the operation finishes, fails or is aborted), and in the C interface.
 Registering memory the region doesn't own is an `unsafe fn`: the caller
-promises the memory stays valid until the region is released.
+promises the memory stays valid until the region is released. A dma-buf region
+is safe to make: the kernel pins the exported memory while it is registered. The
+GPU driver calls (`gpu.rs`) are `unsafe` calls through function pointers looked
+up by name; each signature is the header's, checked by
+`shim/gpu_abi_check.c` against cuda.h 12.8, HIP 6.3's `hip_runtime_api.h` and
+ROCr's `hsa.h`/`hsa_ext_amd.h` (rocm-6.3.0).
 
-## Wire protocol (version 1)
+## Wire protocol (version 2)
 
 **Verbs operations used:** `IBV_WR_SEND` with `IBV_SEND_SIGNALED` (every send
-completes visibly) and receives (`ibv_post_recv`), on RC queue pairs, one
-scatter-gather entry each; nothing else crosses the fabric. No RDMA WRITE, READ
-or atomic is posted and the queue pairs grant no remote access
-(`qp_access_flags` 0), so no memory is remotely accessible and no remote key
-exists to leak. Several sends or receives are posted as one chained request
-list (one doorbell).
+completes visibly) and receives (`ibv_post_recv`), on RC queue pairs; a send has
+one scatter-gather entry (a slot), or two (a slot's header, then a payload
+gathered from registered memory); a receive one (a slot). With rendezvous on
+(`rndv_bytes` > 0), also `IBV_WR_RDMA_WRITE`, signaled, from a slot or from
+registered memory, into memory the peer granted. No READ or atomic is posted.
+Without rendezvous the queue pairs grant no remote access (`qp_access_flags` 0)
+and no remote key exists; with it they grant remote write, and a remote key
+crosses the fabric only in a write grant, for memory registered for that one
+receive (it is never logged or reported). Several requests are posted as one
+chained list (one doorbell).
 
 **Guarantees this rests on (RC):** messages on one queue pair arrive once, in
 order, intact; a send's successful completion means the peer's adapter has the
-message in a posted receive buffer (not that the peer's program has read it); a
-failed request moves the queue pair to the error state, which completes
-everything after it with `WR_FLUSH_ERR`.
+message in a posted receive buffer (not that the peer's program has read it); the
+responder executes the requests of one queue pair in order, so the data of an
+RDMA WRITE has been placed in the responder's memory before a SEND posted after
+it on the same queue pair completes there; a failed request moves the queue pair
+to the error state, which completes everything after it with `WR_FLUSH_ERR`.
+Placement in host memory is then visible to the responder's CPU; placement in
+GPU memory needs the flush in ["GPU memory"](#gpu-memory) before GPU work reads
+it.
 
 **Endpoints.** Each member has one completion channel and one completion queue,
 and one RC queue pair per other member. Per peer it registers `send_slots`
 send buffers and `credits + ctrl_credits` receive buffers of `slot_bytes` each
 (defaults 32, 32 + 4 and 128 KiB), owned by the endpoint and page-aligned.
 Every receive buffer is posted while the queue pair is in `Init`, before the
-member publishes its handshake. **The caller's memory is never registered**:
-a message is copied from the caller's tensor into a send slot, and out of a
-receive slot into the caller's tensor (or a heap buffer, see below). So the
-device can only ever read or write the endpoint's own slots, and A1's
-drain-or-leak on close can only ever leak those slots, never Python's memory.
-This is the "staged/host" path; zero-copy registration of caller memory (with
-the cache keyed by storage identity and a generation) is left to A3 along with
-GPU memory.
+member publishes its handshake. **Plain caller memory is never registered**: a
+message is copied from the caller's tensor into a send slot, and out of a receive
+slot into the caller's tensor (or a heap buffer, see below), so the device never
+reads or writes it and a drain that fails can only leak the endpoint's slots.
+**Registered memory** (A3) is the exception the caller asks for: device memory
+(["GPU memory"](#gpu-memory)) and host buffers the caller owns and registers
+(the Python bridge's pinned staging buffer and scratch buffer). Sends gather
+their payload from it; with rendezvous on, receives are written into it.
 
 **Handshake (through the c10d store).** Each member publishes one line under
 `gpubridge/verbs/<link>/addr/<rank>`: `<protocol>|<chunk bytes>|` then
 
 ```
-gbverbs 1;ll=ib|eth;lid=<LID>;gid=<32 hex digits>;grh=0|1;mtu=<active MTU>;
-slot=<slot_bytes>;credits=<n>;ctrl=<n>;qpn=<per member>;psn=<per member>;dev=<name>;port=<n>
+gbverbs 2;ll=ib|eth;lid=<LID>;gid=<32 hex digits>;grh=0|1;mtu=<active MTU>;
+slot=<slot_bytes>;credits=<n>;ctrl=<n>;rndv=<bytes>;qpn=<per member>;psn=<per member>;
+dev=<name>;port=<n>
 ```
 
 (`qpn` and `psn`: the queue pair number and first send PSN this member uses for
 each member index, 0 for itself.) Readers ignore keys they don't know. Each
 member refuses to connect, and setup fails on every rank with the reason, when
 the protocol version, the link layer (InfiniBand against Ethernet), or
-`slot`/`credits`/`ctrl` differ, when an InfiniBand peer has no unicast LID, or
+`slot`/`credits`/`ctrl`/`rndv` differ, when an InfiniBand peer has no unicast LID, or
 a GID-addressed peer sent no GID. The path MTU is the smaller of the two active
 MTUs. Then `Init -> Rtr -> Rts` (RTR: `min_rnr_timer` 12, no RDMA reads; RTS:
 ACK timeout exponent 14 and 7 retries by default, `rnr_retry` 6). Each member
@@ -260,20 +293,23 @@ way checks the data path.
 | --- | --- |
 | 0-1 | magic `0x4256` |
 | 2 | protocol version (1) |
-| 3 | kind: 1 data, 2 credit, 3 goodbye |
+| 3 | kind: 1 data, 2 credit, 3 goodbye, 4 clear to write, 5 clear to send in chunks, 6 written |
 | 4-7 | sequence number of this message on this queue pair, from 0, wrapping |
 | 8-11 | payload bytes after the header (0 for credit and goodbye) |
 | 12-15 | data receives the sender has reposted for its peer, cumulative, wrapping |
 | 16-19 | control receives the sender has reposted for its peer, cumulative, wrapping |
-| 20-23 | zero |
+| 20-23 | clear to write: the remote key of the granted memory; otherwise zero |
 | 24-31 | tag |
 | 32-39 | the whole message's length |
-| 40-47 | this chunk's offset in the message |
+| 40-47 | data: this chunk's offset in the message; clear to write: the granted address |
 
 A receiver checks the magic, version, sequence number, that the completion's
 byte count is the header plus the payload, that a chunk lies inside its message
 and follows the last one, and that credits never come back beyond what was
-sent; any violation fails the endpoint ("member N broke the protocol: ...").
+sent; that only a write grant carries a key and an address, that a rendezvous
+message names a non-empty message, and that a "written" message answers a grant
+this member made; any violation fails the endpoint ("member N broke the
+protocol: ...").
 
 **Messages and chunking.** A message is `(tag, bytes)` to one peer, split into
 chunks of up to `slot_bytes - 48` bytes, sent in order (an empty message is one
@@ -284,10 +320,31 @@ must be exactly its length ("member N sent X bytes for tag T, posted for Y
 bytes" otherwise). The Python collectives use 64-bit tags of collective number,
 step, sender and chunk (the multitcp bridge's).
 
+**Rendezvous.** With `rndv_bytes` > 0 (the same on every member; the Python
+bridge sets 256 KiB unless `GPUBRIDGE_VERBS_RNDV_BYTES` says otherwise), a
+message of at least that many bytes is not sent until its receiver has posted
+the receive and cleared it:
+
+- into registered memory (`recv_registered`), with a **write grant** (kind 4:
+  tag, length, address, key): the sender RDMA WRITEs the payload there (from its
+  registered memory directly, or slot by slot from plain memory), then SENDs a
+  **written** message (kind 6). The receive completes when that message is
+  polled, by which time RC has placed the writes before it.
+- into plain memory, with **clear to send in chunks** (kind 5): the message then
+  goes as data chunks like any other.
+
+A sender binds grants to its queued messages with the same tag in order, and a
+grant whose length differs from the message is a protocol error on both sides. A
+message waiting for its grant holds up only later messages with its tag; others
+to that peer go ahead. Grants and "written" messages are data-class messages:
+each takes a data receive and a data credit, so the credit rules below cover
+them. Device memory is only ever written by grant: a receive into it below the
+rendezvous size, or with rendezvous off, is refused when posted.
+
 **Credits and receive provisioning.** A sender may have at most `credits` data
 messages and `ctrl_credits` control messages to a peer that the peer hasn't
 reported reposting. A receiver reposts a receive buffer as soon as it has
-copied the message out, and reports the cumulative counts in the header of
+copied the message out (or taken its grant or notice), and reports the cumulative counts in the header of
 every message it sends that peer. When it owes at least `credits / 2` data
 credits and has no data to send that peer (or no credits to send it with), it
 sends a credit message, which uses a control credit. So a send always finds a
@@ -330,6 +387,13 @@ that peer, or the whole endpoint when it names no queue pair. A lost peer is
 noticed when something is sent to it; a receive from a peer that died silently
 waits for its deadline.
 
+**Registered memory and failures.** A receive granted a write that fails
+(deadline, lost peer, abort) stays in the endpoint's table, failed, holding its
+registration: the peer may have been writing until its queue pair reached the
+error state, so the registration (and the memory: the Python bridge keeps such
+tensors) is released only when the endpoint closes. Sends from registered memory
+hold their regions through their work requests, as slots do.
+
 **Teardown.** Closing first sends each connected peer a goodbye (best effort,
 up to a second for it to complete), so the peer takes what follows as a close,
 not a failure: messages that arrived before it stay receivable, receives that
@@ -339,7 +403,9 @@ or writes caller memory), every queue pair moves to the error state, the
 completion thread takes the flushed completions until none is outstanding or
 the close's timeout passes, the thread stops, and the queue pairs close (A1's
 drain-or-leak: work still outstanding keeps its slots registered and allocated,
-and the close says so). `abort` is the same without the goodbye or the release.
+and the close says so). `abort` is the same without the goodbye or the release. When the drain
+times out, registrations still held by outstanding work are leaked too (never
+deregistered), and the Python bridge then never frees their memory.
 
 ## Choosing the endpoint
 
@@ -353,29 +419,167 @@ the best in its table: RoCE v2 with an IPv4-mapped address, then other RoCE v2,
 then link-local RoCE v2, then RoCE v1, the lowest index among equals. Members
 on different link layers refuse to connect. Telemetry reports what was chosen.
 
+## GPU memory
+
+A3 moves GPU tensors one of two ways per call, and says which and why
+(`telemetry()["path"]` and `["path_reason"]`; `paths` counts them):
+
+**Host-staged** (`staged`). The tensor is copied into a pinned host buffer on the
+caller's current stream; the host waits for an event recorded after that copy
+(only that copy and the work queued before it) before the bridge reads the
+buffer; the collective runs on it; the copy back is queued on the same stream,
+so nothing the caller queues after the collective sees the buffer's old contents;
+the next call's copy out waits for that copy back on the device before the host
+overwrites the buffer. This is `PinnedBridgeStaging`'s protocol (`staging.py`),
+unchanged; the verbs bridge registers the buffer (and its scratch buffer) with the
+NIC once, so sends gather from it and receives are written into it with no host
+copy. A larger tensor replaces the buffer after its last copy back has passed,
+the old registration dropped first.
+
+**Direct** (`direct`). The tensor's memory, and the reduction's scratch buffer,
+are registered with the NIC, and the NIC reads and writes them in place. Only
+when every check passes and both registrations succeed; otherwise the call is
+staged and the reason recorded, or, with `GPUBRIDGE_VERBS_GPU_PATH=direct`, the
+call fails with the reason before anything is posted (`staged` forces staging).
+The checks, once per GPU and cached:
+
+1. rendezvous is on (a peer can only write into device memory by grant);
+2. the GPU driver loads at run time: `libcuda.so.1` (CUDA driver API), or the HIP
+   runtime and ROCr the process already mapped (`libamdhip64.so*`,
+   `libhsa-runtime64.so*` from `/proc/self/maps`, never a second copy); the crate
+   has no build dependency on either;
+3. a registration method is available (below);
+4. the NIC's writes can be made visible to the GPU's kernels
+   (`gpubridge.ucx.gdr.for_device`, shared with the UCX bridge): not needed where
+   `CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING` is at least `OWNER`, else
+   `cuFlushGPUDirectRDMAWrites` where `..._FLUSH_WRITES_OPTIONS` has `HOST`; on ROCm
+   `hipDeviceFlushGPUDirectRDMAWrites` where the runtime has it, else the HDP flush
+   register. Neither: staged, with that reason.
+
+**Registration methods**, tried in order for each new registration (`direct.rs`):
+
+| | NVIDIA dma-buf | NVIDIA peer memory | AMD dma-buf |
+| --- | --- | --- | --- |
+| Capability | `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` = 1 and `cuMemGetHandleForAddressRange` present (CUDA 11.7+) | `nvidia_peermem` or `nv_peer_mem` in `/sys/module` or `/proc/modules`; `CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED` not 0; the allocation's `CU_POINTER_ATTRIBUTE_IS_GPU_DIRECT_RDMA_CAPABLE` not 0 | `HSA_AMD_SYSTEM_INFO_DMABUF_SUPPORTED`; `hsa_amd_portable_export_dmabuf`/`close_dmabuf` present |
+| Registration | `cuMemGetHandleForAddressRange(&fd, start, len, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0)` (page-aligned range), then `ibv_reg_dmabuf_mr(pd, 0, len, iova=start, fd, access)` | `ibv_reg_mr` on the device address | `hsa_amd_portable_export_dmabuf(start, len, &fd, &offset)`, then `ibv_reg_dmabuf_mr(pd, offset, len, iova=start, fd, access)` |
+| Descriptor | closed with `close(2)` | none | closed with `hsa_amd_portable_close_dmabuf` |
+| Identity | `CU_POINTER_ATTRIBUTE_BUFFER_ID`, `cuMemGetAddressRange` | as dma-buf | `HIP_POINTER_ATTRIBUTE_BUFFER_ID`, `hipMemGetAddressRange` (not HIP's `RANGE_SIZE`, a 32-bit value in HIP 6.3); HIP 6.0 or later |
+| Once per registration | `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS` set to 1 | as dma-buf | nothing (NVIDIA's rule; ROCm's export asks for none) |
+
+Each method's failure is kept: when all fail, the reason reads `dma-buf: ...;
+peer memory: ...`. CUDA calls run with the device's primary context pushed
+(retained once, released when the driver goes). HIP 6.3 has no dma-buf export of
+its own, so ROCr's is used, as ROCm's headers document it.
+
+**Lifetime rules enforced.**
+
+- *Allocation identity.* Registrations are cached under the allocation's buffer
+  ID, which the driver never reuses within a process: memory freed and handed
+  out again at the same address is a different owner, and its stale entry is
+  dropped (or the registration refused while posted work still holds it, as the
+  memory was freed too early). The cached range is rounded out to 2 MiB inside
+  the allocation, so tensors of one allocator segment share it. The cache is
+  bounded (`GPUBRIDGE_VERBS_DEVICE_CACHE_BYTES`, 8 GiB, 256 entries; host 8 GiB,
+  64 entries), evicting idle entries only.
+- *Holding a pointer is not holding the memory.* A dma-buf import pins the
+  exported memory while registered; the peer-memory module pins GPU pages and
+  revokes the registration if the allocation is freed. The NIC touches a
+  registration only while work posted with it is outstanding or a peer holds a
+  grant for a pending receive; the Python bridge holds the tensors until then
+  (and, after a failure, until the endpoint closes).
+- *Descriptors.* An exported dma-buf descriptor is owned by its region and closed
+  exactly once, after `ibv_dereg_mr` returns; if registering fails it is closed at
+  once; if deregistering fails it is never closed (the region is leaked, like an
+  owned buffer).
+
+**Ordering on the direct path** (NVIDIA's GPUDirect RDMA guide; the ROCm flush as
+the UCX bridge does it):
+
+- before the first message after a wait (and at the start) touches device
+  memory, the host waits for an event recorded on the caller's stream: the NIC
+  must not read what a kernel is still writing, nor write what a queued kernel
+  still reads;
+- a receive into device memory completes only when the sender's "written"
+  message is polled: the writes are complete with respect to this CPU thread;
+- then, before `wait` returns and before any dependent GPU work is launched, the
+  GPU's flush runs (nothing where the GPU orders such writes itself);
+- a message below the rendezvous size can't be written into device memory: it
+  arrives in a pinned bounce buffer and is copied to the GPU on the caller's
+  stream, after the wait and before the kernels that read it.
+
 ## Telemetry
 
 `VerbsTransport.telemetry()` (and `state`: `ok`, `failed`, `closed`) returns
 the endpoint's JSON: `protocol`, `provider` (`libibverbs (<the loaded file>)`,
 whose name carries rdma-core's version, or `MOCK: ...`), `mock`, `library`
 (the crate's version), `device`, `port`, `link_layer`, `gid_index`, `gid_type`,
-`active_mtu`, `firmware`, `vendor_id`, `vendor_part_id`, `path` (`host`: A2
-moves host memory only), `operations` (`RC SEND/RECV`), the protocol settings,
-`state`, `failure`, counts (operations, bytes, chunks, control messages, credit
-stalls, unexpected and held bytes, completions, errors, notifications,
-asynchronous events, batches), and per peer its queue pair number, path MTU,
-whether it said goodbye and why it was lost. There are no remote keys to report.
+`active_mtu`, `firmware`, `vendor_id`, `vendor_part_id`, `operations` (`RC
+SEND/RECV`, plus `RDMA WRITE (rendezvous)` when on), `rndv_bytes`, `gather`, the
+protocol settings, `state`, `failure`, counts (operations, bytes, chunks, control
+messages, credit stalls, unexpected and held bytes, completions, errors,
+notifications, asynchronous events, batches, grants and "go"s sent and received,
+writes and their bytes, "written" messages, bytes moved in place from registered
+host and device memory, bytes the CPU copied), `direct` (the GPU driver and its
+version or why it didn't load, which methods are enabled, registrations by
+method, failures and the last reason, both caches' entries, bytes, hits, misses,
+evictions, stale entries, invalidations, refusals), and per peer its queue pair
+number, path MTU, whether it said goodbye and why it was lost. The Python bridge
+adds `path` and `path_reason` of the last call, `last_gpu` (device, method,
+flush, stream waits and flushes), `paths`, `gpu_path_setting`, `gpus` (each GPU's
+direct-path support: driver, flush, capabilities or reason), operation counts by
+memory kind, and the observation emitter's counts. A remote key is never kept
+where telemetry reads, and the tests check no key-like name appears.
+
+## Transport observations
+
+`GPUBRIDGE_VERBS_OBSERVE=<file>` (`{rank}` in it becomes the global rank) makes
+each leader append `straggler.transport_observation/1` records, the
+straggler-detector's NIC collector input (its `docs/NIC_TELEMETRY.md`), one JSON
+object per line:
+
+- `schema`, `t_wall`, `t_mono`, `rank`, `peer` (global ranks), `bridge`
+  (`verbs`), `op` (`send` or `recv`), `bytes`, `duration_s` (first post to last
+  completion), `status` (`ok`, `error`, `timeout`), `error`;
+- top-level `host` (this node's hostname) and `job` (`GPUBRIDGE_JOB_ID`, else
+  `SLURM_JOB_ID` or `TORCHELASTIC_RUN_ID`, else an id the members agree on through
+  the c10d store);
+- `nic`: `device`, `port`, `gid_index`, `link_layer` (`InfiniBand` or
+  `Ethernet`), `rate_gbps` and `pci_bus_id` (from `/sys/class/infiniband`, null
+  where absent, as on the test fabric); `peer_nic` from the peer's handshake;
+- `path` (`direct` or `staged`) for GPU tensors; `step` when the caller sets
+  `transport.step`; `collective` (the call's sequence number; unknown fields are
+  ignored by the detector).
+
+**Rate:** one record per collective call, per peer and direction that moved
+anything; a failed call gives one per peer and direction with its status.
+Nothing per chunk or completion. **Off the critical path:** the call appends
+dicts to a bounded queue (`GPUBRIDGE_VERBS_OBSERVE_QUEUE`, 10000 records); a
+background thread writes; a full queue or a write error drops records and counts
+them (`observations.dropped`), never failing a call. No record carries a key or a
+raw GID; any key-like field name at any depth is refused before queueing.
 
 ## The Python bridge
 
 `bridge="verbs"` (`src/gpubridge/verbs/transport.py`), opt-in; the default
-stays Gloo, and UCX and multitcp are unchanged. `device_tensors` is False: GPU
-tensors reach it through the policies' usual staging. Its collectives are
-`gpubridge.tagged.TaggedBridge`'s, shared with `bridge="multitcp"` (moved there
-from the multitcp transport unchanged): with two leaders a chunked exchange,
-with more a ring, so every element is reduced in one fixed order. Chunks of
-`GPUBRIDGE_VERBS_CHUNK_BYTES` (4 MiB); the library's settings from
-`GPUBRIDGE_VERBS_SLOT_BYTES`, `_CREDITS`, `_SEND_SLOTS`, `_UNEXPECTED_BYTES`.
+stays Gloo, and UCX and multitcp are unchanged. `device_tensors` is True: GPU
+leaders hand GPU tensors straight to it, and it moves them direct or staged
+(["GPU memory"](#gpu-memory)). Its collectives are
+`gpubridge.tagged.TaggedBridge`'s, shared with `bridge="multitcp"`: with two
+leaders a chunked exchange, with more a ring, so every element is reduced in one
+fixed order. The worker under them is a router (`verbs/gpu.py`) that sends each
+chunk from, and receives it into, whatever memory it lies in: registered device
+memory, the bridge's registered host buffers (staging and scratch: host tensors'
+reductions receive into the registered scratch by write grant), or plain memory
+copied through the slots. Chunks of `GPUBRIDGE_VERBS_CHUNK_BYTES` (4 MiB).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `GPUBRIDGE_VERBS_RNDV_BYTES` | 256K | messages of at least this size go by rendezvous; `0`: off (and with it receives into GPU memory). The same on every leader |
+| `GPUBRIDGE_VERBS_GPU_PATH` | `auto` | `auto`, `direct` (fail instead of staging) or `staged` |
+| `GPUBRIDGE_VERBS_DMABUF`, `GPUBRIDGE_VERBS_PEER_MEMORY` | `1` | `0` keeps the direct path from trying that method |
+| `GPUBRIDGE_VERBS_DEVICE_CACHE_BYTES` | 8G | bound on GPU memory registered at once |
+| `GPUBRIDGE_VERBS_OBSERVE`, `_OBSERVE_QUEUE`, `GPUBRIDGE_JOB_ID` | off, 10000 | transport observations |
+| `GPUBRIDGE_VERBS_SLOT_BYTES`, `_CREDITS`, `_SEND_SLOTS`, `_UNEXPECTED_BYTES` | the library's | the protocol's settings |
 
 The library is built like multitcp's: `python -m gpubridge.verbs build`
 (Linux, the `ibverbs` feature, rdma-core's headers; `GPUBRIDGE_VERBS_LIB` for a
@@ -383,6 +587,31 @@ library built elsewhere), and `python -m gpubridge.verbs info` loads it without
 opening a device. If it can't be built or loaded, or there is no usable device
 or port, setup fails on every rank with the reason. Payload never moves any
 other way: another bridge is only ever chosen explicitly.
+
+## Hardware kit
+
+Prepared, not run (`scripts/gpu/verbs_kit.py`; runbook: `VERBS_BRIDGE=1` in
+steps 05 and 07; HARDWARE_VALIDATION.md items 38 to 42). Same-vendor (step 05)
+and cross-vendor (step 07) runs are separate records:
+
+1. `verbs_build`, `verbs_rdma_report` (each node's dma-buf options, peer-memory
+   modules, `ibv_reg_dmabuf_mr` in its libibverbs, ROCr's dma-buf export);
+2. `verbs_endpoint`: host-to-host verbs between one rank per node: latency,
+   bandwidth sweep, SHA-256 of every buffer on both sides, CPU time;
+3. `verbs_host`, `verbs_gpu_staged`, `verbs_gpu_direct`: the collectives on host
+   tensors, then GPU tensors staged and direct, exactly against Gloo, each call's
+   path and reason recorded and required;
+4. `check_verbs`, `bench_verbs`: every check stage and the bridge-phase benchmark
+   over `bridge="verbs"`, the Gloo and UCX bridges' runs in the same job as the
+   matched references;
+5. `train_verbs`, `train_gloo`: `train_bench.py` over each.
+
+Every `verbs_kit` record holds the endpoint telemetry (the provider must not say
+MOCK), completion errors, a window of every `/sys/class/infiniband/*/ports/*/
+{counters,hw_counters}` file and every interface's `/proc/net/dev` bytes, and
+`tcp_evidence`; `--require-no-tcp` fails a step unless the RDMA port's data
+counters moved at least the payload (they count 4-octet words) while no
+interface moved more than 5% of it over IP.
 
 ## Testing
 
@@ -397,11 +626,30 @@ down, closing with sends and receives outstanding (everything released, no
 violation), goodbye semantics, three members, mismatched versions, settings and
 link layers, the path MTU, and the selection rules.
 
+Rust, registered memory on the in-process mock with a mock GPU (`tests/direct.rs`):
+dma-buf chosen first, peer memory when dma-buf is unsupported or its export
+fails, and both reasons when neither works or a setting disables one; the
+capabilities report; a dma-buf descriptor closed exactly once, only after its
+region is deregistered (the mock GPU records a close while imported as a
+violation), and at once when registering fails; SYNC_MEMOPS once per new
+registration, not on cache hits; an address reallocated with a new buffer ID
+getting a new registration and the stale one dropped (refused while still in
+use); device memory read in place by sends and written by grant, with messages
+below the rendezvous size refused into it; every pairing of plain, registered
+host and device memory at a size spanning several slots; a waiting message
+holding up only its own tag; a grant of the wrong size failing both sides;
+receives into device memory refused with rendezvous off; aborting with a write
+granted keeping the registration until close; and telemetry with no key-like
+name. `gpu.rs`'s own tests: the peer-memory module found in sysfs or
+`/proc/modules` fixtures, a missing driver an `Unsupported` error, a mock
+reallocation getting a new buffer ID.
+
 **The test fabric** (`uds.rs`, feature `test-fabric`): a MOCK provider whose
 nodes are processes on one machine, carrying RC queue pairs over Unix sockets
 in a directory. It emulates RC's ordering, acknowledgements and failures
 (a send to a missing, unconnected or mismatched queue pair, or to a node that
-went away, completes with `RETRY_EXC_ERR`). It exists only in a separate test
+went away, completes with `RETRY_EXC_ERR`), and RDMA WRITE in queue pair order
+where the target queue pair and region allow it (`REM_ACCESS_ERR` otherwise). It exists only in a separate test
 build of the library (`gpubridge.verbs.build(test_fabric=True)`, without
 libibverbs) that only `GPUBRIDGE_VERBS_TEST_FABRIC=<directory>` loads; the
 production library can't select it, and telemetry and a warning say MOCK.
@@ -412,7 +660,29 @@ bad tensors, a receiver after the sender closed, a bad setting and mismatched
 settings failing init everywhere, a deadline, and teardown with a receive
 outstanding, on it, bit for bit against `flat-gloo`; and that without it
 `bridge="verbs"` fails init with the reason. These are software tests of the
-code above the provider, not of any fabric.
+code above the provider, not of any fabric. With A3 they run with rendezvous on
+(256 KiB), so large tensors go by write grant into the registered scratch.
+
+`tests/test_verbs_gpu.py` (no GPU): the router's ordering against a recording
+fake endpoint (one stream wait before the first device message and again after
+each wait, the flush after a wait that completed writes into device memory, a
+small receive bounced and copied only once waited for, registered host memory
+sent in place, plain memory copied); the direct-or-staged choice against a fake
+endpoint, each failing check giving staged with its reason (rendezvous off, no
+driver, no method, no flush, a refused registration, a refused scratch, which
+gives the first registration back), `GPUBRIDGE_VERBS_GPU_PATH=direct` failing
+with the reason, an empty tensor, driver checks once per GPU; the staged path end
+to end on the test fabric with CPU tensors standing in and lazy copies (a copy
+runs only when waited for, so reading the staging buffer early would move zeros):
+all_reduce and broadcast exact, every copy out waited for before the bridge used
+the buffer, the buffer registered and written by grant; and the observations
+those runs wrote, checked field by field against the detector's schema, plus
+key-like names refused at any depth, the NIC identity from sysfs fixtures, the
+job id from the environment or the store, and an emitter that can't write
+dropping and counting.
+
+`shim/gpu_abi_check.c` (compile-only): every constant and signature `gpu.rs` takes
+from cuda.h, HIP's runtime API and ROCr's headers.
 
 ## Building on a node without rdma-core's headers
 
@@ -438,6 +708,25 @@ opens a device is ignored, and belongs on an allocated node:
 
 ## Results so far
 
+- **A3, macOS (mock providers, mock GPU, CPU stand-ins):** `cargo fmt --check` and
+  `cargo clippy --all-targets -D warnings` with and without `test-fabric` are clean;
+  `cargo test` passes 68 tests, 71 with `test-fabric`. `tests/test_verbs.py`: 34
+  passed (now with rendezvous on); `tests/test_verbs_gpu.py`: 9 passed; the
+  multitcp bridge's tests and the pinned-staging tests still pass after the shared
+  `TaggedBridge` gained its scratch hook (61); `tests/test_gpu_kit.py`: everything
+  but the two Triton-cache tests that fail on this Mac on every commit. The kit's
+  `verbs_kit.py` ran in both modes on the MOCK test fabric (its `tcp_evidence`
+  correctly reports no RDMA counters there). `gpu_abi_check.c` against ROCr's
+  rocm-6.3.0 headers: clean.
+- **A3, Linux build (2026-10-18), explorer-02:** at commit a9e61ab, rdma-core v57.0
+  headers and the node's 57.0 runtime, debug builds at `cargo -j 1`: `cargo test
+  --features ibverbs` 72 passed (the device test ignored; its first compile was
+  SIGKILLed, the one retry passed), `--features test-fabric` 71; the shim has no
+  warnings; `gpu_abi_check.c` is clean against CUDA 12.8's cuda.h and HIP 6.3's
+  headers. The mock-only test build was SIGKILLed too (the second kill), so the
+  rest was not run: **clippy on Linux and the library's readelf check are
+  BLOCKED (login-node limits)**. Build evidence, not a transfer: nothing opened the
+  node's device or loaded a GPU driver.
 - **A2, macOS (mock providers):** `cargo fmt --check` and `cargo clippy
   --all-targets -D warnings` with and without `test-fabric` are clean; `cargo
   test --features test-fabric` passes 57 tests (55 without the feature).
@@ -459,6 +748,35 @@ opens a device is ignored, and belongs on an allocated node:
 - **CI:** the `verbs crate` job also lints and tests the `test-fabric` feature;
   the pytest jobs run `tests/test_verbs.py` where cargo is installed (not run
   yet with this change).
-- Nothing has run over a software RDMA provider or RDMA hardware: not validated
-  on RDMA hardware or GPUs. That needs two allocated nodes with usable devices
-  on one fabric (HARDWARE_VALIDATION.md item 38).
+- Nothing has run over a software RDMA provider, RDMA hardware or a GPU: not
+  validated on RDMA hardware or GPUs. That needs allocated GPU nodes with usable
+  RDMA devices on one fabric and the prerequisites of HARDWARE_VALIDATION.md items
+  38 to 42.
+
+## Open risks
+
+- **Untested on hardware**, all of it: real `poll(2)` on the channel descriptors,
+  retry/RNR settings, RoCE GID choice, `IBVERBS_1.12`'s `ibv_reg_dmabuf_mr`, RDMA
+  WRITE and its access checks on a real NIC, every GPU driver call, dma-buf import by
+  the NIC's driver, and whether the flush rules are enough on each GPU.
+- **Remote write exposure.** With rendezvous on, a registered region keeps its
+  remote-write right while cached; the peer gets its key only in a grant for one
+  receive, but a buggy or hostile peer that kept a key could write into that region
+  later (memory the cache still maps, possibly holding another tensor by then). The
+  bridge trusts its peers, as RDMA jobs do; memory windows or deregistering after
+  each receive would close it at a cost.
+- **Freed GPU memory under a cached registration.** The analysis that this is safe
+  rests on dma-buf imports pinning the exported memory and on the peer-memory
+  module revoking registrations; both are drivers' documented behaviour, not
+  something tested here. The cache also keeps freed segments pinned until evicted
+  or found stale (bounded by `GPUBRIDGE_VERBS_DEVICE_CACHE_BYTES`).
+- **AMD ordering.** The HDP flush (or `hipDeviceFlushGPUDirectRDMAWrites`) is what
+  the UCX bridge uses; HIP 6.3 reports no RDMA ordering attributes, so whether a
+  kernel reads the NIC's writes without stale data is a hardware question (item 41).
+- **Throughput unknown.** One completion thread and one CQ per endpoint, the CPU
+  copy for plain host tensors (staged GPU and registered buffers avoid it), a
+  rendezvous round trip per large message, a stream wait per step on the direct
+  path; peer loss is still noticed only when sending; messages buffered then held
+  can stall pathological orderings until the deadline (A2's risks stand).
+- **Linux clippy** for this phase is BLOCKED (login-node limits), so lints of the
+  `ibverbs` cfg are checked only by A2's run and the CI job.

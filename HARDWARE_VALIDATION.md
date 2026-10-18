@@ -602,7 +602,8 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     at close (telemetry). *Status: selection, descriptor lifetimes, cache
     invalidation on reallocation and the rendezvous into device memory are
     tested on a mock GPU and the mock provider (`tests/direct.rs`); the CUDA
-    calls are compiled, never run.* *BLOCKED: hardware/authorization:* item 39's
+    calls are checked against CUDA 12.8's cuda.h (`shim/gpu_abi_check.c`), never
+    run.* *BLOCKED: hardware/authorization:* item 39's
     prerequisites on NVIDIA GPUs, plus either dma-buf support (the open GPU
     kernel modules, a kernel with dma-buf, and an RDMA driver that imports
     dma-bufs: `rdma_report.sh` records each) or the `nvidia_peermem` module
@@ -616,8 +617,9 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     receives, `hipDeviceFlushGPUDirectRDMAWrites` or the HDP flush register
     (as the UCX bridge's direct path). No peer-memory path on AMD. Cross-vendor
     (one NVIDIA and one AMD leader, step 07) separately from AMD pairs. *Status:
-    the ROCm calls are compiled against ROCm 6.3's documented signatures, never
-    run; the selection and lifetimes are the mock GPU's tests.* *BLOCKED:
+    the ROCm calls are checked against ROCm 6.3's HIP and ROCr headers
+    (`shim/gpu_abi_check.c`), never run; the selection and lifetimes are the
+    mock GPU's tests.* *BLOCKED:
     hardware/authorization:* item 39's prerequisites on AMD GPUs with ROCm 6.x,
     a kernel and amdgpu driver with dma-buf export, and an RDMA driver that
     imports dma-bufs.

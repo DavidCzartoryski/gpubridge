@@ -626,7 +626,8 @@ Gloo bridge on a real network is what Explorer's step 08 with
 `init(bridge="verbs")` carries the bridge over RDMA reliable connections with
 raw libibverbs: a Rust library (a C shim compiled against rdma-core's headers)
 with its own versioned wire protocol of RC sends through registered buffers,
-credits and a completion thread. Linux only, opt-in, host tensors only:
+credits, a completion thread, and RDMA WRITE into memory registered for one
+receive. Linux only, opt-in, for host and GPU tensors:
 
 ```bash
 python -m gpubridge.verbs build   # needs cargo and rdma-core's headers; or set GPUBRIDGE_VERBS_LIB
@@ -636,9 +637,16 @@ python -m gpubridge.verbs info    # loads it; opens no device
 `GPUBRIDGE_VERBS_DEVICE`, `_PORT` and `_GID_INDEX` pick the endpoint (else the
 first active port, by documented rules); if verbs can't run, init fails on
 every rank and says why, and nothing falls back to TCP.
-`topology.bridge.telemetry()` reports the device, port, link layer, protocol and
-counts. So far it is tested only on mock fabrics, including a test-only one
-between processes where every bridge policy matches `flat-gloo` bit for bit.
+GPU tensors go direct (their memory registered with the NIC: a dma-buf, else
+NVIDIA peer memory; AMD through ROCr's dma-buf) when every run-time check passes,
+else through a registered pinned buffer on the caller's stream;
+`GPUBRIDGE_VERBS_GPU_PATH` forces `staged` or refuses to stage (`direct`).
+`topology.bridge.telemetry()` reports the device, port, link layer, protocol,
+counts, and each call's path and why. `GPUBRIDGE_VERBS_OBSERVE=<file>` writes
+transport observations for the straggler detector. So far it is tested only on
+mock fabrics (with a mock GPU and CPU tensors standing in), including a test-only
+one between processes where every bridge policy matches `flat-gloo` bit for bit;
+the hardware kit (`VERBS_BRIDGE=1`) is prepared, not run.
 The protocol, the status of each part and what hardware validation needs are
 in [docs/VERBS_TRANSPORT.md](docs/VERBS_TRANSPORT.md).
 

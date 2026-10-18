@@ -255,6 +255,19 @@ hardware.
 
 ### Added
 
+- `bridge="verbs"` takes GPU tensors, phase A3 (docs/VERBS_TRANSPORT.md): wire
+  protocol 2 adds a rendezvous (an RDMA WRITE into memory registered for one
+  receive, from `GPUBRIDGE_VERBS_RNDV_BYTES`, 256 KiB) and sends gathered from
+  registered memory; GPU tensors go direct (NVIDIA dma-buf or peer memory, AMD
+  dma-buf from ROCr, drivers loaded at run time, the caller's stream waited for
+  and the GPU flushed) only when every check passes and registration succeeds,
+  else staged through a registered pinned buffer, with the reason in telemetry;
+  transport observations for the straggler detector (`GPUBRIDGE_VERBS_OBSERVE`,
+  with `host`, `job` and the NIC's `pci_bus_id`); a prepared hardware kit
+  (`VERBS_BRIDGE=1`, `scripts/gpu/verbs_kit.py`, items 38 to 42). Tested on mock
+  providers, a mock GPU and CPU stand-ins; built on Explorer's login node (Linux
+  clippy blocked by its limits); not validated on RDMA hardware or GPUs.
+  (PR pending)
 - `bridge="verbs"`, opt-in, phase A2 of the raw-verbs bridge
   (docs/VERBS_TRANSPORT.md): a versioned wire protocol of RC SEND/RECV through
   each leader's own registered host buffers, with credits, chunking, a
