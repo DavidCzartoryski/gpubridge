@@ -11,8 +11,16 @@
 //!
 //! Nothing moves on its own: every `poll_cq` advances the fabric one tick and moves what
 //! is ready, so a test's sequence of calls fixes the outcome. Faults ([`Fault`]) make a
-//! call fail, delay sends or completions, or fail a send; [`MockFabric::kill`] loses a
-//! node; device limits ([`MockLimits`]) make resources run out.
+//! call fail, delay sends or completions, fail a send or raise an asynchronous event;
+//! [`MockFabric::kill`] loses a node; device limits ([`MockLimits`]) make resources run
+//! out.
+//!
+//! Completion channels work as in verbs: a queue asked for a notification
+//! (`req_notify_cq`) marks its channel when its next completion arrives, and
+//! `wait_events` returns it. A thread blocked in `wait_events` is the fabric's clock while
+//! it waits: it advances a tick about every millisecond and whenever another call changes
+//! something, so threads driving several nodes (the protocol tests) make progress without
+//! anyone polling. Those runs are not tick-deterministic; single-threaded ones still are.
 //!
 //! Like libibverbs, the mock does what it is told; where verbs would let a caller break
 //! memory safety (deregister memory that posted work still uses, destroy a queue pair or
@@ -21,13 +29,15 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ptr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::provider::{Handle, MrKeys, Provider, QpCreated};
 use crate::types::{
-    Access, Address, DeviceAttr, Gid, GidEntry, GidType, LinkLayer, Mtu, PortAttr, PortState,
-    QpCaps, QpState, RawCompletion, RawSge, RtrAttr, RtsAttr, SendOp, Transition, WcStatus,
+    Access, Address, AsyncEvent, AsyncEventKind, DeviceAttr, Events, Gid, GidEntry, GidType,
+    LinkLayer, Mtu, PortAttr, PortState, QpCaps, QpState, RawCompletion, RawSge, RtrAttr, RtsAttr,
+    SendOp, Transition, WcStatus,
 };
 
 pub type NodeId = usize;
@@ -165,6 +175,11 @@ pub enum Call {
     DeallocPd,
     DeregMr,
     CloseDevice,
+    CreateCompChannel,
+    DestroyCompChannel,
+    ReqNotifyCq,
+    /// `wait_events` (`ibv_get_cq_event` / `ibv_get_async_event`).
+    GetEvent,
 }
 
 impl Call {
@@ -186,13 +201,22 @@ impl Call {
             Call::DeallocPd => "ibv_dealloc_pd",
             Call::DeregMr => "ibv_dereg_mr",
             Call::CloseDevice => "ibv_close_device",
+            Call::CreateCompChannel => "ibv_create_comp_channel",
+            Call::DestroyCompChannel => "ibv_destroy_comp_channel",
+            Call::ReqNotifyCq => "ibv_req_notify_cq",
+            Call::GetEvent => "ibv_get_cq_event",
         }
     }
 
     fn releases(self) -> bool {
         matches!(
             self,
-            Call::DestroyQp | Call::DestroyCq | Call::DeallocPd | Call::DeregMr | Call::CloseDevice
+            Call::DestroyQp
+                | Call::DestroyCq
+                | Call::DeallocPd
+                | Call::DeregMr
+                | Call::CloseDevice
+                | Call::DestroyCompChannel
         )
     }
 }
@@ -213,6 +237,9 @@ pub enum Fault {
     CompletionDelay { node: NodeId, ticks: u64 },
     /// The next send `node` moves completes with `status`; its queue pair goes to `Err`.
     FailNextSend { node: NodeId, status: WcStatus },
+    /// Every open context on `node` gets this asynchronous event (`qp_num` and `port` as
+    /// given).
+    AsyncEvent { node: NodeId, event: AsyncEvent },
 }
 
 /// Live resources on a node.
@@ -223,11 +250,12 @@ pub struct LiveCounts {
     pub cqs: usize,
     pub qps: usize,
     pub mrs: usize,
+    pub channels: usize,
 }
 
 impl LiveCounts {
     pub fn total(&self) -> usize {
-        self.contexts + self.pds + self.cqs + self.qps + self.mrs
+        self.contexts + self.pds + self.cqs + self.qps + self.mrs + self.channels
     }
 }
 
@@ -243,6 +271,13 @@ struct Node {
 struct CtxRec {
     node: NodeId,
     dev: usize,
+    events: VecDeque<AsyncEvent>,
+}
+
+struct ChanRec {
+    ctx: Handle,
+    /// A notification is waiting to be taken.
+    pending: bool,
 }
 
 struct PdRec {
@@ -254,6 +289,9 @@ struct CqRec {
     depth: u32,
     entries: VecDeque<(u64, RawCompletion)>,
     overrun: bool,
+    channel: Option<Handle>,
+    /// Notify the channel when the next completion becomes visible.
+    armed: bool,
 }
 
 struct SendJob {
@@ -323,6 +361,7 @@ struct Fabric {
     cqs: BTreeMap<Handle, CqRec>,
     qps: BTreeMap<Handle, QpRec>,
     mrs: BTreeMap<Handle, MrRec>,
+    channels: BTreeMap<Handle, ChanRec>,
     faults: Vec<FaultRule>,
     violations: Vec<String>,
 }
@@ -330,6 +369,8 @@ struct Fabric {
 /// The fabric: create it, add nodes, take each node's provider.
 pub struct MockFabric {
     inner: Mutex<Fabric>,
+    /// Signalled whenever a call may have changed what a waiting thread could see.
+    wake: Condvar,
 }
 
 impl Default for MockFabric {
@@ -348,9 +389,11 @@ impl Default for MockFabric {
                 cqs: BTreeMap::new(),
                 qps: BTreeMap::new(),
                 mrs: BTreeMap::new(),
+                channels: BTreeMap::new(),
                 faults: Vec::new(),
                 violations: Vec::new(),
             }),
+            wake: Condvar::new(),
         }
     }
 }
@@ -399,17 +442,51 @@ impl MockFabric {
             Fault::SendDelay { node, ticks } => f.nodes[node].send_delay = ticks,
             Fault::CompletionDelay { node, ticks } => f.nodes[node].completion_delay = ticks,
             Fault::FailNextSend { node, status } => f.nodes[node].fail_next_send = Some(status),
+            Fault::AsyncEvent { node, event } => {
+                for c in f.ctxs.values_mut().filter(|c| c.node == node) {
+                    c.events.push_back(event);
+                }
+            }
         }
+        drop(f);
+        self.wake.notify_all();
     }
 
     /// The node is gone: nothing reaches it, it moves nothing, and its calls fail (except
     /// releases, so its owner's cleanup still runs).
     pub fn kill(&self, node: NodeId) {
         self.lock().nodes[node].alive = false;
+        self.wake.notify_all();
     }
 
+    /// Changes a port's state; contexts on its device get a `PortErr` event when it leaves
+    /// `Active` and a `PortActive` one when it returns.
     pub fn set_port_state(&self, node: NodeId, device: usize, port: u8, state: PortState) {
-        self.lock().nodes[node].devices[device].ports[usize::from(port) - 1].state = state;
+        let mut f = self.lock();
+        let p = &mut f.nodes[node].devices[device].ports[usize::from(port) - 1];
+        let was = p.state;
+        p.state = state;
+        let kind = match (was == PortState::Active, state == PortState::Active) {
+            (true, false) => Some(AsyncEventKind::PortErr),
+            (false, true) => Some(AsyncEventKind::PortActive),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            let event = AsyncEvent {
+                kind,
+                qp_num: None,
+                port: Some(port),
+            };
+            for c in f
+                .ctxs
+                .values_mut()
+                .filter(|c| c.node == node && c.dev == device)
+            {
+                c.events.push_back(event);
+            }
+        }
+        drop(f);
+        self.wake.notify_all();
     }
 
     /// How many ticks a send keeps trying an unreachable peer, and per RNR retry.
@@ -425,6 +502,8 @@ impl MockFabric {
         for _ in 0..n {
             f.progress();
         }
+        drop(f);
+        self.wake.notify_all();
     }
 
     pub fn tick(&self) -> u64 {
@@ -450,6 +529,7 @@ impl MockFabric {
             cqs: f.cqs.values().filter(|c| on(c.ctx)).count(),
             qps: f.qps.values().filter(|q| q.node == node).count(),
             mrs: f.mrs.values().filter(|m| m.node == node).count(),
+            channels: f.channels.values().filter(|c| on(c.ctx)).count(),
         }
     }
 
@@ -553,6 +633,24 @@ impl Fabric {
             return;
         }
         rec.entries.push_back((visible, wc));
+        self.notify_visible();
+    }
+
+    /// Marks the channel of every armed queue whose oldest completion is visible now.
+    fn notify_visible(&mut self) {
+        let tick = self.tick;
+        let mut ring = Vec::new();
+        for rec in self.cqs.values_mut() {
+            if rec.armed && rec.entries.front().is_some_and(|(v, _)| *v <= tick) {
+                rec.armed = false;
+                ring.extend(rec.channel);
+            }
+        }
+        for ch in ring {
+            if let Some(c) = self.channels.get_mut(&ch) {
+                c.pending = true;
+            }
+        }
     }
 
     fn complete(
@@ -839,6 +937,8 @@ impl Fabric {
         for qp in qps {
             while self.qps.contains_key(&qp) && self.try_send(qp) {}
         }
+        // Delayed completions that became visible with this tick.
+        self.notify_visible();
     }
 }
 
@@ -860,11 +960,51 @@ impl MockProvider {
         f.enter(self.node, call)?;
         Ok(f)
     }
+
+    /// Wakes threads blocked in `wait_events` after a call that changed something.
+    fn changed(&self) {
+        self.fabric.wake.notify_all();
+    }
+
+    fn new_cq(&self, ctx: Handle, depth: u32, channel: Option<Handle>) -> Result<(Handle, u32)> {
+        let mut f = self.enter(Call::CreateCq)?;
+        f.ctx(self.node, ctx, Call::CreateCq)?;
+        if let Some(ch) = channel {
+            if f.channels.get(&ch).map(|c| c.ctx) != Some(ctx) {
+                return Err(verbs(Call::CreateCq, EINVAL));
+            }
+        }
+        let limits = f.device(ctx).limits;
+        if depth == 0 || depth > limits.max_cqe {
+            return Err(verbs(Call::CreateCq, EINVAL));
+        }
+        if f.on_device(ctx, f.cqs.values().map(|c| c.ctx)) >= limits.max_cq as usize {
+            return Err(verbs(Call::CreateCq, ENOMEM));
+        }
+        let h = f.handle();
+        f.cqs.insert(
+            h,
+            CqRec {
+                ctx,
+                depth,
+                entries: VecDeque::new(),
+                overrun: false,
+                channel,
+                armed: false,
+            },
+        );
+        f.log(self.node, Call::CreateCq, h);
+        Ok((h, depth))
+    }
 }
 
 impl Provider for MockProvider {
     fn name(&self) -> &str {
         "mock"
+    }
+
+    fn describe(&self) -> String {
+        "MOCK: in-process fabric (not RDMA)".into()
     }
 
     fn list_devices(&self) -> Result<Vec<String>> {
@@ -889,6 +1029,7 @@ impl Provider for MockProvider {
             CtxRec {
                 node: self.node,
                 dev,
+                events: VecDeque::new(),
             },
         );
         f.log(self.node, Call::OpenDevice, h);
@@ -900,7 +1041,8 @@ impl Provider for MockProvider {
         f.ctx(self.node, ctx, Call::CloseDevice)?;
         let children = f.pds.values().filter(|p| p.ctx == ctx).count()
             + f.cqs.values().filter(|c| c.ctx == ctx).count()
-            + f.qps.values().filter(|q| q.ctx == ctx).count();
+            + f.qps.values().filter(|q| q.ctx == ctx).count()
+            + f.channels.values().filter(|c| c.ctx == ctx).count();
         if children > 0 {
             f.violations.push(format!(
                 "context #{ctx} closed with {children} live children"
@@ -998,27 +1140,103 @@ impl Provider for MockProvider {
     }
 
     fn create_cq(&self, ctx: Handle, depth: u32) -> Result<(Handle, u32)> {
-        let mut f = self.enter(Call::CreateCq)?;
-        f.ctx(self.node, ctx, Call::CreateCq)?;
-        let limits = f.device(ctx).limits;
-        if depth == 0 || depth > limits.max_cqe {
-            return Err(verbs(Call::CreateCq, EINVAL));
-        }
-        if f.on_device(ctx, f.cqs.values().map(|c| c.ctx)) >= limits.max_cq as usize {
-            return Err(verbs(Call::CreateCq, ENOMEM));
-        }
+        self.new_cq(ctx, depth, None)
+    }
+
+    fn create_cq_on_channel(
+        &self,
+        ctx: Handle,
+        depth: u32,
+        channel: Handle,
+    ) -> Result<(Handle, u32)> {
+        self.new_cq(ctx, depth, Some(channel))
+    }
+
+    fn create_comp_channel(&self, ctx: Handle) -> Result<Handle> {
+        let mut f = self.enter(Call::CreateCompChannel)?;
+        f.ctx(self.node, ctx, Call::CreateCompChannel)?;
         let h = f.handle();
-        f.cqs.insert(
+        f.channels.insert(
             h,
-            CqRec {
+            ChanRec {
                 ctx,
-                depth,
-                entries: VecDeque::new(),
-                overrun: false,
+                pending: false,
             },
         );
-        f.log(self.node, Call::CreateCq, h);
-        Ok((h, depth))
+        f.log(self.node, Call::CreateCompChannel, h);
+        Ok(h)
+    }
+
+    fn destroy_comp_channel(&self, channel: Handle) -> Result<()> {
+        let mut f = self.enter(Call::DestroyCompChannel)?;
+        if !f.channels.contains_key(&channel) {
+            return Err(verbs(Call::DestroyCompChannel, EINVAL));
+        }
+        if f.cqs.values().any(|c| c.channel == Some(channel)) {
+            f.violations.push(format!(
+                "completion channel #{channel} destroyed while a completion queue uses it"
+            ));
+            return Err(verbs(Call::DestroyCompChannel, EBUSY));
+        }
+        f.channels.remove(&channel);
+        f.log(self.node, Call::DestroyCompChannel, channel);
+        Ok(())
+    }
+
+    fn req_notify_cq(&self, cq: Handle) -> Result<()> {
+        let mut f = self.enter(Call::ReqNotifyCq)?;
+        let rec = f
+            .cqs
+            .get_mut(&cq)
+            .ok_or_else(|| verbs(Call::ReqNotifyCq, EINVAL))?;
+        if rec.channel.is_none() {
+            return Err(verbs(Call::ReqNotifyCq, EINVAL));
+        }
+        // The next visible completion marks the channel. Callers poll after arming, as
+        // with verbs, so one already queued is never missed either way.
+        rec.armed = true;
+        Ok(())
+    }
+
+    fn wait_events(&self, ctx: Handle, channel: Handle, timeout: Duration) -> Result<Events> {
+        let deadline = Instant::now() + timeout;
+        let mut f = self.enter(Call::GetEvent)?;
+        loop {
+            if f.channels.get(&channel).map(|c| c.ctx) != Some(ctx) {
+                return Err(verbs(Call::GetEvent, EINVAL));
+            }
+            f.ctx(self.node, ctx, Call::GetEvent)?;
+            if !f.nodes[self.node].alive {
+                return Err(verbs(Call::GetEvent, EIO));
+            }
+            f.progress();
+            let ch = f.channels.get_mut(&channel).expect("checked above");
+            let completion = std::mem::take(&mut ch.pending);
+            let async_events: Vec<AsyncEvent> = f
+                .ctxs
+                .get_mut(&ctx)
+                .expect("checked above")
+                .events
+                .drain(..)
+                .collect();
+            if completion || !async_events.is_empty() {
+                return Ok(Events {
+                    completion,
+                    async_events,
+                });
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(Events::default());
+            }
+            let nap = (deadline - now).min(Duration::from_millis(1));
+            f = self
+                .fabric
+                .wake
+                .wait_timeout(f, nap)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
     }
 
     fn destroy_cq(&self, cq: Handle) -> Result<()> {
@@ -1148,6 +1366,8 @@ impl Provider for MockProvider {
                 }
             }
         }
+        drop(f);
+        self.changed();
         Ok(())
     }
 
@@ -1288,6 +1508,8 @@ impl Provider for MockProvider {
             unreachable_since: None,
             rnr_since: None,
         });
+        drop(f);
+        self.changed();
         Ok(())
     }
 
@@ -1309,6 +1531,8 @@ impl Provider for MockProvider {
             wr_id,
             sges: sges.to_vec(),
         });
+        drop(f);
+        self.changed();
         Ok(())
     }
 

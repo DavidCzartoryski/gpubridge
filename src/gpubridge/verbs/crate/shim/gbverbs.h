@@ -15,8 +15,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define GBV_ABI_VERSION 1u
+#define GBV_ABI_VERSION 2u
 #define GBV_MAX_SGE 16u
+/* At most this many work requests per batch post, and this many scatter-gather entries in
+ * all of them together. */
+#define GBV_MAX_BATCH 64u
+#define GBV_MAX_BATCH_SGE 256u
 
 /* Opaque handles: struct ibv_context, ibv_pd, ibv_cq, ibv_qp, ibv_mr. Never defined. */
 typedef struct gbv_context gbv_context;
@@ -24,6 +28,8 @@ typedef struct gbv_pd gbv_pd;
 typedef struct gbv_cq gbv_cq;
 typedef struct gbv_qp gbv_qp;
 typedef struct gbv_mr gbv_mr;
+/* struct ibv_comp_channel. */
+typedef struct gbv_channel gbv_channel;
 
 /* Access flags (our bits; translated to IBV_ACCESS_*). */
 #define GBV_ACCESS_LOCAL_WRITE 1u
@@ -169,6 +175,40 @@ struct gbv_wc {
     uint32_t has_imm;
 };
 
+/* Asynchronous event types: our numbering, translated from enum ibv_event_type. */
+enum {
+    GBV_EV_CQ_ERR = 1,
+    GBV_EV_QP_FATAL = 2,
+    GBV_EV_QP_REQ_ERR = 3,
+    GBV_EV_QP_ACCESS_ERR = 4,
+    GBV_EV_COMM_EST = 5,
+    GBV_EV_SQ_DRAINED = 6,
+    GBV_EV_PATH_MIG = 7,
+    GBV_EV_PATH_MIG_ERR = 8,
+    GBV_EV_DEVICE_FATAL = 9,
+    GBV_EV_PORT_ACTIVE = 10,
+    GBV_EV_PORT_ERR = 11,
+    GBV_EV_LID_CHANGE = 12,
+    GBV_EV_PKEY_CHANGE = 13,
+    GBV_EV_SM_CHANGE = 14,
+    GBV_EV_SRQ_ERR = 15,
+    GBV_EV_SRQ_LIMIT_REACHED = 16,
+    GBV_EV_QP_LAST_WQE_REACHED = 17,
+    GBV_EV_CLIENT_REREGISTER = 18,
+    GBV_EV_GID_CHANGE = 19,
+    GBV_EV_OTHER = 20 /* raw_type has libibverbs' value */
+};
+
+struct gbv_async_event {
+    uint32_t type;     /* GBV_EV_* */
+    uint32_t raw_type; /* libibverbs' enum ibv_event_type value */
+    uint32_t qp_num;   /* when has_qp */
+    uint8_t port_num;  /* when has_port */
+    uint8_t has_qp;
+    uint8_t has_port;
+    uint8_t pad;
+};
+
 /* Layout ids for gbv_layout(): a struct's size, or a field's offset. */
 enum {
     GBV_L_DEVICE_ATTR = 1, GBV_L_DEVICE_ATTR_FW_VER,
@@ -181,6 +221,7 @@ enum {
     GBV_L_SGE, GBV_L_SGE_LKEY,
     GBV_L_SEND_WR, GBV_L_SEND_WR_NUM_SGE,
     GBV_L_WC, GBV_L_WC_HAS_IMM,
+    GBV_L_ASYNC_EVENT, GBV_L_ASYNC_EVENT_HAS_PORT,
     GBV_L_END
 };
 
@@ -225,5 +266,33 @@ int gbv_post_send(gbv_qp *qp, const struct gbv_send_wr *wr, const struct gbv_sge
 int gbv_post_recv(gbv_qp *qp, uint64_t wr_id, const struct gbv_sge *sges, uint32_t num_sge);
 /* Up to max completions into out; *n says how many. */
 int gbv_poll_cq(gbv_cq *cq, struct gbv_wc *out, uint32_t max, uint32_t *n);
+
+/* n (at most GBV_MAX_BATCH) work requests in one ibv_post_send / ibv_post_recv call,
+ * chained in order. sges holds every request's entries one after the other (at most
+ * GBV_MAX_BATCH_SGE). On an error, *posted says how many were posted before the one that
+ * failed (libibverbs' bad_wr); on success it is n. */
+int gbv_post_send_batch(gbv_qp *qp, const struct gbv_send_wr *wrs, uint32_t n,
+                        const struct gbv_sge *sges, uint32_t *posted);
+int gbv_post_recv_batch(gbv_qp *qp, const uint64_t *wr_ids, const uint32_t *num_sges, uint32_t n,
+                        const struct gbv_sge *sges, uint32_t *posted);
+
+/* A completion channel, its descriptor non-blocking (gbv_open_device makes the context's
+ * asynchronous event descriptor non-blocking too). */
+int gbv_create_comp_channel(gbv_context *ctx, gbv_channel **out);
+/* Only after every completion queue on it is destroyed. */
+int gbv_destroy_comp_channel(gbv_channel *channel);
+int gbv_create_cq_on_channel(gbv_context *ctx, uint32_t depth, gbv_channel *channel,
+                             gbv_cq **out, uint32_t *actual);
+/* One notification for the next completion (ibv_req_notify_cq, any completion). */
+int gbv_req_notify_cq(gbv_cq *cq);
+/* Waits up to timeout_ms (poll(2) on the channel's and the context's descriptors) for a
+ * completion notification or asynchronous events, then takes and acknowledges them:
+ * *completion is 1 if a notification came; up to max_events events go into events, *n_events
+ * says how many. An interrupted wait returns 0 with nothing. */
+int gbv_wait_events(gbv_context *ctx, gbv_channel *channel, int timeout_ms, uint32_t *completion,
+                    struct gbv_async_event *events, uint32_t max_events, uint32_t *n_events);
+/* The file libibverbs was loaded from, resolved (its name carries rdma-core's version, e.g.
+ * libibverbs.so.1.14.57.0), NUL-terminated; ENOENT if unknown, ENOSPC if len is too small. */
+int gbv_library_path(char *out, size_t len);
 
 #endif

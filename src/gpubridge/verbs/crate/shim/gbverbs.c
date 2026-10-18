@@ -4,13 +4,19 @@
  * ibv_query_gid_ex, ibv_query_port) are the header's own code, and linked to the system's
  * libibverbs.so.1. Rust sees none of the ibv_* types: see gbverbs.h.
  */
+/* dladdr (gbv_library_path). */
+#define _GNU_SOURCE
 #include "gbverbs.h"
 
 #include <arpa/inet.h>
+#include <dlfcn.h>
 #include <endian.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <infiniband/verbs.h>
@@ -39,6 +45,8 @@ _Static_assert(sizeof(struct gbv_send_wr) == 32, "gbv_send_wr size");
 _Static_assert(offsetof(struct gbv_send_wr, num_sge) == 28, "gbv_send_wr.num_sge");
 _Static_assert(sizeof(struct gbv_wc) == 40, "gbv_wc size");
 _Static_assert(offsetof(struct gbv_wc, has_imm) == 36, "gbv_wc.has_imm");
+_Static_assert(sizeof(struct gbv_async_event) == 16, "gbv_async_event size");
+_Static_assert(offsetof(struct gbv_async_event, has_port) == 14, "gbv_async_event.has_port");
 /* Our scatter-gather entries go straight into ibv_sge's fields, one by one. */
 _Static_assert(sizeof(((struct ibv_sge *)0)->length) == sizeof(uint32_t), "ibv_sge.length");
 
@@ -47,12 +55,19 @@ _Static_assert(sizeof(((struct ibv_sge *)0)->length) == sizeof(uint32_t), "ibv_s
 #define CQ(p) ((struct ibv_cq *)(p))
 #define QP(p) ((struct ibv_qp *)(p))
 #define MR(p) ((struct ibv_mr *)(p))
+#define CH(p) ((struct ibv_comp_channel *)(p))
 
 /* errno after a call that failed without one: never report success for a failure. */
 static int fail(void) { return errno > 0 ? errno : EIO; }
 
 /* A return value that is itself an errno (ibv_modify_qp, ibv_post_*, ibv_destroy_*). */
 static int status(int rc) { return rc == 0 ? 0 : (rc > 0 ? rc : (errno > 0 ? errno : EIO)); }
+
+static int nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return fail();
+    return 0;
+}
 
 uint32_t gbv_abi_version(void) { return GBV_ABI_VERSION; }
 
@@ -81,6 +96,8 @@ uint64_t gbv_layout(uint32_t id) {
     case GBV_L_SEND_WR_NUM_SGE: return offsetof(struct gbv_send_wr, num_sge);
     case GBV_L_WC: return sizeof(struct gbv_wc);
     case GBV_L_WC_HAS_IMM: return offsetof(struct gbv_wc, has_imm);
+    case GBV_L_ASYNC_EVENT: return sizeof(struct gbv_async_event);
+    case GBV_L_ASYNC_EVENT_HAS_PORT: return offsetof(struct gbv_async_event, has_port);
     default: return UINT64_MAX;
     }
 }
@@ -162,6 +179,14 @@ int gbv_open_device(const char *name, gbv_context **out) {
             errno = 0;
             struct ibv_context *ctx = ibv_open_device(list[i]);
             rc = ctx ? 0 : fail();
+            if (ctx) {
+                /* gbv_wait_events polls this descriptor and must never block reading it. */
+                rc = nonblocking(ctx->async_fd);
+                if (rc) {
+                    ibv_close_device(ctx);
+                    ctx = NULL;
+                }
+            }
             *out = (gbv_context *)ctx;
             break;
         }
@@ -428,6 +453,35 @@ static int fill_sges(struct ibv_sge *out, const struct gbv_sge *in, uint32_t n) 
     return 0;
 }
 
+/* One send work request from ours; sg must hold w->num_sge entries (already filled). */
+static int fill_send(struct ibv_send_wr *wr, const struct gbv_send_wr *w, struct ibv_sge *sg) {
+    memset(wr, 0, sizeof(*wr));
+    wr->wr_id = w->wr_id;
+    wr->sg_list = w->num_sge ? sg : NULL;
+    wr->num_sge = (int)w->num_sge;
+    wr->send_flags = IBV_SEND_SIGNALED;
+    switch (w->opcode) {
+    case GBV_WR_SEND: wr->opcode = IBV_WR_SEND; break;
+    case GBV_WR_SEND_WITH_IMM:
+        wr->opcode = IBV_WR_SEND_WITH_IMM;
+        wr->imm_data = htonl(w->imm_data);
+        break;
+    case GBV_WR_RDMA_WRITE:
+        wr->opcode = IBV_WR_RDMA_WRITE;
+        wr->wr.rdma.remote_addr = w->remote_addr;
+        wr->wr.rdma.rkey = w->rkey;
+        break;
+    case GBV_WR_RDMA_WRITE_WITH_IMM:
+        wr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+        wr->imm_data = htonl(w->imm_data);
+        wr->wr.rdma.remote_addr = w->remote_addr;
+        wr->wr.rdma.rkey = w->rkey;
+        break;
+    default: return EINVAL;
+    }
+    return 0;
+}
+
 int gbv_post_send(gbv_qp *qp, const struct gbv_send_wr *w, const struct gbv_sge *sges) {
     if (!qp || !w) return EINVAL;
     struct ibv_sge sg[GBV_MAX_SGE];
@@ -435,31 +489,57 @@ int gbv_post_send(gbv_qp *qp, const struct gbv_send_wr *w, const struct gbv_sge 
     if (rc) return rc;
     struct ibv_send_wr wr;
     struct ibv_send_wr *bad = NULL;
-    memset(&wr, 0, sizeof(wr));
-    wr.wr_id = w->wr_id;
-    wr.sg_list = w->num_sge ? sg : NULL;
-    wr.num_sge = (int)w->num_sge;
-    wr.send_flags = IBV_SEND_SIGNALED;
-    switch (w->opcode) {
-    case GBV_WR_SEND: wr.opcode = IBV_WR_SEND; break;
-    case GBV_WR_SEND_WITH_IMM:
-        wr.opcode = IBV_WR_SEND_WITH_IMM;
-        wr.imm_data = htonl(w->imm_data);
-        break;
-    case GBV_WR_RDMA_WRITE:
-        wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.wr.rdma.remote_addr = w->remote_addr;
-        wr.wr.rdma.rkey = w->rkey;
-        break;
-    case GBV_WR_RDMA_WRITE_WITH_IMM:
-        wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-        wr.imm_data = htonl(w->imm_data);
-        wr.wr.rdma.remote_addr = w->remote_addr;
-        wr.wr.rdma.rkey = w->rkey;
-        break;
-    default: return EINVAL;
-    }
+    rc = fill_send(&wr, w, sg);
+    if (rc) return rc;
     return status(ibv_post_send(QP(qp), &wr, &bad));
+}
+
+int gbv_post_send_batch(gbv_qp *qp, const struct gbv_send_wr *wrs, uint32_t n,
+                        const struct gbv_sge *sges, uint32_t *posted) {
+    if (!qp || !posted || n == 0 || n > GBV_MAX_BATCH || !wrs) return EINVAL;
+    *posted = 0;
+    struct ibv_send_wr wr[GBV_MAX_BATCH];
+    struct ibv_sge sg[GBV_MAX_BATCH_SGE];
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t k = wrs[i].num_sge;
+        if (k > GBV_MAX_SGE || used + k > GBV_MAX_BATCH_SGE) return EINVAL;
+        int rc = fill_sges(sg + used, sges + used, k);
+        if (!rc) rc = fill_send(&wr[i], &wrs[i], sg + used);
+        if (rc) return rc;
+        wr[i].next = i + 1 < n ? &wr[i + 1] : NULL;
+        used += k;
+    }
+    struct ibv_send_wr *bad = NULL;
+    int rc = status(ibv_post_send(QP(qp), wr, &bad));
+    /* Requests before bad_wr were posted; bad_wr and after were not. */
+    *posted = rc == 0 ? n : (bad ? (uint32_t)(bad - wr) : 0);
+    return rc;
+}
+
+int gbv_post_recv_batch(gbv_qp *qp, const uint64_t *wr_ids, const uint32_t *num_sges, uint32_t n,
+                        const struct gbv_sge *sges, uint32_t *posted) {
+    if (!qp || !posted || n == 0 || n > GBV_MAX_BATCH || !wr_ids || !num_sges) return EINVAL;
+    *posted = 0;
+    struct ibv_recv_wr wr[GBV_MAX_BATCH];
+    struct ibv_sge sg[GBV_MAX_BATCH_SGE];
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t k = num_sges[i];
+        if (k > GBV_MAX_SGE || used + k > GBV_MAX_BATCH_SGE) return EINVAL;
+        int rc = fill_sges(sg + used, sges + used, k);
+        if (rc) return rc;
+        memset(&wr[i], 0, sizeof(wr[i]));
+        wr[i].wr_id = wr_ids[i];
+        wr[i].sg_list = k ? sg + used : NULL;
+        wr[i].num_sge = (int)k;
+        wr[i].next = i + 1 < n ? &wr[i + 1] : NULL;
+        used += k;
+    }
+    struct ibv_recv_wr *bad = NULL;
+    int rc = status(ibv_post_recv(QP(qp), wr, &bad));
+    *posted = rc == 0 ? n : (bad ? (uint32_t)(bad - wr) : 0);
+    return rc;
 }
 
 int gbv_post_recv(gbv_qp *qp, uint64_t wr_id, const struct gbv_sge *sges, uint32_t num_sge) {
@@ -535,5 +615,130 @@ int gbv_poll_cq(gbv_cq *cq, struct gbv_wc *out, uint32_t max, uint32_t *n) {
         *n += (uint32_t)got;
         if ((uint32_t)got < want) break;
     }
+    return 0;
+}
+
+int gbv_create_comp_channel(gbv_context *ctx, gbv_channel **out) {
+    if (!ctx || !out) return EINVAL;
+    errno = 0;
+    struct ibv_comp_channel *channel = ibv_create_comp_channel(CTX(ctx));
+    *out = NULL;
+    if (!channel) return fail();
+    int rc = nonblocking(channel->fd);
+    if (rc) {
+        ibv_destroy_comp_channel(channel);
+        return rc;
+    }
+    *out = (gbv_channel *)channel;
+    return 0;
+}
+
+int gbv_destroy_comp_channel(gbv_channel *channel) {
+    if (!channel) return EINVAL;
+    return status(ibv_destroy_comp_channel(CH(channel)));
+}
+
+int gbv_create_cq_on_channel(gbv_context *ctx, uint32_t depth, gbv_channel *channel,
+                             gbv_cq **out, uint32_t *actual) {
+    if (!ctx || !channel || !out || !actual || depth == 0 || depth > INT_MAX) return EINVAL;
+    errno = 0;
+    struct ibv_cq *cq = ibv_create_cq(CTX(ctx), (int)depth, NULL, CH(channel), 0);
+    *out = (gbv_cq *)cq;
+    if (!cq) return fail();
+    *actual = cq->cqe > 0 ? (uint32_t)cq->cqe : 0;
+    return 0;
+}
+
+int gbv_req_notify_cq(gbv_cq *cq) {
+    if (!cq) return EINVAL;
+    return status(ibv_req_notify_cq(CQ(cq), 0));
+}
+
+static uint32_t event_type(enum ibv_event_type t, uint8_t *has_qp, uint8_t *has_port) {
+    *has_qp = 0;
+    *has_port = 0;
+    switch (t) {
+    case IBV_EVENT_CQ_ERR: return GBV_EV_CQ_ERR;
+    case IBV_EVENT_QP_FATAL: *has_qp = 1; return GBV_EV_QP_FATAL;
+    case IBV_EVENT_QP_REQ_ERR: *has_qp = 1; return GBV_EV_QP_REQ_ERR;
+    case IBV_EVENT_QP_ACCESS_ERR: *has_qp = 1; return GBV_EV_QP_ACCESS_ERR;
+    case IBV_EVENT_COMM_EST: *has_qp = 1; return GBV_EV_COMM_EST;
+    case IBV_EVENT_SQ_DRAINED: *has_qp = 1; return GBV_EV_SQ_DRAINED;
+    case IBV_EVENT_PATH_MIG: *has_qp = 1; return GBV_EV_PATH_MIG;
+    case IBV_EVENT_PATH_MIG_ERR: *has_qp = 1; return GBV_EV_PATH_MIG_ERR;
+    case IBV_EVENT_QP_LAST_WQE_REACHED: *has_qp = 1; return GBV_EV_QP_LAST_WQE_REACHED;
+    case IBV_EVENT_DEVICE_FATAL: return GBV_EV_DEVICE_FATAL;
+    case IBV_EVENT_PORT_ACTIVE: *has_port = 1; return GBV_EV_PORT_ACTIVE;
+    case IBV_EVENT_PORT_ERR: *has_port = 1; return GBV_EV_PORT_ERR;
+    case IBV_EVENT_LID_CHANGE: *has_port = 1; return GBV_EV_LID_CHANGE;
+    case IBV_EVENT_PKEY_CHANGE: *has_port = 1; return GBV_EV_PKEY_CHANGE;
+    case IBV_EVENT_SM_CHANGE: *has_port = 1; return GBV_EV_SM_CHANGE;
+    case IBV_EVENT_CLIENT_REREGISTER: *has_port = 1; return GBV_EV_CLIENT_REREGISTER;
+    case IBV_EVENT_GID_CHANGE: *has_port = 1; return GBV_EV_GID_CHANGE;
+    case IBV_EVENT_SRQ_ERR: return GBV_EV_SRQ_ERR;
+    case IBV_EVENT_SRQ_LIMIT_REACHED: return GBV_EV_SRQ_LIMIT_REACHED;
+    default: return GBV_EV_OTHER;
+    }
+}
+
+int gbv_wait_events(gbv_context *ctx, gbv_channel *channel, int timeout_ms, uint32_t *completion,
+                    struct gbv_async_event *events, uint32_t max_events, uint32_t *n_events) {
+    if (!ctx || !channel || !completion || !n_events || (max_events > 0 && !events))
+        return EINVAL;
+    *completion = 0;
+    *n_events = 0;
+    struct pollfd fds[2];
+    fds[0].fd = CH(channel)->fd;
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
+    fds[1].fd = CTX(ctx)->async_fd;
+    fds[1].events = POLLIN;
+    fds[1].revents = 0;
+    int ready = poll(fds, 2, timeout_ms < 0 ? 0 : timeout_ms);
+    if (ready < 0) return errno == EINTR ? 0 : fail();
+    if (ready == 0) return 0;
+    if ((fds[0].revents | fds[1].revents) & (POLLERR | POLLNVAL)) return EIO;
+    if (fds[0].revents & POLLIN) {
+        struct ibv_cq *cq = NULL;
+        void *cq_context = NULL;
+        errno = 0;
+        if (ibv_get_cq_event(CH(channel), &cq, &cq_context) == 0) {
+            /* Acknowledged at once: ibv_destroy_cq waits for every event to be. */
+            ibv_ack_cq_events(cq, 1);
+            *completion = 1;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            return fail();
+        }
+    }
+    if (fds[1].revents & POLLIN) {
+        while (*n_events < max_events) {
+            struct ibv_async_event ev;
+            memset(&ev, 0, sizeof(ev));
+            if (ibv_get_async_event(CTX(ctx), &ev) != 0) break; /* EAGAIN: no more */
+            struct gbv_async_event *o = &events[*n_events];
+            memset(o, 0, sizeof(*o));
+            o->raw_type = (uint32_t)ev.event_type;
+            o->type = event_type(ev.event_type, &o->has_qp, &o->has_port);
+            if (o->has_qp && ev.element.qp) o->qp_num = ev.element.qp->qp_num;
+            else o->has_qp = 0;
+            if (o->has_port) o->port_num = (uint8_t)ev.element.port_num;
+            ibv_ack_async_event(&ev);
+            *n_events += 1;
+        }
+    }
+    return 0;
+}
+
+int gbv_library_path(char *out, size_t len) {
+    if (!out || len == 0) return EINVAL;
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    /* Any function libibverbs.so.1 itself defines (not a header inline). */
+    if (!dladdr((void *)&ibv_get_device_list, &info) || !info.dli_fname) return ENOENT;
+    char resolved[PATH_MAX];
+    const char *path = realpath(info.dli_fname, resolved) ? resolved : info.dli_fname;
+    size_t l = strlen(path);
+    if (l + 1 > len) return ENOSPC;
+    memcpy(out, path, l + 1);
     return 0;
 }

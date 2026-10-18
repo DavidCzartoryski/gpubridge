@@ -11,14 +11,19 @@
 //! so the tests can show the owned layer keeps them.
 
 use std::fmt;
+use std::time::Duration;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{
-    Access, DeviceAttr, GidEntry, PortAttr, QpCaps, RawCompletion, RawSge, SendOp, Transition,
+    Access, DeviceAttr, Events, GidEntry, PortAttr, QpCaps, RawCompletion, RawRecv, RawSend,
+    RawSge, SendOp, Transition,
 };
 
 /// A provider's resource: a pointer value for libibverbs, a number for the mock.
 pub type Handle = u64;
+
+/// A batch post's result: on an error, how many were posted before it.
+pub type BatchResult = std::result::Result<(), (usize, Error)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MrKeys {
@@ -50,7 +55,29 @@ pub trait Provider: Send + Sync + fmt::Debug {
 
     /// Returns the queue and its actual depth (at least `depth`).
     fn create_cq(&self, ctx: Handle, depth: u32) -> Result<(Handle, u32)>;
+    /// A completion queue that notifies `channel` (after [`req_notify_cq`]) instead of
+    /// having to be polled to find out whether anything completed.
+    ///
+    /// [`req_notify_cq`]: Provider::req_notify_cq
+    fn create_cq_on_channel(
+        &self,
+        ctx: Handle,
+        depth: u32,
+        channel: Handle,
+    ) -> Result<(Handle, u32)>;
     fn destroy_cq(&self, cq: Handle) -> Result<()>;
+
+    /// A completion channel (`ibv_create_comp_channel`): a file descriptor that becomes
+    /// readable when a completion queue on it has a notification.
+    fn create_comp_channel(&self, ctx: Handle) -> Result<Handle>;
+    /// Only once every completion queue on it is destroyed.
+    fn destroy_comp_channel(&self, channel: Handle) -> Result<()>;
+    /// Asks for one notification on the queue's channel when its next completion arrives.
+    fn req_notify_cq(&self, cq: Handle) -> Result<()>;
+    /// Blocks up to `timeout` until `channel` has a completion notification or `ctx` an
+    /// asynchronous event, then takes and acknowledges what is there. Returns at once if
+    /// something is already waiting; returns empty [`Events`] at the timeout.
+    fn wait_events(&self, ctx: Handle, channel: Handle, timeout: Duration) -> Result<Events>;
 
     /// A reliable-connected queue pair on which every send is signaled.
     fn create_rc_qp(
@@ -91,6 +118,38 @@ pub trait Provider: Send + Sync + fmt::Debug {
 
     fn post_send(&self, qp: Handle, wr_id: u64, op: &SendOp, sges: &[RawSge]) -> Result<()>;
     fn post_recv(&self, qp: Handle, wr_id: u64, sges: &[RawSge]) -> Result<()>;
+
+    /// Posts several sends at once (one doorbell where the provider can). On an error,
+    /// the first `n` were posted and the rest weren't: `Err((n, error))`.
+    fn post_send_batch(&self, qp: Handle, wrs: &[RawSend<'_>]) -> BatchResult {
+        for (n, wr) in wrs.iter().enumerate() {
+            self.post_send(qp, wr.wr_id, &wr.op, wr.sges)
+                .map_err(|e| (n, e))?;
+        }
+        Ok(())
+    }
+
+    /// Posts several receives at once; errors as for [`post_send_batch`].
+    ///
+    /// [`post_send_batch`]: Provider::post_send_batch
+    fn post_recv_batch(&self, qp: Handle, wrs: &[RawRecv<'_>]) -> BatchResult {
+        for (n, wr) in wrs.iter().enumerate() {
+            self.post_recv(qp, wr.wr_id, wr.sges).map_err(|e| (n, e))?;
+        }
+        Ok(())
+    }
+
+    /// What this provider is, for telemetry: the library it calls (for libibverbs, the
+    /// file it was loaded from, whose name carries rdma-core's version) or that it is a
+    /// mock.
+    fn describe(&self) -> String {
+        self.name().to_owned()
+    }
+
+    /// True for providers that are not RDMA (the mocks): telemetry labels them MOCK.
+    fn is_mock(&self) -> bool {
+        true
+    }
     /// Appends up to `max` completions to `out`; returns how many.
     fn poll_cq(&self, cq: Handle, out: &mut Vec<RawCompletion>, max: usize) -> Result<usize>;
 }

@@ -395,3 +395,80 @@ impl Completion {
         self.status == WcStatus::Success
     }
 }
+
+/// One send of a batch, as the provider posts it (one `ibv_post_send` for the batch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawSend<'a> {
+    pub wr_id: u64,
+    pub op: SendOp,
+    pub sges: &'a [RawSge],
+}
+
+/// One receive of a batch (one `ibv_post_recv` for the batch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawRecv<'a> {
+    pub wr_id: u64,
+    pub sges: &'a [RawSge],
+}
+
+/// An asynchronous event's type (`enum ibv_event_type`, translated by the shim).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AsyncEventKind {
+    CqErr,
+    QpFatal,
+    QpReqErr,
+    QpAccessErr,
+    CommEst,
+    SqDrained,
+    PathMig,
+    PathMigErr,
+    DeviceFatal,
+    PortActive,
+    PortErr,
+    LidChange,
+    PkeyChange,
+    SmChange,
+    SrqErr,
+    SrqLimitReached,
+    QpLastWqeReached,
+    ClientReregister,
+    GidChange,
+    /// Another type: the provider's raw value.
+    Other(u32),
+}
+
+impl AsyncEventKind {
+    /// Whether the event breaks what it names: a queue pair or completion queue error, a
+    /// fatal device error, a port that went down. The others are informational.
+    pub fn fatal(self) -> bool {
+        matches!(
+            self,
+            AsyncEventKind::CqErr
+                | AsyncEventKind::QpFatal
+                | AsyncEventKind::QpReqErr
+                | AsyncEventKind::QpAccessErr
+                | AsyncEventKind::PathMigErr
+                | AsyncEventKind::DeviceFatal
+                | AsyncEventKind::PortErr
+        )
+    }
+}
+
+/// An asynchronous event from a device (`ibv_get_async_event`), already acknowledged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsyncEvent {
+    pub kind: AsyncEventKind,
+    /// The queue pair it is about, for queue pair events.
+    pub qp_num: Option<u32>,
+    /// The port it is about, for port events.
+    pub port: Option<u8>,
+}
+
+/// What [`Provider::wait_events`](crate::Provider::wait_events) found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Events {
+    /// A completion queue notification arrived (and was acknowledged): poll the queues on
+    /// the channel and ask for the next notification.
+    pub completion: bool,
+    pub async_events: Vec<AsyncEvent>,
+}

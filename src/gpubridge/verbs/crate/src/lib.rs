@@ -15,31 +15,40 @@
 //! memory path (phase A3). Nothing here has run on RDMA hardware.
 
 mod cache;
+mod endpoint;
 mod error;
+mod ffi;
 #[cfg(feature = "ibverbs")]
 mod ibv;
 mod mock;
+pub mod protocol;
 mod provider;
 mod resources;
 mod types;
+#[cfg(feature = "test-fabric")]
+mod uds;
 
 pub use cache::{CacheConfig, CacheKey, CacheStats, Invalidated, MrCache};
+pub use endpoint::{Config, Counters, Endpoint, WaitError, TICK};
 pub use error::{Error, Result};
 #[cfg(feature = "ibverbs")]
-pub use ibv::{check_layouts, wc_status_text, IbvProvider};
+pub use ibv::{check_layouts, library_path, wc_status_text, IbvProvider};
 pub use mock::{
     Call, Fault, LiveCounts, MockDevice, MockFabric, MockLimits, MockPort, MockProvider, NodeId,
 };
-pub use provider::{Handle, MrKeys, Provider, QpCreated};
+pub use provider::{BatchResult, Handle, MrKeys, Provider, QpCreated};
 pub use resources::{
-    CompletionQueue, Context, MemoryRegion, ProtectionDomain, QueuePair, SendRequest, Sge,
-    StatsSnapshot, DEFAULT_DRAIN_TIMEOUT,
+    CompletionChannel, CompletionQueue, Context, MemoryRegion, ProtectionDomain, QueuePair,
+    SendRequest, Sge, StatsSnapshot, DEFAULT_DRAIN_TIMEOUT,
 };
 pub use types::{
-    Access, Address, Completion, DeviceAttr, Gid, GidEntry, GidType, GlobalRoute, InitAttr,
-    LinkLayer, Mtu, PortAttr, PortState, QpCaps, QpState, RawCompletion, RawSge, RemoteTarget,
-    RtrAttr, RtsAttr, SendOp, Transition, WcStatus, WorkId, WorkKind, MAX_SGE,
+    Access, Address, AsyncEvent, AsyncEventKind, Completion, DeviceAttr, Events, Gid, GidEntry,
+    GidType, GlobalRoute, InitAttr, LinkLayer, Mtu, PortAttr, PortState, QpCaps, QpState,
+    RawCompletion, RawRecv, RawSend, RawSge, RemoteTarget, RtrAttr, RtsAttr, SendOp, Transition,
+    WcStatus, WorkId, WorkKind, MAX_SGE,
 };
+#[cfg(feature = "test-fabric")]
+pub use uds::UdsProvider;
 
 use std::ffi::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};

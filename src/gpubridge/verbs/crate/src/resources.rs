@@ -32,9 +32,9 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, Result};
 use crate::provider::{Handle, MrKeys, Provider};
 use crate::types::{
-    Access, Address, Completion, DeviceAttr, GidEntry, GlobalRoute, InitAttr, LinkLayer, PortAttr,
-    PortState, QpCaps, QpState, RawCompletion, RawSge, RtrAttr, RtsAttr, SendOp, Transition,
-    WcStatus, WorkId, WorkKind, MAX_SGE,
+    Access, Address, Completion, DeviceAttr, Events, GidEntry, GlobalRoute, InitAttr, LinkLayer,
+    PortAttr, PortState, QpCaps, QpState, RawCompletion, RawRecv, RawSend, RawSge, RtrAttr,
+    RtsAttr, SendOp, Transition, WcStatus, WorkId, WorkKind, MAX_SGE,
 };
 
 /// How long dropping a queue pair waits for its outstanding work to drain.
@@ -192,6 +192,49 @@ impl Context {
                 handle,
                 depth,
                 state: Mutex::new(CqState::default()),
+                channel: None,
+            }),
+        })
+    }
+
+    /// A completion channel: completion queues created on it notify it (after
+    /// [`CompletionQueue::req_notify`]) and [`CompletionChannel::wait`] blocks for that.
+    pub fn create_channel(&self) -> Result<CompletionChannel> {
+        let handle = self.inner.provider.create_comp_channel(self.inner.handle)?;
+        Ok(CompletionChannel {
+            inner: Arc::new(ChanInner {
+                ctx: self.inner.clone(),
+                handle,
+            }),
+        })
+    }
+
+    /// A completion queue on `channel` (of this context), as [`create_cq`] otherwise. It
+    /// holds the channel, which is destroyed after the last queue on it.
+    ///
+    /// [`create_cq`]: Context::create_cq
+    pub fn create_cq_on(&self, depth: u32, channel: &CompletionChannel) -> Result<CompletionQueue> {
+        if !Arc::ptr_eq(&channel.inner.ctx, &self.inner) {
+            return Err(Error::invalid("completion channel from another context"));
+        }
+        if depth == 0 || depth > self.inner.attr.max_cqe {
+            return Err(Error::invalid(format!(
+                "completion queue depth {depth} outside 1 to {}",
+                self.inner.attr.max_cqe
+            )));
+        }
+        let (handle, _actual) = self.inner.provider.create_cq_on_channel(
+            self.inner.handle,
+            depth,
+            channel.inner.handle,
+        )?;
+        Ok(CompletionQueue {
+            inner: Arc::new(CqInner {
+                ctx: self.inner.clone(),
+                handle,
+                depth,
+                state: Mutex::new(CqState::default()),
+                channel: Some(channel.inner.clone()),
             }),
         })
     }
@@ -205,6 +248,38 @@ impl Context {
             stray_completions: s.stray_completions.load(Ordering::Relaxed),
             discarded_completions: s.discarded_completions.load(Ordering::Relaxed),
         }
+    }
+}
+
+struct ChanInner {
+    ctx: Arc<CtxInner>,
+    handle: Handle,
+}
+
+impl Drop for ChanInner {
+    fn drop(&mut self) {
+        // Every completion queue on it holds this, so they are all destroyed by now.
+        if self.ctx.provider.destroy_comp_channel(self.handle).is_err() {
+            self.ctx.release_failed();
+        }
+    }
+}
+
+/// A completion channel. Clones share it; it is destroyed once the last clone and the last
+/// completion queue on it are gone.
+#[derive(Clone)]
+pub struct CompletionChannel {
+    inner: Arc<ChanInner>,
+}
+
+impl CompletionChannel {
+    /// Blocks up to `timeout` for a completion notification on this channel or an
+    /// asynchronous event on its context, and takes (and acknowledges) them. Blocks in the
+    /// kernel (`poll(2)`), not by polling the completion queues.
+    pub fn wait(&self, timeout: Duration) -> Result<Events> {
+        let ctx = &self.inner.ctx;
+        ctx.provider
+            .wait_events(ctx.handle, self.inner.handle, timeout)
     }
 }
 
@@ -698,6 +773,8 @@ struct CqInner {
     handle: Handle,
     depth: u32,
     state: Mutex<CqState>,
+    /// Dropped after the queue is destroyed (Drop below runs first).
+    channel: Option<Arc<ChanInner>>,
 }
 
 impl CqInner {
@@ -830,6 +907,16 @@ impl CompletionQueue {
     /// Work requests filed on this queue and not completed yet.
     pub fn outstanding(&self) -> usize {
         lock(&self.inner.state).outstanding.len()
+    }
+
+    /// Asks for one notification on this queue's channel when its next completion
+    /// arrives. Poll again after this before waiting: a completion that arrived just
+    /// before it may not notify.
+    pub fn req_notify(&self) -> Result<()> {
+        if self.inner.channel.is_none() {
+            return Err(Error::invalid("a completion queue without a channel"));
+        }
+        self.inner.ctx.provider.req_notify_cq(self.inner.handle)
     }
 
     /// Up to `max` completions, oldest first: ones already taken from the provider (by a
@@ -1195,6 +1282,131 @@ impl QueuePair {
         Ok(WorkId(wr_id))
     }
 
+    /// Posts `requests` as one batch (one doorbell where the provider can), each as
+    /// [`post_send`](QueuePair::post_send) would. Nothing is posted if any is invalid or
+    /// they don't all fit; if the provider fails partway, the requests it posted stay
+    /// posted (their ids are lost to the caller, but their completions still release
+    /// their memory) and the error is returned.
+    pub fn post_sends(&self, requests: &[SendRequest<'_>]) -> Result<Vec<WorkId>> {
+        let mut rt = lock(&self.st);
+        self.require(&mut rt, QpState::Rts, "post a send")?;
+        let raw: Vec<Vec<RawSge>> = requests
+            .iter()
+            .map(|r| self.raw_sges(r.sges, self.caps.max_send_sge, false))
+            .collect::<Result<_>>()?;
+        Self::reserve_n(
+            &self.shared.sends,
+            self.caps.max_send_wr,
+            requests.len(),
+            "send",
+        )?;
+        let first = self
+            .next_wr
+            .fetch_add(requests.len() as u64, Ordering::Relaxed);
+        for (i, request) in requests.iter().enumerate() {
+            let posted = Posted {
+                tag: request.tag,
+                kind: request.op.kind(),
+                shared: self.shared.clone(),
+                regions: request
+                    .sges
+                    .iter()
+                    .map(|s| InFlight::new(s.region))
+                    .collect(),
+            };
+            self.send_cq
+                .track(self.shared.qp_num, first + i as u64, posted);
+        }
+        let wrs: Vec<RawSend<'_>> = requests
+            .iter()
+            .zip(&raw)
+            .enumerate()
+            .map(|(i, (r, sges))| RawSend {
+                wr_id: first + i as u64,
+                op: r.op,
+                sges,
+            })
+            .collect();
+        if let Err((posted, e)) = self.provider().post_send_batch(self.handle, &wrs) {
+            for i in posted..requests.len() {
+                drop(self.send_cq.untrack(self.shared.qp_num, first + i as u64));
+            }
+            return Err(e);
+        }
+        Ok((0..requests.len() as u64)
+            .map(|i| WorkId(first + i))
+            .collect())
+    }
+
+    /// Posts receives as one batch: `(tag, scatter list)` each, as
+    /// [`post_recv`](QueuePair::post_recv) would; errors as for
+    /// [`post_sends`](QueuePair::post_sends).
+    pub fn post_recvs(&self, requests: &[(u64, &[Sge<'_>])]) -> Result<Vec<WorkId>> {
+        let mut rt = lock(&self.st);
+        let state = self.current(&mut rt);
+        if !matches!(state, QpState::Init | QpState::Rtr | QpState::Rts) {
+            return Err(Error::InvalidState {
+                state,
+                wanted: "post a receive",
+            });
+        }
+        let raw: Vec<Vec<RawSge>> = requests
+            .iter()
+            .map(|(_, sges)| self.raw_sges(sges, self.caps.max_recv_sge, true))
+            .collect::<Result<_>>()?;
+        Self::reserve_n(
+            &self.shared.recvs,
+            self.caps.max_recv_wr,
+            requests.len(),
+            "receive",
+        )?;
+        let first = self
+            .next_wr
+            .fetch_add(requests.len() as u64, Ordering::Relaxed);
+        for (i, (tag, sges)) in requests.iter().enumerate() {
+            let posted = Posted {
+                tag: *tag,
+                kind: WorkKind::Recv,
+                shared: self.shared.clone(),
+                regions: sges.iter().map(|s| InFlight::new(s.region)).collect(),
+            };
+            self.recv_cq
+                .track(self.shared.qp_num, first + i as u64, posted);
+        }
+        let wrs: Vec<RawRecv<'_>> = raw
+            .iter()
+            .enumerate()
+            .map(|(i, sges)| RawRecv {
+                wr_id: first + i as u64,
+                sges,
+            })
+            .collect();
+        if let Err((posted, e)) = self.provider().post_recv_batch(self.handle, &wrs) {
+            for i in posted..requests.len() {
+                drop(self.recv_cq.untrack(self.shared.qp_num, first + i as u64));
+            }
+            return Err(e);
+        }
+        Ok((0..requests.len() as u64)
+            .map(|i| WorkId(first + i))
+            .collect())
+    }
+
+    /// Reserves `n` of `limit` at once, or none.
+    fn reserve_n(counter: &AtomicU32, limit: u32, n: usize, queue: &'static str) -> Result<()> {
+        let n = u32::try_from(n).map_err(|_| Error::QueueFull { queue, limit })?;
+        let mut now = counter.load(Ordering::Acquire);
+        loop {
+            if now.checked_add(n).map_or(true, |total| total > limit) {
+                return Err(Error::QueueFull { queue, limit });
+            }
+            match counter.compare_exchange_weak(now, now + n, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(()),
+                Err(seen) => now = seen,
+            }
+        }
+    }
+
     fn filed(&self) -> usize {
         let qp = self.shared.qp_num;
         let mut n = self.send_cq.outstanding_for(qp);
@@ -1205,8 +1417,11 @@ impl QueuePair {
     }
 
     /// Polls both completion queues until none of this queue pair's work is outstanding,
-    /// or `deadline`. Returns how much is left.
+    /// or `deadline`. Returns how much is left. Between empty polls it sleeps, from 100 µs
+    /// doubling to 10 ms, so a long drain doesn't spin a CPU. (A transport with a
+    /// completion thread drains its queue pairs before closing them; this is the fallback.)
     fn drain(&self, deadline: Instant) -> usize {
+        let mut nap = Duration::from_micros(100);
         loop {
             let left = self.filed();
             if left == 0 || Instant::now() >= deadline {
@@ -1223,7 +1438,10 @@ impl QueuePair {
                 };
             }
             if got == 0 {
-                thread::sleep(Duration::from_micros(100));
+                thread::sleep(nap.min(deadline.saturating_duration_since(Instant::now())));
+                nap = (nap * 2).min(Duration::from_millis(10));
+            } else {
+                nap = Duration::from_micros(100);
             }
         }
     }

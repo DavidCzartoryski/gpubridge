@@ -17,6 +17,10 @@ build = "build.rs"
 # The libibverbs provider: compiles shim/gbverbs.c against rdma-core's headers and links
 # libibverbs.so.1. Without it, only the mock provider is built (any OS, no headers).
 ibverbs = []
+# A cross-process mock fabric over Unix sockets, for the Python tests of bridge="verbs"
+# between processes (docs/VERBS_TRANSPORT.md, "Testing"). Test builds only: a library
+# built without it can't select it, and telemetry labels it MOCK.
+test-fabric = []
 
 [lib]
 crate-type = ["cdylib", "rlib"]

@@ -8,12 +8,15 @@
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::mem::{offset_of, size_of};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::provider::{Handle, MrKeys, Provider, QpCreated};
+use crate::provider::{BatchResult, Handle, MrKeys, Provider, QpCreated};
 use crate::types::{
-    Access, Address, DeviceAttr, Gid, GidEntry, GidType, LinkLayer, Mtu, PortAttr, PortState,
-    QpCaps, RawCompletion, RawSge, SendOp, Transition, WcStatus, MAX_SGE,
+    Access, Address, AsyncEvent, AsyncEventKind, DeviceAttr, Events, Gid, GidEntry, GidType,
+    LinkLayer, Mtu, PortAttr, PortState, QpCaps, RawCompletion, RawRecv, RawSend, RawSge, SendOp,
+    Transition, WcStatus, MAX_SGE,
 };
 
 #[repr(C)]
@@ -161,8 +164,20 @@ struct GbvWc {
     has_imm: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GbvAsyncEvent {
+    kind: u32,
+    raw_type: u32,
+    qp_num: u32,
+    port_num: u8,
+    has_qp: u8,
+    has_port: u8,
+    pad: u8,
+}
+
 /// (layout id in gbverbs.h, what Rust has): struct sizes and field offsets.
-const LAYOUTS: [(u32, usize); 23] = [
+const LAYOUTS: [(u32, usize); 25] = [
     (1, size_of::<GbvDeviceAttr>()),
     (2, offset_of!(GbvDeviceAttr, fw_ver)),
     (3, size_of::<GbvPortAttr>()),
@@ -186,11 +201,13 @@ const LAYOUTS: [(u32, usize); 23] = [
     (21, offset_of!(GbvSendWr, num_sge)),
     (22, size_of::<GbvWc>()),
     (23, offset_of!(GbvWc, has_imm)),
+    (24, size_of::<GbvAsyncEvent>()),
+    (25, offset_of!(GbvAsyncEvent, has_port)),
 ];
 
 /// The numbers gbverbs.c asserts with _Static_assert, in LAYOUTS' order.
-const EXPECTED: [usize; 23] = [
-    128, 64, 24, 16, 20, 24, 16, 20, 16, 8, 6, 44, 16, 32, 41, 8, 7, 16, 12, 32, 28, 40, 36,
+const EXPECTED: [usize; 25] = [
+    128, 64, 24, 16, 20, 24, 16, 20, 16, 8, 6, 44, 16, 32, 41, 8, 7, 16, 12, 32, 28, 40, 36, 16, 14,
 ];
 
 const _: () = {
@@ -204,7 +221,12 @@ const _: () = {
     }
 };
 
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
+/// The shim's GBV_MAX_BATCH and GBV_MAX_BATCH_SGE.
+const MAX_BATCH: usize = 64;
+const MAX_BATCH_SGE: usize = 256;
+/// Asynchronous events taken per wait.
+const MAX_EVENTS: usize = 16;
 
 extern "C" {
     fn gbv_abi_version() -> u32;
@@ -263,6 +285,41 @@ extern "C" {
     fn gbv_post_send(qp: *mut c_void, wr: *const GbvSendWr, sges: *const GbvSge) -> c_int;
     fn gbv_post_recv(qp: *mut c_void, wr_id: u64, sges: *const GbvSge, num_sge: u32) -> c_int;
     fn gbv_poll_cq(cq: *mut c_void, out: *mut GbvWc, max: u32, n: *mut u32) -> c_int;
+    fn gbv_post_send_batch(
+        qp: *mut c_void,
+        wrs: *const GbvSendWr,
+        n: u32,
+        sges: *const GbvSge,
+        posted: *mut u32,
+    ) -> c_int;
+    fn gbv_post_recv_batch(
+        qp: *mut c_void,
+        wr_ids: *const u64,
+        num_sges: *const u32,
+        n: u32,
+        sges: *const GbvSge,
+        posted: *mut u32,
+    ) -> c_int;
+    fn gbv_create_comp_channel(ctx: *mut c_void, out: *mut *mut c_void) -> c_int;
+    fn gbv_destroy_comp_channel(channel: *mut c_void) -> c_int;
+    fn gbv_create_cq_on_channel(
+        ctx: *mut c_void,
+        depth: u32,
+        channel: *mut c_void,
+        out: *mut *mut c_void,
+        actual: *mut u32,
+    ) -> c_int;
+    fn gbv_req_notify_cq(cq: *mut c_void) -> c_int;
+    fn gbv_wait_events(
+        ctx: *mut c_void,
+        channel: *mut c_void,
+        timeout_ms: c_int,
+        completion: *mut u32,
+        events: *mut GbvAsyncEvent,
+        max_events: u32,
+        n_events: *mut u32,
+    ) -> c_int;
+    fn gbv_library_path(out: *mut c_char, len: usize) -> c_int;
 }
 
 /// Compares the compiled shim's struct layouts and ABI version with this file's. Calls no
@@ -336,6 +393,82 @@ fn wc_status(code: u32, raw: u32) -> WcStatus {
     }
 }
 
+fn event_kind(code: u32, raw: u32) -> AsyncEventKind {
+    match code {
+        1 => AsyncEventKind::CqErr,
+        2 => AsyncEventKind::QpFatal,
+        3 => AsyncEventKind::QpReqErr,
+        4 => AsyncEventKind::QpAccessErr,
+        5 => AsyncEventKind::CommEst,
+        6 => AsyncEventKind::SqDrained,
+        7 => AsyncEventKind::PathMig,
+        8 => AsyncEventKind::PathMigErr,
+        9 => AsyncEventKind::DeviceFatal,
+        10 => AsyncEventKind::PortActive,
+        11 => AsyncEventKind::PortErr,
+        12 => AsyncEventKind::LidChange,
+        13 => AsyncEventKind::PkeyChange,
+        14 => AsyncEventKind::SmChange,
+        15 => AsyncEventKind::SrqErr,
+        16 => AsyncEventKind::SrqLimitReached,
+        17 => AsyncEventKind::QpLastWqeReached,
+        18 => AsyncEventKind::ClientReregister,
+        19 => AsyncEventKind::GidChange,
+        _ => AsyncEventKind::Other(raw),
+    }
+}
+
+/// The file libibverbs was loaded from (its name carries rdma-core's version). Opens
+/// nothing.
+pub fn library_path() -> Option<String> {
+    let mut out = vec![0 as c_char; 4096];
+    // SAFETY: out is a writable buffer of the length passed.
+    if unsafe { gbv_library_path(out.as_mut_ptr(), out.len()) } != 0 {
+        return None;
+    }
+    // SAFETY: on success the shim wrote a NUL-terminated string into out.
+    Some(
+        unsafe { CStr::from_ptr(out.as_ptr()) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn send_wr(wr_id: u64, op: &SendOp, num_sge: u32) -> GbvSendWr {
+    let (opcode, remote, imm) = match *op {
+        SendOp::Send => (1, None, 0),
+        SendOp::SendWithImm(imm) => (2, None, imm),
+        SendOp::Write(r) => (3, Some(r), 0),
+        SendOp::WriteWithImm(r, imm) => (4, Some(r), imm),
+    };
+    GbvSendWr {
+        wr_id,
+        remote_addr: remote.map_or(0, |r| r.addr),
+        opcode,
+        rkey: remote.map_or(0, |r| r.rkey),
+        imm_data: imm,
+        num_sge,
+    }
+}
+
+/// Splits `n` requests with `sge_counts` into runs the shim takes in one call.
+fn batches(sge_counts: impl Iterator<Item = usize>) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let (mut start, mut len, mut sge) = (0, 0, 0);
+    for (i, k) in sge_counts.enumerate() {
+        if len == MAX_BATCH || sge + k > MAX_BATCH_SGE {
+            runs.push((start, len));
+            (start, len, sge) = (i, 0, 0);
+        }
+        len += 1;
+        sge += k;
+    }
+    if len > 0 {
+        runs.push((start, len));
+    }
+    runs
+}
+
 fn sges(sges: &[RawSge]) -> Result<Vec<GbvSge>> {
     if sges.len() > MAX_SGE as usize {
         return Err(Error::invalid(format!(
@@ -370,6 +503,18 @@ impl IbvProvider {
 impl Provider for IbvProvider {
     fn name(&self) -> &str {
         "libibverbs"
+    }
+
+    fn describe(&self) -> String {
+        static PATH: OnceLock<Option<String>> = OnceLock::new();
+        match PATH.get_or_init(library_path) {
+            Some(path) => format!("libibverbs ({path})"),
+            None => "libibverbs".into(),
+        }
+    }
+
+    fn is_mock(&self) -> bool {
+        false
     }
 
     fn list_devices(&self) -> Result<Vec<String>> {
@@ -495,6 +640,74 @@ impl Provider for IbvProvider {
             gbv_create_cq(ptr(ctx), depth, &mut out, &mut actual)
         })?;
         Ok((handle(out), actual))
+    }
+
+    fn create_cq_on_channel(
+        &self,
+        ctx: Handle,
+        depth: u32,
+        channel: Handle,
+    ) -> Result<(Handle, u32)> {
+        let mut out = std::ptr::null_mut();
+        let mut actual = 0u32;
+        // SAFETY: ctx is an open context and channel a live channel of it; out and actual
+        // are valid slots.
+        check("ibv_create_cq", unsafe {
+            gbv_create_cq_on_channel(ptr(ctx), depth, ptr(channel), &mut out, &mut actual)
+        })?;
+        Ok((handle(out), actual))
+    }
+
+    fn create_comp_channel(&self, ctx: Handle) -> Result<Handle> {
+        let mut out = std::ptr::null_mut();
+        // SAFETY: ctx is an open context; out a valid pointer slot.
+        check("ibv_create_comp_channel", unsafe {
+            gbv_create_comp_channel(ptr(ctx), &mut out)
+        })?;
+        Ok(handle(out))
+    }
+
+    fn destroy_comp_channel(&self, channel: Handle) -> Result<()> {
+        // SAFETY: channel came from create_comp_channel; destroyed once, after its queues.
+        check("ibv_destroy_comp_channel", unsafe {
+            gbv_destroy_comp_channel(ptr(channel))
+        })
+    }
+
+    fn req_notify_cq(&self, cq: Handle) -> Result<()> {
+        // SAFETY: cq is a live completion queue.
+        check("ibv_req_notify_cq", unsafe { gbv_req_notify_cq(ptr(cq)) })
+    }
+
+    fn wait_events(&self, ctx: Handle, channel: Handle, timeout: Duration) -> Result<Events> {
+        let ms = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
+        let mut completion = 0u32;
+        let mut raw = [GbvAsyncEvent::default(); MAX_EVENTS];
+        let mut n = 0u32;
+        // SAFETY: ctx and channel are live; raw has room for MAX_EVENTS events; the shim
+        // polls the two descriptors (both non-blocking) and acknowledges what it takes.
+        check("ibv_get_cq_event", unsafe {
+            gbv_wait_events(
+                ptr(ctx),
+                ptr(channel),
+                ms,
+                &mut completion,
+                raw.as_mut_ptr(),
+                MAX_EVENTS as u32,
+                &mut n,
+            )
+        })?;
+        Ok(Events {
+            completion: completion != 0,
+            async_events: raw[..n as usize]
+                .iter()
+                .map(|e| AsyncEvent {
+                    kind: event_kind(e.kind, e.raw_type),
+                    qp_num: (e.has_qp != 0).then_some(e.qp_num),
+                    port: (e.has_port != 0).then_some(e.port_num),
+                })
+                .collect(),
+        })
     }
 
     fn destroy_cq(&self, cq: Handle) -> Result<()> {
@@ -679,20 +892,7 @@ impl Provider for IbvProvider {
 
     fn post_send(&self, qp: Handle, wr_id: u64, op: &SendOp, list: &[RawSge]) -> Result<()> {
         let list = sges(list)?;
-        let (opcode, remote, imm) = match *op {
-            SendOp::Send => (1, None, 0),
-            SendOp::SendWithImm(imm) => (2, None, imm),
-            SendOp::Write(r) => (3, Some(r), 0),
-            SendOp::WriteWithImm(r, imm) => (4, Some(r), imm),
-        };
-        let wr = GbvSendWr {
-            wr_id,
-            remote_addr: remote.map_or(0, |r| r.addr),
-            opcode,
-            rkey: remote.map_or(0, |r| r.rkey),
-            imm_data: imm,
-            num_sge: list.len() as u32,
-        };
+        let wr = send_wr(wr_id, op, list.len() as u32);
         // SAFETY: qp is a live queue pair; wr and list (num_sge entries) outlive the call;
         // each entry lies in a registered region kept registered until this request
         // completes (the owned layer files it with clones of those regions).
@@ -707,6 +907,74 @@ impl Provider for IbvProvider {
         check("ibv_post_recv", unsafe {
             gbv_post_recv(ptr(qp), wr_id, list.as_ptr(), list.len() as u32)
         })
+    }
+
+    fn post_send_batch(&self, qp: Handle, wrs: &[RawSend<'_>]) -> BatchResult {
+        let mut done = 0;
+        for (start, len) in batches(wrs.iter().map(|w| w.sges.len())) {
+            let run = &wrs[start..start + len];
+            let mut list = Vec::new();
+            let mut reqs = Vec::with_capacity(len);
+            for w in run {
+                let s = sges(w.sges).map_err(|e| (done, e))?;
+                reqs.push(send_wr(w.wr_id, &w.op, s.len() as u32));
+                list.extend(s);
+            }
+            let mut posted = 0u32;
+            // SAFETY: qp is a live queue pair; reqs has len requests and list their
+            // entries in order (within the shim's batch limits, see batches()); each entry
+            // lies in a registered region the owned layer keeps registered until the
+            // request completes.
+            let rc = unsafe {
+                gbv_post_send_batch(
+                    ptr(qp),
+                    reqs.as_ptr(),
+                    len as u32,
+                    list.as_ptr(),
+                    &mut posted,
+                )
+            };
+            if rc != 0 {
+                let call = "ibv_post_send";
+                return Err((done + posted as usize, Error::Verbs { call, errno: rc }));
+            }
+            done += len;
+        }
+        Ok(())
+    }
+
+    fn post_recv_batch(&self, qp: Handle, wrs: &[RawRecv<'_>]) -> BatchResult {
+        let mut done = 0;
+        for (start, len) in batches(wrs.iter().map(|w| w.sges.len())) {
+            let run = &wrs[start..start + len];
+            let mut list = Vec::new();
+            let mut ids = Vec::with_capacity(len);
+            let mut counts = Vec::with_capacity(len);
+            for w in run {
+                let s = sges(w.sges).map_err(|e| (done, e))?;
+                ids.push(w.wr_id);
+                counts.push(s.len() as u32);
+                list.extend(s);
+            }
+            let mut posted = 0u32;
+            // SAFETY: as for post_send_batch; ids and counts have len entries each.
+            let rc = unsafe {
+                gbv_post_recv_batch(
+                    ptr(qp),
+                    ids.as_ptr(),
+                    counts.as_ptr(),
+                    len as u32,
+                    list.as_ptr(),
+                    &mut posted,
+                )
+            };
+            if rc != 0 {
+                let call = "ibv_post_recv";
+                return Err((done + posted as usize, Error::Verbs { call, errno: rc }));
+            }
+            done += len;
+        }
+        Ok(())
     }
 
     fn poll_cq(&self, cq: Handle, out: &mut Vec<RawCompletion>, max: usize) -> Result<usize> {
