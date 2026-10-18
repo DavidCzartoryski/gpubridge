@@ -54,7 +54,8 @@ use std::ffi::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// What this build is, for the Python side to check before it uses the library:
-/// `"gpubridge-verbs <version> providers=mock[,libibverbs]"`, NUL-terminated into `out`.
+/// `"gpubridge-verbs <version> providers=mock[,libibverbs][,test-fabric]"`, NUL-terminated
+/// into `out`.
 /// Returns 0, or -1 if `out` is too small or null. Opens nothing.
 ///
 /// # Safety
@@ -72,6 +73,8 @@ pub unsafe extern "C" fn gb_verbs_build_info(out: *mut c_char, len: usize) -> c_
         };
         #[cfg(not(feature = "ibverbs"))]
         let providers = "mock";
+        #[cfg(feature = "test-fabric")]
+        let providers = format!("{providers},test-fabric");
         let text = format!(
             "gpubridge-verbs {} providers={providers}",
             env!("CARGO_PKG_VERSION")

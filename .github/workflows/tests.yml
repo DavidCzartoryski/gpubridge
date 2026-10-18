@@ -232,9 +232,11 @@ jobs:
 
   verbs:
     # The raw-verbs crate (docs/VERBS_TRANSPORT.md): formatted, linted and tested on its
-    # mock provider, then built with the libibverbs provider against Ubuntu's rdma-core
-    # headers. Its tests there check the shim's layouts and call libibverbs without
-    # opening a device (the runners have none to use).
+    # mock providers (in-process, and the cross-process test fabric), then built with the
+    # libibverbs provider against Ubuntu's rdma-core headers. Its tests there check the
+    # shim's layouts and call libibverbs without opening a device (the runners have none
+    # to use). The pytest jobs run tests/test_verbs.py (bridge="verbs" on the test
+    # fabric) where cargo is installed.
     name: verbs crate
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -251,6 +253,8 @@ jobs:
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
           cargo test
+          cargo clippy --all-targets --features test-fabric -- -D warnings
+          cargo test --features test-fabric
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq libibverbs-dev
       - run: |
           cargo clippy --all-targets --features ibverbs -- -D warnings
