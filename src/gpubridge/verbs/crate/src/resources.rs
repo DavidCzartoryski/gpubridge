@@ -370,9 +370,9 @@ impl ProtectionDomain {
             }
         };
         Ok(QueuePair {
-            pd: self.inner.clone(),
             send_cq: send_cq.inner.clone(),
             recv_cq: recv_cq.inner.clone(),
+            pd: self.inner.clone(),
             handle: created.handle,
             shared: Arc::new(QpShared {
                 qp_num: created.qp_num,
@@ -867,9 +867,11 @@ struct QpRuntime {
 /// Dropping it drains and destroys it as [`close`](QueuePair::close) does, with
 /// [`DEFAULT_DRAIN_TIMEOUT`].
 pub struct QueuePair {
-    pd: Arc<PdInner>,
+    // Fields drop in this order once the queue pair is destroyed: its completion queues
+    // before its protection domain, the conventional teardown order.
     send_cq: Arc<CqInner>,
     recv_cq: Arc<CqInner>,
+    pd: Arc<PdInner>,
     handle: Handle,
     shared: Arc<QpShared>,
     caps: QpCaps,
