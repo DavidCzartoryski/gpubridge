@@ -839,12 +839,8 @@ impl Provider for UdsProvider {
             .get_mut(&cq)
             .ok_or_else(|| verbs("ibv_req_notify_cq", EINVAL))?;
         rec.armed = true;
-        if !rec.entries.is_empty() {
-            rec.armed = false;
-            if let Some(ch) = rec.channel {
-                st.channels.insert(ch, true);
-            }
-        }
+        // Existing CQEs don't generate an event retroactively. The endpoint must
+        // re-poll after this arm, as it does with a real completion channel.
         Ok(())
     }
 

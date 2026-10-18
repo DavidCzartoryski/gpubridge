@@ -180,6 +180,8 @@ pub enum Call {
     ReqNotifyCq,
     /// `wait_events` (`ibv_get_cq_event` / `ibv_get_async_event`).
     GetEvent,
+    /// Every event returned by GetEvent is acknowledged before it returns.
+    AckCqEvents,
 }
 
 impl Call {
@@ -205,6 +207,7 @@ impl Call {
             Call::DestroyCompChannel => "ibv_destroy_comp_channel",
             Call::ReqNotifyCq => "ibv_req_notify_cq",
             Call::GetEvent => "ibv_get_cq_event",
+            Call::AckCqEvents => "ibv_ack_cq_events",
         }
     }
 
@@ -240,6 +243,11 @@ pub enum Fault {
     /// Every open context on `node` gets this asynchronous event (`qp_num` and `port` as
     /// given).
     AsyncEvent { node: NodeId, event: AsyncEvent },
+    /// Queue a notification without a corresponding WC (legal in libibverbs).
+    SpuriousNotification { node: NodeId },
+    /// Once, hide a newly visible completion from an empty poll and expose it just
+    /// after that poll, without notifying. Models the poll/arm boundary exactly.
+    CompletionAtPollBoundary { node: NodeId },
 }
 
 /// Live resources on a node.
@@ -277,7 +285,7 @@ struct CtxRec {
 struct ChanRec {
     ctx: Handle,
     /// A notification is waiting to be taken.
-    pending: bool,
+    pending: VecDeque<Handle>,
 }
 
 struct PdRec {
@@ -287,11 +295,14 @@ struct PdRec {
 struct CqRec {
     ctx: Handle,
     depth: u32,
-    entries: VecDeque<(u64, RawCompletion)>,
+    // Visibility tick, WC, and whether it has passed its notification edge.
+    entries: VecDeque<(u64, RawCompletion, bool)>,
     overrun: bool,
     channel: Option<Handle>,
     /// Notify the channel when the next completion becomes visible.
     armed: bool,
+    hide_once: bool,
+    boundary_unpolled: bool,
 }
 
 struct SendJob {
@@ -466,6 +477,32 @@ impl MockFabric {
             Fault::AsyncEvent { node, event } => {
                 for c in f.ctxs.values_mut().filter(|c| c.node == node) {
                     c.events.push_back(event);
+                }
+            }
+            Fault::SpuriousNotification { node } => {
+                let cqs: Vec<(Handle, Handle)> = f
+                    .cqs
+                    .iter()
+                    .filter_map(|(cq, c)| {
+                        (f.ctxs[&c.ctx].node == node)
+                            .then_some(c.channel.map(|ch| (*cq, ch)))
+                            .flatten()
+                    })
+                    .collect();
+                for (cq, ch) in cqs {
+                    f.channels.get_mut(&ch).unwrap().pending.push_back(cq);
+                }
+            }
+            Fault::CompletionAtPollBoundary { node } => {
+                let ctxs: Vec<Handle> = f
+                    .ctxs
+                    .iter()
+                    .filter(|(_, c)| c.node == node)
+                    .map(|(h, _)| *h)
+                    .collect();
+                for c in f.cqs.values_mut().filter(|c| ctxs.contains(&c.ctx)) {
+                    c.hide_once = true;
+                    c.armed = false;
                 }
             }
         }
@@ -665,7 +702,7 @@ impl Fabric {
             ));
             return;
         }
-        rec.entries.push_back((visible, wc));
+        rec.entries.push_back((visible, wc, false));
         self.notify_visible();
     }
 
@@ -673,15 +710,25 @@ impl Fabric {
     fn notify_visible(&mut self) {
         let tick = self.tick;
         let mut ring = Vec::new();
-        for rec in self.cqs.values_mut() {
-            if rec.armed && rec.entries.front().is_some_and(|(v, _)| *v <= tick) {
+        for (&cq, rec) in self.cqs.iter_mut() {
+            if rec.hide_once {
+                continue;
+            }
+            let mut new = false;
+            for (visible, _, seen) in &mut rec.entries {
+                if *visible <= tick && !*seen {
+                    *seen = true;
+                    new = true;
+                }
+            }
+            if rec.armed && new {
                 rec.armed = false;
-                ring.extend(rec.channel);
+                ring.extend(rec.channel.map(|ch| (ch, cq)));
             }
         }
-        for ch in ring {
+        for (ch, cq) in ring {
             if let Some(c) = self.channels.get_mut(&ch) {
-                c.pending = true;
+                c.pending.push_back(cq);
             }
         }
     }
@@ -1028,6 +1075,8 @@ impl MockProvider {
                 overrun: false,
                 channel,
                 armed: false,
+                hide_once: false,
+                boundary_unpolled: false,
             },
         );
         f.log(self.node, Call::CreateCq, h);
@@ -1217,7 +1266,7 @@ impl Provider for MockProvider {
             h,
             ChanRec {
                 ctx,
-                pending: false,
+                pending: VecDeque::new(),
             },
         );
         f.log(self.node, Call::CreateCompChannel, h);
@@ -1267,8 +1316,21 @@ impl Provider for MockProvider {
                 return Err(verbs(Call::GetEvent, EIO));
             }
             f.progress();
+            if !timeout.is_zero()
+                && f.cqs
+                    .values()
+                    .any(|c| c.channel == Some(channel) && c.boundary_unpolled)
+            {
+                f.violations
+                    .push("slept with a poll/arm boundary completion left unpolled".into());
+                return Err(verbs(Call::GetEvent, EIO));
+            }
             let ch = f.channels.get_mut(&channel).expect("checked above");
-            let completion = std::mem::take(&mut ch.pending);
+            let pending = std::mem::take(&mut ch.pending);
+            let completion = !pending.is_empty();
+            for cq in pending {
+                f.log(self.node, Call::AckCqEvents, cq);
+            }
             let async_events: Vec<AsyncEvent> = f
                 .ctxs
                 .get_mut(&ctx)
@@ -1281,6 +1343,15 @@ impl Provider for MockProvider {
                     completion,
                     async_events,
                 });
+            }
+            // Wake an event waiter to exercise the injected empty-poll boundary. This
+            // is a spurious wake, not a CQ notification; no event is fabricated/acked.
+            if f.cqs.values().any(|c| {
+                c.channel == Some(channel)
+                    && c.hide_once
+                    && c.entries.front().is_some_and(|(v, _, _)| *v <= f.tick)
+            }) {
+                return Ok(Events::default());
             }
             let now = Instant::now();
             if now >= deadline {
@@ -1304,6 +1375,12 @@ impl Provider for MockProvider {
         if f.qps.values().any(|q| q.send_cq == cq || q.recv_cq == cq) {
             f.violations.push(format!(
                 "completion queue #{cq} destroyed while a queue pair uses it"
+            ));
+            return Err(verbs(Call::DestroyCq, EBUSY));
+        }
+        if f.channels.values().any(|ch| ch.pending.contains(&cq)) {
+            f.violations.push(format!(
+                "completion queue #{cq} destroyed with unacknowledged events"
             ));
             return Err(verbs(Call::DestroyCq, EBUSY));
         }
@@ -1657,15 +1734,31 @@ impl Provider for MockProvider {
         if rec.overrun {
             return Err(verbs(Call::PollCq, EIO));
         }
+        if rec.hide_once && rec.entries.front().is_some_and(|(v, _, _)| *v <= tick) {
+            rec.hide_once = false;
+            rec.boundary_unpolled = true;
+            for (visible, _, seen) in &mut rec.entries {
+                if *visible <= tick {
+                    *seen = true;
+                }
+            }
+            f.nodes[self.node]
+                .log
+                .push("MOCK poll/arm boundary completion exposed".into());
+            return Ok(0);
+        }
         let mut n = 0;
         while n < max {
             match rec.entries.front() {
-                Some((visible, _)) if *visible <= tick => {
+                Some((visible, _, _)) if *visible <= tick => {
                     out.push(rec.entries.pop_front().unwrap().1);
                     n += 1;
                 }
                 _ => break,
             }
+        }
+        if n > 0 {
+            rec.boundary_unpolled = false;
         }
         Ok(n)
     }

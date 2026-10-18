@@ -46,6 +46,7 @@ use crate::cache::Invalidated;
 use crate::direct::{json_str, DirectConfig, Registered, Registrar, Window};
 use crate::error::{Error, Result};
 use crate::gpu::{GpuMemory, PeerModules};
+use crate::progress::{self, Progress};
 use crate::protocol::{self, Header, Info, Kind, Selected, HEADER_BYTES, PROTOCOL_VERSION};
 use crate::provider::Provider;
 use crate::resources::{
@@ -60,6 +61,11 @@ use crate::types::{
 pub const TICK: Duration = Duration::from_millis(100);
 /// Completions taken per poll.
 const POLL_BATCH: usize = 64;
+/// Balanced bounds each idle spin episode by both time and poll count.
+pub const BALANCED_SPIN: Duration = Duration::from_micros(50);
+pub const BALANCED_POLLS: u32 = 64;
+/// Async errors and already queued notifications are serviced even under saturation.
+const EVENT_SERVICE: Duration = Duration::from_millis(1);
 /// The most one RDMA WRITE from registered memory carries (below the 2 GiB message limit
 /// of common devices).
 pub const WRITE_CHUNK: u64 = 1 << 30;
@@ -75,6 +81,9 @@ pub enum WaitError {
 /// `ctrl_credits` (the handshake checks).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
+    pub progress: Progress,
+    /// Optional CPU for the latency thread, within the inherited allowed set only.
+    pub progress_cpu: Option<u32>,
     pub device: Option<String>,
     pub port: Option<u8>,
     pub gid_index: Option<u32>,
@@ -109,6 +118,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            progress: Progress::Economy,
+            progress_cpu: None,
             device: None,
             port: None,
             gid_index: None,
@@ -144,6 +155,8 @@ impl Config {
                 _ => Err(bad()),
             };
             match key {
+                "progress" => c.progress = Progress::parse(value)?,
+                "progress_cpu" => c.progress_cpu = Some(u32::try_from(n()?).map_err(|_| bad())?),
                 "device" => c.device = (!value.is_empty()).then(|| value.to_owned()),
                 "port" => c.port = Some(u8::try_from(n()?).map_err(|_| bad())?),
                 "gid_index" => c.gid_index = Some(u32::try_from(n()?).map_err(|_| bad())?),
@@ -174,6 +187,11 @@ impl Config {
     }
 
     fn check(&self) -> Result<()> {
+        if self.progress_cpu.is_some() && self.progress != Progress::Latency {
+            return Err(Error::invalid(
+                "progress_cpu is only valid with progress=latency",
+            ));
+        }
         let min = HEADER_BYTES as u32 + 64;
         if !(min..=16 << 20).contains(&self.slot_bytes) || self.slot_bytes % 64 != 0 {
             return Err(Error::invalid(format!(
@@ -549,6 +567,9 @@ impl Endpoint {
         config: Config,
     ) -> Result<Endpoint> {
         config.check()?;
+        if let Some(cpu) = config.progress_cpu {
+            progress::cpu(cpu, false)?;
+        }
         if members < 2 || index >= members || members > 4096 {
             return Err(Error::invalid(format!(
                 "member {index} of {members}: need 2 to 4096 members"
@@ -728,10 +749,29 @@ impl Endpoint {
             stop: AtomicBool::new(false),
         });
         let worker = shared.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("gpubridge-verbs".into())
-            .spawn(move || worker.run())
+            .spawn(move || {
+                let ready = worker
+                    .config
+                    .progress_cpu
+                    .map_or(Ok(()), |c| progress::cpu(c, true));
+                let ok = ready.is_ok();
+                let _ = ready_tx.send(ready);
+                if ok {
+                    worker.run();
+                }
+            })
             .map_err(|e| Error::Exhausted(format!("starting the completion thread: {e}")))?;
+        if let Err(e) = ready_rx.recv().unwrap_or_else(|_| {
+            Err(Error::Exhausted(
+                "completion thread exited during setup".into(),
+            ))
+        }) {
+            let _ = thread.join();
+            return Err(e);
+        }
         Ok(Endpoint {
             shared,
             thread: Some(thread),
@@ -1277,6 +1317,14 @@ impl Endpoint {
             s.index,
             q(&l.fork),
         );
+        let _ = write!(
+            o,
+            "\"progress\":{},\"progress_cpu\":{},",
+            q(s.config.progress.name()),
+            s.config
+                .progress_cpu
+                .map_or("null".into(), |c| c.to_string())
+        );
         let state = match (&st.failed, st.closing) {
             (_, true) => "closed",
             (Some(_), false) => "failed",
@@ -1441,9 +1489,40 @@ impl Shared {
     // ---- the completion thread ------------------------------------------------------
 
     fn run(&self) {
+        let mut spin_start = Instant::now();
+        let mut empty_polls = 0u32;
+        let mut events_at = Instant::now();
         while !self.stop.load(Ordering::Acquire) {
-            if self.poll_and_handle() > 0 {
+            let n = self.poll_and_handle();
+            let now = Instant::now();
+            if now >= events_at {
+                self.events(Duration::ZERO);
+                events_at = now + EVENT_SERVICE;
+            }
+            // Failure must still drain posted work, but needn't consume a CPU while
+            // awaiting close. All policies share the same cancellation/drain machinery.
+            if lock(&self.state).failed.is_some() {
+                self.events(TICK);
                 continue;
+            }
+            if n > 0 {
+                spin_start = now;
+                empty_polls = 0;
+                continue;
+            }
+            empty_polls = empty_polls.saturating_add(1);
+            match self.config.progress {
+                Progress::Latency => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                Progress::Balanced
+                    if empty_polls < BALANCED_POLLS && spin_start.elapsed() < BALANCED_SPIN =>
+                {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                Progress::Balanced | Progress::Economy => {}
             }
             // Arm, then poll once more: a completion between the empty poll and the arm
             // would otherwise wait for the next one.
@@ -1455,18 +1534,28 @@ impl Shared {
             if self.poll_and_handle() > 0 {
                 continue;
             }
-            match self.channel.wait(TICK) {
-                Ok(events) => {
-                    if events.completion {
-                        lock(&self.state).counters.notifications += 1;
-                    }
-                    for e in events.async_events {
-                        self.async_event(e);
-                    }
+            self.events(TICK);
+            spin_start = Instant::now();
+            empty_polls = 0;
+        }
+        // No new posts after stop. Take/ack queued events before resource destruction.
+        self.events(Duration::ZERO);
+    }
+
+    fn events(&self, timeout: Duration) {
+        match self.channel.wait(timeout) {
+            Ok(events) => {
+                if events.completion {
+                    lock(&self.state).counters.notifications += 1;
                 }
-                Err(e) => {
-                    self.fail_all(&format!("waiting for completions failed: {e}"));
-                    thread::sleep(TICK);
+                for e in events.async_events {
+                    self.async_event(e);
+                }
+            }
+            Err(e) => {
+                self.fail_all(&format!("waiting for completions failed: {e}"));
+                if !timeout.is_zero() {
+                    thread::sleep(timeout);
                 }
             }
         }

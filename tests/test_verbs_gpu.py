@@ -317,6 +317,11 @@ def test_driver_support_is_checked_once_per_gpu(monkeypatch):
 
 
 def test_settings(monkeypatch):
+    monkeypatch.setenv(vt.PROGRESS_ENV, "balanced")
+    assert vt.endpoint_settings()["progress"] == "balanced"
+    monkeypatch.setenv(vt.PROGRESS_ENV, "latency")
+    monkeypatch.setenv(vt.PROGRESS_CPU_ENV, "3")
+    assert vt.endpoint_settings()["progress_cpu"] == 3
     monkeypatch.setenv(vt.GPU_PATH_ENV, "sideways")
     with pytest.raises(ValueError, match=vt.GPU_PATH_ENV):
         vt.gpu_path_setting()
@@ -451,11 +456,13 @@ def _check_staged(obs_dir, topology):
 
 
 @needs_library
-def test_the_staged_path_with_cpu_tensors_standing_in_and_its_observations(tmp_path):
+@pytest.mark.parametrize("progress", ["latency", "balanced", "economy"])
+def test_the_staged_path_with_cpu_tensors_standing_in_and_its_observations(tmp_path, progress):
     fabric = tempfile.mkdtemp(prefix="gbvf-", dir="/tmp")
     obs = tmp_path / "obs"
     env = {verbs.TEST_FABRIC_ENV: fabric, observe.OBSERVE_ENV: str(obs / "rank-{rank}.jsonl"),
-           observe.JOB_ENV: "job-a3", vt.RNDV_BYTES_ENV: "64K", vt.CHUNK_BYTES_ENV: "256K"}
+           observe.JOB_ENV: "job-a3", vt.RNDV_BYTES_ENV: "64K", vt.CHUNK_BYTES_ENV: "256K",
+           vt.PROGRESS_ENV: progress}
     try:
         run_ranks(LAYOUTS["2+2"][0], partial(_check_staged, str(obs)), tmp_path,
                   init_kwargs={"bridge": "verbs"}, before_init=partial(_stand_in, env))

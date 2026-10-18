@@ -79,6 +79,8 @@ GID_INDEX_ENV = "GPUBRIDGE_VERBS_GID_INDEX"
 SLOT_BYTES_ENV = "GPUBRIDGE_VERBS_SLOT_BYTES"
 CREDITS_ENV = "GPUBRIDGE_VERBS_CREDITS"
 SEND_SLOTS_ENV = "GPUBRIDGE_VERBS_SEND_SLOTS"
+PROGRESS_ENV = "GPUBRIDGE_VERBS_PROGRESS"
+PROGRESS_CPU_ENV = "GPUBRIDGE_VERBS_PROGRESS_CPU"
 #: Bytes of arrived, not yet received messages a leader buffers per bridge.
 UNEXPECTED_BYTES_ENV = "GPUBRIDGE_VERBS_UNEXPECTED_BYTES"
 #: Messages of at least this size go by rendezvous (into registered memory: RDMA WRITE);
@@ -141,6 +143,8 @@ def endpoint_settings() -> dict[str, object]:
     rendezvous size, 256 KiB unless set)."""
     rndv = _number(RNDV_BYTES_ENV, size=True)
     return {
+        "progress": os.environ.get(PROGRESS_ENV, "").strip().lower() or "economy",
+        "progress_cpu": _number(PROGRESS_CPU_ENV),
         "rndv_bytes": DEFAULT_RNDV_BYTES if rndv is None else rndv,
         "dmabuf": _flag(DMABUF_ENV),
         "peer_memory": _flag(PEER_MEMORY_ENV),

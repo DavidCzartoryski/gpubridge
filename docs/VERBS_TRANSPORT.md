@@ -548,6 +548,46 @@ the UCX bridge does it):
   not `direct` but `direct+bounce`, its reason giving the bounced receives and
   bytes (also in `last_gpu` and in the observations' `bounced_bytes`).
 
+## Native progress policies
+
+`Config.progress` (`progress=...` in the native endpoint settings) and
+`GPUBRIDGE_VERBS_PROGRESS` select a **local** policy; peers may choose different
+policies without changing the wire protocol. All use the same dedicated native
+completion thread and the same ordering, deadline, cancellation and DMA-safe
+teardown code. No shared async-runtime worker busy-polls.
+
+| Policy | Behavior and CPU cost |
+| --- | --- |
+| `economy` (default) | Original behavior: drain ready CQEs, arm notifications, re-poll, then block on completion/async events for at most 100 ms. Low idle CPU; no reserved core. |
+| `balanced` | After work or an event wake, spin for at most **50 microseconds or 64 empty polls**, whichever is reached first, then use the same arm/re-poll/event wait. Extra CPU during brief idle gaps, no continuously reserved core. |
+| `latency` | Continuously polls the CQ on the native thread. Can consume approximately one CPU per bridge endpoint (normally one per island leader, and more for extra subgroup endpoints), including while idle. Opt-in only; no core is automatically reserved or pinned. |
+
+Every policy services queued completion notifications and asynchronous device
+errors at least once per 1 ms of active polling (subject to scheduler/handler
+delays). Failed endpoints continue draining posted work with event waits rather
+than spinning. Event policies always re-arm **then re-poll before sleeping**.
+The shim consumes queued events and acknowledges each successful get immediately;
+shutdown and CQ drop also drain queued notifications before releasing resources.
+Spurious events with an empty CQ are normal. These choices follow
+[rdma-core's completion-event contract](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_get_cq_event.3).
+
+Optional `GPUBRIDGE_VERBS_PROGRESS_CPU=<integer>` (`Config.progress_cpu`) applies
+only to `latency` in a Linux `ibverbs` build. Setup checks membership in the live
+calling thread's allowed set using `sched_getaffinity`; the new progress thread
+checks its inherited set again before applying `sched_setaffinity` to itself.
+An out-of-set CPU, unsupported platform/build, or affinity failure rejects setup.
+The setting never widens a job's allowed CPUs or changes a training thread's
+affinity. Choose a permitted CPU near the selected NIC/GPU NUMA node, considering
+the job's existing CPU allocation and memory placement. CPU topology and optimal
+placement must be measured on the allocation; a CPU number alone implies no NUMA
+locality. Hardware performance and native affinity execution remain BLOCKED.
+
+The software tests use strict one-shot notifications (arming never creates a
+retroactive event), injected poll/arm-boundary CQEs and spurious notifications.
+They verify bursts, empty messages, errors, disconnect, deadlines, abort and
+shutdown for all policies, including registered GPU-memory pairings and keeping
+a granted write window alive after abort. These are MOCK evidence only.
+
 ## Telemetry
 
 `VerbsTransport.telemetry()` (and `state`: `ok`, `failed`, `closed`) returns
@@ -557,6 +597,7 @@ whose name carries rdma-core's version, or `MOCK: ...`), `mock`, `library`
 `active_mtu`, `firmware`, `vendor_id`, `vendor_part_id`, `operations` (`RC
 SEND/RECV`, plus `RDMA WRITE (rendezvous)` when on), `rndv_bytes`, `gather`, the
 protocol settings, `fork_safety` (what the open found and did), `state`,
+`progress` and `progress_cpu` (the local policy and optional native-thread CPU),
 `failure`, counts (operations, bytes, chunks, control
 messages, credit stalls, unexpected and held bytes, completions, errors,
 notifications, asynchronous events, batches, grants and "go"s sent and received,
@@ -638,6 +679,8 @@ copied through the slots. Chunks of `GPUBRIDGE_VERBS_CHUNK_BYTES` (4 MiB).
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `GPUBRIDGE_VERBS_RNDV_BYTES` | 256K | messages of at least this size go by rendezvous; `0`: off (and with it receives into GPU memory). The same on every leader |
+| `GPUBRIDGE_VERBS_PROGRESS` | `economy` | native progress policy: `latency`, `balanced`, `economy`; local to each endpoint |
+| `GPUBRIDGE_VERBS_PROGRESS_CPU` | unset | optional latency-thread CPU, inside the inherited allowed set; Linux `ibverbs` only |
 | `GPUBRIDGE_VERBS_GPU_PATH` | `auto` | `auto`, `direct` (fail instead of staging) or `staged` |
 | `GPUBRIDGE_VERBS_DMABUF`, `GPUBRIDGE_VERBS_PEER_MEMORY` | `1` | `0` keeps the direct path from trying that method |
 | `GPUBRIDGE_VERBS_DEVICE_CACHE_BYTES` | 8G | bound on GPU memory registered at once |

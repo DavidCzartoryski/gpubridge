@@ -29,6 +29,7 @@ pub mod gpu;
 #[cfg(feature = "ibverbs")]
 mod ibv;
 mod mock;
+mod progress;
 pub mod protocol;
 mod provider;
 mod resources;
@@ -48,6 +49,7 @@ pub use ibv::{check_layouts, library_path, wc_status_text, IbvProvider};
 pub use mock::{
     Call, Fault, LiveCounts, MockDevice, MockFabric, MockLimits, MockPort, MockProvider, NodeId,
 };
+pub use progress::Progress;
 pub use provider::{BatchResult, Handle, MrKeys, Provider, QpCreated};
 pub use resources::{
     CompletionChannel, CompletionQueue, Context, DmabufCloser, DmabufFd, MemoryRegion,

@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <sched.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -702,11 +703,12 @@ int gbv_wait_events(gbv_context *ctx, gbv_channel *channel, int timeout_ms, uint
         struct ibv_cq *cq = NULL;
         void *cq_context = NULL;
         errno = 0;
-        if (ibv_get_cq_event(CH(channel), &cq, &cq_context) == 0) {
+        while (ibv_get_cq_event(CH(channel), &cq, &cq_context) == 0) {
             /* Acknowledged at once: ibv_destroy_cq waits for every event to be. */
             ibv_ack_cq_events(cq, 1);
             *completion = 1;
-        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
             return fail();
         }
     }
@@ -727,6 +729,38 @@ int gbv_wait_events(gbv_context *ctx, gbv_channel *channel, int timeout_ms, uint
         }
     }
     return 0;
+}
+
+int gbv_progress_cpu(uint32_t cpu, int apply) {
+    /* Dynamic masks also support kernels configured with more than CPU_SETSIZE CPUs.
+     * Bound allocation to 1 MiB (over eight million CPUs), and fail closed beyond it. */
+    size_t ncpus = 128;
+    while (ncpus <= (1u << 23)) {
+        size_t size = CPU_ALLOC_SIZE(ncpus);
+        cpu_set_t *allowed = CPU_ALLOC(ncpus);
+        if (!allowed) return ENOMEM;
+        CPU_ZERO_S(size, allowed);
+        if (sched_getaffinity(0, size, allowed) == 0) {
+            if (cpu >= ncpus || !CPU_ISSET_S(cpu, size, allowed)) {
+                CPU_FREE(allowed);
+                return EINVAL;
+            }
+            if (!apply) {
+                CPU_FREE(allowed);
+                return 0;
+            }
+            CPU_ZERO_S(size, allowed);
+            CPU_SET_S(cpu, size, allowed);
+            int rc = sched_setaffinity(0, size, allowed) == 0 ? 0 : errno;
+            CPU_FREE(allowed);
+            return rc;
+        }
+        int rc = errno;
+        CPU_FREE(allowed);
+        if (rc != EINVAL) return rc;
+        ncpus *= 2;
+    }
+    return EOVERFLOW;
 }
 
 int gbv_fork_status(uint32_t *out) {

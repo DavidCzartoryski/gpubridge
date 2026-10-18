@@ -15,7 +15,7 @@ use common::{eventually, ib_fabric, RawMember};
 use gpubridge_verbs::protocol::Kind;
 use gpubridge_verbs::{
     Access, Allocation, Call, Config, DmabufCloser, Endpoint, Error, Fault, GpuMemory, Method,
-    MockFabric, MockGpu, NodeId, PeerModules, Result, Vendor, WcStatus, CACHED_ACCESS,
+    MockFabric, MockGpu, NodeId, PeerModules, Progress, Result, Vendor, WcStatus, CACHED_ACCESS,
     DEVICE_ROUND,
 };
 
@@ -179,8 +179,19 @@ fn modules(name: &str, loaded: bool) -> PeerModules {
 }
 
 fn pair(rndv: u64, gpu: &MockGpu, peer_module: bool) -> (Arc<MockFabric>, Endpoint, Endpoint) {
+    pair_with_progress(rndv, gpu, peer_module, Progress::Economy)
+}
+
+fn pair_with_progress(
+    rndv: u64,
+    gpu: &MockGpu,
+    peer_module: bool,
+    progress: Progress,
+) -> (Arc<MockFabric>, Endpoint, Endpoint) {
     let (fabric, a, b) = ib_fabric();
-    let mut eps = endpoints(&fabric, &[a, b], &config(rndv));
+    let mut c = config(rndv);
+    c.progress = progress;
+    let mut eps = endpoints(&fabric, &[a, b], &c);
     let eb = eps.pop().unwrap();
     let ea = eps.pop().unwrap();
     for (i, ep) in [&ea, &eb].into_iter().enumerate() {
@@ -451,8 +462,14 @@ fn device_memory_is_written_by_rdma_write_and_read_in_place_by_the_device() {
 
 #[test]
 fn every_pairing_of_plain_host_registered_and_device_memory_moves_the_same_bytes() {
+    for p in [Progress::Latency, Progress::Balanced, Progress::Economy] {
+        check_memory_pairings(p);
+    }
+}
+
+fn check_memory_pairings(progress: Progress) {
     let gpu = MockGpu::new();
-    let (fabric, a, b) = pair(RNDV, &gpu, true);
+    let (fabric, a, b) = pair_with_progress(RNDV, &gpu, true, progress);
     let n = 3 * 1024 + RNDV as usize; // several slots' worth
     let kinds = ["plain", "host", "device"];
     let mut tag = 0;
@@ -593,8 +610,14 @@ fn a_grant_of_the_wrong_size_and_receives_device_memory_cant_take_are_refused() 
 
 #[test]
 fn aborting_with_a_write_granted_keeps_the_registration_until_close() {
+    for p in [Progress::Latency, Progress::Balanced, Progress::Economy] {
+        check_aborting_with_write_granted(p);
+    }
+}
+
+fn check_aborting_with_write_granted(progress: Progress) {
     let gpu = MockGpu::new();
-    let (fabric, a, b) = pair(RNDV, &gpu, false);
+    let (fabric, a, b) = pair_with_progress(RNDV, &gpu, false, progress);
     let dev = gpu.alloc(0, 1 << 20);
     let reg = b.register_device(0, dev, 1 << 20).unwrap();
     let r = b

@@ -244,6 +244,8 @@ int gbv_dealloc_pd(gbv_pd *pd);
 
 int gbv_create_cq(gbv_context *ctx, uint32_t depth, gbv_cq **out, uint32_t *actual);
 int gbv_destroy_cq(gbv_cq *cq);
+/* Only the calling native progress thread; validate against its inherited allowed set. */
+int gbv_progress_cpu(uint32_t cpu, int apply);
 
 /* An RC queue pair, every send signaled. caps: what to ask for in, what was given out. */
 int gbv_create_rc_qp(gbv_pd *pd, gbv_cq *send_cq, gbv_cq *recv_cq, struct gbv_qp_caps *caps,

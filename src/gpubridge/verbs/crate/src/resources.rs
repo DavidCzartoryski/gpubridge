@@ -975,6 +975,20 @@ impl CqInner {
 
 impl Drop for CqInner {
     fn drop(&mut self) {
+        // Its QPs are gone: no more completions can be generated for this CQ. Consume
+        // queued notifications too (they may have outlived the WC that triggered them).
+        // Providers acknowledge each event before returning it; the channel stays alive
+        // through this queue's Arc until after destruction.
+        if let Some(channel) = &self.channel {
+            if self
+                .ctx
+                .provider
+                .wait_events(self.ctx.handle, channel.handle, Duration::ZERO)
+                .is_err()
+            {
+                self.ctx.release_failed();
+            }
+        }
         if self.ctx.provider.destroy_cq(self.handle).is_err() {
             self.ctx.release_failed();
         }
