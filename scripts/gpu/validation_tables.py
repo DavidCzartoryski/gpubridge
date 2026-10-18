@@ -130,6 +130,8 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
          [Step(r"pp_(gpipe|1f1b)_(even|auto|[0-9]+(-[0-9]+)+)")]),
     37: ("Megatron-Core's pipeline across vendors tracks one GPU",
          [Step("megatron_pp2"), Step("megatron_pp1")]),
+    # No kit step yet: the hardware commands come with the GPU paths (phase A3).
+    38: ("The verbs bridge on RDMA hardware", []),
 }
 
 

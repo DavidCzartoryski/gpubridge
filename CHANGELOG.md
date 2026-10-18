@@ -255,8 +255,19 @@ hardware.
 
 ### Added
 
-- The foundation of a raw-verbs bridge, phase A1 of an opt-in `bridge="verbs"`
-  that doesn't exist yet (docs/VERBS_TRANSPORT.md): a Rust crate,
+- `bridge="verbs"`, opt-in, phase A2 of the raw-verbs bridge
+  (docs/VERBS_TRANSPORT.md): a versioned wire protocol of RC SEND/RECV through
+  each leader's own registered host buffers, with credits, chunking, a
+  completion thread on a completion channel, deadlines, peer loss and teardown
+  that never frees memory the device may still use; handshake through the c10d
+  store, documented device, port and GID selection, and telemetry. If verbs
+  can't run, setup fails with the reason; nothing falls back to TCP. Host
+  tensors only. The multitcp bridge's collectives moved to a shared
+  `TaggedBridge` that both use. Tested on mock providers (bit for bit against
+  `flat-gloo` between processes on a test-only fabric) and built on Explorer's
+  login node; not validated on RDMA hardware or GPUs. (PR pending)
+- The foundation of a raw-verbs bridge, phase A1 of the opt-in `bridge="verbs"`
+  above (docs/VERBS_TRANSPORT.md): a Rust crate,
   `gpubridge-verbs`, with a C shim compiled against rdma-core's headers and
   linked to `libibverbs.so.1`, owned device, protection domain, completion
   queue, queue pair and memory region types that release in a correct order,
@@ -265,8 +276,8 @@ hardware.
   bounded registration cache keyed by allocation identity, and a
   deterministic mock fabric with injectable faults. Tested on the mock
   provider (macOS and Linux) and built against rdma-core 57.0 on Explorer's
-  login node; not validated on RDMA hardware or GPUs, and nothing moves a
-  tensor yet. A CI job tests the crate. (PR pending)
+  login node; not validated on RDMA hardware or GPUs. A CI job tests the
+  crate. (PR pending)
 - Step 07's and the two-machine runner's `DP_RUNS` take `ddp-shares-<rows>`: DDP
   with the rows per rank as given, in rank order (`ddp-shares-5-3` runs
   `train_dp.py --shares 5,3`), and `-r<N>` at the end to name a repeat

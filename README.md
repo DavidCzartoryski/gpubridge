@@ -621,6 +621,27 @@ Gloo bridge on a real network is what Explorer's step 08 with
 `MULTITCP_BRIDGE=1` measures. The design and the gate are in
 [docs/RUST_TRANSPORT.md](docs/RUST_TRANSPORT.md).
 
+#### The verbs bridge (experimental, **not validated on RDMA hardware or GPUs**)
+
+`init(bridge="verbs")` carries the bridge over RDMA reliable connections with
+raw libibverbs: a Rust library (a C shim compiled against rdma-core's headers)
+with its own versioned wire protocol of RC sends through registered buffers,
+credits and a completion thread. Linux only, opt-in, host tensors only:
+
+```bash
+python -m gpubridge.verbs build   # needs cargo and rdma-core's headers; or set GPUBRIDGE_VERBS_LIB
+python -m gpubridge.verbs info    # loads it; opens no device
+```
+
+`GPUBRIDGE_VERBS_DEVICE`, `_PORT` and `_GID_INDEX` pick the endpoint (else the
+first active port, by documented rules); if verbs can't run, init fails on
+every rank and says why, and nothing falls back to TCP.
+`topology.bridge.telemetry()` reports the device, port, link layer, protocol and
+counts. So far it is tested only on mock fabrics, including a test-only one
+between processes where every bridge policy matches `flat-gloo` bit for bit.
+The protocol, the status of each part and what hardware validation needs are
+in [docs/VERBS_TRANSPORT.md](docs/VERBS_TRANSPORT.md).
+
 ### Observing collectives
 
 Monitoring or profiling tools can watch every collective on a rank. After each

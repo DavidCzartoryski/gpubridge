@@ -544,6 +544,28 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     *Step:* `megatron_pp1` and `megatron_pp2` in
     Explorer step 07 with `STEPS_07=megatron`.
 
+38. **The verbs bridge on RDMA hardware.** `bridge="verbs"`
+    (docs/VERBS_TRANSPORT.md) moves the bridge over RC queue pairs on
+    libibverbs: its own wire protocol of RC SEND/RECV through registered host
+    buffers, with credits and a completion thread. Between two machines on one
+    InfiniBand or RoCE fabric: the endpoint each leader selects (device, port,
+    GID) as telemetry reports it; every bridge policy bit for bit against
+    `flat-gloo`; a deliberately lost peer and a short deadline fail with their
+    reasons; teardown with work outstanding leaks nothing; no bridge payload
+    on TCP (port counters move, the Gloo bridge isn't used); then its bridge
+    phase against the Gloo and multitcp bridges at each size. *Status: works on
+    the mock providers only: the protocol's failure cases on the in-process mock
+    (`src/gpubridge/verbs/crate/tests/protocol.rs`), and every bridge policy,
+    compression, subgroups and async on two, three and four leaders, bit for bit
+    against `flat-gloo`, between processes on the MOCK test fabric
+    (`tests/test_verbs.py`). The libibverbs provider compiles and links on
+    Explorer's login node; it has opened no device. Not validated on RDMA
+    hardware or GPUs.* *BLOCKED: hardware/authorization:* needs two allocated
+    nodes with an RDMA device each on one fabric (Explorer's `mlx5_0` nodes),
+    permission to open the devices from a job, the library built there
+    (`python -m gpubridge.verbs build` with rdma-core's headers), and kit steps
+    for it, which come with phase A3.
+
 32. **Point-to-point across islands through the backend on GPUs.** `send`,
     `recv`, `isend`, `irecv` and `batch_isend_irecv` on `backend="gpubridge"`
     go native within an island and through the bridge across islands. On GPUs,
@@ -639,6 +661,7 @@ failures count against all six whichever test failed.
 | 35. The multitcp bridge against the Gloo bridge | step `multitcp_build`; step `matrix_D-multitcp(-pinned\|-1stream)?` | not run |
 | 36. Automatic stage balancing against even and hand-tuned splits | step `pp_(gpipe\|1f1b)_(even\|auto\|[0-9]+(-[0-9]+)+)` | not run |
 | 37. Megatron-Core's pipeline across vendors tracks one GPU | step `megatron_pp2`; step `megatron_pp1` | not run |
+| 38. The verbs bridge on RDMA hardware |  | not run |
 
 Where the FAILs come from:
 
