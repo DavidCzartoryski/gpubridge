@@ -729,6 +729,27 @@ int gbv_wait_events(gbv_context *ctx, gbv_channel *channel, int timeout_ms, uint
     return 0;
 }
 
+int gbv_fork_status(uint32_t *out) {
+    if (!out) return EINVAL;
+    /* enum ibv_fork_status { IBV_FORK_DISABLED, IBV_FORK_ENABLED, IBV_FORK_UNNEEDED }
+     * (verbs.h, rdma-core 35+). Looked up rather than called, so older libraries still load. */
+    typedef int (*fork_status_fn)(void);
+    fork_status_fn fn = (fork_status_fn)dlsym(RTLD_DEFAULT, "ibv_is_fork_initialized");
+    if (!fn) {
+        *out = GBV_FORK_UNKNOWN;
+        return 0;
+    }
+    switch (fn()) {
+    case 0: *out = GBV_FORK_DISABLED; break;
+    case 1: *out = GBV_FORK_ENABLED; break;
+    case 2: *out = GBV_FORK_UNNEEDED; break;
+    default: *out = GBV_FORK_UNKNOWN; break;
+    }
+    return 0;
+}
+
+int gbv_fork_init(void) { return status(ibv_fork_init()); }
+
 int gbv_library_path(char *out, size_t len) {
     if (!out || len == 0) return EINVAL;
     Dl_info info;

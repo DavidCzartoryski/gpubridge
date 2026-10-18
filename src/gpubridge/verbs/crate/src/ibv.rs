@@ -14,9 +14,9 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use crate::provider::{BatchResult, Handle, MrKeys, Provider, QpCreated};
 use crate::types::{
-    Access, Address, AsyncEvent, AsyncEventKind, DeviceAttr, Events, Gid, GidEntry, GidType,
-    LinkLayer, Mtu, PortAttr, PortState, QpCaps, RawCompletion, RawRecv, RawSend, RawSge, SendOp,
-    Transition, WcStatus, MAX_SGE,
+    Access, Address, AsyncEvent, AsyncEventKind, DeviceAttr, Events, ForkStatus, Gid, GidEntry,
+    GidType, LinkLayer, Mtu, PortAttr, PortState, QpCaps, RawCompletion, RawRecv, RawSend, RawSge,
+    SendOp, Transition, WcStatus, MAX_SGE,
 };
 
 #[repr(C)]
@@ -222,6 +222,10 @@ const _: () = {
 };
 
 const ABI_VERSION: u32 = 2;
+// gbverbs.h's GBV_FORK_*.
+const GBV_FORK_DISABLED: u32 = 1;
+const GBV_FORK_ENABLED: u32 = 2;
+const GBV_FORK_UNNEEDED: u32 = 3;
 /// The shim's GBV_MAX_BATCH and GBV_MAX_BATCH_SGE.
 const MAX_BATCH: usize = 64;
 const MAX_BATCH_SGE: usize = 256;
@@ -320,6 +324,8 @@ extern "C" {
         n_events: *mut u32,
     ) -> c_int;
     fn gbv_library_path(out: *mut c_char, len: usize) -> c_int;
+    fn gbv_fork_status(out: *mut u32) -> c_int;
+    fn gbv_fork_init() -> c_int;
 }
 
 /// Compares the compiled shim's struct layouts and ABI version with this file's. Calls no
@@ -515,6 +521,25 @@ impl Provider for IbvProvider {
 
     fn is_mock(&self) -> bool {
         false
+    }
+
+    fn fork_status(&self) -> Result<ForkStatus> {
+        let mut raw = 0u32;
+        // SAFETY: raw is a valid u32 for the shim to fill.
+        check("ibv_is_fork_initialized", unsafe {
+            gbv_fork_status(&mut raw)
+        })?;
+        Ok(match raw {
+            GBV_FORK_DISABLED => ForkStatus::Disabled,
+            GBV_FORK_ENABLED => ForkStatus::Enabled,
+            GBV_FORK_UNNEEDED => ForkStatus::Unneeded,
+            _ => ForkStatus::Unknown,
+        })
+    }
+
+    fn fork_init(&self) -> Result<()> {
+        // SAFETY: no arguments; libibverbs refuses it (EINVAL) once memory is registered.
+        check("ibv_fork_init", unsafe { gbv_fork_init() })
     }
 
     fn list_devices(&self) -> Result<Vec<String>> {

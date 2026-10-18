@@ -295,4 +295,11 @@ int gbv_wait_events(gbv_context *ctx, gbv_channel *channel, int timeout_ms, uint
  * libibverbs.so.1.14.57.0), NUL-terminated; ENOENT if unknown, ENOSPC if len is too small. */
 int gbv_library_path(char *out, size_t len);
 
+/* Fork safety of registered memory: ibv_is_fork_initialized(), looked up at run time (it is in
+ * rdma-core 35 and later), as GBV_FORK_*; GBV_FORK_UNKNOWN where this libibverbs lacks it. */
+enum { GBV_FORK_DISABLED = 1, GBV_FORK_ENABLED = 2, GBV_FORK_UNNEEDED = 3, GBV_FORK_UNKNOWN = 4 };
+int gbv_fork_status(uint32_t *out);
+/* ibv_fork_init(): only before any memory is registered in the process (EINVAL after). */
+int gbv_fork_init(void);
+
 #endif

@@ -46,8 +46,8 @@ use crate::resources::{
     CompletionChannel, CompletionQueue, MemoryRegion, QueuePair, SendRequest, Sge,
 };
 use crate::types::{
-    Access, Address, Completion, GlobalRoute, InitAttr, LinkLayer, Mtu, QpCaps, RemoteTarget,
-    RtrAttr, RtsAttr, SendOp, WcStatus,
+    Access, Address, Completion, ForkStatus, GlobalRoute, InitAttr, LinkLayer, Mtu, QpCaps,
+    RemoteTarget, RtrAttr, RtsAttr, SendOp, WcStatus,
 };
 
 /// How long the completion thread blocks at most before it checks whether to stop.
@@ -429,6 +429,39 @@ struct Local {
     vendor: (u32, u32),
     provider: String,
     mock: bool,
+    /// Whether registered memory survives a fork here, and what was done about it.
+    fork: String,
+}
+
+/// Makes sure memory this process registers stays what the device reads and writes
+/// across a `fork()` (DataLoader workers, subprocesses): on a kernel that doesn't keep
+/// registered pages with the parent, `ibv_fork_init` before anything is registered, or
+/// fail with the reason. Returns what telemetry says about it.
+fn fork_safety(provider: &dyn Provider) -> Result<String> {
+    let status = provider.fork_status()?;
+    let why = match status {
+        ForkStatus::Unneeded => {
+            return Ok("unneeded: the kernel keeps registered pages with the parent on fork".into())
+        }
+        ForkStatus::Enabled => {
+            return Ok("enabled: ibv_fork_init already ran (or RDMAV_FORK_SAFE is set)".into())
+        }
+        ForkStatus::Disabled => "the kernel doesn't keep registered pages with the parent on fork",
+        ForkStatus::Unknown => "this libibverbs can't say whether the kernel is fork-safe",
+    };
+    match provider.fork_init() {
+        Ok(()) => Ok(format!(
+            "enabled by gpubridge (ibv_fork_init): {why}, so registered pages are kept out of \
+             forked children"
+        )),
+        Err(e) => Err(Error::Unsupported(format!(
+            "{why}, and ibv_fork_init failed ({e}): a fork() (a DataLoader worker, a \
+             subprocess) would leave the device reading and writing pages the parent no \
+             longer uses. ibv_fork_init must run before any memory is registered in the \
+             process: set RDMAV_FORK_SAFE=1 before starting it, or open the verbs bridge \
+             before anything else registers memory"
+        ))),
+    }
 }
 
 struct Shared {
@@ -512,6 +545,8 @@ impl Endpoint {
                 "member {index} of {members}: need 2 to 4096 members"
             )));
         }
+        // Before anything is registered (the slots, below).
+        let fork = fork_safety(provider.as_ref())?;
         let Selected {
             ctx,
             port,
@@ -661,6 +696,7 @@ impl Endpoint {
                 vendor: (dev.vendor_id, dev.vendor_part_id),
                 provider: provider.describe(),
                 mock: provider.is_mock(),
+                fork,
             },
             config,
             index,
@@ -1172,7 +1208,7 @@ impl Endpoint {
              \"active_mtu\":{},\"firmware\":{},\"vendor_id\":{},\"vendor_part_id\":{},\
              \"operations\":{},\"rndv_bytes\":{},\"gather\":{},\"slot_bytes\":{},\
              \"credits\":{},\"ctrl_credits\":{},\"send_slots\":{},\"members\":{},\"index\":{},\
-             \"direct\":{direct},",
+             \"fork_safety\":{},\"direct\":{direct},",
             q(&l.provider),
             l.mock,
             q(&format!("gpubridge-verbs {}", env!("CARGO_PKG_VERSION"))),
@@ -1198,6 +1234,7 @@ impl Endpoint {
             s.config.send_slots,
             s.members,
             s.index,
+            q(&l.fork),
         );
         let state = match (&st.failed, st.closing) {
             (_, true) => "closed",

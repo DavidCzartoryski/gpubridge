@@ -35,9 +35,9 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, Result};
 use crate::provider::{Handle, MrKeys, Provider, QpCreated};
 use crate::types::{
-    Access, Address, AsyncEvent, AsyncEventKind, DeviceAttr, Events, Gid, GidEntry, GidType,
-    LinkLayer, Mtu, PortAttr, PortState, QpCaps, QpState, RawCompletion, RawSge, RtrAttr, RtsAttr,
-    SendOp, Transition, WcStatus,
+    Access, Address, AsyncEvent, AsyncEventKind, DeviceAttr, Events, ForkStatus, Gid, GidEntry,
+    GidType, LinkLayer, Mtu, PortAttr, PortState, QpCaps, QpState, RawCompletion, RawSge, RtrAttr,
+    RtsAttr, SendOp, Transition, WcStatus,
 };
 
 pub type NodeId = usize;
@@ -379,6 +379,10 @@ struct Fabric {
     channels: BTreeMap<Handle, ChanRec>,
     faults: Vec<FaultRule>,
     violations: Vec<String>,
+    /// What `fork_status` reports, and how `fork_init` answers (an errno to fail with);
+    /// how often `fork_init` was called.
+    fork: (ForkStatus, Option<i32>),
+    fork_inits: u32,
 }
 
 /// The fabric: create it, add nodes, take each node's provider.
@@ -407,6 +411,8 @@ impl Default for MockFabric {
                 channels: BTreeMap::new(),
                 faults: Vec::new(),
                 violations: Vec::new(),
+                fork: (ForkStatus::Unneeded, None),
+                fork_inits: 0,
             }),
             wake: Condvar::new(),
         }
@@ -465,6 +471,18 @@ impl MockFabric {
         }
         drop(f);
         self.wake.notify_all();
+    }
+
+    /// What every provider of this fabric says about fork safety: `status` from
+    /// `fork_status`, and `fork_init` failing with `init_errno` if given (else enabling
+    /// it).
+    pub fn set_fork(&self, status: ForkStatus, init_errno: Option<i32>) {
+        self.lock().fork = (status, init_errno);
+    }
+
+    /// How often `fork_init` was called.
+    pub fn fork_inits(&self) -> u32 {
+        self.lock().fork_inits
     }
 
     /// The node is gone: nothing reaches it, it moves nothing, and its calls fail (except
@@ -1024,6 +1042,26 @@ impl Provider for MockProvider {
 
     fn describe(&self) -> String {
         "MOCK: in-process fabric (not RDMA)".into()
+    }
+
+    fn fork_status(&self) -> Result<ForkStatus> {
+        Ok(self.fabric.lock().fork.0)
+    }
+
+    fn fork_init(&self) -> Result<()> {
+        let mut f = self.fabric.lock();
+        f.fork_inits += 1;
+        f.nodes[self.node].log.push("ibv_fork_init".into());
+        match f.fork.1 {
+            Some(errno) => Err(Error::Verbs {
+                call: "ibv_fork_init",
+                errno,
+            }),
+            None => {
+                f.fork.0 = ForkStatus::Enabled;
+                Ok(())
+            }
+        }
     }
 
     fn list_devices(&self) -> Result<Vec<String>> {

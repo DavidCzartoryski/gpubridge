@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::types::{
-    Access, DeviceAttr, Events, GidEntry, PortAttr, QpCaps, RawCompletion, RawRecv, RawSend,
-    RawSge, SendOp, Transition,
+    Access, DeviceAttr, Events, ForkStatus, GidEntry, PortAttr, QpCaps, RawCompletion, RawRecv,
+    RawSend, RawSge, SendOp, Transition,
 };
 
 /// A provider's resource: a pointer value for libibverbs, a number for the mock.
@@ -149,6 +149,18 @@ pub trait Provider: Send + Sync + fmt::Debug {
     /// True for providers that are not RDMA (the mocks): telemetry labels them MOCK.
     fn is_mock(&self) -> bool {
         true
+    }
+
+    /// Whether registered memory survives a `fork()` (`ibv_is_fork_initialized`). The
+    /// mocks' default: no device reads their memory, so there is nothing to protect.
+    fn fork_status(&self) -> Result<ForkStatus> {
+        Ok(ForkStatus::Unneeded)
+    }
+
+    /// `ibv_fork_init`: keeps registered pages out of forked children. Only before any
+    /// memory is registered in the process.
+    fn fork_init(&self) -> Result<()> {
+        Ok(())
     }
     /// Appends up to `max` completions to `out`; returns how many.
     fn poll_cq(&self, cq: Handle, out: &mut Vec<RawCompletion>, max: usize) -> Result<usize>;

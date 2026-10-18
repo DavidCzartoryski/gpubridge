@@ -113,6 +113,23 @@ impl Mtu {
     }
 }
 
+/// Whether memory registered in this process stays what the device reads and writes
+/// after a `fork()` (`ibv_is_fork_initialized`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkStatus {
+    /// Not protected: a fork, then a write by the parent to a registered page, gives the
+    /// parent a copy the device never sees (`IBV_FORK_DISABLED`).
+    Disabled,
+    /// `ibv_fork_init` ran (or `RDMAV_FORK_SAFE` was set): registered pages are kept out
+    /// of children (`IBV_FORK_ENABLED`).
+    Enabled,
+    /// The kernel keeps registered pages with the parent on fork (Linux 5.13 and later,
+    /// FOLL_PIN copy-on-fork): nothing to do (`IBV_FORK_UNNEEDED`).
+    Unneeded,
+    /// This libibverbs predates `ibv_is_fork_initialized` (rdma-core 35): can't tell.
+    Unknown,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortState {
     Down,

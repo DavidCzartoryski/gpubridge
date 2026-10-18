@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use common::{eventually, garbage, ib_fabric, roce_gid, RawMember};
 use gpubridge_verbs::{
-    AsyncEvent, AsyncEventKind, Config, Endpoint, Fault, MockDevice, MockFabric, MockPort, Mtu,
-    NodeId, PortState, WaitError, WcStatus,
+    AsyncEvent, AsyncEventKind, Config, Endpoint, Fault, ForkStatus, MockDevice, MockFabric,
+    MockPort, Mtu, NodeId, PortState, WaitError, WcStatus,
 };
 
 const LONG: Duration = Duration::from_secs(20);
@@ -543,6 +543,73 @@ fn queued_sends_to_a_member_that_said_goodbye_fail_at_once_with_its_reason() {
     );
     a.close(LONG).ok();
     assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+}
+
+/// Fork safety is checked when an endpoint opens, before it registers anything:
+/// `ibv_fork_init` where the kernel (or an old libibverbs) can't promise it, a failure
+/// with the reason if that fails, and the outcome in telemetry.
+#[test]
+fn fork_safety_is_checked_at_open_before_anything_is_registered() {
+    for (status, init, inits, expect) in [
+        (
+            ForkStatus::Unneeded,
+            None,
+            0,
+            Ok("unneeded: the kernel keeps"),
+        ),
+        (
+            ForkStatus::Enabled,
+            None,
+            0,
+            Ok("enabled: ibv_fork_init already ran"),
+        ),
+        (
+            ForkStatus::Disabled,
+            None,
+            1,
+            Ok("enabled by gpubridge (ibv_fork_init)"),
+        ),
+        (
+            ForkStatus::Unknown,
+            None,
+            1,
+            Ok("enabled by gpubridge (ibv_fork_init)"),
+        ),
+        (
+            ForkStatus::Disabled,
+            Some(22),
+            1,
+            Err("ibv_fork_init failed"),
+        ),
+    ] {
+        let (fabric, na, _nb) = ib_fabric();
+        fabric.set_fork(status, init);
+        let opened = Endpoint::new(fabric.provider(na), 2, 0, small());
+        assert_eq!(fabric.fork_inits(), inits, "{status:?}");
+        let log = fabric.log(na);
+        if inits > 0 {
+            let first_reg = log.iter().position(|l| l.starts_with("ibv_reg_mr"));
+            assert_eq!(
+                log.first().map(String::as_str),
+                Some("ibv_fork_init"),
+                "{log:?}"
+            );
+            assert!(first_reg.map_or(true, |i| i > 0));
+        }
+        match (opened, expect) {
+            (Ok(ep), Ok(text)) => {
+                let t = ep.telemetry();
+                assert!(t.contains(&format!("\"fork_safety\":\"{text}")), "{t}");
+            }
+            (Err(e), Err(text)) => {
+                let e = e.to_string();
+                assert!(e.contains(text) && e.contains("RDMAV_FORK_SAFE"), "{e}");
+                assert!(!log.iter().any(|l| l.starts_with("ibv_reg_mr")), "{log:?}");
+                assert_eq!(fabric.live(na).total(), 0);
+            }
+            (got, want) => panic!("{status:?}: {:?} where {want:?}", got.map(|_| ())),
+        }
+    }
 }
 
 #[test]

@@ -48,8 +48,8 @@ pub use resources::{
     ProtectionDomain, QueuePair, SendRequest, Sge, StatsSnapshot, DEFAULT_DRAIN_TIMEOUT,
 };
 pub use types::{
-    Access, Address, AsyncEvent, AsyncEventKind, Completion, DeviceAttr, Events, Gid, GidEntry,
-    GidType, GlobalRoute, InitAttr, LinkLayer, Mtu, PortAttr, PortState, QpCaps, QpState,
+    Access, Address, AsyncEvent, AsyncEventKind, Completion, DeviceAttr, Events, ForkStatus, Gid,
+    GidEntry, GidType, GlobalRoute, InitAttr, LinkLayer, Mtu, PortAttr, PortState, QpCaps, QpState,
     RawCompletion, RawRecv, RawSend, RawSge, RemoteTarget, RtrAttr, RtsAttr, SendOp, Transition,
     WcStatus, WorkId, WorkKind, MAX_SGE,
 };
