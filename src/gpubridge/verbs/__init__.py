@@ -154,6 +154,8 @@ def _declare(lib: ctypes.CDLL) -> ctypes.CDLL:
     lib.gb_verbs_last_error.argtypes = [c.c_void_p, c.c_char_p, c.c_size_t]
     lib.gb_verbs_telemetry.argtypes = [c.c_void_p, c.c_char_p, c.c_size_t]
     lib.gb_verbs_telemetry.restype = c.c_int64
+    lib.gb_verbs_op_outcome.argtypes = [c.c_void_p, c.c_int64, c.c_char_p, c.c_size_t]
+    lib.gb_verbs_op_outcome.restype = c.c_int64
     lib.gb_verbs_abort.argtypes = [c.c_void_p, c.c_char_p]
     lib.gb_verbs_close.argtypes = [c.c_void_p, c.c_double, c.c_char_p, c.c_size_t]
     lib.gb_verbs_rndv_bytes.argtypes, lib.gb_verbs_rndv_bytes.restype = [c.c_void_p], c.c_uint64
@@ -386,6 +388,18 @@ class Endpoint:
         while True:
             out = ctypes.create_string_buffer(size)
             n = self._lib.gb_verbs_telemetry(self._handle, out, size)
+            if n >= 0:
+                return json.loads(out.value.decode())
+            size = -n + 1
+
+    def operation_outcome(self, op: int) -> dict:
+        """Native outcome after a failed wait; valid even after abort, until close."""
+        if self._handle is None:
+            return {"status": "cancelled"}
+        size = 4096
+        while True:
+            out = ctypes.create_string_buffer(size)
+            n = self._lib.gb_verbs_op_outcome(self._handle, op, out, size)
             if n >= 0:
                 return json.loads(out.value.decode())
             size = -n + 1

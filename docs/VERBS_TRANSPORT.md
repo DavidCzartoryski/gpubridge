@@ -584,7 +584,7 @@ object per line:
 
 - `schema`, `t_wall`, `t_mono`, `rank`, `peer` (global ranks), `bridge`
   (`verbs`), `op` (`send` or `recv`), `bytes`, `duration_s` (first post to last
-  completion), `status` (`ok`, `error`, `timeout`), `error`;
+  completion), `status` (`ok`, `error`, `timeout`, `cancelled`), `error`;
 - top-level `host` (this node's hostname) and `job` (`GPUBRIDGE_JOB_ID`, else
   `SLURM_JOB_ID` or `TORCHELASTIC_RUN_ID`, else an id the members agree on through
   the c10d store);
@@ -595,6 +595,23 @@ object per line:
   `direct+bounce` call's receive records `bounced_bytes`; `step` when the caller sets
   `transport.step`; `collective` (the call's sequence number; unknown fields are
   ignored by the detector).
+
+MOCK/test-fabric records always carry `synthetic: true`. When an operation's own
+work completion fails, its record has `status: error` and `wc_status` using the
+stable libibverbs spelling (for example `IBV_WC_RETRY_EXC_ERR`). Other unfinished
+operations cancelled by that failure or a local abort have `status: cancelled`;
+operations already completed remain `ok`. A timeout marks outstanding operations
+`timeout`. Aggregating a peer/direction gives an error precedence over cancellation,
+and cancellation over success. Receive-slot/control failures that cannot be
+attributed to a user operation remain endpoint diagnostics; no invented operation
+WC status is attached to them.
+
+`bytes` is the requested total for a non-ok record, including a failed post; it is
+not a measurement of moved traffic. Successful records report completed payload
+bytes. **Pre-transfer refusals**, including forced-direct rejection in `_plan`,
+are exceptions/telemetry diagnostics and produce no transport observation: no
+operation was attempted. They must not be inferred as successful transfers or
+as zero-traffic hardware evidence.
 
 **Rate:** one record per collective call, per peer and direction that moved
 anything; a failed call gives one per peer and direction with its status.

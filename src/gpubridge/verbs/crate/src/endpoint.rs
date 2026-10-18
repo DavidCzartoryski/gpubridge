@@ -402,6 +402,9 @@ struct Op {
     done: bool,
     /// Set once the operation failed, which cancels it ([`State::fail_op`]).
     error: Option<String>,
+    /// Distinguishes collateral/local cancellation from the operation's own failure.
+    cancelled: bool,
+    wc_status: Option<WcStatus>,
     /// A receive the peer will RDMA WRITE into: the registration of exactly its bytes
     /// with remote write, made for this one receive ([`Registrar::expose`]). Its key is
     /// the one the write grant carries; it is deregistered once the "written" message
@@ -902,6 +905,8 @@ impl Endpoint {
                 kind,
                 done: false,
                 error: None,
+                cancelled: false,
+                wc_status: None,
                 exposure,
             },
         );
@@ -1099,6 +1104,34 @@ impl Endpoint {
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
         }
+    }
+
+    /// A failed wait leaves operations available for observation until close. Successful
+    /// waits forget them; callers already know those operations completed successfully.
+    pub fn operation_outcome(&self, id: i64) -> String {
+        let st = lock(&self.shared.state);
+        let Some(op) = st.ops.get(&id) else {
+            return "{\"status\":\"unknown\"}".into();
+        };
+        let status = if op.done {
+            "ok"
+        } else if op.cancelled {
+            "cancelled"
+        } else if op.error.is_some() {
+            "error"
+        } else {
+            "pending"
+        };
+        let wc = op
+            .wc_status
+            .map(|w| json_str(w.name()))
+            .unwrap_or_else(|| "null".into());
+        let error = op
+            .error
+            .as_deref()
+            .map(json_str)
+            .unwrap_or_else(|| "null".into());
+        format!("{{\"status\":{status:?},\"wc_status\":{wc},\"error\":{error}}}")
     }
 
     /// Fails the endpoint now: every operation is cancelled (so nothing reads or writes
@@ -1535,6 +1568,10 @@ impl Shared {
                     status_text(c.status)
                 );
                 st.fail_op(id, &why);
+                if let Some(op) = st.ops.get_mut(&id) {
+                    op.wc_status = Some(c.status);
+                    op.cancelled = c.status == WcStatus::WrFlushErr;
+                }
             } else {
                 peer.slot_use[slot as usize] = SlotUse::Free;
                 peer.free_send.push(slot);
@@ -1766,6 +1803,11 @@ impl Shared {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
+            if let Some(op) = st.ops.get_mut(&id) {
+                if !op.done && op.error.is_none() {
+                    op.cancelled = true;
+                }
+            }
             st.fail_op(id, why);
         }
         let peer = st.peer(member);
@@ -1779,6 +1821,11 @@ impl Shared {
         let why = st.failed.clone().unwrap_or_else(|| "cancelled".into());
         let ids: Vec<i64> = st.ops.keys().copied().collect();
         for id in ids {
+            if let Some(op) = st.ops.get_mut(&id) {
+                if !op.done && op.error.is_none() {
+                    op.cancelled = true;
+                }
+            }
             st.fail_op(id, &why);
         }
         for peer in st.peers.iter_mut().flatten() {

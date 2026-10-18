@@ -381,6 +381,28 @@ pub enum WcStatus {
     Other(u32),
 }
 
+impl WcStatus {
+    /// Stable libibverbs spelling for observation consumers (never parsed from prose).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Success => "IBV_WC_SUCCESS",
+            Self::LocLenErr => "IBV_WC_LOC_LEN_ERR",
+            Self::LocQpOpErr => "IBV_WC_LOC_QP_OP_ERR",
+            Self::LocProtErr => "IBV_WC_LOC_PROT_ERR",
+            Self::WrFlushErr => "IBV_WC_WR_FLUSH_ERR",
+            Self::BadRespErr => "IBV_WC_BAD_RESP_ERR",
+            Self::LocAccessErr => "IBV_WC_LOC_ACCESS_ERR",
+            Self::RemInvReqErr => "IBV_WC_REM_INV_REQ_ERR",
+            Self::RemAccessErr => "IBV_WC_REM_ACCESS_ERR",
+            Self::RemOpErr => "IBV_WC_REM_OP_ERR",
+            Self::RetryExcErr => "IBV_WC_RETRY_EXC_ERR",
+            Self::RnrRetryExcErr => "IBV_WC_RNR_RETRY_EXC_ERR",
+            Self::GeneralErr => "IBV_WC_GENERAL_ERR",
+            Self::Other(_) => "IBV_WC_UNKNOWN",
+        }
+    }
+}
+
 /// What the provider reported for one finished work request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawCompletion {

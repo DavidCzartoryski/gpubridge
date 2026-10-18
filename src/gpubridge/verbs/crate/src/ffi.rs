@@ -565,6 +565,28 @@ pub unsafe extern "C" fn gb_verbs_wait(
 /// # Safety
 /// `h` from gb_verbs_create; `out` holds `size` bytes.
 #[no_mangle]
+pub unsafe extern "C" fn gb_verbs_op_outcome(
+    h: *mut c_void,
+    id: i64,
+    out: *mut c_char,
+    size: usize,
+) -> i64 {
+    guard(FAILED, || {
+        // SAFETY: the caller's contract.
+        let text = unsafe { handle(h) }.endpoint.operation_outcome(id);
+        if write_c(&text, out, size) {
+            text.len() as i64
+        } else {
+            -(text.len() as i64 + 1)
+        }
+    })
+}
+
+/// The last error's text into `out` (truncated to fit).
+///
+/// # Safety
+/// `h` from gb_verbs_create; `out` holds `size` bytes.
+#[no_mangle]
 pub unsafe extern "C" fn gb_verbs_last_error(
     h: *mut c_void,
     out: *mut c_char,

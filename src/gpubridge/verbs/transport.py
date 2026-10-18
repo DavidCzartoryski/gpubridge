@@ -422,6 +422,17 @@ class VerbsTransport(TaggedBridge):
             self._keep.append((tensor, plan))
             raise
         finally:
+            if status != "ok" and hasattr(router.endpoint, "operation_outcome"):
+                for op in call.log.ops:
+                    if call.log.outcomes.get(op, {}).get("status") == "ok":
+                        continue
+                    outcome = router.endpoint.operation_outcome(op)
+                    if outcome["status"] in ("ok", "error", "cancelled"):
+                        # A timeout describes outstanding work, even though _guarded
+                        # has now cancelled it to make caller memory safe.
+                        if status == "timeout" and outcome["status"] == "cancelled":
+                            outcome = {"status": "timeout", "error": error}
+                        call.log.outcomes[op] = outcome
             router.end()
             self._device_scratch = None
             router.sync = router.flush = lambda: None
@@ -448,6 +459,8 @@ class VerbsTransport(TaggedBridge):
         if self.emitter is None:
             return
         base = {**self.base_record, "collective": self._seq}
+        if self.worker.endpoint.telemetry().get("mock"):
+            base["synthetic"] = True
         if path != "host":
             base["path"] = path
         if self.step is not None:

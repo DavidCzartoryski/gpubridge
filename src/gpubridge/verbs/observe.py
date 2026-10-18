@@ -209,6 +209,14 @@ class CallLog:
         self.done: dict[tuple[int, str], float] = {}
         #: Bytes of those that went through a host bounce buffer (direct path only).
         self.bounce: dict[tuple[int, str], int] = {}
+        self.outcomes: dict[int, dict] = {}
+        self.post_errors: dict[tuple[int, str], str] = {}
+
+    def failed_post(self, peer: int, direction: str, nbytes: int, exc: Exception) -> None:
+        key = (peer, direction)
+        self.start.setdefault(key, time.monotonic())
+        self.bytes[key] = self.bytes.get(key, 0) + nbytes
+        self.post_errors[key] = f"{type(exc).__name__}: {exc}"[:500]
 
     def posted(self, op: int, peer: int, direction: str, nbytes: int) -> None:
         key = (peer, direction)
@@ -226,21 +234,38 @@ class CallLog:
             key = self.ops.get(op)
             if key is not None:
                 self.done[key] = now
+                self.outcomes[op] = {"status": "ok"}
 
     def records(self, base: dict, status: str, error: str | None, members: list[int],
                 peer_nics: dict[int, dict]) -> list[dict]:
         now_wall, now_mono = time.time(), time.monotonic()
         out = []
         for (peer, direction), start in sorted(self.start.items()):
-            end = self.done.get((peer, direction), now_mono) if status == "ok" else now_mono
+            key = (peer, direction)
+            outcomes = [self.outcomes.get(op, {"status": status, "error": error})
+                        for op, group in self.ops.items() if group == key]
+            failed = next((o for o in outcomes if o["status"] == "error"), None)
+            if key in self.post_errors:
+                result = {"status": "error", "error": self.post_errors[key]}
+            elif failed is not None:
+                result = failed
+            elif outcomes and all(o["status"] == "ok" for o in outcomes):
+                result = {"status": "ok"}
+            else:
+                result = next((o for o in outcomes if o["status"] != "ok"),
+                              {"status": status, "error": error})
+            result_status = result["status"]
+            end = self.done.get(key, now_mono) if result_status == "ok" else now_mono
             record = {**base, "t_wall": now_wall - (now_mono - end), "t_mono": end,
                       "peer": members[peer], "peer_nic": peer_nics.get(peer),
                       "op": direction, "bytes": self.bytes[(peer, direction)],
-                      "duration_s": max(0.0, end - start), "status": status}
+                      "duration_s": max(0.0, end - start), "status": result_status}
             if (peer, direction) in self.bounce:
                 record["bounced_bytes"] = self.bounce[(peer, direction)]
-            if error is not None:
-                record["error"] = error
+            if result.get("error") is not None and result_status != "ok":
+                record["error"] = result["error"][:500]
+            if result.get("wc_status") is not None:
+                record["wc_status"] = result["wc_status"]
             out.append(record)
         return out
 

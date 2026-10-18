@@ -38,9 +38,15 @@ its regression tests are evidence, not an independent review.
 
 ## Detector findings at audit base
 
-F1 (missing synthetic marker), F2 (local abort labelled error), F3 (forced-direct
-rejection absent), F4 (one failure copied to all records), F5 (free-text-only WC
-status) and F8 (failed post absent) are valid software gaps to fix. F6 is a
+F1 (missing synthetic marker), F2 (local abort labelled error), F4 (one failure
+copied to all records), F5 (free-text-only WC status) and F8 (failed post absent)
+are fixed by the integration observation changes. Native `operation_outcome`
+preserves completion failures and distinguishes cancellations; `CallLog` preserves
+completed work and failed posts. Rust protocol tests cover root WC error versus
+collateral cancellation and local abort; Python observation tests cover aggregation,
+synthetic records and failed send/receive posts. F3 is resolved by explicitly
+documenting pre-transfer refusals as exceptions/telemetry only, without records;
+the forced-direct refusal test verifies that boundary. F6 is a
 non-issue under the agreed contract: non-ok `bytes` means requested bytes, not
 traffic moved. F7 (peer rate/PCI/host advertisement) is an optional enhancement;
 the base wire handshake carries only device, port and link layer. Never infer

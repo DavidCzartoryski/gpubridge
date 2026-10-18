@@ -340,11 +340,17 @@ fn a_failed_completion_and_a_fatal_async_event_propagate() {
         status: WcStatus::RemAccessErr,
     });
     let data = [1u8; 4];
+    let mut output = [0u8; 4];
+    let r = recv(&a, 1, &mut output, 77);
     let s = send(&a, 1, &data, 1);
     match a.wait(&[s], LONG) {
         Err(WaitError::Failed(e)) => assert!(e.contains("RemAccessErr"), "{e}"),
         other => panic!("{other:?}"),
     }
+    let outcome = a.operation_outcome(s);
+    assert!(outcome.contains("\"status\":\"error\""), "{outcome}");
+    assert!(outcome.contains("IBV_WC_REM_ACCESS_ERR"), "{outcome}");
+    assert!(a.operation_outcome(r).contains("\"status\":\"cancelled\""));
     fabric.inject(Fault::AsyncEvent {
         node: 1,
         event: AsyncEvent {
@@ -359,6 +365,21 @@ fn a_failed_completion_and_a_fatal_async_event_propagate() {
     }
     assert!(b.failure().unwrap().contains("DeviceFatal"));
     assert!(b.telemetry().contains("\"state\":\"failed\""));
+}
+
+#[test]
+fn local_abort_is_cancellation_without_a_work_completion_failure() {
+    let (fabric, a, b) = pair(&small());
+    let mut output = [0u8; 4];
+    let r = recv(&a, 1, &mut output, 88);
+    a.abort("local teardown");
+    let outcome = a.operation_outcome(r);
+    assert!(outcome.contains("\"status\":\"cancelled\""), "{outcome}");
+    assert!(outcome.contains("\"wc_status\":null"), "{outcome}");
+    assert!(a.wait(&[r], LONG).is_err());
+    drop(a);
+    drop(b);
+    assert!(fabric.violations().is_empty());
 }
 
 #[test]

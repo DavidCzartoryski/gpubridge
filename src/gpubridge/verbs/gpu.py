@@ -136,6 +136,14 @@ class Router:
         return op
 
     def send(self, member: int, pointer: int, nbytes: int, tag: int) -> int:
+        try:
+            return self._send(member, pointer, nbytes, tag)
+        except TransportError as exc:
+            if self.call is not None:
+                self.call.log.failed_post(member, "send", nbytes, exc)
+            raise
+
+    def _send(self, member: int, pointer: int, nbytes: int, tag: int) -> int:
         span = self._device(pointer, nbytes) if nbytes else None
         if span is not None:
             self._touch_device()
@@ -150,6 +158,14 @@ class Router:
         return self._log(op, member, "send", nbytes)
 
     def recv(self, member: int, pointer: int, nbytes: int, tag: int) -> int:
+        try:
+            return self._recv(member, pointer, nbytes, tag)
+        except TransportError as exc:
+            if self.call is not None:
+                self.call.log.failed_post(member, "recv", nbytes, exc)
+            raise
+
+    def _recv(self, member: int, pointer: int, nbytes: int, tag: int) -> int:
         span = self._device(pointer, nbytes) if nbytes else None
         if span is not None:
             self._touch_device()

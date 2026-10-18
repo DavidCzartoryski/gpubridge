@@ -471,6 +471,7 @@ def test_the_staged_path_with_cpu_tensors_standing_in_and_its_observations(tmp_p
         for r in records:
             observe.check_record(r)
             assert r["schema"] == observe.SCHEMA
+            assert r["synthetic"] is True
             assert r["job"] == "job-a3" and r["host"] and r["bridge"] == "verbs"
             assert "pci_bus_id" in r["nic"] and r["nic"]["device"] == "mockfab0"
             assert r["nic"]["link_layer"] == "InfiniBand"
@@ -479,3 +480,96 @@ def test_the_staged_path_with_cpu_tensors_standing_in_and_its_observations(tmp_p
             assert r["path"] == "staged" and r["bytes"] > 0 and r["duration_s"] >= 0
             assert r["t_wall"] > 1.7e9 and isinstance(r["rank"], int)
             assert r["peer"] != r["rank"]
+
+
+def test_observations_keep_root_failure_separate_from_cancelled_and_completed_work(monkeypatch):
+    endpoint = FakeEndpoint()
+    planner = _planner(endpoint, monkeypatch)
+    planner.emitter = Records()
+    endpoint.telemetry = lambda: {"mock": True}
+    endpoint.abort = lambda why: None
+    outcomes = {
+        1: {"status": "error", "error": "retry exhausted", "wc_status": "IBV_WC_RETRY_EXC_ERR"},
+        2: {"status": "cancelled", "error": "retry exhausted"},
+    }
+    endpoint.operation_outcome = outcomes.__getitem__
+    tensor = torch.ones(8)
+
+    def run(t):
+        planner.worker.send(1, t.data_ptr(), 32, 1)
+        planner.worker.recv(1, t.data_ptr(), 32, 2)
+        raise verbs.TransportError("a send failed with retry exhausted")
+
+    with pytest.raises(verbs.TransportError):
+        planner._run("host", None, tensor, run)
+    by_op = {r["op"]: r for r in planner.emitter.records}
+    assert by_op["send"]["status"] == "error"
+    assert by_op["send"]["wc_status"] == "IBV_WC_RETRY_EXC_ERR"
+    assert by_op["recv"]["status"] == "cancelled"
+    assert "wc_status" not in by_op["recv"]
+    assert all(r["synthetic"] for r in by_op.values())
+
+    log = observe.CallLog()
+    log.posted(1, 1, "send", 4)
+    log.completed([1])
+    record = log.records({}, "error", "another operation failed", [0, 1], {})[0]
+    assert record["status"] == "ok" and "error" not in record
+
+
+@pytest.mark.parametrize("direction", ["send", "recv"])
+def test_a_failed_post_is_observed_with_requested_bytes(direction):
+    endpoint = FakeEndpoint()
+    router = Router(endpoint)
+    call = router.begin([])
+
+    def reject(*args):
+        raise verbs.TransportError("posting failed: queue pair in state Err")
+
+    setattr(endpoint, direction, reject)
+    with pytest.raises(verbs.TransportError, match="posting failed"):
+        getattr(router, direction)(1, 0, 1024, 7)
+    record = call.log.records({}, "error", "posting failed", [0, 1], {})[0]
+    assert record["op"] == direction and record["bytes"] == 1024
+    assert record["status"] == "error" and "queue pair in state Err" in record["error"]
+
+
+def test_forced_direct_refusal_is_a_pre_transfer_diagnostic_without_observations(monkeypatch):
+    endpoint = FakeEndpoint()
+    endpoint.caps = {"dmabuf": "unavailable", "peer_memory": "unavailable"}
+    planner = _planner(endpoint, monkeypatch)
+    planner.gpu_path = "direct"
+    planner.emitter = Records()
+    planner._is_device = lambda t: True
+    with pytest.raises(RuntimeError, match="staging is off"):
+        planner._call(torch.ones(8), 0, lambda t: pytest.fail("a refused call cannot run"))
+    assert planner.emitter.records == []
+    assert planner.telemetry()["gpus"]["0"]["direct"] is False
+
+
+@needs_library
+def test_native_local_abort_is_emitted_as_cancelled(monkeypatch, tmp_path):
+    fabric = tempfile.mkdtemp(prefix="gbvf-abort-", dir="/tmp")
+    monkeypatch.setenv(verbs.TEST_FABRIC_ENV, fabric)
+    a = verbs.Endpoint(2, 0, {})
+    b = verbs.Endpoint(2, 1, {})
+    try:
+        a.connect(1, b.local_info())
+        b.connect(0, a.local_info())
+        planner = vt.VerbsTransport(Router(a), [0, 1], 0, timedelta(seconds=5), 4096,
+                                   emitter=Records())
+        tensor = torch.zeros(8)
+
+        def run(t):
+            op = planner.worker.recv(1, t.data_ptr(), 32, 777)
+            a.abort("local teardown")
+            planner.worker.wait([op], 0)
+
+        with pytest.raises(verbs.TransportError):
+            planner._run("host", None, tensor, run)
+        record, = planner.emitter.records
+        assert record["status"] == "cancelled" and record["synthetic"] is True
+        assert "wc_status" not in record
+    finally:
+        a.close(timeout=1)
+        b.close(timeout=1)
+        shutil.rmtree(fabric, ignore_errors=True)
