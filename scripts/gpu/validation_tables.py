@@ -130,8 +130,14 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
          [Step(r"pp_(gpipe|1f1b)_(even|auto|[0-9]+(-[0-9]+)+)")]),
     37: ("Megatron-Core's pipeline across vendors tracks one GPU",
          [Step("megatron_pp2"), Step("megatron_pp1")]),
-    # No kit step yet: the hardware commands come with the GPU paths (phase A3).
-    38: ("The verbs bridge on RDMA hardware", []),
+    38: ("The verbs bridge between hosts on RDMA hardware",
+         [Step("verbs_build"), Step("verbs_endpoint"), Step("verbs_host"), Step("check_verbs"),
+          Step("bench_verbs")]),
+    39: ("GPU tensors staged through the verbs bridge", [Step("verbs_gpu_staged")]),
+    40: ("NVIDIA GPU memory direct through the verbs bridge", [Step("verbs_gpu_direct")]),
+    41: ("AMD GPU memory direct through the verbs bridge", [Step("verbs_gpu_direct")]),
+    42: ("Training over the verbs bridge against the Gloo bridge",
+         [Step("train_verbs"), Step("train_gloo")]),
 }
 
 

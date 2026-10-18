@@ -544,27 +544,90 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     *Step:* `megatron_pp1` and `megatron_pp2` in
     Explorer step 07 with `STEPS_07=megatron`.
 
-38. **The verbs bridge on RDMA hardware.** `bridge="verbs"`
+38. **The verbs bridge between hosts on RDMA hardware.** `bridge="verbs"`
     (docs/VERBS_TRANSPORT.md) moves the bridge over RC queue pairs on
-    libibverbs: its own wire protocol of RC SEND/RECV through registered host
-    buffers, with credits and a completion thread. Between two machines on one
-    InfiniBand or RoCE fabric: the endpoint each leader selects (device, port,
-    GID) as telemetry reports it; every bridge policy bit for bit against
-    `flat-gloo`; a deliberately lost peer and a short deadline fail with their
-    reasons; teardown with work outstanding leaks nothing; no bridge payload
-    on TCP (port counters move, the Gloo bridge isn't used); then its bridge
-    phase against the Gloo and multitcp bridges at each size. *Status: works on
-    the mock providers only: the protocol's failure cases on the in-process mock
-    (`src/gpubridge/verbs/crate/tests/protocol.rs`), and every bridge policy,
-    compression, subgroups and async on two, three and four leaders, bit for bit
-    against `flat-gloo`, between processes on the MOCK test fabric
-    (`tests/test_verbs.py`). The libibverbs provider compiles and links on
-    Explorer's login node; it has opened no device. Not validated on RDMA
-    hardware or GPUs.* *BLOCKED: hardware/authorization:* needs two allocated
-    nodes with an RDMA device each on one fabric (Explorer's `mlx5_0` nodes),
-    permission to open the devices from a job, the library built there
-    (`python -m gpubridge.verbs build` with rdma-core's headers), and kit steps
-    for it, which come with phase A3.
+    libibverbs: its wire protocol (version 2) of RC SEND/RECV with credits and a
+    completion thread, and RDMA WRITE into memory registered for one receive
+    (rendezvous, from `GPUBRIDGE_VERBS_RNDV_BYTES`). Between two machines on one
+    InfiniBand or RoCE fabric (step 05 with `VERBS_BRIDGE=1`): the endpoint each
+    leader selects (device, port, GID) as telemetry reports it, and that the
+    provider is libibverbs, not MOCK; host-to-host verbs without collectives
+    (`verbs_endpoint`: latency, a bandwidth sweep, SHA-256 of every buffer on
+    both sides, CPU time); host tensors through the collectives exactly against
+    a Gloo reduction (`verbs_host`); every bridge policy (`check_verbs`); a
+    deliberately lost peer and a short deadline fail with their reasons;
+    teardown with work outstanding leaks nothing; no bridge payload on TCP
+    (every `verbs_kit` record's counter window: the RDMA port's data counters
+    moved at least the payload, no interface's IP bytes moved more than 5% of
+    it); then its bridge phase against the Gloo, multitcp and UCX bridges at
+    each size (`bench_verbs`). *Status: works on the mock providers only: the
+    protocol's failure cases and the rendezvous on the in-process mock
+    (`src/gpubridge/verbs/crate/tests/protocol.rs`, `tests/direct.rs`), and
+    every bridge policy, compression, subgroups and async on two, three and four
+    leaders, bit for bit against `flat-gloo`, between processes on the MOCK test
+    fabric (`tests/test_verbs.py`); the kit's `verbs_kit.py` ran on the MOCK
+    fabric only. The libibverbs provider compiles and links on Explorer's login
+    node; it has opened no device. Not validated on RDMA hardware or GPUs.*
+    *BLOCKED: hardware/authorization:* needs two allocated nodes with an RDMA
+    device each on one fabric, permission to open the devices from a job
+    (`/dev/infiniband/uverbs*`), the library built there (`python -m
+    gpubridge.verbs build` with rdma-core's headers, or
+    `GPUBRIDGE_VERBS_INCLUDE_DIR`), and project authorization to run the job.
+
+39. **GPU tensors staged through the verbs bridge.** With
+    `GPUBRIDGE_VERBS_GPU_PATH=staged`, every call on a GPU tensor copies it
+    into a pinned host buffer registered with the NIC on the caller's stream,
+    waits for that copy before the bridge reads, and queues the copy back
+    (`verbs_gpu_staged`, steps 05 and 07). Every call's record says `path`
+    `staged` and its reason; results exact against Gloo; no payload on TCP;
+    the same with async collectives and busy GPUs (`check_verbs`). Same-vendor
+    (step 05) and cross-vendor (step 07) separately. *Status: the stream
+    ordering is tested with CPU tensors standing in and lazy copies
+    (`tests/test_verbs_gpu.py`), not on a GPU.* *BLOCKED: hardware/authorization:*
+    item 38's prerequisites plus GPUs on those nodes and a CUDA or ROCm build
+    of PyTorch there.
+
+40. **NVIDIA GPU memory direct through the verbs bridge.** With
+    `GPUBRIDGE_VERBS_GPU_PATH=direct` on NVIDIA leaders, every call registers the
+    tensor (and the reduction's scratch) with the NIC: a dma-buf from
+    `cuMemGetHandleForAddressRange` into `ibv_reg_dmabuf_mr` where the driver
+    reports `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED`, else `ibv_reg_mr` on the
+    device pointer with `nvidia_peermem` loaded; `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS`
+    set once per registration; the cache keyed by `CU_POINTER_ATTRIBUTE_BUFFER_ID`;
+    the host waits for the caller's stream before the NIC touches the memory;
+    `cuFlushGPUDirectRDMAWrites` after receives where the GPU doesn't order
+    remote writes itself (`verbs_gpu_direct`). The record names the method and
+    the flush; `direct` must fail loudly, not stage, where a check fails.
+    Results exact against Gloo; registrations and dma-buf descriptors released
+    at close (telemetry). *Status: selection, descriptor lifetimes, cache
+    invalidation on reallocation and the rendezvous into device memory are
+    tested on a mock GPU and the mock provider (`tests/direct.rs`); the CUDA
+    calls are compiled, never run.* *BLOCKED: hardware/authorization:* item 39's
+    prerequisites on NVIDIA GPUs, plus either dma-buf support (the open GPU
+    kernel modules, a kernel with dma-buf, and an RDMA driver that imports
+    dma-bufs: `rdma_report.sh` records each) or the `nvidia_peermem` module
+    loaded on both nodes.
+
+41. **AMD GPU memory direct through the verbs bridge.** As item 40 on AMD
+    leaders: the dma-buf comes from ROCr (`hsa_amd_portable_export_dmabuf`, closed
+    with `hsa_amd_portable_close_dmabuf` after deregistering) where ROCr reports
+    `HSA_AMD_SYSTEM_INFO_DMABUF_SUPPORTED`; allocation identity from HIP's
+    `HIP_POINTER_ATTRIBUTE_BUFFER_ID` and `hipMemGetAddressRange`; after
+    receives, `hipDeviceFlushGPUDirectRDMAWrites` or the HDP flush register
+    (as the UCX bridge's direct path). No peer-memory path on AMD. Cross-vendor
+    (one NVIDIA and one AMD leader, step 07) separately from AMD pairs. *Status:
+    the ROCm calls are compiled against ROCm 6.3's documented signatures, never
+    run; the selection and lifetimes are the mock GPU's tests.* *BLOCKED:
+    hardware/authorization:* item 39's prerequisites on AMD GPUs with ROCm 6.x,
+    a kernel and amdgpu driver with dma-buf export, and an RDMA driver that
+    imports dma-bufs.
+
+42. **Training over the verbs bridge against the Gloo bridge.**
+    `train_bench.py` with `GPUBRIDGE_BRIDGE=verbs` and with `gloo` on the same
+    nodes (`train_verbs`, `train_gloo`, steps 05 and 07): the loss curves agree
+    as the Gloo bridge's runs do, throughput and the step split side by side,
+    the verbs runs' observations (`verbs_observations/`) cover every step.
+    *Status: not run.* *BLOCKED: hardware/authorization:* items 38 to 41.
 
 32. **Point-to-point across islands through the backend on GPUs.** `send`,
     `recv`, `isend`, `irecv` and `batch_isend_irecv` on `backend="gpubridge"`
@@ -661,7 +724,11 @@ failures count against all six whichever test failed.
 | 35. The multitcp bridge against the Gloo bridge | step `multitcp_build`; step `matrix_D-multitcp(-pinned\|-1stream)?` | not run |
 | 36. Automatic stage balancing against even and hand-tuned splits | step `pp_(gpipe\|1f1b)_(even\|auto\|[0-9]+(-[0-9]+)+)` | not run |
 | 37. Megatron-Core's pipeline across vendors tracks one GPU | step `megatron_pp2`; step `megatron_pp1` | not run |
-| 38. The verbs bridge on RDMA hardware |  | not run |
+| 38. The verbs bridge between hosts on RDMA hardware | step `verbs_build`; step `verbs_endpoint`; step `verbs_host`; step `check_verbs`; step `bench_verbs` | not run |
+| 39. GPU tensors staged through the verbs bridge | step `verbs_gpu_staged` | not run |
+| 40. NVIDIA GPU memory direct through the verbs bridge | step `verbs_gpu_direct` | not run |
+| 41. AMD GPU memory direct through the verbs bridge | step `verbs_gpu_direct` | not run |
+| 42. Training over the verbs bridge against the Gloo bridge | step `train_verbs`; step `train_gloo` | not run |
 
 Where the FAILs come from:
 
