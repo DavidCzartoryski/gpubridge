@@ -83,7 +83,9 @@ def test_settings(monkeypatch):
     for env in (CHUNK_BYTES_ENV, SLOT_BYTES_ENV, CREDITS_ENV):
         monkeypatch.delenv(env, raising=False)
     assert verbs_transport.chunk_bytes_setting() == 4 * 2**20
-    assert set(verbs_transport.endpoint_settings().values()) == {None}
+    defaults = verbs_transport.endpoint_settings()
+    assert defaults.pop("rndv_bytes") == verbs_transport.DEFAULT_RNDV_BYTES
+    assert set(defaults.values()) == {None}
     monkeypatch.setenv(CHUNK_BYTES_ENV, "64K")
     monkeypatch.setenv(SLOT_BYTES_ENV, "8K")
     monkeypatch.setenv(CREDITS_ENV, "16")
@@ -98,7 +100,7 @@ def test_settings(monkeypatch):
 def test_verbs_is_a_known_bridge_and_not_the_default():
     assert gpubridge.resolve_transport("verbs") is VerbsTransport
     assert gpubridge.transport.DEFAULT_TRANSPORT == "gloo"
-    assert VerbsTransport.device_tensors is False
+    assert VerbsTransport.device_tensors is True
 
 
 def test_the_test_build_and_the_real_build_are_different_libraries():
@@ -117,7 +119,7 @@ def test_off_linux_the_real_library_says_why(monkeypatch):
 @needs_library
 def test_the_test_library_reports_its_providers():
     lib = verbs.load(test_fabric=True)
-    assert verbs.protocol(lib) == 1
+    assert verbs.protocol(lib) == 2
     assert "test-fabric" in verbs.build_info(lib)
     assert "libibverbs" not in verbs.build_info(lib)
 
@@ -227,7 +229,7 @@ def _check_empty_and_bad_tensors(topology):
             empty = torch.empty(0)
             bridge.all_reduce(empty)
             bridge.broadcast(empty, bridge.members[0])
-        with pytest.raises(ValueError, match="contiguous host tensors"):
+        with pytest.raises(ValueError, match="contiguous host or GPU tensors"):
             bridge.all_reduce(torch.ones(4, 2).t())
         tensor = torch.ones(3)
         bridge.all_reduce(tensor)  # a bad argument leaves the bridge working
@@ -249,8 +251,9 @@ def _check_telemetry(topology):
     if bridge is not None:
         t = bridge.telemetry()
         assert t["mock"] is True and t["provider"].startswith("MOCK"), t
-        assert (t["protocol"], t["path"], t["state"]) == (1, "host", "ok"), t
-        assert t["operations"] == "RC SEND/RECV"
+        assert (t["protocol"], t["path"], t["state"]) == (2, "host", "ok"), t
+        assert t["operations"] == "RC SEND/RECV, RDMA WRITE (rendezvous)"
+        assert t["rndv_bytes"] == verbs_transport.DEFAULT_RNDV_BYTES
         assert t["device"] == "mockfab0" and t["link_layer"] == "InfiniBand"
         assert t["bytes_sent"] >= 4000 and t["bytes_received"] >= 4000
         assert [p["connected"] for p in t["peers"]] == [True] * (len(bridge.members) - 1)

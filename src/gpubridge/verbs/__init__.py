@@ -35,6 +35,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 CRATE = Path(__file__).with_name("crate")
@@ -155,8 +156,24 @@ def _declare(lib: ctypes.CDLL) -> ctypes.CDLL:
     lib.gb_verbs_telemetry.restype = c.c_int64
     lib.gb_verbs_abort.argtypes = [c.c_void_p, c.c_char_p]
     lib.gb_verbs_close.argtypes = [c.c_void_p, c.c_double, c.c_char_p, c.c_size_t]
+    lib.gb_verbs_rndv_bytes.argtypes, lib.gb_verbs_rndv_bytes.restype = [c.c_void_p], c.c_uint64
+    lib.gb_verbs_gpu_load.argtypes = [c.c_void_p, c.c_char_p, c.c_char_p, c.c_size_t]
+    lib.gb_verbs_gpu_caps.argtypes = [c.c_void_p, c.c_int, c.c_char_p, c.c_size_t]
+    lib.gb_verbs_gpu_caps.restype = c.c_int64
+    lib.gb_verbs_reg_device.argtypes = [c.c_void_p, c.c_int, c.c_uint64, c.c_uint64,
+                                        c.POINTER(c.c_uint64), c.POINTER(c.c_int)]
+    lib.gb_verbs_reg_host.argtypes = [c.c_void_p, c.c_void_p, c.c_size_t, c.c_uint64,
+                                      c.POINTER(c.c_uint64)]
+    lib.gb_verbs_release.argtypes = [c.c_void_p, c.c_uint64]
+    lib.gb_verbs_invalidate_host.argtypes = [c.c_void_p, c.c_uint64]
+    for name in ("gb_verbs_send_reg", "gb_verbs_recv_reg"):
+        getattr(lib, name).argtypes = [c.c_void_p, c.c_int, c.c_uint64, c.c_uint64, c.c_uint64,
+                                       c.c_uint64]
+        getattr(lib, name).restype = c.c_int64
     for name in ("gb_verbs_build_info", "gb_verbs_local_info", "gb_verbs_connect",
-                 "gb_verbs_wait", "gb_verbs_last_error", "gb_verbs_abort", "gb_verbs_close"):
+                 "gb_verbs_wait", "gb_verbs_last_error", "gb_verbs_abort", "gb_verbs_close",
+                 "gb_verbs_gpu_load", "gb_verbs_reg_device", "gb_verbs_reg_host",
+                 "gb_verbs_release", "gb_verbs_invalidate_host"):
         getattr(lib, name).restype = c.c_int
     return lib
 
@@ -204,6 +221,22 @@ def build_info(lib: ctypes.CDLL | None = None) -> str:
     out = ctypes.create_string_buffer(256)
     (lib or load()).gb_verbs_build_info(out, len(out))
     return out.value.decode()
+
+
+@dataclass(frozen=True)
+class Registration:
+    """Memory the library registered for the device to read and write in place: a handle
+    for :meth:`Endpoint.send_reg` and :meth:`Endpoint.recv_reg`, the registered range
+    (``addr``, ``length``: what offsets are counted from) and how (``dmabuf``,
+    ``peer_memory`` or ``host``). Give it back with :meth:`Endpoint.release`."""
+
+    handle: int
+    addr: int
+    length: int
+    method: str
+
+    def contains(self, pointer: int, nbytes: int) -> bool:
+        return self.addr <= pointer and pointer + nbytes <= self.addr + self.length
 
 
 class Endpoint:
@@ -266,6 +299,76 @@ class Endpoint:
         self._usable()
         return self._check(self._lib.gb_verbs_recv(self._handle, member, pointer, nbytes, tag))
 
+    def rndv_bytes(self) -> int:
+        """Messages of at least this many bytes go by rendezvous (0: none)."""
+        return int(self._lib.gb_verbs_rndv_bytes(self._handle))
+
+    def load_gpu(self, vendor: str) -> str:
+        """Load the ``cuda`` or ``rocm`` driver into the library; its description.
+
+        Raises:
+            TransportError: with the reason it can't be used.
+        """
+        self._usable()
+        out = ctypes.create_string_buffer(1024)
+        if self._lib.gb_verbs_gpu_load(self._handle, vendor.encode(), out, len(out)) != 0:
+            raise TransportError(self._error())
+        return out.value.decode()
+
+    def gpu_capabilities(self, device: int) -> dict:
+        """What the direct paths can do on ``device``: ``{"driver", "dmabuf",
+        "peer_memory"}``, each ``ok`` (with the module) or the reason."""
+        size = 4096
+        while True:
+            out = ctypes.create_string_buffer(size)
+            n = self._lib.gb_verbs_gpu_caps(self._handle, device, out, size)
+            if n >= 0:
+                return json.loads(out.value.decode())
+            size = -n + 1
+
+    def register_device(self, device: int, pointer: int, nbytes: int) -> Registration | str:
+        """A direct registration of device memory (dma-buf, then peer memory), or the
+        reasons there is none (the caller stages instead and says why)."""
+        self._usable()
+        out, method = (ctypes.c_uint64 * 3)(), ctypes.c_int(0)
+        if self._lib.gb_verbs_reg_device(self._handle, device, pointer, nbytes, out,
+                                         ctypes.byref(method)) != 0:
+            return self._error()
+        return Registration(out[0], out[1], out[2],
+                            "dmabuf" if method.value == 1 else "peer_memory")
+
+    def register_host(self, pointer: int, nbytes: int, owner: int) -> Registration:
+        """Register host memory the caller owns and identifies as ``owner``. The caller
+        keeps it valid until :meth:`invalidate_host` and :meth:`release`, and every
+        operation on it is done, or the endpoint closed."""
+        self._usable()
+        out = (ctypes.c_uint64 * 3)()
+        if self._lib.gb_verbs_reg_host(self._handle, pointer, nbytes, owner, out) != 0:
+            raise TransportError(self._error())
+        return Registration(out[0], out[1], out[2], "host")
+
+    def release(self, registration: Registration) -> None:
+        if self._handle is not None:
+            self._lib.gb_verbs_release(self._handle, registration.handle)
+
+    def invalidate_host(self, owner: int) -> int:
+        """Drop ``owner``'s host registrations; how many were still in use."""
+        if self._handle is None:
+            return 0
+        return int(self._lib.gb_verbs_invalidate_host(self._handle, owner))
+
+    def send_reg(self, member: int, registration: Registration, pointer: int, nbytes: int,
+                 tag: int) -> int:
+        self._usable()
+        return self._check(self._lib.gb_verbs_send_reg(
+            self._handle, member, registration.handle, pointer - registration.addr, nbytes, tag))
+
+    def recv_reg(self, member: int, registration: Registration, pointer: int, nbytes: int,
+                 tag: int) -> int:
+        self._usable()
+        return self._check(self._lib.gb_verbs_recv_reg(
+            self._handle, member, registration.handle, pointer - registration.addr, nbytes, tag))
+
     def wait(self, ids: Sequence[int], deadline: float) -> None:
         """Wait for operations ``ids`` until ``deadline`` (``time.monotonic()``)."""
         self._usable()
@@ -288,19 +391,27 @@ class Endpoint:
             size = -n + 1
 
     def abort(self, why: str = "aborted") -> None:
-        """Fail the endpoint now: once this returns, nothing reads or writes the memory of
-        any operation posted (the library copies through its own registered slots and
-        cancels every operation under its lock). Every later call raises."""
+        """Fail the endpoint now: once this returns, nothing reads or writes the plain
+        memory of any operation posted (the library copies it through its own slots and
+        cancels every operation under its lock), and every queue pair is in the error
+        state, so no peer can write any more. Registered memory of failed operations stays
+        registered until :meth:`close`: keep it allocated until then. Every later call
+        raises."""
         if self._handle is not None:
             if self.failed is None:
                 self.failed = why
             self._lib.gb_verbs_abort(self._handle, why.encode())
 
-    def close(self, timeout: float = 10.0) -> None:
+    def close(self, timeout: float = 10.0) -> bool:
+        """Close; False if work didn't drain in time. Its memory then stays registered
+        (leaked): the endpoint's own slots, and any registered caller memory that work
+        still held, which the caller must then never free."""
         if self._handle is not None:
             handle, self._handle = self._handle, None
             error = ctypes.create_string_buffer(1024)
             if self._lib.gb_verbs_close(handle, timeout, error, len(error)) != 0:
                 log.warning("gpubridge: closing the verbs bridge left work undrained after "
-                            "%g s; its slots stay registered (leaked, never the caller's "
-                            "memory): %s", timeout, error.value.decode())
+                            "%g s; its memory stays registered (leaked, never released "
+                            "early): %s", timeout, error.value.decode())
+                return False
+        return True

@@ -134,6 +134,11 @@ class TaggedBridge(BridgeTransport):
         if not tensor.is_contiguous() or tensor.device.type != "cpu":
             raise ValueError(f"the {self.name} bridge carries contiguous host tensors")
 
+    def _scratch(self, numel: int, like: torch.Tensor) -> torch.Tensor:
+        """A buffer of ``numel`` elements like ``like`` for incoming data (a subclass may
+        hand out one its worker has registered)."""
+        return torch.empty(numel, dtype=like.dtype, device=like.device)
+
     def _start(self, tensor: torch.Tensor) -> tuple[int, float, int]:
         self._seq += 1
         chunk = max(1, self.chunk_bytes // tensor.element_size())
@@ -178,7 +183,7 @@ class TaggedBridge(BridgeTransport):
         flat = tensor.view(-1)
         if size == 2:
             (peer,) = self._peers()
-            scratch = torch.empty_like(flat)
+            scratch = self._scratch(flat.numel(), flat)
             received = self._recv(peer, scratch, seq, 0, chunk)
             sent = self._send(peer, flat, seq, 0, chunk)
             # Chunk i is reduced once it has arrived and this side's copy of it has gone
@@ -190,7 +195,7 @@ class TaggedBridge(BridgeTransport):
             return
         right, left = (self.index + 1) % size, (self.index - 1) % size
         segments = _segments(flat.numel(), size)
-        scratch = torch.empty(max(length for _, length in segments), dtype=flat.dtype)
+        scratch = self._scratch(max(length for _, length in segments), flat)
 
         def segment(i: int) -> torch.Tensor:
             start, length = segments[i % size]
