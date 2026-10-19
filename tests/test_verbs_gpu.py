@@ -364,6 +364,17 @@ def test_records_with_key_like_names_are_refused():
             observe.check_record(bad)
 
 
+def test_the_key_check_still_refuses_after_names_are_remembered():
+    clean = {"nic": {"device": "mlx5_0"}, "peers": [[{"port": 1}]], "bytes": 8}
+    for _ in range(2):
+        observe.check_record(clean)
+    # Below remembered names, inside nested lists, and every time: never remembered.
+    for bad in ({"nic": {"rkey": 1}}, {"peers": [[{"lkey": 2}]]}, {"bytes": 8, "Key": 3}):
+        for _ in range(2):
+            with pytest.raises(ValueError, match="looks like a key"):
+                observe.check_record(bad)
+
+
 def test_nic_identity_comes_from_sysfs_and_is_null_where_absent(tmp_path):
     pci = tmp_path / "devices" / "0000:3b:00.0"
     pci.mkdir(parents=True)

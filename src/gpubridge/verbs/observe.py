@@ -50,16 +50,27 @@ SYSFS = Path("/sys/class/infiniband")
 _KEYLIKE = re.compile(r"(^|_)(rkey|lkey|mkey|qkey|remote_key|key)$", re.IGNORECASE)
 
 
+#: Field names already found not key-like. Records repeat the same few names, so each is
+#: matched once; the bound keeps odd input from growing it without limit.
+_CLEAN_NAMES: set[str] = set()
+_CLEAN_LIMIT = 4096
+
+
 def check_record(record: object, path: str = "") -> None:
     """Raise ValueError if ``record`` has a key-like field name anywhere."""
     if isinstance(record, dict):
         for name, value in record.items():
-            if _KEYLIKE.search(str(name)):
-                raise ValueError(f"observation field {path}{name} looks like a key")
-            check_record(value, f"{path}{name}.")
+            if name not in _CLEAN_NAMES:
+                if _KEYLIKE.search(str(name)):
+                    raise ValueError(f"observation field {path}{name} looks like a key")
+                if isinstance(name, str) and len(_CLEAN_NAMES) < _CLEAN_LIMIT:
+                    _CLEAN_NAMES.add(name)
+            if isinstance(value, (dict, list)):
+                check_record(value, f"{path}{name}.")
     elif isinstance(record, list):
         for item in record:
-            check_record(item, path)
+            if isinstance(item, (dict, list)):
+                check_record(item, path)
 
 
 def job_id(store=None, key: str = "gpubridge/verbs/job") -> str:
