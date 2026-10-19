@@ -46,7 +46,12 @@ copied to all records), F5 (free-text-only WC status) and F8 (failed post absent
 are fixed by the integration observation changes. Native `operation_outcome`
 preserves completion failures and distinguishes cancellations; `CallLog` preserves
 completed work and failed posts. Rust protocol tests cover root WC error versus
-collateral cancellation and local abort; Python observation tests cover aggregation,
+collateral cancellation and local abort. The safety review's #1 (faults with no
+operation to blame gave only `cancelled`) is fixed natively: device, port and
+queue pair faults, a protocol break, a failed receive completion (with its
+`wc_status`), failed verbs and a departed peer are the reached operations' own
+`error` (`tests/protocol.rs`: `device_port_and_queue_pair_faults_*`,
+`a_failed_receive_completion_*`, `a_protocol_break_*`); Python observation tests cover aggregation,
 synthetic records and failed send/receive posts. F3 is resolved by explicitly
 documenting pre-transfer refusals as exceptions/telemetry only, without records;
 the forced-direct refusal test verifies that boundary. F6 is a

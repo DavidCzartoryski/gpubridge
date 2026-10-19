@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{eventually, garbage, ib_fabric, roce_gid, RawMember};
+use gpubridge_verbs::protocol::Info;
 use gpubridge_verbs::{
     AsyncEvent, AsyncEventKind, Config, Endpoint, Fault, ForkStatus, MockDevice, MockFabric,
     MockPort, Mtu, NodeId, PortState, WaitError, WcStatus,
@@ -391,6 +392,119 @@ fn a_port_going_down_fails_the_endpoint() {
         thread::sleep(Duration::from_millis(2));
     }
     assert!(a.failure().unwrap().contains("PortErr on port 1"));
+}
+
+/// The failure an operation's outcome reports once its wait has failed.
+fn failed_outcome(ep: &Endpoint, id: i64, why: &str) -> String {
+    match ep.wait(&[id], LONG) {
+        Err(WaitError::Failed(e)) => assert!(e.contains(why), "{e}"),
+        other => panic!("{other:?}"),
+    }
+    ep.operation_outcome(id)
+}
+
+/// A fault of the device, a port or a queue pair is the `error` of the operations it
+/// reaches (every one, for the device and its ports), not their cancellation: no single
+/// operation caused it, and an observer must still see a failure (docs: "Transport
+/// observations").
+#[test]
+fn device_port_and_queue_pair_faults_are_the_operations_own_errors() {
+    let qp_fatal = |b: &Endpoint| AsyncEvent {
+        kind: AsyncEventKind::QpFatal,
+        qp_num: Some(Info::decode(&b.local_info()).unwrap().qpns[0]),
+        port: None,
+    };
+    for fault in ["DeviceFatal", "PortErr on port 1", "QpFatal on queue pair"] {
+        let (fabric, a, b) = pair(&small());
+        let mut out = [0u8; 4];
+        let r = recv(&b, 0, &mut out, 99);
+        match fault {
+            "DeviceFatal" => fabric.inject(Fault::AsyncEvent {
+                node: 1,
+                event: AsyncEvent {
+                    kind: AsyncEventKind::DeviceFatal,
+                    qp_num: None,
+                    port: None,
+                },
+            }),
+            "PortErr on port 1" => fabric.set_port_state(1, 0, 1, PortState::Down),
+            _ => fabric.inject(Fault::AsyncEvent {
+                node: 1,
+                event: qp_fatal(&b),
+            }),
+        }
+        eventually(LONG, fault, || b.telemetry().contains(fault));
+        let outcome = failed_outcome(&b, r, fault);
+        assert!(
+            outcome.contains("\"status\":\"error\""),
+            "{fault}: {outcome}"
+        );
+        assert!(outcome.contains("\"wc_status\":null"), "{fault}: {outcome}");
+        drop((a, b));
+        assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+    }
+}
+
+/// A receive's failed work completion is not any one operation's, so it is the error
+/// of every operation with that peer, with its status.
+#[test]
+fn a_failed_receive_completion_is_the_error_of_the_peer_s_operations() {
+    let (fabric, na, nb) = ib_fabric();
+    let config = small();
+    let a = Endpoint::new(fabric.provider(na), 2, 0, config.clone()).unwrap();
+    let b = RawMember::new(&fabric, nb, 2, 0, &config);
+    b.connect(&a.local_info(), 1);
+    a.connect(1, &b.info).unwrap();
+    let mut out = [0u8; 4];
+    let r = recv(&a, 1, &mut out, 7);
+    // Longer than a's receive slots: a's receive completes with LocLenErr.
+    let long = vec![0u8; config.slot_bytes as usize + 64];
+    assert_eq!(b.send(&long), WcStatus::RemInvReqErr);
+    let outcome = failed_outcome(&a, r, "LocLenErr");
+    assert!(outcome.contains("\"status\":\"error\""), "{outcome}");
+    assert!(outcome.contains("IBV_WC_LOC_LEN_ERR"), "{outcome}");
+    assert_eq!(out, [0; 4]);
+    drop((a, b));
+    assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+}
+
+/// A member that breaks the protocol fails its own operations with that error; the
+/// operations with other members fail only because the endpoint then did: cancelled.
+#[test]
+fn a_protocol_break_is_the_error_of_that_member_s_operations_only() {
+    let fabric = MockFabric::new();
+    let nodes: Vec<NodeId> = (1..=3)
+        .map(|lid| {
+            fabric.add_node(vec![MockDevice::new(
+                "mlx0",
+                vec![MockPort::infiniband(lid)],
+            )])
+        })
+        .collect();
+    let config = small();
+    let a = Endpoint::new(fabric.provider(nodes[0]), 3, 0, config.clone()).unwrap();
+    let c = Endpoint::new(fabric.provider(nodes[2]), 3, 2, config.clone()).unwrap();
+    let b = RawMember::new(&fabric, nodes[1], 3, 0, &config);
+    b.connect(&a.local_info(), 1);
+    a.connect(1, &b.info).unwrap();
+    a.connect(2, &c.local_info()).unwrap();
+    c.connect(0, &a.local_info()).unwrap();
+    let (mut from_b, mut from_c) = ([0u8; 4], [0u8; 4]);
+    let rb = recv(&a, 1, &mut from_b, 1);
+    let rc = recv(&a, 2, &mut from_c, 1);
+    assert_eq!(b.send(&garbage()), WcStatus::Success);
+    let outcome = failed_outcome(&a, rb, "member 1 broke the protocol");
+    assert!(outcome.contains("\"status\":\"error\""), "{outcome}");
+    assert!(outcome.contains("\"wc_status\":null"), "{outcome}");
+    let collateral = a.operation_outcome(rc);
+    assert!(
+        collateral.contains("\"status\":\"cancelled\""),
+        "{collateral}"
+    );
+    a.close(LONG).ok();
+    c.close(LONG).ok();
+    drop(b);
+    assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
 }
 
 #[test]

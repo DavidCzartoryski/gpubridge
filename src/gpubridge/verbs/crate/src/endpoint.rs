@@ -411,6 +411,18 @@ impl Mem {
     }
 }
 
+/// Whose failure it is, for an operation's outcome ([`Endpoint::operation_outcome`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Blame {
+    /// The operation's own (`error`): its work completion failed (with that status), or
+    /// a fault reached it that no operation caused: an asynchronous error on its queue
+    /// pair, port or device, a protocol error by its peer, a failed receive or control
+    /// completion on its queue pair (with that status), a failed verb, a peer that left.
+    Own(Option<WcStatus>),
+    /// Another operation's own failure, or a local abort or close (`cancelled`).
+    Collateral,
+}
+
 struct Op {
     peer: usize,
     tag: u64,
@@ -420,7 +432,7 @@ struct Op {
     done: bool,
     /// Set once the operation failed, which cancels it ([`State::fail_op`]).
     error: Option<String>,
-    /// Distinguishes collateral/local cancellation from the operation's own failure.
+    /// Its failure was collateral ([`Blame::Collateral`]), not its own.
     cancelled: bool,
     wc_status: Option<WcStatus>,
     /// A receive the peer will RDMA WRITE into: the registration of exactly its bytes
@@ -1112,7 +1124,7 @@ impl Endpoint {
                         if let Some(e) = op.error.clone() {
                             // One failed operation fails the endpoint, which cancels the
                             // rest.
-                            s.fail_endpoint(&mut st, &e);
+                            s.fail_endpoint(&mut st, &e, Blame::Collateral);
                             return Err(WaitError::Failed(e));
                         }
                         if !op.done {
@@ -1148,6 +1160,8 @@ impl Endpoint {
 
     /// A failed wait leaves operations available for observation until close. Successful
     /// waits forget them; callers already know those operations completed successfully.
+    /// A failure is `error` when it is the operation's own (its completion, or a fault of
+    /// its link or the device), `cancelled` when collateral or local.
     pub fn operation_outcome(&self, id: i64) -> String {
         let st = lock(&self.shared.state);
         let Some(op) = st.ops.get(&id) else {
@@ -1180,7 +1194,7 @@ impl Endpoint {
     pub fn abort(&self, why: &str) {
         let s = &self.shared;
         let mut st = lock(&s.state);
-        s.fail_endpoint(&mut st, why);
+        s.fail_endpoint(&mut st, why, Blame::Collateral);
         for peer in st.peers.iter_mut().flatten() {
             let _ = peer.qp.to_error();
             peer.lost.get_or_insert_with(|| why.to_owned());
@@ -1231,7 +1245,7 @@ impl Endpoint {
                         .0;
                 }
             }
-            s.fail_endpoint(&mut st, "closed");
+            s.fail_endpoint(&mut st, "closed", Blame::Collateral);
             for peer in st.peers.iter_mut().flatten() {
                 let _ = peer.qp.to_error();
                 peer.lost.get_or_insert_with(|| "closed".into());
@@ -1446,7 +1460,8 @@ impl State {
     /// Fails an operation, which cancels it: from here on nothing copies to or from its
     /// memory (it leaves every queue, an arriving message for it is dropped, its posted
     /// chunks no longer count for it), all under the endpoint lock that every copy takes.
-    fn fail_op(&mut self, id: i64, why: &str) {
+    /// Its outcome is `blame`'s; the first failure is the one that counts.
+    fn fail_op(&mut self, id: i64, why: &str, blame: Blame) {
         let Some(op) = self.ops.get_mut(&id) else {
             return;
         };
@@ -1454,6 +1469,10 @@ impl State {
             return;
         }
         op.error = Some(why.to_owned());
+        match blame {
+            Blame::Own(wc) => op.wc_status = wc,
+            Blame::Collateral => op.cancelled = true,
+        }
         let member = op.peer;
         let Some(peer) = self.peers.get_mut(member).and_then(Option::as_mut) else {
             return;
@@ -1527,7 +1546,7 @@ impl Shared {
             // Arm, then poll once more: a completion between the empty poll and the arm
             // would otherwise wait for the next one.
             if let Err(e) = self.cq.req_notify() {
-                self.fail_all(&format!("asking for completion notifications failed: {e}"));
+                self.fail_device(&format!("asking for completion notifications failed: {e}"));
                 thread::sleep(TICK);
                 continue;
             }
@@ -1553,7 +1572,7 @@ impl Shared {
                 }
             }
             Err(e) => {
-                self.fail_all(&format!("waiting for completions failed: {e}"));
+                self.fail_device(&format!("waiting for completions failed: {e}"));
                 if !timeout.is_zero() {
                     thread::sleep(timeout);
                 }
@@ -1582,25 +1601,29 @@ impl Shared {
                     .find(|p| p.qp.qp_num() == q)
                     .map(|p| p.member);
                 if let Some(m) = member {
-                    self.lose(&mut st, m, &why);
+                    self.lose(&mut st, m, &why, Blame::Own(None));
                 }
             }
-            None => self.fail_endpoint(&mut st, &why),
+            // The device or a port: every operation's own.
+            None => self.fail_endpoint(&mut st, &why, Blame::Own(None)),
         }
         self.changed.notify_all();
     }
 
-    fn fail_all(&self, why: &str) {
+    /// A verb on the completion queue or channel failed: the device's fault, every
+    /// operation's own error.
+    fn fail_device(&self, why: &str) {
         let mut st = lock(&self.state);
-        self.fail_endpoint(&mut st, why);
+        self.fail_endpoint(&mut st, why, Blame::Own(None));
         self.changed.notify_all();
     }
 
-    /// The endpoint failed: every operation is cancelled, and nothing is posted or
-    /// copied from here on ([`State::fail_op`], [`pump`](Shared::pump)).
-    fn fail_endpoint(&self, st: &mut State, why: &str) {
+    /// The endpoint failed: every operation is cancelled (with `blame`, unless it already
+    /// failed), and nothing is posted or copied from here on ([`State::fail_op`],
+    /// [`pump`](Shared::pump)).
+    fn fail_endpoint(&self, st: &mut State, why: &str, blame: Blame) {
         st.failed.get_or_insert_with(|| why.to_owned());
-        self.cancel_all(st);
+        self.cancel_all(st, blame);
     }
 
     /// Polls once and handles what came; returns how many.
@@ -1608,7 +1631,7 @@ impl Shared {
         let completions = match self.cq.poll(POLL_BATCH) {
             Ok(c) => c,
             Err(e) => {
-                self.fail_all(&format!("polling the completion queue failed: {e}"));
+                self.fail_device(&format!("polling the completion queue failed: {e}"));
                 return 0;
             }
         };
@@ -1645,9 +1668,14 @@ impl Shared {
         if !c.ok() {
             st.counters.completion_errors += 1;
             let peer = st.peer(member);
+            // Whether this is an operation's own completion: then the rest of the peer's
+            // work fails with it, collateral.
+            let mut owned = false;
             if recv {
-                // A flushed receive: its slot isn't reposted (the queue pair is done).
+                // A failed receive: its slot isn't reposted (the queue pair is done).
             } else if let SlotUse::Data { op: Some(id) } = peer.slot_use[slot as usize] {
+                // Still the op's (failing it here, an abort or a close would have cleared
+                // the slot): even a flush is the first sign of its queue pair's failure.
                 peer.slot_use[slot as usize] = SlotUse::Free;
                 peer.free_send.push(slot);
                 let why = format!(
@@ -1656,29 +1684,34 @@ impl Shared {
                     c.vendor_err,
                     status_text(c.status)
                 );
-                st.fail_op(id, &why);
-                if let Some(op) = st.ops.get_mut(&id) {
-                    op.wc_status = Some(c.status);
-                    op.cancelled = c.status == WcStatus::WrFlushErr;
-                }
+                st.fail_op(id, &why, Blame::Own(Some(c.status)));
+                owned = true;
             } else {
                 peer.slot_use[slot as usize] = SlotUse::Free;
                 peer.free_send.push(slot);
             }
             let peer = st.peer(member);
+            // Not lost yet: nothing here failed the queue pair (lose, abort and close mark
+            // it lost first), so the link did. A receive or control message's completion
+            // is no operation's own: it is the peer's operations' error, with its status
+            // unless it was only flushed (the failure came before it).
             if peer.lost.is_none() {
-                let why = if peer.said_bye {
-                    format!("member {member} closed its end of the bridge")
+                let (why, blame) = if peer.said_bye {
+                    let why = format!("member {member} closed its end of the bridge");
+                    (why, Blame::Own(None))
                 } else {
-                    format!(
+                    let why = format!(
                         "member {member}: {} completed with {:?} (vendor error {:#x}){}",
                         if recv { "a receive" } else { "a send" },
                         c.status,
                         c.vendor_err,
                         status_text(c.status)
-                    )
+                    );
+                    let wc = (c.status != WcStatus::WrFlushErr).then_some(c.status);
+                    (why, Blame::Own(wc))
                 };
-                self.lose(st, member, &why);
+                let blame = if owned { Blame::Collateral } else { blame };
+                self.lose(st, member, &why, blame);
             }
             return;
         }
@@ -1834,11 +1867,11 @@ impl Shared {
                     let why =
                         format!("member {member} closed its end of the bridge before sending this");
                     for id in waiting {
-                        st.fail_op(id, &why);
+                        st.fail_op(id, &why, Blame::Own(None));
                     }
                     let why = format!("member {member} closed its end of the bridge");
                     for id in unsent {
-                        st.fail_op(id, &why);
+                        st.fail_op(id, &why, Blame::Own(None));
                     }
                 }
             }
@@ -1877,14 +1910,17 @@ impl Shared {
         Ok(h)
     }
 
+    /// `member` broke the protocol: its operations' own error; the rest fail with the
+    /// endpoint, collateral.
     fn protocol_error(&self, st: &mut State, member: usize, why: &str) {
         st.failed.get_or_insert_with(|| why.to_owned());
-        self.lose(st, member, why);
-        self.fail_endpoint(st, why);
+        self.lose(st, member, why, Blame::Own(None));
+        self.fail_endpoint(st, why, Blame::Collateral);
     }
 
-    /// The link to `member` is gone: fail what involves it and stop using it.
-    fn lose(&self, st: &mut State, member: usize, why: &str) {
+    /// The link to `member` is gone: fail what involves it (with `blame`) and stop using
+    /// it.
+    fn lose(&self, st: &mut State, member: usize, why: &str, blame: Blame) {
         let ids: Vec<i64> = st
             .ops
             .iter()
@@ -1892,12 +1928,7 @@ impl Shared {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            if let Some(op) = st.ops.get_mut(&id) {
-                if !op.done && op.error.is_none() {
-                    op.cancelled = true;
-                }
-            }
-            st.fail_op(id, why);
+            st.fail_op(id, why, blame);
         }
         let peer = st.peer(member);
         peer.lost.get_or_insert_with(|| why.to_owned());
@@ -1905,17 +1936,13 @@ impl Shared {
         let _ = peer.qp.to_error();
     }
 
-    /// Cancels every operation: none of them reads or writes caller memory after this.
-    fn cancel_all(&self, st: &mut State) {
+    /// Cancels every operation (with `blame`): none of them reads or writes caller memory
+    /// after this.
+    fn cancel_all(&self, st: &mut State, blame: Blame) {
         let why = st.failed.clone().unwrap_or_else(|| "cancelled".into());
         let ids: Vec<i64> = st.ops.keys().copied().collect();
         for id in ids {
-            if let Some(op) = st.ops.get_mut(&id) {
-                if !op.done && op.error.is_none() {
-                    op.cancelled = true;
-                }
-            }
-            st.fail_op(id, &why);
+            st.fail_op(id, &why, blame);
         }
         for peer in st.peers.iter_mut().flatten() {
             peer.forget_work();
@@ -2128,7 +2155,7 @@ impl Shared {
             }
         } else if peer.said_bye {
             let why = format!("member {member} closed its end of the bridge before sending this");
-            st.fail_op(id, &why);
+            st.fail_op(id, &why, Blame::Own(None));
         } else {
             self.defer_recv(st, member, id);
         }
@@ -2193,7 +2220,7 @@ impl Shared {
         st.counters.batches_posted += 1;
         if let Err(e) = result {
             let why = format!("member {member}: reposting receives failed: {e}");
-            self.lose(st, member, &why);
+            self.lose(st, member, &why, Blame::Own(None));
         }
     }
 
@@ -2417,7 +2444,7 @@ impl Shared {
                 if let Err(e) = peer.send_slots[slot as usize].write(0, &h.encode()) {
                     peer.free_send.push(slot);
                     let why = format!("member {member}: filling a send slot failed: {e}");
-                    self.lose(st, member, &why);
+                    self.lose(st, member, &why, Blame::Own(None));
                     return;
                 }
                 peer.send_seq = peer.send_seq.wrapping_add(1);
@@ -2568,7 +2595,7 @@ impl Shared {
                 Err(e) => {
                     st.peer(member).free_send.push(slot);
                     let why = format!("member {member}: filling a send slot failed: {e}");
-                    self.lose(st, member, &why);
+                    self.lose(st, member, &why, Blame::Own(None));
                     return;
                 }
             };
@@ -2663,10 +2690,17 @@ impl Shared {
                     _ => None,
                 })
                 .collect();
+            // The rest is collateral to the rejected operations, or, if only control
+            // messages were rejected, the failed verb is every operation's own.
+            let blame = if ids.is_empty() {
+                Blame::Own(None)
+            } else {
+                Blame::Collateral
+            };
             for id in ids {
-                st.fail_op(id, &why);
+                st.fail_op(id, &why, Blame::Own(None));
             }
-            self.lose(st, member, &why);
+            self.lose(st, member, &why, blame);
         }
     }
 }

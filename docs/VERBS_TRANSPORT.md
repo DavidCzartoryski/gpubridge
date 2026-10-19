@@ -409,7 +409,8 @@ asynchronous event that breaks something (`QP_FATAL`, `QP_REQ_ERR`,
 `QP_ACCESS_ERR`, `PATH_MIG_ERR`, `CQ_ERR`, `PORT_ERR`, `DEVICE_FATAL`) fails
 that peer, or the whole endpoint when it names no queue pair. A lost peer is
 noticed when something is sent to it; a receive from a peer that died silently
-waits for its deadline.
+waits for its deadline. Which operations report a failure as their own (`error`)
+and which as `cancelled` is in "Transport observations".
 
 **Failure is cancellation.** An operation fails (a completion error, a lost or
 departed peer, a protocol error, a deadline the caller turns into `abort`) only
@@ -647,14 +648,25 @@ object per line:
 
 MOCK/test-fabric records always carry `synthetic: true`. When an operation's own
 work completion fails, its record has `status: error` and `wc_status` using the
-stable libibverbs spelling (for example `IBV_WC_RETRY_EXC_ERR`). Other unfinished
-operations cancelled by that failure or a local abort have `status: cancelled`;
-operations already completed remain `ok`. A native timeout return code (never
-an error-message substring) marks outstanding operations
+stable libibverbs spelling (for example `IBV_WC_RETRY_EXC_ERR`). A fault that no
+single operation caused is the `error` of every operation it reaches, too:
+- the device's or a port's (`DEVICE_FATAL`, `PORT_ERR`, `CQ_ERR`, a failed poll,
+  arm or event wait): every unfinished operation;
+- one peer's: an asynchronous error on its queue pair (`QP_FATAL`, `QP_REQ_ERR`,
+  `QP_ACCESS_ERR`, `PATH_MIG_ERR`), a protocol error by it, a failed repost or
+  post to it, its leaving, or a failed receive or control message completion on
+  its queue pair: that peer's unfinished operations. A failed receive or control
+  completion gives them its `wc_status`, unless it was only flushed; the others
+  have none.
+
+Other unfinished operations cancelled by such a failure (an operation's own, or
+a fault with another peer that then fails the endpoint) or by a local abort or
+close have `status: cancelled`; operations already completed remain `ok`. So a
+call that failed for a fault with a peer it moved nothing with has only
+`cancelled` records, with the fault's text as their `error`. A native timeout
+return code (never an error-message substring) marks outstanding operations
 `timeout`. Aggregating a peer/direction gives an error precedence over cancellation,
-and cancellation over success. Receive-slot/control failures that cannot be
-attributed to a user operation remain endpoint diagnostics; no invented operation
-WC status is attached to them.
+and cancellation over success.
 
 `bytes` is the requested total for a non-ok record, including a failed post; it is
 not a measurement of moved traffic. Successful records report completed payload
