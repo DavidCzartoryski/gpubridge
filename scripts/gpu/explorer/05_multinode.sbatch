@@ -91,7 +91,8 @@ fi
 # can't run fails, never stages); the check and the benchmark over bridge="verbs", whose
 # matched references are the Gloo bridge's runs above and UCX's (UCX_BRIDGE=1); then
 # training over verbs and over Gloo. Observations go to verbs_observations/, and every
-# verbs_kit record must show the payload on the RDMA port, not on TCP.
+# leader's verbs_kit tcp_evidence must pass: the bridge's own libibverbs telemetry
+# moved the payload and the process's TCP sockets (ss) stayed idle.
 if [ "$VERBS_BRIDGE" = 1 ]; then
     one_per_node() {
         local tag=$1

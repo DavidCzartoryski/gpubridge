@@ -195,9 +195,12 @@ with its reason instead of staging); `check_verbs` and `bench_verbs` over
 references; `train_verbs` and `train_gloo` (`train_bench.py`, `VERBS_TRAIN_MODEL`).
 Each `verbs_kit` record holds the endpoint telemetry (device, port, GID, provider: it
 must not say MOCK), every call's `path` and `path_reason`, completion errors, a window
-of every NIC counter and every interface's bytes, CPU time, and `tcp_evidence`; with
-`--require-no-tcp` a step fails unless the payload moved on the RDMA port and not over
-TCP/IP. Transport observations for the straggler detector go to
+of every NIC counter and every interface's bytes (context only: shared, and RoCE
+netdevs carry non-TCP traffic), CPU time, and `tcp_evidence`; with `--require-no-tcp` a
+bridge leader's step fails unless that evidence is `pass`: the bridge's own telemetry
+(libibverbs, not MOCK) moved the payload with completions and no errors, and the
+process's own TCP sockets (`ss -tinp`) stayed idle. Without `ss` on the node it is
+`unknown` and the step fails; install or load iproute2's `ss` before the run. Transport observations for the straggler detector go to
 `verbs_observations/rank-<N>.jsonl` (`GPUBRIDGE_VERBS_OBSERVE`). None of this has run
 on hardware yet.
 Steps 04 and 07, the AMD script and `mixed/node.sh` also measure opt-in bridge

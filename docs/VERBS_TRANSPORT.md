@@ -731,12 +731,21 @@ and cross-vendor (step 07) runs are separate records:
    matched references;
 5. `train_verbs`, `train_gloo`: `train_bench.py` over each.
 
-Every `verbs_kit` record holds the endpoint telemetry (the provider must not say
-MOCK), completion errors, a window of every `/sys/class/infiniband/*/ports/*/
-{counters,hw_counters}` file and every interface's `/proc/net/dev` bytes, and
-`tcp_evidence`; `--require-no-tcp` fails a step unless the RDMA port's data
-counters moved at least the payload (they count 4-octet words) while no
-interface moved more than 5% of it over IP.
+Every `verbs_kit` record holds the endpoint telemetry, completion errors, a window
+of every `/sys/class/infiniband/*/ports/*/{counters,hw_counters}` file and every
+interface's `/proc/net/dev` bytes, and `tcp_evidence`. Port and netdev counters are
+context only: a port is shared with every process and job on the node, and a RoCE
+netdev carries traffic that is not TCP, so they can't show which transport carried
+this job's payload. `tcp_evidence` is `pass` only with positive evidence attributable
+to the process: the bridge's own telemetry over the window (provider `libibverbs`, not
+MOCK; its sent plus received bytes at least the payload; completions from its own
+queue pairs; no completion errors), and the process's own TCP sockets to other hosts
+(`ss -tinp`, by pid: Gloo's and the store's) moving no more than 5% of the payload
+plus 1 MiB. Its RC queue pairs as the kernel lists them (`rdma resource show qp`, by
+pid) are recorded where the `rdma` tool exists, and contradict a pass when it lists
+none. Without `ss` the verdict is `unknown`, never a pass; Gloo reference collectives
+run before the window. `--require-no-tcp` fails a bridge leader's step unless its
+verdict is `pass`; other ranks record `not applicable`.
 
 ## Testing
 

@@ -241,7 +241,7 @@ if [ "$STEPS_07" = all ]; then
     # venv; host-to-host verbs; host tensors, then GPU tensors staged and direct (NVIDIA:
     # dma-buf or peer memory; AMD: ROCr's dma-buf), the check and the benchmark (the
     # Gloo and UCX bridges' runs here are the matched references), then training over
-    # verbs and over Gloo. Every verbs_kit record must show no payload on TCP.
+    # verbs and over Gloo. Every leader's verbs_kit tcp_evidence must pass (see 05).
     if [ "$VERBS_BRIDGE" = 1 ]; then
         step verbs_build both @VENV@/bin/python -m gpubridge.verbs build
         step verbs_rdma_report both bash "$KIT_DIR/rdma_report.sh" \

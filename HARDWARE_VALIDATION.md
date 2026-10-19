@@ -557,9 +557,10 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     a Gloo reduction (`verbs_host`); every bridge policy (`check_verbs`); a
     deliberately lost peer and a short deadline fail with their reasons;
     teardown with work outstanding leaks nothing; no bridge payload on TCP
-    (every `verbs_kit` record's counter window: the RDMA port's data counters
-    moved at least the payload, no interface's IP bytes moved more than 5% of
-    it); then its bridge phase against the Gloo, multitcp and UCX bridges at
+    (every bridge leader's `verbs_kit` `tcp_evidence` is `pass`: the bridge's own
+    libibverbs telemetry moved the payload with completions and no errors, and
+    the process's own TCP sockets, by `ss -tinp`, moved no more than 5% of it;
+    port and netdev counters are recorded as context, never as proof); then its bridge phase against the Gloo, multitcp and UCX bridges at
     each size (`bench_verbs`). *Status: works on the mock providers only: the
     protocol's failure cases and the rendezvous on the in-process mock
     (`src/gpubridge/verbs/crate/tests/protocol.rs`, `tests/direct.rs`), and

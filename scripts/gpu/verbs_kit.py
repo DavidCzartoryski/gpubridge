@@ -12,11 +12,27 @@ OUT/rank<N>.json with what a reviewer needs to judge the run, never a remote key
 - latency and bandwidth, and the process's CPU time over the same window;
 - NIC counter windows: every ``/sys/class/infiniband/*/ports/*/counters`` and
   ``hw_counters`` file before and after (raw values; the standard IB data counters
-  count 4-octet words), next to the bytes the bridge reports moving;
-- no-silent-TCP evidence: ``/proc/net/dev`` bytes of every interface (IPoIB too) over
-  the same window. A verbs run passes it when the RDMA port's data counters moved at
-  least the payload while no interface's TCP/IP bytes moved more than a small fraction
-  of it.
+  count 4-octet words), and ``/proc/net/dev`` bytes of every interface: context only.
+  A port is shared with every other process and job on the node, and on RoCE its
+  Ethernet netdev also carries traffic that is not TCP, so neither proves which
+  transport carried this job's payload;
+- no-silent-TCP evidence (``tcp_evidence``), positive and attributable to this
+  process, judged ``pass``, ``fail`` or ``unknown``:
+
+  1. the bridge's own telemetry over the window: a real provider (``libibverbs``,
+     not MOCK), its sent plus received bytes at least the payload, completions
+     polled from its own queue pairs and no completion errors; each call's path
+     (``host``/``direct``/``staged``) is in the call records;
+  2. this process's RC queue pairs as the kernel lists them (``rdma resource show
+     qp``, by pid), where the ``rdma`` tool exists (recorded; not required);
+  3. this process's own TCP sockets to other hosts (``ss -tinp``, by pid: Gloo's,
+     the store's) idle over the window: they moved no more than a small fraction of
+     the payload. Without ``ss`` this is ``unknown``, never a pass.
+
+  Gloo reference collectives run before the window, not inside it. A run passes
+  only when every part is shown; ``--require-no-tcp`` fails a bridge leader's step
+  unless its evidence is ``pass``. Ranks that aren't bridge leaders carry no bridge
+  traffic and record ``not applicable``.
 
 Modes:
 
@@ -48,18 +64,22 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import resource
 import socket
+import subprocess
 import sys
 import time
 from datetime import timedelta
 from pathlib import Path
 
 SYSFS = Path("/sys/class/infiniband")
-#: A verbs run "moved no payload over TCP" when no interface's bytes grew by more than
-#: this fraction of the payload (plus a little for the store and Gloo's own traffic).
+#: This process's TCP sockets to other hosts are "idle" over a window when they moved no
+#: more than this fraction of the payload, plus a little for the store's and Gloo's own
+#: control traffic (barriers, keep-alives).
 TCP_FRACTION = 0.05
-TCP_SLACK = 4 << 20
+TCP_SLACK = 1 << 20
+_LOOPBACK = ("127.", "[::1]", "::1", "[::ffff:127.")
 
 
 def rank_from_env() -> int:
@@ -106,25 +126,134 @@ def window(before: dict, after: dict) -> dict:
     return out
 
 
-def tcp_evidence(netdev: dict, counters: dict, payload: int, device: str | None) -> dict:
-    """Whether the payload went over the RDMA port and not over TCP/IP; see the module."""
-    tcp = max((max(v.get("rx_bytes") or 0, v.get("tx_bytes") or 0) for v in netdev.values()),
-              default=0)
-    words = sum(v or 0 for k, v in counters.items()
+def parse_ss(text: str, pid: int) -> dict:
+    """Bytes sent and received by each of ``pid``'s TCP sockets to another host, from
+    ``ss -tinpH`` (a socket line, then its indented info line), by "local peer"."""
+    out: dict = {}
+    current = None
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            fields = line.split()
+            current = None
+            if len(fields) >= 5 and re.search(rf"\bpid={pid}\b", line) \
+                    and not fields[4].startswith(_LOOPBACK):
+                current = f"{fields[3]} {fields[4]}"
+                out[current] = {"sent": 0, "received": 0}
+        elif current is not None:
+            sent = re.search(r"\bbytes_acked:(\d+)", line) or \
+                re.search(r"\bbytes_sent:(\d+)", line)
+            got = re.search(r"\bbytes_received:(\d+)", line)
+            out[current]["sent"] += int(sent.group(1)) if sent else 0
+            out[current]["received"] += int(got.group(1)) if got else 0
+    return out
+
+
+def read_process_tcp(pid: int | None = None, run=subprocess.run) -> dict | None:
+    """:func:`parse_ss` of this process, or None where ``ss`` can't say."""
+    try:
+        done = run(["ss", "-tinpH"], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    return parse_ss(done.stdout, os.getpid() if pid is None else pid)
+
+
+def read_qps(pid: int | None = None, run=subprocess.run) -> list | None:
+    """This process's queue pairs as the kernel lists them (``rdma -j resource show
+    qp``), or None where the ``rdma`` tool can't say."""
+    pid = os.getpid() if pid is None else pid
+    try:
+        done = run(["rdma", "-j", "resource", "show", "qp"], capture_output=True, text=True,
+                   timeout=10, check=False)
+        entries = json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if not isinstance(entries, list):
+        return None
+    return [{k: e.get(k) for k in ("ifname", "port", "lqpn", "type", "state", "pid", "comm")}
+            for e in entries if isinstance(e, dict) and e.get("pid") == pid]
+
+
+def tcp_moved(before: dict | None, after: dict | None) -> int | None:
+    """Bytes this process's TCP sockets to other hosts moved between two snapshots (a
+    socket opened in between counts in full), or None if either is unknown."""
+    if before is None or after is None:
+        return None
+    total = 0
+    for key, now in after.items():
+        then = before.get(key, {"sent": 0, "received": 0})
+        total += max(0, now["sent"] - then["sent"]) + max(0, now["received"] - then["received"])
+    return total
+
+
+def tcp_evidence(payload: int, tele_before: dict | None, tele_after: dict | None,
+                 tcp: int | None, qps: list | None, netdev: dict | None = None,
+                 counters: dict | None = None, device: str | None = None) -> dict:
+    """Whether this process's payload went by verbs and not over TCP; see the module.
+    ``verdict`` is ``pass`` only with every positive part shown, ``fail`` when a part
+    contradicts it, else ``unknown``; ``no_silent_tcp`` is ``verdict == "pass"``."""
+    fails, unknown = [], []
+    moved = completions = errors = None
+    if tele_after is None:
+        unknown.append("no bridge telemetry on this rank")
+    else:
+        before = tele_before or {}
+        provider = str(tele_after.get("provider") or "")
+        if tele_after.get("mock") or "MOCK" in provider.upper():
+            fails.append(f"the bridge ran on a MOCK provider ({provider}): not RDMA")
+        elif "libibverbs" not in provider:
+            fails.append(f"the provider is {provider or 'unreported'}, not libibverbs")
+
+        def grew(key: str) -> int:
+            return int(tele_after.get(key) or 0) - int(before.get(key) or 0)
+
+        moved = grew("bytes_sent") + grew("bytes_received")
+        completions, errors = grew("completions"), grew("completion_errors")
+        if moved < payload:
+            fails.append(f"the bridge's own counters moved {moved} bytes, less than the "
+                         f"payload {payload}")
+        if completions <= 0:
+            fails.append("no completions were polled from the bridge's queue pairs")
+        if errors:
+            fails.append(f"{errors} completion errors")
+    limit = TCP_FRACTION * payload + TCP_SLACK
+    if tcp is None:
+        unknown.append("this process's TCP sockets could not be read (no ss): TCP not "
+                       "shown idle")
+    elif tcp > limit:
+        fails.append(f"this process's TCP sockets to other hosts moved {tcp} bytes "
+                     f"(limit {int(limit)})")
+    if qps is not None and tele_after is not None and not any(
+            q.get("type") == "RC" for q in qps):
+        fails.append("the kernel lists no RC queue pair for this process")
+    words = sum(v or 0 for k, v in (counters or {}).items()
                 if device and k.startswith(f"{device}/")
                 and k.endswith(("/counters/port_xmit_data", "/counters/port_rcv_data")))
-    rdma_bytes = 4 * words  # the standard IB data counters count 4-octet words
-    return {"payload_bytes": payload, "max_interface_bytes": tcp,
-            "rdma_port_data_bytes": rdma_bytes,
-            "tcp_small": tcp <= TCP_FRACTION * payload + TCP_SLACK,
-            "rdma_moved_payload": rdma_bytes >= payload,
-            "no_silent_tcp": tcp <= TCP_FRACTION * payload + TCP_SLACK and rdma_bytes >= payload}
+    interfaces = max((max(v.get("rx_bytes") or 0, v.get("tx_bytes") or 0)
+                      for v in (netdev or {}).values()), default=0)
+    verdict = "fail" if fails else "unknown" if unknown else "pass"
+    return {"verdict": verdict, "no_silent_tcp": verdict == "pass", "failures": fails,
+            "unknown": unknown, "payload_bytes": payload, "bridge_bytes": moved,
+            "bridge_completions": completions, "bridge_completion_errors": errors,
+            "process_tcp_bytes": tcp, "process_tcp_limit": int(limit),
+            "qps": qps if qps is not None else "unavailable (no rdma tool)",
+            "context_only": {
+                "rdma_port_data_bytes": 4 * words, "max_interface_bytes": interfaces,
+                "why": "port and netdev counters are shared by every process and job on the "
+                       "node, and a RoCE netdev carries non-TCP traffic: never decisive"}}
 
 
 class Window:
     """Counters, netdev bytes, CPU time and wall time over a measured region."""
 
+    def __init__(self, telemetry=None) -> None:
+        #: The bridge's telemetry (a callable), read at both ends; None off the bridge.
+        self.telemetry = telemetry
+
     def __enter__(self) -> Window:
+        self.tele0 = self.telemetry() if self.telemetry else None
+        self.tcp0 = read_process_tcp()
         self.counters0, self.netdev0 = read_counters(), read_netdev()
         self.cpu0, self.wall0 = resource.getrusage(resource.RUSAGE_SELF), time.monotonic()
         return self
@@ -135,12 +264,16 @@ class Window:
         self.cpu = (cpu.ru_utime - self.cpu0.ru_utime) + (cpu.ru_stime - self.cpu0.ru_stime)
         self.counters = window(self.counters0, read_counters())
         self.netdev = window(self.netdev0, read_netdev())
+        self.tcp = tcp_moved(self.tcp0, read_process_tcp())
+        self.tele1 = self.telemetry() if self.telemetry else None
+        self.qps = read_qps() if self.telemetry else None
 
     def record(self, payload: int, device: str | None) -> dict:
         return {"wall_s": self.wall, "cpu_s": self.cpu,
                 "cpu_per_wall": self.cpu / self.wall if self.wall else None,
                 "nic_counters": self.counters, "netdev": self.netdev,
-                "tcp_evidence": tcp_evidence(self.netdev, self.counters, payload, device)}
+                "tcp_evidence": tcp_evidence(payload, self.tele0, self.tele1, self.tcp,
+                                             self.qps, self.netdev, self.counters, device)}
 
 
 def sizes(max_bytes: int) -> list[int]:
@@ -194,7 +327,7 @@ def endpoint_mode(args, store, rank: int, world: int) -> dict:
         out["latency"] = {"round_trips": len(times), "median_us": 1e6 * times[len(times) // 2],
                           "p99_us": 1e6 * times[int(0.99 * (len(times) - 1))]}
         moved = 0
-        with Window() as w:
+        with Window(ep.telemetry) as w:
             for n in sizes(args.max_bytes):
                 data = torch.randint(0, 256, (n,), dtype=torch.uint8,
                                      generator=torch.Generator().manual_seed(n))
@@ -251,15 +384,22 @@ def collectives_mode(args, rank: int, world: int) -> dict:
         if args.expect_path and args.memory == "gpu" and t.get("path") != args.expect_path:
             out["path_violations"] += 1
 
+    # Integer-valued, so every reduction order gives the same bits. The Gloo references
+    # run before the measured window: inside it, their TCP traffic would be counted
+    # against the bridge.
+    wants = {}
+    for n in sizes(args.max_bytes):
+        wants[n] = (torch.arange(max(1, n // 4), dtype=torch.float32) % 1024) + rank
+        dist.all_reduce(wants[n], group=reference)
     moved = 0
-    with Window() as w:
+    leader_telemetry = bridge.telemetry if bridge is not None and hasattr(
+        bridge, "telemetry") else None
+    with Window(leader_telemetry) as w:
         for n in sizes(args.max_bytes):
             numel = max(1, n // 4)
-            # Integer-valued, so every reduction order gives the same bits.
             base = (torch.arange(numel, dtype=torch.float32) % 1024) + rank
             tensor = base.clone().to(device)  # a copy on CPU too: the call works in place
-            want = base.clone()
-            dist.all_reduce(want, group=reference)
+            want = wants[n]
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             t0 = time.monotonic()
@@ -323,10 +463,16 @@ def main() -> int:
             result = collectives_mode(args, rank, world)
         if result.get("mismatches") or result.get("path_violations"):
             status = "failed"
-        evidence = (result.get("window") or {}).get("tcp_evidence") or {}
-        if args.require_no_tcp and args.bridge == "verbs" and "window" in result \
-                and not evidence.get("no_silent_tcp"):
-            status, error = "failed", f"no evidence the payload avoided TCP: {evidence}"
+        window_record = result.get("window") or {}
+        evidence = window_record.get("tcp_evidence") or {}
+        if result.get("leader") is False and evidence:
+            # Not a bridge leader: no bridge traffic here to judge.
+            evidence.update(verdict="not applicable (not a bridge leader)", no_silent_tcp=None)
+        elif args.require_no_tcp and args.bridge == "verbs" and "window" in result \
+                and evidence.get("verdict") != "pass":
+            status, error = "failed", (
+                f"no-silent-TCP evidence is {evidence.get('verdict')}: "
+                + "; ".join(evidence.get("failures", []) + evidence.get("unknown", [])))
     except Exception as exc:  # noqa: BLE001 - recorded, then the exit code says so
         status, error = "error", f"{type(exc).__name__}: {exc}"
     record = {"kit": "verbs_kit", "mode": args.mode, "args": vars(args), "status": status,
