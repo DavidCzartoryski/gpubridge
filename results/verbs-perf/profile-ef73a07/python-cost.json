@@ -1,0 +1,62 @@
+{
+ "label": "CPU/MOCK, not a GPU or RDMA speedup; no fabric: Python and torch only",
+ "machine": {
+  "model": "Mac16,10 / Apple M4",
+  "machine": "arm64",
+  "cpus": 10,
+  "system": "macOS-27.0.1-arm64-arm-64bit",
+  "python": "3.12.15"
+ },
+ "load": "21:03  up 1 day, 23:10, 1 user, load averages: 2.16 1.97 1.98",
+ "src": "/Users/davidczartoryski/code/audit/rr-gb-int-wt/src",
+ "runs": [
+  {
+   "bytes": 4096,
+   "observe": false,
+   "us_per_call": [
+    7.5922499963780865,
+    7.628895997186191,
+    7.667333004064858,
+    7.7245830034371465,
+    7.734229497145861
+   ],
+   "median_us": 7.667333004064858
+  },
+  {
+   "bytes": 1048576,
+   "observe": false,
+   "us_per_call": [
+    31.00060399447102,
+    31.038104003528133,
+    31.081875000381842,
+    30.7282705034595,
+    31.00674999586772
+   ],
+   "median_us": 31.00674999586772
+  },
+  {
+   "bytes": 4096,
+   "observe": true,
+   "us_per_call": [
+    37.15635399566963,
+    40.81314599898178,
+    38.38566649938002,
+    38.72149999369867,
+    38.38943749724422
+   ],
+   "median_us": 38.38943749724422
+  },
+  {
+   "bytes": 1048576,
+   "observe": true,
+   "us_per_call": [
+    61.30616650625598,
+    61.18264599354006,
+    61.07210399932228,
+    61.66470800235402,
+    61.39950000215322
+   ],
+   "median_us": 61.30616650625598
+  }
+ ]
+}

@@ -103,3 +103,68 @@ with each run. For each metric, the **spread** is the larger of the two arms'
 
 Results are reported for every metric of every series, passing or failing, with the
 raw runs in `results/verbs-perf/`.
+
+## 2. Profile (base `ef73a07`, CPU/MOCK, not a GPU or RDMA speedup)
+
+Mac mini (Mac16,10, Apple M4, 10 cores), Python 3.12, torch 2.14.1, the test library
+in cargo's release mode. Another worker ran tests on this machine at the same time
+(load 1.9 to 2.4 during these runs). One run per series and policy; raw records and
+cProfile text in `results/verbs-perf/profile-ef73a07/`. These are single runs, for
+finding hot spots; the comparisons in section 3 use interleaved pairs.
+
+Where a call's time goes (rank 0, economy; "native" is time inside the library's
+exported functions, "Python" the rest of the call):
+
+| Series, size | p50 | native wait | native send/recv posts | Python and torch |
+| --- | --- | --- | --- | --- |
+| host 4 KiB | 70 us | ~24 us | ~4 us | ~22 us |
+| host 1 MiB | 987 us | ~940 us | ~8 us | ~47 us |
+| host 16 MiB | 14.8 ms | ~14.0 ms | ~45 us | ~0.8 ms (mostly torch's `add_`) |
+| observe 4 KiB | 117 us | ~21 us | ~18 us | ~55 us |
+| pingpong 8 B (one round trip) | 38 us | all | | |
+
+`python-cost` (rank 0's Python alone, against an endpoint that completes at once):
+7.7 us per 4 KiB call and 31 us per 1 MiB call without observations; **38.4 us and
+61.3 us with observations on**.
+
+Findings, each with its evidence:
+
+1. **H1, observation export (demonstrated).** With `GPUBRIDGE_VERBS_OBSERVE` set, a
+   4 KiB call's p50 rose from 70 to 117 us (economy; 74 to 122 balanced) and its
+   Python from ~22 to ~55 us; `python-cost` attributes +30.7 us per call to it with
+   no fabric at all. cProfile (`cprofile-observe-economy-4k.txt`): `check_record`,
+   the recursive key-name check, runs 26 times per record (104,000 calls for 4,000
+   records) and is the largest single cost, then the per-record wake of the writer
+   thread and its `json.dumps` under the GIL. Budget B4 (at most +10%) fails by a
+   wide margin.
+2. **H2, a full telemetry read per observed call (demonstrated).** `_observe` calls
+   `endpoint.telemetry()` on every call to read the constant `mock` flag: one more
+   native crossing per call (`gb_verbs_telemetry`, ~4.4 us inside the library) plus
+   allocating a 16 KiB buffer and parsing the whole telemetry JSON.
+3. **Copies through slots (measured, protocol-inherent here).** `copied_bytes` equals
+   the payload on every host call: the caller's tensor is not registered, so the
+   library copies sends through its slots (the receive lands in place in the
+   transport's registered scratch). Eager messages that arrive before their receive
+   is posted are copied once more (4 KiB: 4,194 to 5,702 bytes per 4,096-byte call).
+   Removing this means registering caller memory per call, which trades a copy for a
+   registration whose cost only a real NIC can tell: a reservation tuning question,
+   not changed here.
+4. **Crossings (counted).** 3 per chunk (post receive, post send, wait), 12 for a
+   16 MiB call: budget B2 (2 per chunk + 2) fails for multi-chunk calls. A crossing
+   costs ~1 to 3 us here, under 5% of a 4 KiB call and below its run-to-run spread,
+   so batching posts is not a demonstrated hot spot and is not changed.
+5. **Python bookkeeping without observations: not a hot spot.** 7.7 us per call spread
+   over ~85 small calls; the largest, `_all_reduce` itself, is ~2.5 us. Thread-count
+   switching (`torch.set_num_threads`) costs 0.03 us.
+6. **Reduction kernels: kept.** At 16 MiB most of the Python share is torch's native
+   `add_` on 4M floats per call; it stays as is.
+7. **Registrations: none in steady state** (B1 passes on the host path, all
+   policies; the staged path's buffer is registered once). The direct path calls
+   `register_device` and `release` per call and allocates its scratch per call; the
+   library's device cache should make the second registration a hit, but that is a
+   GPU-only check (no GPU here).
+8. **Progress policies on a shared CPU.** `latency` costs a full core idle (1.00
+   core-s/s) and, with two ranks plus the mock's socket threads on a loaded machine,
+   was *slower* than economy above 4 KiB (1 MiB: 1,463 vs 987 us; CPU per op 2.6x).
+   `economy` and `balanced` idle at 0.003 to 0.005 core-s/s (B3 passes). This is a
+   property of an oversubscribed mock, disclosed, not tuned.
