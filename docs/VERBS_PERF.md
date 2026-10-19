@@ -178,6 +178,34 @@ spread as defined in section 1, pairs better, verdict). Every metric of every si
 RSS and counts included: `results/verbs-perf/ab-*/summary.md`. All 240 runs: 0 wrong
 results.
 
+### Deviations from section 1 (labelled after the perf review)
+
+The comparisons did not apply rule 3 as section 1 wrote it in two places (perf review
+r1, finding 4). The verdicts below and in `results/verbs-perf/ab-*/summary.*` are the
+ones the harness judged, kept as recorded. Rechecked from the raw records with the
+harness's own `compare` (which reproduces all 204 recorded verdicts of each
+comparison), once as judged and once under rule 3 as written:
+
+- **D1: copies judged as a timed metric.** Rule 3 lists copies among the counted
+  metrics, which must not increase at all. `scripts/verbs_perf.py` leaves
+  `copied_bytes` out of `COUNTED` and judges it against its spread, because an eager
+  message that arrives before its receive is posted is copied once more, so copied
+  bytes per call depend on timing. Under the rule as written, change 1 regresses on
+  copies at observe/latency/4 KiB (5242.88 → 5357.57 bytes per call, +2.19%, spread
+  19%): rule 4 would keep it opt-in or drop it, not make it the default. Change 2
+  regresses on copies at host/balanced/4 KiB (+0.77%) and observe/latency/4 KiB
+  (+2.13%) and stays dropped either way. No other verdict changes. So change 1's
+  default status rests on this deviation, or on its deterministic crossing reduction
+  (4 → 3 per observed call in every pair), which rule 2 doesn't list as a win; its
+  one rule-2 win is a single cell, about the size of the drift between sessions
+  (the same code's p50 there was 1011 us as comparison 1's after arm and 1028 us as
+  comparison 2's before arm). That is David's to
+  accept or reject, with the change-2 proposal below.
+- **D2: a 2 MiB floor for RSS.** The harness calls a max-RSS or RSS-growth difference
+  under 2 MiB "no change", a floor rule 3 doesn't have. Judged against the spread
+  instead, no RSS row of either comparison is a regression or a win: D2 changed no
+  verdict.
+
 ### Change 1: read the endpoint's mock flag once (`b89b4d9`): DEFAULT
 
 `_observe` parsed the whole native telemetry on every observed call to read a flag
@@ -186,7 +214,9 @@ Pure-Python probe: 38.6 → 32.5 us per 4 KiB observed call. Counted: crossings 
 observed call 4 → 3 in every pair (the per-call
 `gb_verbs_telemetry` is gone). Rule 2: wins on observe/economy 1 MiB (p50 -2.2%,
 spread 1.1%, 5/5; throughput +2.2%). Rule 3: no metric regressed beyond its spread
-under any policy or series. Rule 4: passes; it is the default.
+under any policy or series, with copies judged against their spread (deviation D1;
+as written, copies regress at observe/latency/4 KiB). Rule 4: passes under D1; it is
+the default, pending David's decision on D1.
 
 | series | policy | size | p50 us | p99 us | CPU per op us |
 | --- | --- | --- | --- | --- | --- |
@@ -271,12 +301,13 @@ From the `before` arm of comparison 2 (that code is today's default).
 | --- | --- | --- |
 | B1 registrations per host call after warmup, all policies | PASS | 0 |
 | B2 crossings per 2-leader call <= 2 per chunk + 2 | PASS for 1 chunk, FAIL for several | 3 per chunk: 3 (4 KiB to 1 MiB), 12 at 16 MiB (budget 10) |
-| B3 idle CPU, economy <= 0.02 and balanced <= 0.05 core-s/s | PASS | 0.0037 and 0.0038; latency 1.00 (disclosed: a full core per endpoint, idle included) |
+| B3 idle CPU, economy <= 0.02 and balanced <= 0.05 core-s/s | PASS | 0.0035 and 0.0037 (corrected from 0.0037 and 0.0038, which didn't match the raw records); latency 1.00 (disclosed: a full core per endpoint, idle included) |
 | B4 observation export: 4 KiB p50 <= +10%, no drops | FAIL (drops: PASS) | +37% economy, +42% balanced, +100% latency at 4 KiB; +1 to +4% at 1 MiB; 0 dropped of 2,920 per run |
-| B5 RSS growth over a timed series <= 2 MiB | FAIL as written at 16 MiB | over both comparisons' 240 runs, 46 of 720 rank-series over, all `host` 16 MiB (up to 4.1 MiB); every other size within it |
+| B5 RSS growth over a timed series <= 2 MiB | FAIL as written at 16 MiB | over both comparisons' 240 runs, 46 of 720 rank-series over, all `host` 16 MiB (up to 4.38 MiB, 4,587,520 bytes: corrected from "4.1 MiB", which was another run's 4,112,384 bytes read as decimal MB); every other size within it |
 | B6 copies per host call no more than before | PASS | unchanged: the payload once through slots, plus timing-dependent copies of eager messages that arrived before their receive |
 
-B5's failures are max-RSS high-water marks at the largest size after only 3 warmup
+Budgets aren't rule 3, so neither deviation (section 3) affects this table. B5's
+failures are max-RSS high-water marks at the largest size after only 3 warmup
 calls; whether they are a leak or allocator growth is not shown (hypothesis: the
 latter, since smaller sizes never exceed the budget). B4 remains the open hot spot:
 the `python-cost` probe puts observation export at 32.5 us of Python per 4 KiB call

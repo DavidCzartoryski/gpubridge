@@ -27,6 +27,15 @@ the same machine throughout; every record has `uptime` before and after its run.
   - `ab-1-mock-flag/`: before `49a6ad7`, after `b89b4d9`.
   - `ab-2-key-check/`: before `b89b4d9`, after `04bfc24` (dropped by the rule; reverted in `613a26c`).
 
+**Labelled deviations (after the perf review).** The `summary.*` verdicts are the
+harness's, kept as recorded, and depart from docs/VERBS_PERF.md rule 3 in two ways:
+copies (`copied_bytes`) are judged against their spread rather than as a count that
+must not increase (D1), and RSS differences under 2 MiB are "no change" (D2). Under the
+rule as written, D1 turns copies at observe/latency/4 KiB into a regression for
+`ab-1` (change 1, so its default status rests on D1) and two copies cells for `ab-2`
+(already dropped); D2 changes no verdict. Details: docs/VERBS_PERF.md, section 3,
+"Deviations from section 1".
+
 Each arm's source is an exported tree of that commit (`git archive <commit> src`), so
 its `src_rev` field is null and the arm name plus this list identify it. The harness
 is the same file for both arms.
