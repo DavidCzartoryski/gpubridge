@@ -32,7 +32,9 @@ OUT/rank<N>.json with what a reviewer needs to judge the run, never a remote key
   Gloo reference collectives run before the window, not inside it. A run passes
   only when every part is shown; ``--require-no-tcp`` fails a bridge leader's step
   unless its evidence is ``pass``. Ranks that aren't bridge leaders carry no bridge
-  traffic and record ``not applicable``.
+  traffic and record ``not applicable``; a job with no leader at all (one island: an
+  all-NVIDIA node without ``GPUBRIDGE_SPLIT_TEST``, say) never runs the bridge, and
+  ``--require-no-tcp`` fails every rank of it.
 
 Modes:
 
@@ -366,8 +368,12 @@ def collectives_mode(args, rank: int, world: int) -> dict:
         raise SystemExit("--memory gpu needs a GPU on every rank")
     reference = dist.new_group(backend="gloo")
     bridge = topology.bridge
+    # How many ranks lead a bridge: none in a job of one island.
+    leaders = torch.tensor([int(bridge is not None)])
+    dist.all_reduce(leaders, group=reference)
     out = {"rank": rank, "host": socket.gethostname(), "bridge": args.bridge,
-           "memory": args.memory, "leader": bridge is not None, "calls": [],
+           "memory": args.memory, "leader": bridge is not None,
+           "leaders": int(leaders.item()), "calls": [],
            "mismatches": 0, "path_violations": 0, "bounced_bytes": 0}
     tele0 = bridge.telemetry() if bridge is not None and hasattr(bridge, "telemetry") else None
 
@@ -465,7 +471,17 @@ def main() -> int:
             status = "failed"
         window_record = result.get("window") or {}
         evidence = window_record.get("tcp_evidence") or {}
-        if result.get("leader") is False and evidence:
+        if result.get("leaders") == 0 and args.bridge == "verbs":
+            # No rank ran the bridge: nothing shows it carried the payload.
+            why = ("no rank is a bridge leader, so the verbs bridge carried nothing (a job of "
+                   "one island, like an all-NVIDIA node without GPUBRIDGE_SPLIT_TEST)")
+            if args.require_no_tcp:
+                status, error = "failed", why
+                evidence.update(verdict="fail (no bridge leader in the job)", no_silent_tcp=False)
+            else:
+                evidence.update(verdict="not applicable (no bridge leader in the job)",
+                                no_silent_tcp=None)
+        elif result.get("leader") is False and evidence:
             # Not a bridge leader: no bridge traffic here to judge.
             evidence.update(verdict="not applicable (not a bridge leader)", no_silent_tcp=None)
         elif args.require_no_tcp and args.bridge == "verbs" and "window" in result \

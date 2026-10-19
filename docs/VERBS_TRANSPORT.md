@@ -768,7 +768,10 @@ plus 1 MiB. Its RC queue pairs as the kernel lists them (`rdma resource show qp`
 pid) are recorded where the `rdma` tool exists, and contradict a pass when it lists
 none. Without `ss` the verdict is `unknown`, never a pass; Gloo reference collectives
 run before the window. `--require-no-tcp` fails a bridge leader's step unless its
-verdict is `pass`; other ranks record `not applicable`.
+verdict is `pass`; other ranks record `not applicable`. A job with no bridge leader
+at all (one island: an all-NVIDIA node without `GPUBRIDGE_SPLIT_TEST`, say) never
+runs the bridge, so `--require-no-tcp` fails every rank of it (each record says
+`leaders: 0`).
 
 ## Testing
 

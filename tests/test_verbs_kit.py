@@ -139,18 +139,22 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _kit(mode: str, out: Path, fabric: str, *extra: str) -> list[subprocess.CompletedProcess]:
+def _kit(mode: str, out: Path, fabric: str, *extra: str,
+         split: str | None = "half") -> list[subprocess.CompletedProcess]:
     """Both ranks as plain processes. Under torchrun the agent SIGTERMs the other rank as
     soon as one exits nonzero, so when every rank fails only the first one's record is
-    sure to be written."""
+    sure to be written. ``split=None``: one NVIDIA island, so no bridge leader."""
     port = _free_port()
     procs = []
     for rank in (0, 1):
         env = {**os.environ, "GPUBRIDGE_VERBS_TEST_FABRIC": fabric,
                "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), os.environ.get("PYTHONPATH", "")]),
-               "GPUBRIDGE_VENDOR": "nvidia", "GPUBRIDGE_SPLIT_TEST": "half",
+               "GPUBRIDGE_VENDOR": "nvidia",
                "MASTER_ADDR": "127.0.0.1", "MASTER_PORT": str(port), "RANK": str(rank),
                "LOCAL_RANK": str(rank), "WORLD_SIZE": "2", "LOCAL_WORLD_SIZE": "2"}
+        env.pop("GPUBRIDGE_SPLIT_TEST", None)
+        if split is not None:
+            env["GPUBRIDGE_SPLIT_TEST"] = split
         procs.append(subprocess.Popen(
             [sys.executable, str(ROOT / "scripts" / "gpu" / "verbs_kit.py"), mode,
              "--out", str(out), "--max-bytes", "4096", "--iters", "5", "--timeout", "60", *extra],
@@ -187,3 +191,21 @@ def test_the_kit_on_the_mock_fabric_never_passes_the_no_tcp_requirement(tmp_path
         assert any("MOCK" in f for f in evidence["failures"])
         if mode == "collectives":
             assert record["mismatches"] == 0 and record["leader"] is True
+
+
+def test_a_job_without_a_bridge_leader_fails_the_no_tcp_requirement(tmp_path):
+    from test_verbs import UNAVAILABLE
+
+    if UNAVAILABLE is not None:
+        pytest.skip(f"verbs test library unavailable: {UNAVAILABLE}")
+    fabric = tempfile.mkdtemp(prefix="gbvk-", dir="/tmp")
+    try:
+        done = _kit("collectives", tmp_path, fabric, "--require-no-tcp", split=None)
+    finally:
+        shutil.rmtree(fabric, ignore_errors=True)
+    assert all(rank.returncode != 0 for rank in done), [rank.stderr[-2000:] for rank in done]
+    for r in (0, 1):
+        record = json.loads((tmp_path / f"rank{r}.json").read_text())
+        assert record["leader"] is False and record["leaders"] == 0
+        assert record["status"] == "failed" and "no rank is a bridge leader" in record["error"]
+        assert record["window"]["tcp_evidence"]["no_silent_tcp"] is False
