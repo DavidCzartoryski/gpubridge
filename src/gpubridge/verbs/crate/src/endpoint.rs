@@ -1520,8 +1520,12 @@ impl Shared {
             }
             // Failure must still drain posted work, but needn't consume a CPU while
             // awaiting close. All policies share the same cancellation/drain machinery.
+            // A full batch means more flushed work is waiting: take it now, else a big
+            // endpoint's close would time out a batch per tick and leak it all.
             if lock(&self.state).failed.is_some() {
-                self.events(TICK);
+                if n < POLL_BATCH {
+                    self.events(TICK);
+                }
                 continue;
             }
             if n > 0 {

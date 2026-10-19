@@ -2,12 +2,12 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{eventually, ib_fabric};
 use gpubridge_verbs::{
     Access, AsyncEvent, AsyncEventKind, Call, Config, Context, Endpoint, Fault, InitAttr,
-    MockFabric, Progress, SendOp, SendRequest, Sge, WaitError, WcStatus,
+    MockDevice, MockFabric, MockPort, Progress, SendOp, SendRequest, Sge, WaitError, WcStatus,
 };
 
 const POLICIES: [Progress; 3] = [Progress::Latency, Progress::Balanced, Progress::Economy];
@@ -145,6 +145,47 @@ fn every_policy_reports_root_wc_failure_and_services_fatal_async_events() {
             "{policy:?}: {:?}",
             f.violations()
         );
+    }
+}
+
+/// A failed endpoint's flushed work drains as fast as it is polled, not a batch per
+/// tick: 2064 receives flushed by an abort (33 polls) would otherwise take 3.3 s, past
+/// the close's timeout, and be leaked.
+#[test]
+fn every_policy_drains_a_failed_endpoint_s_flushed_work_promptly() {
+    for policy in POLICIES {
+        let f = MockFabric::new();
+        let big = |lid| {
+            let mut d = MockDevice::new("mlx0", vec![MockPort::infiniband(lid)]);
+            d.limits.max_qp_wr = 4096;
+            d.limits.max_mr = 8192;
+            d
+        };
+        let (na, nb) = (f.add_node(vec![big(1)]), f.add_node(vec![big(2)]));
+        let c = Config {
+            progress: policy,
+            slot_bytes: 128,
+            credits: 2000,
+            ctrl_credits: 64,
+            send_slots: 4,
+            ..Config::default()
+        };
+        let a = Endpoint::new(f.provider(na), 2, 0, c.clone()).unwrap();
+        let b = Endpoint::new(f.provider(nb), 2, 1, c).unwrap();
+        a.connect(1, &b.local_info()).unwrap();
+        b.connect(0, &a.local_info()).unwrap();
+        a.abort("test over");
+        let start = Instant::now();
+        let closed = a.close(Duration::from_millis(1500));
+        assert!(closed.is_ok(), "{policy:?}: {closed:?}");
+        assert!(start.elapsed() < Duration::from_millis(1500), "{policy:?}");
+        b.close(LONG).unwrap();
+        assert!(
+            f.violations().is_empty(),
+            "{policy:?}: {:?}",
+            f.violations()
+        );
+        assert_eq!(f.live(na).total(), 0, "{policy:?}");
     }
 }
 
