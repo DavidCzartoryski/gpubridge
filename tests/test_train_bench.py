@@ -281,3 +281,40 @@ def test_decompose_counts_each_ranks_own_batch():
     assert [r["batch_size"] for r in out["ranks"]] == [20, 12]
     assert [r["compute_ms_per_sample"] for r in out["ranks"]] == [50.0, 125.0]
     assert [r["alone_samples_per_s"] for r in out["ranks"]] == [20.0, 8.0]
+
+
+def _bench(tmp_path: Path, *extra: str) -> dict:
+    import json
+    import os
+    import subprocess
+
+    out = tmp_path / "bench.json"
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "GPUBRIDGE_VENDOR": "nvidia",
+           "PYTHONPATH": os.pathsep.join([str(root / "src"), os.environ.get("PYTHONPATH", "")])}
+    done = subprocess.run(
+        [sys.executable, "-m", "torch.distributed.run", "--nproc-per-node=2",
+         "--rdzv-backend=c10d", "--rdzv-endpoint=localhost:0",
+         str(root / "scripts" / "gpu" / "train_bench.py"), "--model", "tiny-gpt",
+         "--steps", "2", "--warmup-steps", "1", "--comm-trials", "2", "--bucket-mb", "0.01",
+         "--timeout", "120", "--json", str(out), *extra],
+        env=env, capture_output=True, text=True, timeout=300, check=False)
+    assert done.returncode == 0, done.stderr[-3000:]
+    return json.loads(out.read_text())
+
+
+def test_native_control_is_plain_ddp_without_gpubridge_labelled_on_cpu(tmp_path):
+    record = _bench(tmp_path, "--grad-sync", "native")
+    assert record["grad_sync"] == ("native: plain DistributedDataParallel on a gloo world "
+                                   "group, no gpubridge")
+    assert record["native_backend"] == "gloo"
+    assert record["native_stand_in"].startswith("CPU/Gloo stand-in, not an NCCL/RCCL result")
+    assert record["exchanges_counted"] is False and record["exchanges_per_step"] == 1
+    assert record["buckets"] > 1 and record["comm_alone_ms"] > 0
+    assert record["params_identical"] and record["params_finite"]
+    # The same flags through gpubridge: the bridged run, with no native label.
+    bridged = _bench(tmp_path)
+    assert bridged["grad_sync"] == "DistributedDataParallel + gpubridge.ddp_comm_hook"
+    assert bridged["native_backend"] is None and "native_stand_in" not in bridged
+    assert bridged["model"]["gradient_bytes"] == record["model"]["gradient_bytes"]
+    assert bridged["buckets"] == record["buckets"]  # the same buckets, from DDP itself

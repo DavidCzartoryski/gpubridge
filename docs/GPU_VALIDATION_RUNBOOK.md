@@ -193,6 +193,11 @@ collectives`: host tensors, then GPU tensors with `GPUBRIDGE_VERBS_GPU_PATH=stag
 with its reason instead of staging); `check_verbs` and `bench_verbs` over
 `bridge="verbs"`, next to the Gloo bridge's runs and UCX's (`UCX_BRIDGE=1`) as matched
 references; `train_verbs` and `train_gloo` (`train_bench.py`, `VERBS_TRAIN_MODEL`).
+The engineering baseline they are compared against is `train_bench.py --grad-sync
+native`: plain DDP on an NCCL (RCCL on ROCm) world group, no gpubridge, same flags;
+one vendor only. It is not wired into a job step yet; run it with the same model,
+batch and bucket flags beside `train_verbs`. On CPU it runs on Gloo and its record
+says `native_stand_in`: never an NCCL/RCCL result.
 Each `verbs_kit` record holds the endpoint telemetry (device, port, GID, provider: it
 must not say MOCK), every call's `path` and `path_reason`, completion errors, a window
 of every NIC counter and every interface's bytes (context only: shared, and RoCE
