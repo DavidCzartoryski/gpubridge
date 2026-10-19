@@ -380,7 +380,7 @@ fail the endpoint.
 
 **Unexpected messages and backpressure.** A message that arrives before its
 receive is posted is copied into a heap buffer, up to `unexpected_bytes` (256
-MiB by default) per endpoint. Past that, it and every later data message from
+MiB by default) per endpoint; an empty message counts as one byte. Past that, it and every later data message from
 that peer stay in their receive buffers, unreposted, so their credits don't go
 back and the peer stops sending; posting receives drains them in arrival
 order. Posted operations are bounded too (`max_pending`, 65536); beyond that a

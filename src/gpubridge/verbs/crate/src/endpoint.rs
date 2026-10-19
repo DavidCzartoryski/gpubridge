@@ -102,8 +102,8 @@ pub struct Config {
     /// Operations posted and not yet waited for, at most.
     pub max_pending: usize,
     /// Bytes of arrived messages nobody has posted a receive for yet that this member
-    /// buffers; beyond that it stops returning the sender's credits until receives are
-    /// posted (backpressure).
+    /// buffers (an empty one counts as a byte); beyond that it stops returning the
+    /// sender's credits until receives are posted (backpressure).
     pub unexpected_bytes: u64,
     /// The local ACK timeout exponent (4.096 µs * 2^n) and retry count: how long until a
     /// lost peer fails a send.
@@ -547,6 +547,13 @@ fn random_psn(salt: u64) -> u32 {
             .map_or(0, |d| d.as_nanos()),
     );
     (h.finish() as u32) & 0xFF_FFFF
+}
+
+/// What an arrived message nobody received yet counts against `unexpected_bytes`: its
+/// length, and an empty one a byte, so a peer can't have empty messages buffered without
+/// bound (each would return its credit at once).
+fn unexpected_cost(len: u64) -> u64 {
+    len.max(1)
 }
 
 fn status_text(status: WcStatus) -> &'static str {
@@ -1995,10 +2002,11 @@ impl Shared {
                     Dest::Op(id)
                 }
                 None => {
-                    if h.msg_len > 0 && st.unexpected + h.msg_len > limit {
+                    let cost = unexpected_cost(h.msg_len);
+                    if st.unexpected + cost > limit {
                         return false;
                     }
-                    st.unexpected += h.msg_len;
+                    st.unexpected += cost;
                     st.counters.unexpected_peak = st.counters.unexpected_peak.max(st.unexpected);
                     Dest::Buffer(vec![0u8; h.msg_len as usize])
                 }
@@ -2107,7 +2115,7 @@ impl Shared {
             peer.complete.remove(&tag);
         }
         if let Some(buf) = whole {
-            st.unexpected -= buf.len() as u64;
+            st.unexpected -= unexpected_cost(buf.len() as u64);
             if buf.len() as u64 != len {
                 let why = format!(
                     "member {member} sent {} bytes for tag {tag:#x}, posted for {len} bytes",
@@ -2153,7 +2161,7 @@ impl Shared {
                     // SAFETY: as above; have <= msg_len == len.
                     unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, have) };
                 }
-                let freed = buf.len() as u64;
+                let freed = unexpected_cost(buf.len() as u64);
                 inc.dest = Dest::Op(id);
                 st.unexpected -= freed;
                 st.counters.copied_bytes += have as u64;

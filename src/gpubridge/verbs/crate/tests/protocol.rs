@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{eventually, garbage, ib_fabric, roce_gid, RawMember};
-use gpubridge_verbs::protocol::Info;
+use gpubridge_verbs::protocol::{Info, Kind};
 use gpubridge_verbs::{
     AsyncEvent, AsyncEventKind, Config, Endpoint, Fault, ForkStatus, MockDevice, MockFabric,
     MockPort, Mtu, NodeId, PortState, WaitError, WcStatus,
@@ -219,6 +219,37 @@ fn unclaimed_messages_are_buffered_up_to_the_limit_then_held_in_their_slots() {
     assert_eq!(c.unexpected_bytes, 0);
     assert!(c.unexpected_peak <= 1000);
     assert!(fabric.violations().is_empty());
+}
+
+/// An empty message nobody posted a receive for yet counts as one byte against the
+/// unexpected-bytes bound: past it, empty messages wait in their slots like any other
+/// (holding the sender's credits) instead of being buffered without bound.
+#[test]
+fn empty_unclaimed_messages_count_against_the_bound() {
+    let (fabric, na, nb) = ib_fabric();
+    let config = Config {
+        unexpected_bytes: 2,
+        ..small()
+    };
+    let a = Endpoint::new(fabric.provider(na), 2, 0, config.clone()).unwrap();
+    let mut b = RawMember::new(&fabric, nb, 2, 0, &config);
+    b.connect(&a.local_info(), 1);
+    a.connect(1, &b.info).unwrap();
+    for tag in 1..=4 {
+        let h = b.header(Kind::Data, tag, 0);
+        assert_eq!(b.send(&h.encode()), WcStatus::Success);
+    }
+    eventually(LONG, "all four arrive", || {
+        a.counters().chunks_received == 4
+    });
+    let c = a.counters();
+    assert_eq!((c.unexpected_bytes, c.held_chunks), (2, 2), "{c:?}");
+    let ids: Vec<i64> = (1..=4).map(|tag| recv(&a, 1, &mut [], tag)).collect();
+    a.wait(&ids, LONG).unwrap();
+    assert_eq!(a.counters().unexpected_bytes, 0);
+    a.close(LONG).ok();
+    drop(b);
+    assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
 }
 
 #[test]
