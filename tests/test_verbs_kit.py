@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -132,16 +133,38 @@ def test_missing_tools_read_as_unknown():
     assert verbs_kit.read_qps(run=missing) is None
 
 
-def _kit(mode: str, out: Path, fabric: str, *extra: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "GPUBRIDGE_VERBS_TEST_FABRIC": fabric,
-           "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), os.environ.get("PYTHONPATH", "")]),
-           "GPUBRIDGE_VENDOR": "nvidia", "GPUBRIDGE_SPLIT_TEST": "half"}
-    return subprocess.run(
-        [sys.executable, "-m", "torch.distributed.run", "--nproc-per-node=2",
-         "--master-port=0", "--rdzv-backend=c10d", "--rdzv-endpoint=localhost:0",
-         str(ROOT / "scripts" / "gpu" / "verbs_kit.py"), mode, "--out", str(out),
-         "--max-bytes", "4096", "--iters", "5", "--timeout", "60", *extra],
-        env=env, capture_output=True, text=True, timeout=240, check=False)
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _kit(mode: str, out: Path, fabric: str, *extra: str) -> list[subprocess.CompletedProcess]:
+    """Both ranks as plain processes. Under torchrun the agent SIGTERMs the other rank as
+    soon as one exits nonzero, so when every rank fails only the first one's record is
+    sure to be written."""
+    port = _free_port()
+    procs = []
+    for rank in (0, 1):
+        env = {**os.environ, "GPUBRIDGE_VERBS_TEST_FABRIC": fabric,
+               "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), os.environ.get("PYTHONPATH", "")]),
+               "GPUBRIDGE_VENDOR": "nvidia", "GPUBRIDGE_SPLIT_TEST": "half",
+               "MASTER_ADDR": "127.0.0.1", "MASTER_PORT": str(port), "RANK": str(rank),
+               "LOCAL_RANK": str(rank), "WORLD_SIZE": "2", "LOCAL_WORLD_SIZE": "2"}
+        procs.append(subprocess.Popen(
+            [sys.executable, str(ROOT / "scripts" / "gpu" / "verbs_kit.py"), mode,
+             "--out", str(out), "--max-bytes", "4096", "--iters", "5", "--timeout", "60", *extra],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+    done = []
+    try:
+        for proc in procs:
+            stdout, stderr = proc.communicate(timeout=240)
+            done.append(subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr))
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+    return done
 
 
 @pytest.mark.parametrize("mode", ["endpoint", "collectives"])
@@ -155,7 +178,7 @@ def test_the_kit_on_the_mock_fabric_never_passes_the_no_tcp_requirement(tmp_path
         done = _kit(mode, tmp_path, fabric, "--require-no-tcp")
     finally:
         shutil.rmtree(fabric, ignore_errors=True)
-    assert done.returncode != 0, done.stderr[-2000:]
+    assert all(rank.returncode != 0 for rank in done), [rank.stderr[-2000:] for rank in done]
     records = [json.loads((tmp_path / f"rank{r}.json").read_text()) for r in (0, 1)]
     for record in records:
         evidence = record["window"]["tcp_evidence"]
