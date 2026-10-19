@@ -525,10 +525,15 @@ pub unsafe extern "C" fn gb_verbs_send_reg(
     })
 }
 
-/// As gb_verbs_recv, into `size` bytes at `offset` of registration `region`.
+/// As gb_verbs_recv, into `size` bytes at `offset` of registration `region`. A peer may
+/// be granted an RDMA WRITE into exactly those bytes (rendezvous); a failure anywhere on
+/// the endpoint, as a failed gb_verbs_wait reports it, moves every queue pair to the error
+/// state, so from then on no peer can write them (as after gb_verbs_abort).
 ///
 /// # Safety
-/// `h` from gb_verbs_create; nothing else uses the memory until the operation finishes.
+/// `h` from gb_verbs_create; nothing else uses the memory until the operation finishes,
+/// fails, or the endpoint is aborted or closed; the registration's memory stays allocated
+/// until gb_verbs_close (a write the device had already begun may still land).
 #[no_mangle]
 pub unsafe extern "C" fn gb_verbs_recv_reg(
     h: *mut c_void,
@@ -562,7 +567,9 @@ pub unsafe extern "C" fn gb_verbs_recv_reg(
 }
 
 /// 0 once every operation in `ids` finished; -2 timed out, -3 failed (see
-/// gb_verbs_last_error).
+/// gb_verbs_last_error). A failure fails the whole endpoint, as gb_verbs_abort does: every
+/// operation is cancelled and every queue pair is in the error state, so no peer can
+/// write a receive's granted window any more; later calls fail. A timeout fails nothing.
 ///
 /// # Safety
 /// `h` from gb_verbs_create; `ids` holds `count` ids.

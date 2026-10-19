@@ -15,8 +15,8 @@ use common::{eventually, ib_fabric, RawMember};
 use gpubridge_verbs::protocol::Kind;
 use gpubridge_verbs::{
     Access, Allocation, Call, Config, DmabufCloser, Endpoint, Error, Fault, GpuMemory, Method,
-    MockFabric, MockGpu, NodeId, PeerModules, Progress, Result, Vendor, WcStatus, CACHED_ACCESS,
-    DEVICE_ROUND,
+    MockDevice, MockFabric, MockGpu, MockPort, NodeId, PeerModules, Progress, Result, Vendor,
+    WaitError, WcStatus, CACHED_ACCESS, DEVICE_ROUND,
 };
 
 const LONG: Duration = Duration::from_secs(20);
@@ -672,6 +672,55 @@ fn check_aborting_with_write_granted(progress: Progress) {
     assert_eq!(gpu.open_fds(), 0);
     assert!(gpu.violations().is_empty(), "{:?}", gpu.violations());
     assert!(fabric.violations().is_empty(), "{:?}", fabric.violations());
+}
+
+/// A failed wait fails the endpoint, which moves every queue pair to the error state:
+/// a peer granted a write can't write the window any more once the wait has reported
+/// the failure, though its own link is fine (here member 1's failed instead).
+#[test]
+fn a_failed_wait_stops_every_granted_write() {
+    let fabric = MockFabric::new();
+    let nodes: Vec<NodeId> = (1..=3)
+        .map(|lid| {
+            fabric.add_node(vec![MockDevice::new(
+                "mlx0",
+                vec![MockPort::infiniband(lid)],
+            )])
+        })
+        .collect();
+    let config = config(RNDV);
+    let a = Endpoint::new(fabric.provider(nodes[0]), 3, 0, config.clone()).unwrap();
+    let b = RawMember::new(&fabric, nodes[1], 3, 0, &config);
+    let c = RawMember::new(&fabric, nodes[2], 3, 0, &config);
+    b.connect(&a.local_info(), 1);
+    c.connect(&a.local_info(), 2);
+    a.connect(1, &b.info).unwrap();
+    a.connect(2, &c.info).unwrap();
+    let len = 2 * RNDV;
+    let reg = host(&a, &vec![0xAAu8; len as usize], 3);
+    let window = reg.addr() as u64;
+    let r = a.recv_registered(2, &reg, 0, len, 5).unwrap();
+    let grant = c.receive(LONG);
+    assert_eq!((grant.kind, grant.offset), (Kind::Cts, window));
+    // The next send on a's node, to member 1, fails: a's wait reports it.
+    fabric.inject(Fault::FailNextSend {
+        node: nodes[0],
+        status: WcStatus::RetryExcErr,
+    });
+    let data = [1u8; 8];
+    // SAFETY: data outlives the wait below, which fails the endpoint.
+    let s = unsafe { a.send(1, data.as_ptr() as usize, 8, 1) }.unwrap();
+    assert!(matches!(a.wait(&[s], LONG), Err(WaitError::Failed(_))));
+    assert_ne!(c.write(&[0x55; 64], window, grant.key), WcStatus::Success);
+    // SAFETY: the registration covers len bytes at window, all still allocated.
+    let now = unsafe { std::slice::from_raw_parts(window as *const u8, len as usize) };
+    assert!(
+        now.iter().all(|&x| x == 0xAA),
+        "a write landed after the failure"
+    );
+    assert!(a.wait(&[r], LONG).is_err());
+    a.close(LONG).ok();
+    drop((b, c));
 }
 
 #[test]

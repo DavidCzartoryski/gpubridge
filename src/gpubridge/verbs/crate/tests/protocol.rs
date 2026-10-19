@@ -555,8 +555,9 @@ fn a_peer_that_said_goodbye_left_its_messages_and_no_failure() {
 
 /// Member 1 breaks the protocol while member 0 is part-way through a plain send to
 /// member 2 and a plain receive from it. Once member 0's wait has reported the failure,
-/// nothing reads the send's buffer or writes the receive's again, though member 2's
-/// credits come back and its chunks keep arriving (docs: "Failure is cancellation").
+/// nothing reads the send's buffer or writes the receive's again, though member 2 tries
+/// to return credits and send more chunks: the failure moved member 0's queue pairs to
+/// the error state, so they fail (docs: "Failure is cancellation").
 #[test]
 fn a_failure_cancels_plain_operations_so_nothing_touches_their_memory_after_it() {
     let fabric = MockFabric::new();
@@ -617,13 +618,14 @@ fn a_failure_cancels_plain_operations_so_nothing_touches_their_memory_after_it()
         "the receive was part-way when it failed"
     );
 
-    // 2 receives what 0 sent so far: its credits go back to 0, which (before this fix)
-    // copied the rest of the send's buffer into slots and sent it.
+    // 2 receives what 0 sent so far: it returns credits to 0, which (before the
+    // cancellation fix) copied the rest of the send's buffer into slots and sent it.
     let mut drained = vec![0u8; outgoing.len()];
     let u = recv(&c, 0, &mut drained, 1);
-    // And 2's chunks keep landing at 0 (each batch 200 ticks after the last).
-    eventually(LONG, "more of member 2's chunks arrive", || {
-        a.counters().chunks_received > at_failure.chunks_received
+    // And 2's next chunks for 0 fail rather than land (each batch 200 ticks after the
+    // last): 0's queue pair to it is in the error state.
+    eventually(LONG, "member 2's link to 0 fails", || {
+        c.telemetry().contains("\"lost\":\"member 0")
     });
     thread::sleep(Duration::from_millis(300));
     let after = a.counters();

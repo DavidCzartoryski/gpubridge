@@ -417,8 +417,8 @@ departed peer, a protocol error, a deadline the caller turns into `abort`) only
 by being cancelled, under the endpoint's lock, before anyone can be told: it
 leaves every queue, a chunk arriving for it is dropped, its posted chunks stop
 counting for it. A wait that sees a failed operation fails the endpoint, and a
-failed endpoint cancels every operation and posts nothing more (no chunks, no
-credits). So once `wait` has reported a failure, nothing copies to or from the
+failed endpoint cancels every operation, posts nothing more (no chunks, no
+credits) and moves every queue pair to the error state: a failure is an abort. So once `wait` has reported a failure, nothing copies to or from the
 caller's plain memory again, which is what `send`/`recv`'s contracts (Rust and C)
 promise; it no longer rests on the Python bridge calling `abort` first.
 
@@ -426,10 +426,12 @@ promise; it no longer rests on the Python bridge calling `abort` first.
 (deadline, lost peer, abort) gives its write window to its peer's queue pair: the
 peer may have been writing until that queue pair reached the error state, so the
 window, and the registration it lies in, are deregistered only once the queue
-pair is closed (and never, if it didn't drain). Until then that peer can still
-write those bytes (only those), so the Python bridge keeps such tensors until the
-endpoint closes, and aborts on a failure, which moves every queue pair to the
-error state. Sends from registered memory hold their regions through their work
+pair is closed (and never, if it didn't drain). A failure (any failed wait, not
+only the Python bridge's abort) moves every queue pair to the error state, so once
+it is reported no peer can write a window any more; a write the device had already
+begun may still finish (how promptly is hardware-dependent), so the Python bridge
+keeps such tensors until the endpoint closes, and Rust and C callers must keep
+registered memory allocated until close too. Sends from registered memory hold their regions through their work
 requests, as slots do.
 
 **Teardown.** Closing first sends each connected peer a goodbye (best effort,

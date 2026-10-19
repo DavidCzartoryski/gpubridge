@@ -17,9 +17,12 @@
 //! them early.
 //!
 //! **Failure is cancellation.** An operation fails only by being cancelled under the
-//! endpoint's lock ([`State::fail_op`]), and a failed endpoint cancels them all and posts
-//! nothing more, before any wait can report it: nothing copies to or from plain caller
-//! memory after a failure has been reported.
+//! endpoint's lock ([`State::fail_op`]), and a failed endpoint cancels them all, posts
+//! nothing more and moves every queue pair to the error state, before any wait can report
+//! it: nothing copies to or from plain caller memory after a failure has been reported,
+//! and no peer can write registered memory through a window it was granted (a failure is
+//! an [`Endpoint::abort`]; the device may still finish a write already under way, as for
+//! an abort, so registered memory stays the caller's to keep until close).
 //!
 //! **Rendezvous** (`rndv_bytes` > 0, the same on every member). A message of at least
 //! `rndv_bytes` bytes waits until its receiver posts the receive and clears it: with a
@@ -1028,7 +1031,9 @@ impl Endpoint {
     /// For device memory, completion means the write has completed with respect to this
     /// endpoint (its "written" message, sent after the writes on the same RC queue pair,
     /// was polled); making it visible to GPU work is the caller's flush (docs: "GPU
-    /// memory").
+    /// memory"). Once a wait has reported a failure, no peer can write the window (see
+    /// [`wait`](Endpoint::wait)); a write the device had begun may still finish, so the
+    /// memory stays allocated until close.
     pub fn recv_registered(
         &self,
         member: usize,
@@ -1105,7 +1110,10 @@ impl Endpoint {
     }
 
     /// Waits until every operation in `ids` is done (and forgets them), one fails, the
-    /// endpoint fails, or `timeout` passes.
+    /// endpoint fails, or `timeout` passes. A failure fails the endpoint, which is an
+    /// [`abort`](Endpoint::abort): every operation cancelled, every queue pair in the error
+    /// state, so no peer can write a window it was granted any more. A timeout fails
+    /// nothing.
     pub fn wait(&self, ids: &[i64], timeout: Duration) -> std::result::Result<(), WaitError> {
         let s = &self.shared;
         let start = Instant::now();
@@ -1195,10 +1203,6 @@ impl Endpoint {
         let s = &self.shared;
         let mut st = lock(&s.state);
         s.fail_endpoint(&mut st, why, Blame::Collateral);
-        for peer in st.peers.iter_mut().flatten() {
-            let _ = peer.qp.to_error();
-            peer.lost.get_or_insert_with(|| why.to_owned());
-        }
         s.changed.notify_all();
     }
 
@@ -1246,10 +1250,6 @@ impl Endpoint {
                 }
             }
             s.fail_endpoint(&mut st, "closed", Blame::Collateral);
-            for peer in st.peers.iter_mut().flatten() {
-                let _ = peer.qp.to_error();
-                peer.lost.get_or_insert_with(|| "closed".into());
-            }
             // The completion thread takes the flushed completions.
             while s.cq.outstanding() > 0 && Instant::now() < deadline {
                 st = s
@@ -1619,11 +1619,16 @@ impl Shared {
     }
 
     /// The endpoint failed: every operation is cancelled (with `blame`, unless it already
-    /// failed), and nothing is posted or copied from here on ([`State::fail_op`],
-    /// [`pump`](Shared::pump)).
+    /// failed), nothing is posted or copied from here on ([`State::fail_op`],
+    /// [`pump`](Shared::pump)), and every queue pair moves to the error state, so no peer
+    /// can write a window it was granted any more: a failure is an abort.
     fn fail_endpoint(&self, st: &mut State, why: &str, blame: Blame) {
         st.failed.get_or_insert_with(|| why.to_owned());
         self.cancel_all(st, blame);
+        for peer in st.peers.iter_mut().flatten() {
+            let _ = peer.qp.to_error();
+            peer.lost.get_or_insert_with(|| why.to_owned());
+        }
     }
 
     /// Polls once and handles what came; returns how many.
