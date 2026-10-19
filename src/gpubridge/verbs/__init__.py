@@ -309,8 +309,19 @@ class Endpoint:
         return self._use(lambda h: None if fn(h, *args) == 0 else self._error(h))
 
     def _checked(self, fn, *args) -> int:
-        """``fn(handle, *args)``'s result; a failure is remembered and raised."""
-        handle = self._enter()
+        """``fn(handle, *args)``'s result, with the handle in use; a failure is remembered
+        and raised. Refuses once failed or closed. The hot path (every send, receive and
+        wait), so :meth:`_enter` and :meth:`_leave` are inlined."""
+        if self.failed is not None:
+            raise TransportError(f"the verbs bridge already failed ({self.failed})")
+        lock = self._lock
+        lock.acquire()
+        try:
+            handle = self._handle
+            if handle is not None:
+                self._inflight += 1
+        finally:
+            lock.release()
         if handle is None:
             _closed()
         try:
@@ -319,7 +330,13 @@ class Endpoint:
                 return result
             text = self._error(handle)
         finally:
-            self._leave()
+            lock.acquire()
+            try:
+                self._inflight -= 1
+                if not self._inflight and self._handle is None:
+                    self._idle.notify_all()  # a close is waiting
+            finally:
+                lock.release()
         self.failed = f"verbs bridge {text}" if result == TIMED_OUT else \
             f"verbs bridge failed: {text}"
         error = TransportError(self.failed)
@@ -364,11 +381,9 @@ class Endpoint:
             raise TransportError(error)
 
     def send(self, member: int, pointer: int, nbytes: int, tag: int) -> int:
-        self._usable()
         return self._checked(self._lib.gb_verbs_send, member, pointer, nbytes, tag)
 
     def recv(self, member: int, pointer: int, nbytes: int, tag: int) -> int:
-        self._usable()
         return self._checked(self._lib.gb_verbs_recv, member, pointer, nbytes, tag)
 
     def rndv_bytes(self) -> int:
@@ -424,20 +439,18 @@ class Endpoint:
 
     def send_reg(self, member: int, registration: Registration, pointer: int, nbytes: int,
                  tag: int) -> int:
-        self._usable()
         return self._checked(self._lib.gb_verbs_send_reg, member, registration.handle,
                              pointer - registration.addr, nbytes, tag)
 
     def recv_reg(self, member: int, registration: Registration, pointer: int, nbytes: int,
                  tag: int) -> int:
-        self._usable()
         return self._checked(self._lib.gb_verbs_recv_reg, member, registration.handle,
                              pointer - registration.addr, nbytes, tag)
 
     def wait(self, ids: Sequence[int], deadline: float) -> None:
         """Wait for operations ``ids`` until ``deadline`` (``time.monotonic()``)."""
-        self._usable()
         if not ids:
+            self._usable()
             return
         array = (ctypes.c_int64 * len(ids))(*ids)
         timeout = max(0.0, deadline - time.monotonic())
