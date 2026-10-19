@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -385,3 +386,102 @@ def test_teardown_with_an_operation_outstanding(fabric, tmp_path):
     env = {**fabric, "GB_RDZV": str(tmp_path / "rdzv")}
     run_ranks(["nvidia", "amd"], _check_teardown, tmp_path,
               before_init=partial(_label_islands, None, env), init_kwargs={"bridge": "verbs"})
+
+
+#: Two endpoints on the test fabric and a receive nothing will meet; ``waiting()`` runs
+#: ``a.wait`` on it in a thread, then goes on using ``a`` as a failed call does (abort,
+#: outcomes, another post). Run in a process of its own: a freed handle crashes it.
+_CLOSE_RACE = """
+import ctypes, json, threading, time
+from gpubridge import verbs
+a, b = verbs.Endpoint(2, 0, {}), verbs.Endpoint(2, 1, {})
+a.connect(1, b.local_info())
+b.connect(0, a.local_info())
+buf = (ctypes.c_char * 16)()
+op = a.recv(1, ctypes.addressof(buf), 16, 5)
+got = {}
+
+def waiting():
+    try:
+        a.wait([op], time.monotonic() + 60)
+        got["wait"] = "returned"
+    except verbs.TransportError as exc:
+        got["wait"] = str(exc)
+    a.abort("the waiter gave up")
+    got["outcome"] = a.operation_outcome(op)
+    try:
+        a.send(1, ctypes.addressof(buf), 16, 6)
+    except verbs.TransportError as exc:
+        got["send"] = str(exc)
+
+waiter = threading.Thread(target=waiting)
+"""
+
+
+def _run_close_race(script: str, fabric: dict) -> dict:
+    result = subprocess.run([sys.executable, "-c", _CLOSE_RACE + script],
+                            env={**os.environ, **fabric}, capture_output=True, text=True,
+                            timeout=120)
+    assert result.returncode == 0, (result.returncode, result.stderr[-3000:])
+    return json.loads(result.stdout.splitlines()[-1])
+
+
+@needs_library
+def test_closing_while_another_thread_waits_aborts_it_first_and_frees_nothing_it_uses(
+        fabric):
+    got = _run_close_race("""
+waiter.start()
+time.sleep(0.5)  # inside gb_verbs_wait, the GIL let go
+start = time.monotonic()
+got["drained"] = a.close(timeout=5)
+got["close_s"] = time.monotonic() - start
+waiter.join(10)
+got["alive"] = waiter.is_alive()
+b.close(timeout=1)
+print(json.dumps(got))
+""", fabric)
+    assert got["alive"] is False and got["drained"] is True
+    assert "closed while another call was in the library" in got["wait"], got
+    assert got["close_s"] < 4, got  # aborted at once, not left to its deadline
+    assert got["outcome"] == {"status": "cancelled"}
+    assert "already failed" in got["send"] or "closed" in got["send"], got
+
+
+@needs_library
+def test_a_call_that_stays_in_the_library_past_the_bound_leaks_the_endpoint(fabric):
+    got = _run_close_race("""
+class Stuck:
+    # The library, with gb_verbs_wait held until released: a call that doesn't return
+    # after the abort.
+    def __init__(self, lib):
+        self.lib, self.entered, self.release, self.closes = lib, threading.Event(), \
+            threading.Event(), 0
+    def __getattr__(self, name):
+        return getattr(self.lib, name)
+    def gb_verbs_wait(self, *args):
+        self.entered.set()
+        self.release.wait()
+        return self.lib.gb_verbs_wait(*args)
+    def gb_verbs_close(self, *args):
+        self.closes += 1
+        return self.lib.gb_verbs_close(*args)
+
+stuck = a._lib = Stuck(a._lib)
+waiter.start()
+stuck.entered.wait(10)
+start = time.monotonic()
+got["drained"] = a.close(timeout=0.5)
+got["close_s"] = time.monotonic() - start
+got["closes"] = stuck.closes
+stuck.release.set()  # it enters the library now, with the handle that was kept
+waiter.join(10)
+got["alive"] = waiter.is_alive()
+got["telemetry"] = a.telemetry()
+b.close(timeout=1)
+print(json.dumps(got))
+""", fabric)
+    assert got["drained"] is False and got["closes"] == 0, got
+    assert got["close_s"] < 3, got
+    assert got["alive"] is False
+    assert "closed while another call was in the library" in got["wait"], got
+    assert got["telemetry"] == {"state": "closed"}

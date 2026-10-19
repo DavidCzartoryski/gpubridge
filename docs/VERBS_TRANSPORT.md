@@ -447,6 +447,15 @@ and the close says so). `abort` is the same without the goodbye or the release. 
 times out, registrations still held by outstanding work are leaked too (never
 deregistered), and the Python bridge then never frees their memory.
 
+`gb_verbs_close` frees the endpoint's handle, so no other thread may be in the
+library with it meanwhile; every `gb_verbs_*` function refuses a null handle. The
+Python `Endpoint` counts the calls each thread has in the library. Its `close`
+refuses new ones, and if one is still in (an async collective blocked in a wait
+while the process groups are destroyed), it aborts first so that call returns at
+once, and waits for it, within the close's timeout, before closing. A call still
+there after that leaves the endpoint open and never freed (leaked, like undrained
+work: `close` returns False and the bridge keeps its buffers).
+
 ## Choosing the endpoint
 
 `GPUBRIDGE_VERBS_DEVICE`, `GPUBRIDGE_VERBS_PORT` and `GPUBRIDGE_VERBS_GID_INDEX`

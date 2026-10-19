@@ -3,7 +3,8 @@
 //! (`gb_tcp_*`), so the Python collectives are shared.
 //!
 //! Every function catches panics. Errors are a negative return value and a message
-//! [`gb_verbs_last_error`] copies out.
+//! [`gb_verbs_last_error`] copies out. A null handle is refused, never dereferenced:
+//! each function returns its failure value (0 from `gb_verbs_rndv_bytes`).
 //!
 //! Registrations (`gb_verbs_reg_device`, `gb_verbs_reg_host`) come back as handles the
 //! caller passes to `gb_verbs_send_reg`/`gb_verbs_recv_reg` and gives back with
@@ -98,12 +99,17 @@ fn seconds(value: f64) -> Duration {
     })
 }
 
+/// The handle, or None for a null one, which every function refuses (it returns its
+/// failure value) rather than dereference.
+///
 /// # Safety
-/// `handle` must come from gb_verbs_create and not be closed yet.
-unsafe fn handle<'a>(h: *mut c_void) -> &'a Handle {
+/// `h` must be null, or come from gb_verbs_create and not be closed yet.
+unsafe fn handle<'a>(h: *mut c_void) -> Option<&'a Handle> {
     // SAFETY: the caller's contract.
-    unsafe { &*(h as *const Handle) }
+    unsafe { (h as *const Handle).as_ref() }
 }
+
+const NULL_HANDLE: &str = "a null handle";
 
 /// The provider the settings name: `provider=libibverbs` (the default) or
 /// `provider=test-fabric` with `fabric_dir=` (a test build only).
@@ -205,7 +211,9 @@ pub unsafe extern "C" fn gb_verbs_local_info(
 ) -> c_int {
     guard(FAILED as c_int, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED as c_int;
+        };
         if write_c(&h.endpoint.local_info(), out, size) {
             0
         } else {
@@ -226,7 +234,11 @@ pub unsafe extern "C" fn gb_verbs_connect(
 ) -> c_int {
     guard(FAILED as c_int, || {
         // SAFETY: the caller's contract.
-        let (h, info) = unsafe { (handle(h), CStr::from_ptr(info).to_string_lossy()) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED as c_int;
+        };
+        // SAFETY: NUL-terminated (the caller's contract).
+        let info = unsafe { CStr::from_ptr(info) }.to_string_lossy();
         let member = usize::try_from(member).unwrap_or(usize::MAX);
         match h.endpoint.connect(member, &info) {
             Ok(()) => 0,
@@ -253,7 +265,9 @@ pub unsafe extern "C" fn gb_verbs_send(
 ) -> i64 {
     guard(FAILED, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED;
+        };
         let member = usize::try_from(member).unwrap_or(usize::MAX);
         // SAFETY: the caller keeps the memory valid as Endpoint::send requires.
         match unsafe { h.endpoint.send(member, data as usize, size as u64, tag) } {
@@ -280,7 +294,9 @@ pub unsafe extern "C" fn gb_verbs_recv(
 ) -> i64 {
     guard(FAILED, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED;
+        };
         let member = usize::try_from(member).unwrap_or(usize::MAX);
         // SAFETY: the caller keeps the memory valid as Endpoint::recv requires.
         match unsafe { h.endpoint.recv(member, data as usize, size as u64, tag) } {
@@ -301,7 +317,7 @@ pub unsafe extern "C" fn gb_verbs_recv(
 pub unsafe extern "C" fn gb_verbs_rndv_bytes(h: *mut c_void) -> u64 {
     guard(0, || {
         // SAFETY: the caller's contract.
-        unsafe { handle(h) }.endpoint.rndv_bytes()
+        unsafe { handle(h) }.map_or(0, |h| h.endpoint.rndv_bytes())
     })
 }
 
@@ -319,7 +335,11 @@ pub unsafe extern "C" fn gb_verbs_gpu_load(
 ) -> c_int {
     guard(FAILED as c_int, || {
         // SAFETY: the caller's contract.
-        let (h, vendor) = unsafe { (handle(h), CStr::from_ptr(vendor).to_string_lossy()) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED as c_int;
+        };
+        // SAFETY: NUL-terminated (the caller's contract).
+        let vendor = unsafe { CStr::from_ptr(vendor) }.to_string_lossy();
         match h.endpoint.load_gpu(&vendor) {
             Ok(text) => {
                 write_c(&text, out, size);
@@ -346,7 +366,10 @@ pub unsafe extern "C" fn gb_verbs_gpu_caps(
 ) -> i64 {
     guard(FAILED, || {
         // SAFETY: the caller's contract.
-        let text = unsafe { handle(h) }.endpoint.gpu_capabilities(device);
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED;
+        };
+        let text = h.endpoint.gpu_capabilities(device);
         if write_c(&text, out, size) {
             text.len() as i64
         } else {
@@ -373,7 +396,9 @@ pub unsafe extern "C" fn gb_verbs_reg_device(
 ) -> c_int {
     guard(FAILED as c_int, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED as c_int;
+        };
         match h.endpoint.register_device(device, ptr, len) {
             Ok(reg) => {
                 if !method.is_null() {
@@ -409,7 +434,9 @@ pub unsafe extern "C" fn gb_verbs_reg_host(
 ) -> c_int {
     guard(FAILED as c_int, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED as c_int;
+        };
         // SAFETY: the caller keeps the memory valid as Endpoint::register_host requires.
         match unsafe { h.endpoint.register_host(ptr as usize, len, owner) } {
             // SAFETY: out holds 3 u64s.
@@ -430,7 +457,9 @@ pub unsafe extern "C" fn gb_verbs_reg_host(
 pub unsafe extern "C" fn gb_verbs_release(h: *mut c_void, region: u64) -> c_int {
     guard(FAILED as c_int, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED as c_int;
+        };
         let gone = h
             .regions
             .lock()
@@ -453,7 +482,9 @@ pub unsafe extern "C" fn gb_verbs_release(h: *mut c_void, region: u64) -> c_int 
 pub unsafe extern "C" fn gb_verbs_invalidate_host(h: *mut c_void, owner: u64) -> c_int {
     guard(FAILED as c_int, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED as c_int;
+        };
         h.endpoint.invalidate_host(owner).in_use as c_int
     })
 }
@@ -473,7 +504,9 @@ pub unsafe extern "C" fn gb_verbs_send_reg(
 ) -> i64 {
     guard(FAILED, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED;
+        };
         let member = usize::try_from(member).unwrap_or(usize::MAX);
         let Some(reg) = h.region(region) else {
             h.set_error(format!("no registration {region}"));
@@ -507,7 +540,9 @@ pub unsafe extern "C" fn gb_verbs_recv_reg(
 ) -> i64 {
     guard(FAILED, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED;
+        };
         let member = usize::try_from(member).unwrap_or(usize::MAX);
         let Some(reg) = h.region(region) else {
             h.set_error(format!("no registration {region}"));
@@ -540,7 +575,9 @@ pub unsafe extern "C" fn gb_verbs_wait(
 ) -> c_int {
     guard(FAILED as c_int, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED as c_int;
+        };
         let ids = match usize::try_from(count) {
             // SAFETY: ids holds count entries (the caller's contract).
             Ok(n) if n > 0 => unsafe { std::slice::from_raw_parts(ids, n) },
@@ -574,7 +611,10 @@ pub unsafe extern "C" fn gb_verbs_op_outcome(
 ) -> i64 {
     guard(FAILED, || {
         // SAFETY: the caller's contract.
-        let text = unsafe { handle(h) }.endpoint.operation_outcome(id);
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED;
+        };
+        let text = h.endpoint.operation_outcome(id);
         if write_c(&text, out, size) {
             text.len() as i64
         } else {
@@ -595,7 +635,10 @@ pub unsafe extern "C" fn gb_verbs_last_error(
 ) -> c_int {
     guard(FAILED as c_int, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            write_c(NULL_HANDLE, out, size);
+            return FAILED as c_int;
+        };
         let text = h
             .last_error
             .lock()
@@ -614,7 +657,9 @@ pub unsafe extern "C" fn gb_verbs_last_error(
 pub unsafe extern "C" fn gb_verbs_telemetry(h: *mut c_void, out: *mut c_char, size: usize) -> i64 {
     guard(FAILED, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED;
+        };
         let text = h.endpoint.telemetry();
         if write_c(&text, out, size) {
             text.len() as i64
@@ -633,7 +678,9 @@ pub unsafe extern "C" fn gb_verbs_telemetry(h: *mut c_void, out: *mut c_char, si
 pub unsafe extern "C" fn gb_verbs_abort(h: *mut c_void, why: *const c_char) -> c_int {
     guard(FAILED as c_int, || {
         // SAFETY: the caller's contract.
-        let h = unsafe { handle(h) };
+        let Some(h) = (unsafe { handle(h) }) else {
+            return FAILED as c_int;
+        };
         let why = if why.is_null() {
             "aborted".into()
         } else {
@@ -653,8 +700,14 @@ pub unsafe extern "C" fn gb_verbs_abort(h: *mut c_void, why: *const c_char) -> c
 /// window), stay registered for good, so the caller must never free that memory. Plain
 /// caller memory is never held.
 ///
+/// It frees the handle once the endpoint has closed, so no other call may be in the
+/// library with `h`, or enter it, from when this starts: abort first so a waiter returns,
+/// and if one doesn't, leak the handle rather than close it (Python's `Endpoint.close`
+/// does both).
+///
 /// # Safety
-/// `h` from gb_verbs_create, not used again afterwards; `error` holds `error_size` bytes.
+/// `h` from gb_verbs_create, not used again afterwards (nor by any other thread meanwhile);
+/// `error` holds `error_size` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn gb_verbs_close(
     h: *mut c_void,
@@ -663,6 +716,10 @@ pub unsafe extern "C" fn gb_verbs_close(
     error_size: usize,
 ) -> c_int {
     guard(FAILED as c_int, || {
+        if h.is_null() {
+            write_c(NULL_HANDLE, error, error_size);
+            return FAILED as c_int;
+        }
         // SAFETY: from gb_verbs_create and closed once (the caller's contract).
         let h = unsafe { Box::from_raw(h as *mut Handle) };
         match h.endpoint.close(seconds(timeout)) {
@@ -673,4 +730,54 @@ pub unsafe extern "C" fn gb_verbs_close(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A null handle (say, a caller that raced a close) is refused by every function,
+    /// never dereferenced.
+    #[test]
+    fn every_function_refuses_a_null_handle() {
+        let null = std::ptr::null_mut();
+        let mut buf = [0 as c_char; 64];
+        let (out, size) = (buf.as_mut_ptr(), buf.len());
+        let mut regs = [0u64; 3];
+        let ids = [1i64];
+        let text = c"x".as_ptr();
+        // SAFETY: every pointer but the handle is valid; the null handle is what each
+        // function must refuse.
+        unsafe {
+            assert_eq!(gb_verbs_local_info(null, out, size), -1);
+            assert_eq!(gb_verbs_connect(null, 1, text), -1);
+            assert_eq!(gb_verbs_send(null, 1, out.cast(), 4, 1), -1);
+            assert_eq!(gb_verbs_recv(null, 1, out.cast(), 4, 1), -1);
+            assert_eq!(gb_verbs_rndv_bytes(null), 0);
+            assert_eq!(gb_verbs_gpu_load(null, text, out, size), -1);
+            assert_eq!(gb_verbs_gpu_caps(null, 0, out, size), -1);
+            let method = std::ptr::null_mut();
+            assert_eq!(
+                gb_verbs_reg_device(null, 0, 0, 4, regs.as_mut_ptr(), method),
+                -1
+            );
+            assert_eq!(
+                gb_verbs_reg_host(null, out.cast(), 4, 1, regs.as_mut_ptr()),
+                -1
+            );
+            assert_eq!(gb_verbs_release(null, 1), -1);
+            assert_eq!(gb_verbs_invalidate_host(null, 1), -1);
+            assert_eq!(gb_verbs_send_reg(null, 1, 1, 0, 4, 1), -1);
+            assert_eq!(gb_verbs_recv_reg(null, 1, 1, 0, 4, 1), -1);
+            assert_eq!(gb_verbs_wait(null, ids.as_ptr(), 1, 0.0), -1);
+            assert_eq!(gb_verbs_op_outcome(null, 1, out, size), -1);
+            assert_eq!(gb_verbs_telemetry(null, out, size), -1);
+            assert_eq!(gb_verbs_abort(null, text), -1);
+            assert_eq!(gb_verbs_last_error(null, out, size), -1);
+            assert_eq!(CStr::from_ptr(out).to_str(), Ok("a null handle"));
+            buf[0] = 0;
+            assert_eq!(gb_verbs_close(null, 0.0, buf.as_mut_ptr(), size), -1);
+            assert_eq!(CStr::from_ptr(buf.as_ptr()).to_str(), Ok("a null handle"));
+        }
+    }
 }

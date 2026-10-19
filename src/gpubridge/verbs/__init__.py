@@ -244,10 +244,15 @@ class Registration:
         return self.addr <= pointer and pointer + nbytes <= self.addr + self.length
 
 
+def _closed():
+    raise TransportError("the verbs bridge is closed")
+
+
 class Endpoint:
     """One bridge member's end: an RC queue pair to every other member, made by
     :meth:`__init__` and connected by :meth:`connect`. Thread-safe in the library; a
-    failure is remembered here, after which every call raises."""
+    failure is remembered here, after which every call raises. Every call holds the
+    handle in use while it is in the library, so :meth:`close` never frees it under one."""
 
     def __init__(self, members: int, index: int, settings: Mapping[str, object]) -> None:
         fabric = test_fabric_dir()
@@ -261,24 +266,82 @@ class Endpoint:
         if not handle:
             raise TransportError(error.value.decode())
         self._handle: int | None = handle
+        #: Calls in the library with the handle, under ``_lock`` (see :meth:`close`).
+        self._lock = threading.Lock()
+        self._idle = threading.Condition(self._lock)
+        self._inflight = 0
         #: The first error, after which every call raises: a timed-out collective may
         #: have left messages half sent or received.
         self.failed: str | None = None
 
-    def _error(self) -> str:
+    # ---- the handle in use -------------------------------------------------------------
+
+    def _enter(self) -> int | None:
+        """The handle, in use until :meth:`_leave`; None once closed."""
+        with self._lock:
+            if self._handle is not None:
+                self._inflight += 1
+            return self._handle
+
+    def _leave(self) -> None:
+        with self._lock:
+            self._inflight -= 1
+            if not self._inflight and self._handle is None:
+                self._idle.notify_all()  # a close is waiting
+
+    def _use(self, call, closed=_closed):
+        """``call(handle)`` with the handle in use; ``closed()`` once it is closed."""
+        handle = self._enter()
+        if handle is None:
+            return closed()
+        try:
+            return call(handle)
+        finally:
+            self._leave()
+
+    def _error(self, handle: int) -> str:
         out = ctypes.create_string_buffer(2048)
-        self._lib.gb_verbs_last_error(self._handle, out, len(out))
+        self._lib.gb_verbs_last_error(handle, out, len(out))
         return out.value.decode()
 
-    def _check(self, result: int) -> int:
-        if result < 0:
-            text = self._error()
-            self.failed = f"verbs bridge {text}" if result == TIMED_OUT else \
-                f"verbs bridge failed: {text}"
-            error = TransportError(self.failed)
-            error.timed_out = result == TIMED_OUT
-            raise error
-        return result
+    def _failure(self, fn, *args) -> str | None:
+        """None if ``fn(handle, *args)`` returned 0, else the library's error text."""
+        return self._use(lambda h: None if fn(h, *args) == 0 else self._error(h))
+
+    def _checked(self, fn, *args) -> int:
+        """``fn(handle, *args)``'s result; a failure is remembered and raised."""
+        handle = self._enter()
+        if handle is None:
+            _closed()
+        try:
+            result = fn(handle, *args)
+            if result >= 0:
+                return result
+            text = self._error(handle)
+        finally:
+            self._leave()
+        self.failed = f"verbs bridge {text}" if result == TIMED_OUT else \
+            f"verbs bridge failed: {text}"
+        error = TransportError(self.failed)
+        error.timed_out = result == TIMED_OUT
+        raise error
+
+    def _json(self, fn, *args, size: int = 4096, closed=_closed):
+        """The JSON ``fn(handle, *args, out, size)`` writes, into a buffer grown until it
+        fits; ``closed()`` once closed."""
+
+        def call(handle: int):
+            nonlocal size
+            while True:
+                out = ctypes.create_string_buffer(size)
+                n = fn(handle, *args, out, size)
+                if n >= 0:
+                    return json.loads(out.value.decode())
+                if n == -1:  # refused or panicked: JSON is never empty
+                    raise TransportError(f"the verbs library's {fn.__name__} failed")
+                size = -n + 1
+
+        return self._use(call, closed)
 
     def _usable(self) -> None:
         if self.failed is not None:
@@ -286,29 +349,31 @@ class Endpoint:
         if self._handle is None:
             raise TransportError("the verbs bridge is closed")
 
+    # ---- calls -------------------------------------------------------------------------
+
     def local_info(self) -> str:
         """This member's handshake line (addresses and queue pair numbers; no keys)."""
         out = ctypes.create_string_buffer(64 * 1024)
-        if self._lib.gb_verbs_local_info(self._handle, out, len(out)) != 0:
+        if self._use(lambda h: self._lib.gb_verbs_local_info(h, out, len(out))) != 0:
             raise TransportError("the verbs handshake line didn't fit")
         return out.value.decode()
 
     def connect(self, member: int, info: str) -> None:
         self._usable()
-        if self._lib.gb_verbs_connect(self._handle, member, info.encode()) != 0:
-            raise TransportError(self._error())
+        if (error := self._failure(self._lib.gb_verbs_connect, member, info.encode())):
+            raise TransportError(error)
 
     def send(self, member: int, pointer: int, nbytes: int, tag: int) -> int:
         self._usable()
-        return self._check(self._lib.gb_verbs_send(self._handle, member, pointer, nbytes, tag))
+        return self._checked(self._lib.gb_verbs_send, member, pointer, nbytes, tag)
 
     def recv(self, member: int, pointer: int, nbytes: int, tag: int) -> int:
         self._usable()
-        return self._check(self._lib.gb_verbs_recv(self._handle, member, pointer, nbytes, tag))
+        return self._checked(self._lib.gb_verbs_recv, member, pointer, nbytes, tag)
 
     def rndv_bytes(self) -> int:
         """Messages of at least this many bytes go by rendezvous (0: none)."""
-        return int(self._lib.gb_verbs_rndv_bytes(self._handle))
+        return int(self._use(self._lib.gb_verbs_rndv_bytes))
 
     def load_gpu(self, vendor: str) -> str:
         """Load the ``cuda`` or ``rocm`` driver into the library; its description.
@@ -318,29 +383,24 @@ class Endpoint:
         """
         self._usable()
         out = ctypes.create_string_buffer(1024)
-        if self._lib.gb_verbs_gpu_load(self._handle, vendor.encode(), out, len(out)) != 0:
-            raise TransportError(self._error())
+        if (error := self._failure(self._lib.gb_verbs_gpu_load, vendor.encode(), out,
+                                   len(out))):
+            raise TransportError(error)
         return out.value.decode()
 
     def gpu_capabilities(self, device: int) -> dict:
         """What the direct paths can do on ``device``: ``{"driver", "dmabuf",
         "peer_memory"}``, each ``ok`` (with the module) or the reason."""
-        size = 4096
-        while True:
-            out = ctypes.create_string_buffer(size)
-            n = self._lib.gb_verbs_gpu_caps(self._handle, device, out, size)
-            if n >= 0:
-                return json.loads(out.value.decode())
-            size = -n + 1
+        return self._json(self._lib.gb_verbs_gpu_caps, device)
 
     def register_device(self, device: int, pointer: int, nbytes: int) -> Registration | str:
         """A direct registration of device memory (dma-buf, then peer memory), or the
         reasons there is none (the caller stages instead and says why)."""
         self._usable()
         out, method = (ctypes.c_uint64 * 3)(), ctypes.c_int(0)
-        if self._lib.gb_verbs_reg_device(self._handle, device, pointer, nbytes, out,
-                                         ctypes.byref(method)) != 0:
-            return self._error()
+        if (error := self._failure(self._lib.gb_verbs_reg_device, device, pointer, nbytes,
+                                   out, ctypes.byref(method))):
+            return error
         return Registration(out[0], out[1], out[2],
                             "dmabuf" if method.value == 1 else "peer_memory")
 
@@ -350,31 +410,29 @@ class Endpoint:
         operation on it is done, or the endpoint closed."""
         self._usable()
         out = (ctypes.c_uint64 * 3)()
-        if self._lib.gb_verbs_reg_host(self._handle, pointer, nbytes, owner, out) != 0:
-            raise TransportError(self._error())
+        if (error := self._failure(self._lib.gb_verbs_reg_host, pointer, nbytes, owner, out)):
+            raise TransportError(error)
         return Registration(out[0], out[1], out[2], "host")
 
     def release(self, registration: Registration) -> None:
-        if self._handle is not None:
-            self._lib.gb_verbs_release(self._handle, registration.handle)
+        self._use(lambda h: self._lib.gb_verbs_release(h, registration.handle), lambda: None)
 
     def invalidate_host(self, owner: int) -> int:
         """Drop ``owner``'s host registrations; how many were still in use."""
-        if self._handle is None:
-            return 0
-        return int(self._lib.gb_verbs_invalidate_host(self._handle, owner))
+        return int(self._use(lambda h: self._lib.gb_verbs_invalidate_host(h, owner),
+                             lambda: 0))
 
     def send_reg(self, member: int, registration: Registration, pointer: int, nbytes: int,
                  tag: int) -> int:
         self._usable()
-        return self._check(self._lib.gb_verbs_send_reg(
-            self._handle, member, registration.handle, pointer - registration.addr, nbytes, tag))
+        return self._checked(self._lib.gb_verbs_send_reg, member, registration.handle,
+                             pointer - registration.addr, nbytes, tag)
 
     def recv_reg(self, member: int, registration: Registration, pointer: int, nbytes: int,
                  tag: int) -> int:
         self._usable()
-        return self._check(self._lib.gb_verbs_recv_reg(
-            self._handle, member, registration.handle, pointer - registration.addr, nbytes, tag))
+        return self._checked(self._lib.gb_verbs_recv_reg, member, registration.handle,
+                             pointer - registration.addr, nbytes, tag)
 
     def wait(self, ids: Sequence[int], deadline: float) -> None:
         """Wait for operations ``ids`` until ``deadline`` (``time.monotonic()``)."""
@@ -383,31 +441,17 @@ class Endpoint:
             return
         array = (ctypes.c_int64 * len(ids))(*ids)
         timeout = max(0.0, deadline - time.monotonic())
-        self._check(self._lib.gb_verbs_wait(self._handle, array, len(ids), timeout))
+        self._checked(self._lib.gb_verbs_wait, array, len(ids), timeout)
 
     def telemetry(self) -> dict:
         """What the endpoint reports (docs/VERBS_TRANSPORT.md, "Telemetry")."""
-        if self._handle is None:
-            return {"state": "closed"}
-        size = 16 * 1024
-        while True:
-            out = ctypes.create_string_buffer(size)
-            n = self._lib.gb_verbs_telemetry(self._handle, out, size)
-            if n >= 0:
-                return json.loads(out.value.decode())
-            size = -n + 1
+        return self._json(self._lib.gb_verbs_telemetry, size=16 * 1024,
+                          closed=lambda: {"state": "closed"})
 
     def operation_outcome(self, op: int) -> dict:
         """Native outcome after a failed wait; valid even after abort, until close."""
-        if self._handle is None:
-            return {"status": "cancelled"}
-        size = 4096
-        while True:
-            out = ctypes.create_string_buffer(size)
-            n = self._lib.gb_verbs_op_outcome(self._handle, op, out, size)
-            if n >= 0:
-                return json.loads(out.value.decode())
-            size = -n + 1
+        return self._json(self._lib.gb_verbs_op_outcome, op,
+                          closed=lambda: {"status": "cancelled"})
 
     def abort(self, why: str = "aborted") -> None:
         """Fail the endpoint now: once this returns, nothing reads or writes the plain
@@ -416,21 +460,45 @@ class Endpoint:
         state, so no peer can write any more. Registered memory of failed operations stays
         registered until :meth:`close`: keep it allocated until then. Every later call
         raises."""
-        if self._handle is not None:
+
+        def call(handle: int) -> None:
             if self.failed is None:
                 self.failed = why
-            self._lib.gb_verbs_abort(self._handle, why.encode())
+            self._lib.gb_verbs_abort(handle, why.encode())
+
+        self._use(call, lambda: None)
 
     def close(self, timeout: float = 10.0) -> bool:
         """Close; False if work didn't drain in time. Its memory then stays registered
         (leaked): the endpoint's own slots, and any registered caller memory that work
-        still held, which the caller must then never free."""
-        if self._handle is not None:
+        still held, which the caller must then never free.
+
+        Calls from here on raise (closed). A call another thread still has in the library
+        (an async collective blocked in a wait, say) is aborted first, so it returns at
+        once, and the handle is freed only after it has: if it is still there after
+        ``timeout``, the endpoint is left open and never freed (leaked, False)."""
+        deadline = time.monotonic() + timeout
+        with self._lock:
             handle, self._handle = self._handle, None
-            error = ctypes.create_string_buffer(1024)
-            if self._lib.gb_verbs_close(handle, timeout, error, len(error)) != 0:
-                log.warning("gpubridge: closing the verbs bridge left work undrained after "
-                            "%g s; its memory stays registered (leaked, never released "
-                            "early): %s", timeout, error.value.decode())
+            busy = self._inflight
+        if handle is None:
+            return True
+        if busy:
+            self._lib.gb_verbs_abort(handle, b"closed while another call was in the library")
+            with self._lock:
+                while self._inflight and (left := deadline - time.monotonic()) > 0:
+                    self._idle.wait(left)
+                busy = self._inflight
+            if busy:
+                log.warning("gpubridge: closing the verbs bridge: %d calls still in the "
+                            "library after %g s; it stays open with all its memory "
+                            "(leaked, never freed)", busy, timeout)
                 return False
+        error = ctypes.create_string_buffer(1024)
+        left = max(0.0, deadline - time.monotonic())
+        if self._lib.gb_verbs_close(handle, left, error, len(error)) != 0:
+            log.warning("gpubridge: closing the verbs bridge left work undrained after "
+                        "%g s; its memory stays registered (leaked, never released "
+                        "early): %s", timeout, error.value.decode())
+            return False
         return True
