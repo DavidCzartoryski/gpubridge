@@ -148,6 +148,15 @@ mod dl {
     }
 
     impl Library {
+        /// A stand-in that loads nothing, for tests that fill in the functions.
+        #[cfg(test)]
+        pub fn none() -> Library {
+            Library {
+                handle: std::ptr::null_mut(),
+                path: "(none)".into(),
+            }
+        }
+
         pub fn open(path: &str) -> Result<Library, String> {
             let c = CString::new(path).map_err(|_| format!("bad library name {path:?}"))?;
             // SAFETY: c is NUL-terminated; loading runs the library's initialisers, which
@@ -361,11 +370,8 @@ impl CudaDriver {
         self.check("cuCtxPushCurrent", unsafe {
             (self.fns.ctx_push_current)(ctx as CuContext)
         })?;
-        let out = f();
-        let mut popped: CuContext = std::ptr::null_mut();
-        // SAFETY: pops what was pushed above, on the same thread.
-        unsafe { (self.fns.ctx_pop_current)(&mut popped) };
-        out
+        let _pop = PopCurrent(self.fns.ctx_pop_current);
+        f()
     }
 
     fn device_attribute(&self, device: i32, attr: c_int) -> Result<i32> {
@@ -394,6 +400,19 @@ impl CudaDriver {
     /// The driver version (`cuDriverGetVersion`: 12080 for 12.8).
     pub fn version(&self) -> i32 {
         self.version
+    }
+}
+
+/// Pops the context [`CudaDriver::with_ctx`] pushed when it goes, so also when the call
+/// panics (the C interface catches the panic, and the thread would keep a stale current
+/// context).
+struct PopCurrent(unsafe extern "C" fn(*mut CuContext) -> CuResult);
+
+impl Drop for PopCurrent {
+    fn drop(&mut self) {
+        let mut popped: CuContext = std::ptr::null_mut();
+        // SAFETY: pops what with_ctx pushed, on the same thread (this is its local).
+        unsafe { (self.0)(&mut popped) };
     }
 }
 
@@ -1288,6 +1307,79 @@ mod tests {
         std::fs::create_dir_all(dir.join("sys/module/nvidia_peermem")).unwrap();
         assert_eq!(m.nvidia().unwrap(), "nvidia_peermem");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    thread_local! {
+        /// Contexts pushed and not yet popped on this thread, by the fake driver below.
+        static PUSHED: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    }
+
+    unsafe extern "C" fn device_get(dev: *mut c_int, ordinal: c_int) -> CuResult {
+        // SAFETY: a valid out pointer (with_ctx's).
+        unsafe { *dev = ordinal };
+        0
+    }
+    unsafe extern "C" fn retain(ctx: *mut CuContext, _: c_int) -> CuResult {
+        // SAFETY: as above.
+        unsafe { *ctx = std::ptr::NonNull::<c_void>::dangling().as_ptr() };
+        0
+    }
+    unsafe extern "C" fn release(_: c_int) -> CuResult {
+        0
+    }
+    unsafe extern "C" fn push(_: CuContext) -> CuResult {
+        PUSHED.with(|p| p.set(p.get() + 1));
+        0
+    }
+    unsafe extern "C" fn pop(_: *mut CuContext) -> CuResult {
+        PUSHED.with(|p| p.set(p.get() - 1));
+        0
+    }
+    unsafe extern "C" fn error_string(_: CuResult, _: *mut *const c_char) -> CuResult {
+        1
+    }
+    unsafe extern "C" fn attribute(_: *mut c_int, _: c_int, _: c_int) -> CuResult {
+        1
+    }
+    unsafe extern "C" fn pointer_get(_: *mut c_void, _: c_int, _: CuDeviceptr) -> CuResult {
+        1
+    }
+    unsafe extern "C" fn pointer_set(_: *const c_void, _: c_int, _: CuDeviceptr) -> CuResult {
+        1
+    }
+    unsafe extern "C" fn range(_: *mut CuDeviceptr, _: *mut usize, _: CuDeviceptr) -> CuResult {
+        1
+    }
+
+    /// The context a driver call pushed is popped even when the call panics (the C
+    /// interface catches the panic; the thread must not keep a stale current context).
+    #[test]
+    fn a_panic_in_a_driver_call_still_pops_its_context() {
+        let driver = CudaDriver {
+            lib: dl::Library::none(),
+            fns: CudaFns {
+                get_error_string: error_string,
+                device_get,
+                device_get_attribute: attribute,
+                pointer_get_attribute: pointer_get,
+                pointer_set_attribute: pointer_set,
+                mem_get_address_range: range,
+                mem_get_handle_for_address_range: None,
+                primary_ctx_retain: retain,
+                primary_ctx_release: release,
+                ctx_push_current: push,
+                ctx_pop_current: pop,
+            },
+            version: 0,
+            contexts: Mutex::new(HashMap::new()),
+        };
+        assert_eq!(driver.with_ctx(0, || Ok(7)).unwrap(), 7);
+        assert_eq!(PUSHED.with(std::cell::Cell::get), 0);
+        let call = std::panic::AssertUnwindSafe(|| {
+            driver.with_ctx(0, || -> Result<()> { panic!("a driver call panicked") })
+        });
+        assert!(std::panic::catch_unwind(call).is_err());
+        assert_eq!(PUSHED.with(std::cell::Cell::get), 0, "still pushed");
     }
 
     #[test]
