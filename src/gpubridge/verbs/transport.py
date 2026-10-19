@@ -211,6 +211,8 @@ class VerbsTransport(TaggedBridge):
         self.peer_nics = peer_nics or {}
         #: The training step to put in observations, if the caller sets it.
         self.step: int | None = None
+        #: Whether the endpoint is the MOCK fabric: fixed for its life, so read once.
+        self._synthetic: bool | None = None
         self.paths = {"host": 0, "direct": 0, "direct+bounce": 0, "staged": 0}
         self.last: dict = {"path": None, "path_reason": None, "gpu": None}
         self._support: dict[int, Support] = {}
@@ -463,7 +465,9 @@ class VerbsTransport(TaggedBridge):
         if self.emitter is None:
             return
         base = {**self.base_record, "collective": self._seq}
-        if self.worker.endpoint.telemetry().get("mock"):
+        if self._synthetic is None:
+            self._synthetic = bool(self.worker.endpoint.telemetry().get("mock"))
+        if self._synthetic:
             base["synthetic"] = True
         if path != "host":
             base["path"] = path

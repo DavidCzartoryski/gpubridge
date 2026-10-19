@@ -249,6 +249,26 @@ class Records:
         return {"emitted": len(self.records)}
 
 
+@pytest.mark.parametrize("mock", [True, False])
+def test_observed_calls_read_the_mock_flag_once_and_mark_every_record(monkeypatch, mock):
+    endpoint = FakeEndpoint()
+    reads = []
+    endpoint.telemetry = lambda: reads.append(1) or {"state": "ok", "mock": mock}
+    planner = _planner(endpoint, monkeypatch)
+    planner.emitter = Records()
+    tensor = torch.zeros(64, dtype=torch.uint8)
+
+    def run(_):
+        router = planner.worker
+        router.wait([router.send(1, tensor.data_ptr(), 64, 0)], 0)
+
+    for _ in range(3):
+        planner._run("host", None, tensor, run)
+    assert len(reads) == 1
+    assert len(planner.emitter.records) == 3
+    assert all(r.get("synthetic", False) is mock for r in planner.emitter.records)
+
+
 def test_direct_is_reported_only_when_nothing_bounced_else_the_split(monkeypatch):
     endpoint = FakeEndpoint(rndv=1024)
     planner = _planner(endpoint, monkeypatch)
