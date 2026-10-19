@@ -236,6 +236,47 @@ if [ "$STEPS_07" = all ]; then
             --out "$RESULTS/bench_ucx" --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES" \
             --bridge ucx
     fi
+    # The verbs bridge between real NVIDIA and AMD leaders (items 38 to 42, the
+    # cross-vendor records), opt-in with VERBS_BRIDGE=1: each side builds it in its own
+    # venv; host-to-host verbs; host tensors, then GPU tensors staged and direct (NVIDIA:
+    # dma-buf or peer memory; AMD: ROCr's dma-buf), the check and the benchmark (the
+    # Gloo and UCX bridges' runs here are the matched references), then training over
+    # verbs and over Gloo. Every leader's verbs_kit tcp_evidence must pass (see 05).
+    if [ "$VERBS_BRIDGE" = 1 ]; then
+        step verbs_build both @VENV@/bin/python -m gpubridge.verbs build
+        step verbs_rdma_report both bash "$KIT_DIR/rdma_report.sh" \
+            "$RESULTS/verbs_rdma_report/@SIDE@" @VENV@/bin/python
+        export GPUBRIDGE_VERBS_OBSERVE="$RESULTS/verbs_observations/rank-{rank}.jsonl"
+        step verbs_endpoint both @VENV@/bin/torchrun --nnodes=2 --nproc-per-node=1 \
+            --rdzv-backend=c10d --rdzv-endpoint="$HEAD:$RDZV_PORT" \
+            --rdzv-id="${SLURM_JOB_ID:-local}-verbs-endpoint" "$KIT_DIR/verbs_kit.py" endpoint \
+            --out "$RESULTS/verbs_endpoint" --max-bytes "$BENCH_MAX_BYTES" --require-no-tcp
+        step verbs_host mixed_torchrun verbs-host "$KIT_DIR/verbs_kit.py" collectives \
+            --memory host --out "$RESULTS/verbs_host" --max-bytes "$BENCH_MAX_BYTES" \
+            --require-no-tcp
+        for path in staged direct; do
+            export GPUBRIDGE_VERBS_GPU_PATH="$path"
+            # Direct means nothing bounced: every message by rendezvous, written in place.
+            if [ "$path" = direct ]; then export GPUBRIDGE_VERBS_RNDV_BYTES=1; fi
+            step "verbs_gpu_$path" mixed_torchrun "verbs-gpu-$path" "$KIT_DIR/verbs_kit.py" \
+                collectives --memory gpu --expect-path "$path" --out "$RESULTS/verbs_gpu_$path" \
+                --max-bytes "$BENCH_MAX_BYTES" --require-no-tcp
+        done
+        unset GPUBRIDGE_VERBS_GPU_PATH GPUBRIDGE_VERBS_RNDV_BYTES
+        step check_verbs mixed_torchrun check-verbs "$KIT_DIR/check.py" \
+            --out "$RESULTS/check_verbs" --bridge verbs
+        step summarize_verbs python "$KIT_DIR/summarize.py" "$RESULTS/check_verbs"
+        step bench_verbs mixed_torchrun bench-verbs "$KIT_DIR/bench_all_reduce.py" \
+            --out "$RESULTS/bench_verbs" --ops gpubridge --phases --max-bytes "$BENCH_MAX_BYTES" \
+            --bridge verbs
+        for bridge in verbs gloo; do
+            export GPUBRIDGE_BRIDGE="$bridge"
+            step "train_$bridge" mixed_torchrun "train-$bridge" "$KIT_DIR/train_bench.py" \
+                --model "$VERBS_TRAIN_MODEL" --bridge "$bridge" \
+                --json "$RESULTS/train_${bridge}.json"
+        done
+        unset GPUBRIDGE_BRIDGE GPUBRIDGE_VERBS_OBSERVE
+    fi
     # Opt-in policies on the real mixed job (items 17 to 21).
     for policy in $OPT_IN_POLICIES; do
         step "check_$policy" mixed_torchrun "check-$policy" "$KIT_DIR/check.py" \

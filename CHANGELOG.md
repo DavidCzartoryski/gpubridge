@@ -255,6 +255,42 @@ hardware.
 
 ### Added
 
+- `bridge="verbs"` takes GPU tensors, phase A3 (docs/VERBS_TRANSPORT.md): wire
+  protocol 2 adds a rendezvous (an RDMA WRITE into memory registered for one
+  receive, from `GPUBRIDGE_VERBS_RNDV_BYTES`, 256 KiB) and sends gathered from
+  registered memory; GPU tensors go direct (NVIDIA dma-buf or peer memory, AMD
+  dma-buf from ROCr, drivers loaded at run time, the caller's stream waited for
+  and the GPU flushed) only when every check passes and registration succeeds,
+  else staged through a registered pinned buffer, with the reason in telemetry;
+  transport observations for the straggler detector (`GPUBRIDGE_VERBS_OBSERVE`,
+  with `host`, `job` and the NIC's `pci_bus_id`); a prepared hardware kit
+  (`VERBS_BRIDGE=1`, `scripts/gpu/verbs_kit.py`, items 38 to 42). Tested on mock
+  providers, a mock GPU and CPU stand-ins; built on Explorer's login node (Linux
+  clippy blocked by its limits); not validated on RDMA hardware or GPUs.
+  (PR pending)
+- `bridge="verbs"`, opt-in, phase A2 of the raw-verbs bridge
+  (docs/VERBS_TRANSPORT.md): a versioned wire protocol of RC SEND/RECV through
+  each leader's own registered host buffers, with credits, chunking, a
+  completion thread on a completion channel, deadlines, peer loss and teardown
+  that never frees memory the device may still use; handshake through the c10d
+  store, documented device, port and GID selection, and telemetry. If verbs
+  can't run, setup fails with the reason; nothing falls back to TCP. Host
+  tensors only. The multitcp bridge's collectives moved to a shared
+  `TaggedBridge` that both use. Tested on mock providers (bit for bit against
+  `flat-gloo` between processes on a test-only fabric) and built on Explorer's
+  login node; not validated on RDMA hardware or GPUs. (PR pending)
+- The foundation of a raw-verbs bridge, phase A1 of the opt-in `bridge="verbs"`
+  above (docs/VERBS_TRANSPORT.md): a Rust crate,
+  `gpubridge-verbs`, with a C shim compiled against rdma-core's headers and
+  linked to `libibverbs.so.1`, owned device, protection domain, completion
+  queue, queue pair and memory region types that release in a correct order,
+  work tracking that keeps memory registered while posted work can use it,
+  the queue pair state machine with InfiniBand and RoCE address checks, a
+  bounded registration cache keyed by allocation identity, and a
+  deterministic mock fabric with injectable faults. Tested on the mock
+  provider (macOS and Linux) and built against rdma-core 57.0 on Explorer's
+  login node; not validated on RDMA hardware or GPUs. A CI job tests the
+  crate. (PR pending)
 - Step 07's and the two-machine runner's `DP_RUNS` take `ddp-shares-<rows>`: DDP
   with the rows per rank as given, in rank order (`ddp-shares-5-3` runs
   `train_dp.py --shares 5,3`), and `-r<N>` at the end to name a repeat

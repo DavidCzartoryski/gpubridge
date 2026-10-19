@@ -23,6 +23,12 @@ OPT_IN_POLICIES="${OPT_IN_POLICIES:-pipelined-reduce-bridge-broadcast sharded-br
 # the gpubridge benchmark over bridge="ucx" (docs/RDMA_TRANSPORT.md). Needs UCX
 # there (e.g. MODULES="ucx") and a C++ compiler. Off by default.
 UCX_BRIDGE="${UCX_BRIDGE:-0}"
+# 1: steps 05 and 07 also build the verbs bridge on each node (rdma-core's headers:
+# GPUBRIDGE_VERBS_INCLUDE_DIR if not installed) and run its kit (docs/VERBS_TRANSPORT.md,
+# HARDWARE_VALIDATION.md items 38 to 42). Off by default.
+VERBS_BRIDGE="${VERBS_BRIDGE:-0}"
+# The model the verbs block trains, against the same run over the Gloo bridge.
+VERBS_TRAIN_MODEL="${VERBS_TRAIN_MODEL:-gpt2-small}"
 # Triton's kernels persist here between jobs; each job builds and reads them in a
 # node-local copy (triton_cache_begin in common.sh). "" = Triton's own default cache.
 export TRITON_CACHE_STORE="${TRITON_CACHE_STORE-$WORK_DIR/triton-cache}"

@@ -1,0 +1,29 @@
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+26000/1000    0.014    0.000    0.023    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/src/gpubridge/verbs/observe.py:53(check_record)
+      500    0.008    0.000    0.008    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+    25000    0.006    0.000    0.006    0.000 {method 'search' of 're.Pattern' objects}
+      500    0.006    0.000    0.006    0.000 /opt/homebrew/Cellar/python@3.12/3.12.15/Frameworks/Python.framework/Versions/3.12/lib/python3.12/json/decoder.py:344(raw_decode)
+      998    0.005    0.000    0.005    0.000 /opt/homebrew/Cellar/python@3.12/3.12.15/Frameworks/Python.framework/Versions/3.12/lib/python3.12/json/encoder.py:205(iterencode)
+      500    0.005    0.000    0.005    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/src/gpubridge/verbs/__init__.py:379(wait)
+      500    0.004    0.000    0.006    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/src/gpubridge/verbs/observe.py:239(records)
+      500    0.004    0.000    0.011    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/src/gpubridge/verbs/__init__.py:388(telemetry)
+    52496    0.003    0.000    0.003    0.000 {built-in method builtins.isinstance}
+      498    0.003    0.000    0.004    0.000 {method 'flush' of '_io.TextIOWrapper' objects}
+     1000    0.003    0.000    0.003    0.000 {method 'view' of 'torch._C.TensorBase' objects}
+2900/1950    0.002    0.000    0.002    0.000 {method 'acquire' of '_thread.lock' objects}
+      500    0.002    0.000    0.024    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/src/gpubridge/tagged.py:179(_all_reduce)
+      500    0.002    0.000    0.002    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/src/gpubridge/verbs/__init__.py:301(send)
+   498/25    0.002    0.000    0.001    0.000 /opt/homebrew/Cellar/python@3.12/3.12.15/Frameworks/Python.framework/Versions/3.12/lib/python3.12/threading.py:637(wait)
+      500    0.002    0.000    0.048    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/src/gpubridge/verbs/transport.py:462(_observe)
+      500    0.001    0.000    0.005    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/src/gpubridge/verbs/transport.py:372(_scratch)
+      500    0.001    0.000    0.014    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/src/gpubridge/verbs/gpu.py:197(wait)
+      500    0.001    0.000    0.041    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/src/gpubridge/verbs/transport.py:389(<lambda>)
+      500    0.001    0.000    0.001    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/src/gpubridge/verbs/__init__.py:373(recv_reg)
+      500    0.001    0.000    0.001    0.000 {built-in method torch.equal}
+      500    0.001    0.000    0.001    0.000 {method 'copy_' of 'torch._C.TensorBase' objects}
+     1000    0.001    0.000    0.028    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/src/gpubridge/verbs/observe.py:142(emit)
+   500/27    0.001    0.000    0.006    0.000 /Users/davidczartoryski/code/audit/rr-gb-int-wt/scripts/verbs_perf.py:150(one)
+     1000    0.001    0.000    0.001    0.000 {built-in method resource.getrusage}
+
+
+

@@ -695,6 +695,15 @@ def test_submit_free_and_multi_submit_every_step():
         ("05_multinode.sbatch", ["[check_pinned]", "[bench_pinned]", "check-pinned"]),
         ("05_multinode.sbatch", ["UCX_BRIDGE=1", "[ucx_build]", "python -m gpubridge.ucx build",
                                  "--bridge ucx", "[bench_ucx]"]),
+        ("05_multinode.sbatch", ["VERBS_BRIDGE=1", "[verbs_build]", "python -m gpubridge.verbs build",
+                                 "verbs_kit.py endpoint", "--nproc-per-node=1",
+                                 "--memory gpu --expect-path direct", "--require-no-tcp",
+                                 "--bridge verbs", "[bench_verbs]", "[train_verbs]",
+                                 "[train_gloo]", "--bridge verbs --json",
+                                 "--bridge gloo --json", "rdma_report.sh"]),
+        ("07_mixed_hetjob.sbatch", ["VERBS_BRIDGE=1", "[verbs_build]", "[verbs_gpu_staged]",
+                                    "--expect-path staged", "[check_verbs]", "[train_verbs]",
+                                    "--bridge verbs --json", "--bridge gloo --json"]),
         ("07_mixed_hetjob.sbatch", ["[check_pinned]", "[bench_pinned]"]),
         ("06_scaling.sbatch", ["--nproc-per-node=4", "train_synthetic.py", "summarize.py"]),
         ("07_mixed_hetjob.sbatch", ["--het-group=1", "--rdzv-backend=c10d", "summarize.py",
@@ -702,8 +711,9 @@ def test_submit_free_and_multi_submit_every_step():
     ],
 )
 def test_explorer_jobs_dry_run(job, expected):
-    env = {"UCX_BRIDGE": "1"} if "UCX_BRIDGE=1" in expected else {}
-    expected = [text for text in expected if text != "UCX_BRIDGE=1"]
+    flags = [text for text in expected if text in ("UCX_BRIDGE=1", "VERBS_BRIDGE=1")]
+    env = {text.split("=")[0]: "1" for text in flags}
+    expected = [text for text in expected if text not in flags]
     result = dry_run(KIT / "explorer" / job, **env)
     assert result.returncode == 0, result.stderr
     for text in expected:
@@ -1814,7 +1824,8 @@ def test_tables_cover_every_hardware_validation_item():
 
 
 def test_every_step_the_tables_look_for_is_one_a_job_runs():
-    runs = [dry_run(KIT / "explorer" / job, UCX_BRIDGE="1", MULTITCP_BRIDGE="1") for job in sorted(
+    runs = [dry_run(KIT / "explorer" / job, UCX_BRIDGE="1", MULTITCP_BRIDGE="1",
+                    VERBS_BRIDGE="1") for job in sorted(
         p.name for p in (KIT / "explorer").glob("0*.sbatch"))]
     runs += [dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="dp"),
              dry_run(KIT / "explorer" / "07_mixed_hetjob.sbatch", STEPS_07="pipeline"),

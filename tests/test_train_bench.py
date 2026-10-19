@@ -281,3 +281,75 @@ def test_decompose_counts_each_ranks_own_batch():
     assert [r["batch_size"] for r in out["ranks"]] == [20, 12]
     assert [r["compute_ms_per_sample"] for r in out["ranks"]] == [50.0, 125.0]
     assert [r["alone_samples_per_s"] for r in out["ranks"]] == [20.0, 8.0]
+
+
+def _bench(tmp_path: Path, *extra: str, **env_vars: str) -> dict:
+    import json
+    import os
+    import subprocess
+
+    out = tmp_path / "bench.json"
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "GPUBRIDGE_VENDOR": "nvidia",
+           "PYTHONPATH": os.pathsep.join([str(root / "src"), os.environ.get("PYTHONPATH", "")]),
+           **env_vars}
+    done = subprocess.run(
+        [sys.executable, "-m", "torch.distributed.run", "--nproc-per-node=2",
+         "--rdzv-backend=c10d", "--rdzv-endpoint=localhost:0",
+         str(root / "scripts" / "gpu" / "train_bench.py"), "--model", "tiny-gpt",
+         "--steps", "2", "--warmup-steps", "1", "--comm-trials", "2", "--bucket-mb", "0.01",
+         "--timeout", "120", "--json", str(out), *extra],
+        env=env, capture_output=True, text=True, timeout=300, check=False)
+    assert done.returncode == 0, done.stderr[-3000:]
+    return json.loads(out.read_text())
+
+
+def test_native_control_is_plain_ddp_without_gpubridge_labelled_on_cpu(tmp_path):
+    record = _bench(tmp_path, "--grad-sync", "native")
+    assert record["grad_sync"] == ("native: plain DistributedDataParallel on a gloo world "
+                                   "group, no gpubridge")
+    assert record["native_backend"] == "gloo"
+    assert record["native_stand_in"].startswith("CPU/Gloo stand-in, not an NCCL/RCCL result")
+    assert record["exchanges_counted"] is False and record["exchanges_per_step"] == 1
+    assert record["buckets"] > 1 and record["comm_alone_ms"] > 0
+    assert record["params_identical"] and record["params_finite"]
+    # The same flags through gpubridge: the bridged run, with no native label.
+    bridged = _bench(tmp_path)
+    assert bridged["grad_sync"] == "DistributedDataParallel + gpubridge.ddp_comm_hook"
+    assert bridged["native_backend"] is None and "native_stand_in" not in bridged
+    assert bridged["model"]["gradient_bytes"] == record["model"]["gradient_bytes"]
+    assert bridged["buckets"] == record["buckets"]  # the same buckets, from DDP itself
+
+
+def test_gpubridge_bridge_verbs_trains_over_the_verbs_bridge(tmp_path):
+    """GPUBRIDGE_BRIDGE reaches gpubridge.init: two islands on the MOCK verbs test fabric
+    (tests/test_verbs.py) train over verbs, and both leaders observe the bridge's calls."""
+    import shutil
+    import tempfile
+
+    from test_verbs import UNAVAILABLE
+
+    if UNAVAILABLE is not None:
+        pytest.skip(f"verbs test library unavailable: {UNAVAILABLE}")
+    fabric = tempfile.mkdtemp(prefix="gbtb-", dir="/tmp")  # short: Unix socket paths
+    try:
+        record = _bench(tmp_path, GPUBRIDGE_BRIDGE="verbs", GPUBRIDGE_SPLIT_TEST="half",
+                        GPUBRIDGE_VERBS_TEST_FABRIC=fabric,
+                        GPUBRIDGE_VERBS_OBSERVE=str(tmp_path / "obs.rank{rank}.jsonl"))
+    finally:
+        shutil.rmtree(fabric, ignore_errors=True)
+    assert record["run"]["bridge"] == "verbs"
+    assert len(record["run"]["islands"]) == 2
+    assert record["params_identical"] and record["params_finite"]
+    for rank in (0, 1):
+        assert (tmp_path / f"obs.rank{rank}.jsonl").read_text().strip()
+
+
+@pytest.mark.parametrize("env, flag", [("bogus", []), ("", ["--bridge", "bogus"])],
+                         ids=["env", "flag"])
+def test_an_unknown_bridge_fails_and_never_falls_back_to_gloo(monkeypatch, env, flag):
+    monkeypatch.setenv("GPUBRIDGE_BRIDGE", env)
+    monkeypatch.setattr(sys, "argv", ["train_bench.py", "--model", "tiny-gpt", *flag])
+    with pytest.raises(ValueError, match="unknown bridge transport 'bogus'"):
+        train_bench.main()
+    assert not gpubridge.is_initialized()

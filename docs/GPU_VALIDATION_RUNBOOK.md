@@ -180,6 +180,34 @@ benchmark over the UCX bridge (`check_ucx`, `bench_ucx`; items 26 and 27); the
 run records say whether GPU tensors went to UCX directly or through pinned host
 memory (`run.bridge_path`), and how received data was flushed into the GPU
 (`run.bridge_flush`).
+With `VERBS_BRIDGE=1`, steps 05 (same vendor) and 07 (NVIDIA against AMD) also
+build the raw-verbs bridge on each node (`python -m gpubridge.verbs build`; rdma-core's
+headers, or `GPUBRIDGE_VERBS_INCLUDE_DIR`) and run its kit
+([VERBS_TRANSPORT.md](VERBS_TRANSPORT.md), items 38 to 42). In order:
+`verbs_rdma_report` (`rdma_report.sh` per node: kernel dma-buf options, peer-memory
+modules, `ibv_reg_dmabuf_mr`, ROCr's dma-buf export); `verbs_endpoint` (host-to-host
+verbs between one rank per node: latency, bandwidth, SHA-256 of every buffer);
+`verbs_host`, then `verbs_gpu_staged` and `verbs_gpu_direct` (`verbs_kit.py
+collectives`: host tensors, then GPU tensors with `GPUBRIDGE_VERBS_GPU_PATH=staged` and
+`=direct`, exactly against a Gloo reduction; a direct path that can't run fails the step
+with its reason instead of staging); `check_verbs` and `bench_verbs` over
+`bridge="verbs"`, next to the Gloo bridge's runs and UCX's (`UCX_BRIDGE=1`) as matched
+references; `train_verbs` and `train_gloo` (`train_bench.py`, `VERBS_TRAIN_MODEL`).
+The engineering baseline they are compared against is `train_bench.py --grad-sync
+native`: plain DDP on an NCCL (RCCL on ROCm) world group, no gpubridge, same flags;
+one vendor only. It is not wired into a job step yet; run it with the same model,
+batch and bucket flags beside `train_verbs`. On CPU it runs on Gloo and its record
+says `native_stand_in`: never an NCCL/RCCL result.
+Each `verbs_kit` record holds the endpoint telemetry (device, port, GID, provider: it
+must not say MOCK), every call's `path` and `path_reason`, completion errors, a window
+of every NIC counter and every interface's bytes (context only: shared, and RoCE
+netdevs carry non-TCP traffic), CPU time, and `tcp_evidence`; with `--require-no-tcp` a
+bridge leader's step fails unless that evidence is `pass`: the bridge's own telemetry
+(libibverbs, not MOCK) moved the payload with completions and no errors, and the
+process's own TCP sockets (`ss -tinp`) stayed idle. Without `ss` on the node it is
+`unknown` and the step fails; install or load iproute2's `ss` before the run. Transport observations for the straggler detector go to
+`verbs_observations/rank-<N>.jsonl` (`GPUBRIDGE_VERBS_OBSERVE`). None of this has run
+on hardware yet.
 Steps 04 and 07, the AMD script and `mixed/node.sh` also measure opt-in bridge
 compression (items 28 and 29). `bench_compression_kernels` times the Triton
 kernels against the GPU's memory bandwidth and checks they give the CPU
@@ -244,6 +272,8 @@ as of 2026-10-06; **verify each one**:
 | `USE_PREFLIGHT_IFNAME` | `1` | `0` leaves `GLOO_SOCKET_IFNAME` unset after the preflight, so Gloo picks by hostname |
 | `SHARED_GPU_CHECK_SECONDS` | `60` | step 02's limit for its deliberate failing run, which fails within seconds when the check works |
 | `UCX_BRIDGE` | `0` | `1`: steps 05 and 07 also build the UCX bridge on each node (`python -m gpubridge.ucx build`) and run `check_ucx` and `bench_ucx` over `bridge="ucx"` (items 26 and 27; [RDMA_TRANSPORT.md](RDMA_TRANSPORT.md)). Needs UCX and a C++ compiler on the nodes, e.g. `MODULES=ucx` |
+| `VERBS_BRIDGE` | `0` | `1`: steps 05 and 07 also build the verbs bridge on each node and run its kit (`verbs_endpoint`, `verbs_host`, `verbs_gpu_staged`, `verbs_gpu_direct`, `check_verbs`, `bench_verbs`, `train_verbs`, `train_gloo`; items 38 to 42; [VERBS_TRANSPORT.md](VERBS_TRANSPORT.md)). Needs an RDMA device on each node that a job may open, and rdma-core's headers where it builds |
+| `VERBS_TRAIN_MODEL` | `gpt2-small` | the model `train_verbs` and `train_gloo` train |
 | `PREFLIGHT_SECONDS` | `2` | seconds of raw TCP data each way per pair of interfaces in the preflight |
 | `TIME_NET`, `TIME_08`, `TIME_TRAIN` | 10, 40, 30 min | walltimes of the network check, the comparison matrix and the one-GPU training benchmark |
 | `SAME_PARTITION_PAIRS_OK` | `0` | `1` lets `08-nvidia-pair`, `08-amd-pair`, `07-nvidia-pair` and `07-amd-pair` submit: two GPUs of one type in one partition, once RC confirms that is within intended use. The 07 pairs run step 07's `STEPS_07=dp` or `pipeline` on one island of two (native NCCL or RCCL), the same-vendor baselines in [BENCHMARKS.md](BENCHMARKS.md#what-mixing-vendors-costs-and-whether-it-helps) |

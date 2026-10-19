@@ -68,6 +68,14 @@ the micro-batch size, and each rank gets at least K samples. The record holds
 K, each rank's micro-batch sizes, the samples per step, and the exchanges per
 step the hook counted (and per sample).
 
+``--grad-sync native``: the engineering baseline the reports compare against. Plain
+DistributedDataParallel on a world group of torch's own GPU backend (NCCL, which is
+RCCL on ROCm), with DDP's built-in allreduce and no gpubridge in the gradient path
+(gpubridge.init still sets the run up). One vendor only: NCCL/RCCL can't span vendors,
+so a mixed-vendor run refuses it. Comm alone all_reduces the buckets DDP reports on the
+same group. On CPU the group is Gloo: a stand-in that tests the code path, labelled
+"CPU/Gloo stand-in, not an NCCL/RCCL result" in the record.
+
 So, for "does adding a second GPU raise throughput?", compare a run's
 samples_per_s with a one-rank run's on the faster GPU. The decomposition is a
 model: compute measured alone can differ from compute while gradients sync
@@ -81,6 +89,10 @@ Gradients arrive with the same bits on every rank, but across vendors the
 optimizer step itself may round differently, so this is recorded, not
 enforced, unless a value is not finite.
 
+``--bridge NAME``: the transport between island leaders, passed to gpubridge.init.
+It defaults to ``GPUBRIDGE_BRIDGE``, else gloo. An unknown name fails on every rank;
+nothing falls back to Gloo. The record's ``run.bridge`` is the transport the run used.
+
 Rank 0 writes --json PATH. On CPU, in simulation mode:
 
     GPUBRIDGE_VENDOR=nvidia GPUBRIDGE_SPLIT_TEST=half torchrun --nproc-per-node=2 \\
@@ -92,6 +104,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import os
 import statistics
 import sys
 import time
@@ -109,6 +122,8 @@ from torch.distributed import ReduceOp
 from torch.nn.parallel import DistributedDataParallel
 
 import gpubridge
+from gpubridge.config import BRIDGE_ENV, GPU_BACKEND
+from gpubridge.transport import DEFAULT_TRANSPORT
 
 
 @dataclass(frozen=True)
@@ -341,19 +356,46 @@ def recording_hook(sizes: list[tuple[int, torch.dtype]], exchanges: list[int] | 
     return hook
 
 
+def native_group(device: torch.device) -> tuple[Any, str]:
+    """The native control's world group: torch's own GPU backend (NCCL; RCCL on ROCm), or
+    Gloo on CPU as a stand-in. Its backend name."""
+    backend = GPU_BACKEND if device.type == "cuda" else "gloo"
+    return dist.new_group(list(range(dist.get_world_size())), backend=backend), backend
+
+
+def ddp_bucket_sizes(ddp: DistributedDataParallel) -> list[tuple[int, torch.dtype]]:
+    """The buckets DDP uses after its first steps (its logging data has their bytes: the
+    rebuilt ones once it has rebuilt them), as (elements, dtype)."""
+    dtype = next(ddp.parameters()).dtype
+    size = torch.tensor([], dtype=dtype).element_size()
+    data = ddp._get_ddp_logging_data()
+    raw = str(data.get("rebuilt_bucket_sizes") if data.get("has_rebuilt_buckets")
+              else data.get("bucket_sizes", ""))
+    return [(int(b) // size, dtype) for b in raw.split(",") if b.strip()]
+
+
 def comm_alone(sizes: list[tuple[int, torch.dtype]], device: torch.device,
-               trials: int) -> list[float]:
-    """Seconds to average every bucket (async, as the hook does) with nothing else running."""
+               trials: int, group: Any = None) -> list[float]:
+    """Seconds to average every bucket (async, as the hook does) with nothing else running:
+    through gpubridge, or with ``group`` on that plain torch.distributed group (a SUM,
+    then a division by the world size, as DDP's own allreduce does)."""
     buffers = [torch.ones(n, dtype=dtype, device=device) for n, dtype in sizes]
+    world = dist.get_world_size()
     out = []
     for i in range(trials + 1):
         sync(device)
         dist.barrier()
         start = time.perf_counter()
-        works = [gpubridge.all_reduce(b, op=ReduceOp.AVG, async_op=True) for b in buffers]
+        if group is None:
+            works = [gpubridge.all_reduce(b, op=ReduceOp.AVG, async_op=True) for b in buffers]
+        else:
+            works = [dist.all_reduce(b, group=group, async_op=True) for b in buffers]
         for work in works:
             if work is not None:
                 work.wait()
+        if group is not None:
+            for b in buffers:
+                b.div_(world)
         sync(device)
         if i:  # the first is a warmup
             out.append(time.perf_counter() - start)
@@ -476,6 +518,13 @@ def main() -> int:
     parser.add_argument("--bucket-mb", type=float, default=25.0, help="DDP's bucket_cap_mb")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--json", type=Path, help="rank 0 writes the result here")
+    parser.add_argument("--grad-sync", choices=["gpubridge", "native"], default="gpubridge",
+                        help="gpubridge.ddp_comm_hook, or plain DDP on NCCL/RCCL (the native "
+                        "control; Gloo stand-in on CPU)")
+    parser.add_argument("--bridge", default=os.environ.get(BRIDGE_ENV, "").strip()
+                        or DEFAULT_TRANSPORT,
+                        help="bridge transport for gpubridge.init: gloo, verbs, ucx or multitcp; "
+                        f"default {BRIDGE_ENV}, else {DEFAULT_TRANSPORT}")
     parser.add_argument("--timeout", type=float, default=default_timeout(600),
                         help="process-group timeout (s); default KIT_TIMEOUT, else 600")
     args = parser.parse_args()
@@ -489,8 +538,15 @@ def main() -> int:
     if isinstance(config, GPTConfig) and not 0 < seq <= config.context:
         raise SystemExit(f"--seq-len must be 1 to {config.context} for {args.model}")
 
-    topology = gpubridge.init(timeout=timedelta(seconds=args.timeout))
+    # An unknown name raises ValueError here on every rank, before any group exists.
+    topology = gpubridge.init(timeout=timedelta(seconds=args.timeout), bridge=args.bridge)
     device, rank, world = topology.device, topology.rank, topology.world_size
+    native, native_backend = None, None
+    if args.grad_sync == "native":
+        if topology.run_kind == "gpu-mixed":
+            raise SystemExit("--grad-sync native needs one GPU vendor: NCCL/RCCL can't span "
+                             "vendors (use the gpubridge run for mixed vendors)")
+        native, native_backend = native_group(device)
     if topology.split_test and rank == 0:
         print("SPLIT TEST: not a mixed-vendor result.", file=sys.stderr, flush=True)
     shares, split = batch_sizes(args, world)
@@ -547,13 +603,19 @@ def main() -> int:
     mark = memory_mark(device)
     ddp = DistributedDataParallel(model, device_ids=[device.index] if device.type == "cuda"
                                   else None, bucket_cap_mb=args.bucket_mb,
-                                  broadcast_buffers=False)
+                                  broadcast_buffers=False, process_group=native)
     sizes: list[tuple[int, torch.dtype]] = []
     exchanges = [0]
-    ddp.register_comm_hook(None, recording_hook(sizes, exchanges))
+    if native is None:
+        ddp.register_comm_hook(None, recording_hook(sizes, exchanges))
     optimizer = torch.optim.AdamW(ddp.parameters(), lr=args.lr)
     ddp_times, losses = timed_steps(ddp, optimizer, data, device, args.warmup_steps, args.steps,
                                     scale)
+    if native is not None:
+        # No hook to count with: DDP's own allreduce syncs once per optimizer step (the
+        # micro-batches before the last run under no_sync), on the buckets it reports.
+        sizes = ddp_bucket_sizes(ddp)
+        exchanges[0] = args.warmup_steps + args.steps
     exchanges_per_step = exchanges[0] / (args.warmup_steps + args.steps)
     memory["ddp"] = memory_peaks(device, mark)
 
@@ -568,7 +630,7 @@ def main() -> int:
 
     # 3. comm alone: the same buckets, no compute.
     mark = memory_mark(device)
-    alone = comm_alone(sizes, device, args.comm_trials)
+    alone = comm_alone(sizes, device, args.comm_trials, native)
     memory["comm_alone"] = memory_peaks(device, mark)
 
     gpu = device.type == "cuda"
@@ -591,7 +653,11 @@ def main() -> int:
         record = {
             "kit_version": KIT_VERSION, "script": "scripts/gpu/train_bench.py",
             "argv": sys.argv, "run": run_info(topology), "world_size": world,
-            "grad_sync": "DistributedDataParallel + gpubridge.ddp_comm_hook",
+            "grad_sync": ("DistributedDataParallel + gpubridge.ddp_comm_hook" if native is None
+                          else f"native: plain DistributedDataParallel on a {native_backend} "
+                          "world group, no gpubridge"),
+            "native_backend": native_backend,
+            "exchanges_counted": native is None,
             "policy": topology.policy_name,
             "model": {"name": args.model, "config": asdict(config), "parameters": parameters,
                       "gradient_bytes": sum(n * torch.tensor([], dtype=d).element_size()
@@ -622,6 +688,9 @@ def main() -> int:
         }
         if topology.split_test:
             record["warning"] = "SPLIT TEST: not a mixed-vendor result."
+        if native is not None and native_backend != GPU_BACKEND:
+            record["native_stand_in"] = ("CPU/Gloo stand-in, not an NCCL/RCCL result: it "
+                                         "tests the native control's code path only")
         print(f"{args.model}, {world} rank(s), {topology.run_kind}: "
               f"{result['samples_per_s']} samples/s, step {result['step_ms']} ms = slowest "
               f"compute {result['slowest_compute_ms']} + exposed comm "

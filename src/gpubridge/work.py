@@ -25,10 +25,15 @@ Stream semantics on GPUs, matching ``torch.distributed`` with NCCL:
 
 The bridge steps of a collective block the worker thread on host copies, not
 the caller, so the caller's thread can keep queueing GPU work.
+
+Submissions are bounded (GPUBRIDGE_ASYNC_QUEUE, 1024 waiting calls by default).
+Overflow rejects the new call; accepted work keeps its FIFO order. Wait for it
+before retrying, preserving the same collective sequence on every rank.
 """
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 from collections.abc import Callable, Sequence
@@ -36,6 +41,21 @@ from datetime import timedelta
 from typing import Any
 
 import torch
+
+QUEUE_ENV = "GPUBRIDGE_ASYNC_QUEUE"
+DEFAULT_QUEUE = 1024
+
+
+def queue_limit() -> int:
+    """Maximum queued (not yet running) async collectives per rank."""
+    raw = os.environ.get(QUEUE_ENV, "").strip()
+    try:
+        limit = int(raw) if raw else DEFAULT_QUEUE
+    except ValueError:
+        raise ValueError(f"{QUEUE_ENV} must be a positive whole number") from None
+    if limit <= 0:
+        raise ValueError(f"{QUEUE_ENV} must be a positive whole number")
+    return limit
 
 
 class Work:
@@ -100,8 +120,9 @@ class _Worker:
 
     def __init__(self, device: torch.device) -> None:
         self.device = device
+        self.limit = queue_limit()
         self.queue: queue.Queue[tuple[Work, Callable[[], None], Any, tuple] | None] = (
-            queue.Queue())
+            queue.Queue(self.limit))
         self.failed: BaseException | None = None
         self.stream: torch.cuda.Stream | None = None
         self.thread = threading.Thread(target=self._run, name="gpubridge-async", daemon=True)
@@ -114,7 +135,13 @@ class _Worker:
         if self.device.type == "cuda":
             ready = torch.cuda.Event()
             ready.record(torch.cuda.current_stream(self.device))
-        self.queue.put((work, fn, ready, tuple(tensors)))
+        try:
+            self.queue.put_nowait((work, fn, ready, tuple(tensors)))
+        except queue.Full:
+            raise RuntimeError(
+                f"gpubridge async queue is full ({self.limit} queued collectives); "
+                "wait for accepted work before retrying this collective, preserving "
+                f"the same collective order on every rank ({QUEUE_ENV})") from None
         return work
 
     def drain(self) -> None:
