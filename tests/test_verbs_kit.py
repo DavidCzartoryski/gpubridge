@@ -24,7 +24,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "gpu"))
-import verbs_kit
+import verbs_kit  # noqa: E402
 
 PAYLOAD = 64 << 20
 REAL = {"provider": "libibverbs (/usr/lib64/libibverbs.so.1)", "mock": False,
