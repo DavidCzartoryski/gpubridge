@@ -89,6 +89,10 @@ Gradients arrive with the same bits on every rank, but across vendors the
 optimizer step itself may round differently, so this is recorded, not
 enforced, unless a value is not finite.
 
+``--bridge NAME``: the transport between island leaders, passed to gpubridge.init.
+It defaults to ``GPUBRIDGE_BRIDGE``, else gloo. An unknown name fails on every rank;
+nothing falls back to Gloo. The record's ``run.bridge`` is the transport the run used.
+
 Rank 0 writes --json PATH. On CPU, in simulation mode:
 
     GPUBRIDGE_VENDOR=nvidia GPUBRIDGE_SPLIT_TEST=half torchrun --nproc-per-node=2 \\
@@ -100,6 +104,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import os
 import statistics
 import sys
 import time
@@ -117,7 +122,8 @@ from torch.distributed import ReduceOp
 from torch.nn.parallel import DistributedDataParallel
 
 import gpubridge
-from gpubridge.config import GPU_BACKEND
+from gpubridge.config import BRIDGE_ENV, GPU_BACKEND
+from gpubridge.transport import DEFAULT_TRANSPORT
 
 
 @dataclass(frozen=True)
@@ -515,6 +521,10 @@ def main() -> int:
     parser.add_argument("--grad-sync", choices=["gpubridge", "native"], default="gpubridge",
                         help="gpubridge.ddp_comm_hook, or plain DDP on NCCL/RCCL (the native "
                         "control; Gloo stand-in on CPU)")
+    parser.add_argument("--bridge", default=os.environ.get(BRIDGE_ENV, "").strip()
+                        or DEFAULT_TRANSPORT,
+                        help="bridge transport for gpubridge.init: gloo, verbs, ucx or multitcp; "
+                        f"default {BRIDGE_ENV}, else {DEFAULT_TRANSPORT}")
     parser.add_argument("--timeout", type=float, default=default_timeout(600),
                         help="process-group timeout (s); default KIT_TIMEOUT, else 600")
     args = parser.parse_args()
@@ -528,7 +538,8 @@ def main() -> int:
     if isinstance(config, GPTConfig) and not 0 < seq <= config.context:
         raise SystemExit(f"--seq-len must be 1 to {config.context} for {args.model}")
 
-    topology = gpubridge.init(timeout=timedelta(seconds=args.timeout))
+    # An unknown name raises ValueError here on every rank, before any group exists.
+    topology = gpubridge.init(timeout=timedelta(seconds=args.timeout), bridge=args.bridge)
     device, rank, world = topology.device, topology.rank, topology.world_size
     native, native_backend = None, None
     if args.grad_sync == "native":

@@ -272,7 +272,8 @@ if [ "$STEPS_07" = all ]; then
         for bridge in verbs gloo; do
             export GPUBRIDGE_BRIDGE="$bridge"
             step "train_$bridge" mixed_torchrun "train-$bridge" "$KIT_DIR/train_bench.py" \
-                --model "$VERBS_TRAIN_MODEL" --json "$RESULTS/train_${bridge}.json"
+                --model "$VERBS_TRAIN_MODEL" --bridge "$bridge" \
+                --json "$RESULTS/train_${bridge}.json"
         done
         unset GPUBRIDGE_BRIDGE GPUBRIDGE_VERBS_OBSERVE
     fi

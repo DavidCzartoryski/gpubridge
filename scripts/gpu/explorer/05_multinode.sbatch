@@ -132,7 +132,7 @@ if [ "$VERBS_BRIDGE" = 1 ]; then
     for bridge in verbs gloo; do
         export GPUBRIDGE_BRIDGE="$bridge"
         step "train_$bridge" multinode "train-$bridge" "$KIT_DIR/train_bench.py" \
-            --model "$VERBS_TRAIN_MODEL" --json "$RESULTS/train_${bridge}.json"
+            --model "$VERBS_TRAIN_MODEL" --bridge "$bridge" --json "$RESULTS/train_${bridge}.json"
     done
     unset GPUBRIDGE_BRIDGE
     unset GPUBRIDGE_VERBS_OBSERVE
