@@ -168,3 +168,129 @@ Findings, each with its evidence:
    was *slower* than economy above 4 KiB (1 MiB: 1,463 vs 987 us; CPU per op 2.6x).
    `economy` and `balanced` idle at 0.003 to 0.005 core-s/s (B3 passes). This is a
    property of an oversubscribed mock, disclosed, not tuned.
+
+## 3. Changes and matched comparisons (CPU/MOCK, not a GPU or RDMA speedup)
+
+Each change ran against its parent: `scripts/verbs_perf.py ab`, series `observe` and
+`host`, every policy, 5 interleaved pairs (A B, B A, ...), 60 runs per comparison, load
+average 1.7 to 3.6 (another worker's tests). Cells are before → after medians (change,
+spread as defined in section 1, pairs better, verdict). Every metric of every size,
+RSS and counts included: `results/verbs-perf/ab-*/summary.md`. All 240 runs: 0 wrong
+results.
+
+### Change 1: read the endpoint's mock flag once (`b89b4d9`): DEFAULT
+
+`_observe` parsed the whole native telemetry on every observed call to read a flag
+that is fixed for the endpoint's life (H2). Now read on the first observed call.
+Pure-Python probe: 38.6 → 32.5 us per 4 KiB observed call. Counted: crossings per
+observed call 4 → 3 in every pair (the per-call
+`gb_verbs_telemetry` is gone). Rule 2: wins on observe/economy 1 MiB (p50 -2.2%,
+spread 1.1%, 5/5; throughput +2.2%). Rule 3: no metric regressed beyond its spread
+under any policy or series. Rule 4: passes; it is the default.
+
+| series | policy | size | p50 us | p99 us | CPU per op us |
+| --- | --- | --- | --- | --- | --- |
+| host | balanced | idle | idle CPU core-s/s: 0.004 → 0.004 (+8%, spread 33%, 2/5; inside spread) | | |
+| host | balanced | 4 KiB | 74 → 63 (-15%, spread 49%, 3/5; inside spread) | 162 → 127 (-21%, spread 55%, 4/5; inside spread) | 107 → 87 (-18%, spread 37%, 4/5; inside spread) |
+| host | balanced | 64 KiB | 96 → 96 (-0%, spread 21%, 4/5; inside spread) | 125 → 124 (-2%, spread 58%, 5/5; inside spread) | 117 → 116 (-1%, spread 8%, 5/5; inside spread) |
+| host | balanced | 1 MiB | 1000 → 1002 (+0%, spread 25%, 4/5; inside spread) | 1158 → 1064 (-8%, spread 60%, 4/5; inside spread) | 1186 → 1171 (-1%, spread 20%, 4/5; inside spread) |
+| host | balanced | 16 MiB | 14866 → 14888 (+0%, spread 1%, 1/5; inside spread) | 15490 → 15488 (-0%, spread 13%, 2/5; inside spread) | 18607 → 18429 (-1%, spread 2%, 3/5; inside spread) |
+| host | economy | idle | idle CPU core-s/s: 0.003 → 0.004 (+4%, spread 28%, 2/5; inside spread) | | |
+| host | economy | 4 KiB | 71 → 71 (-0%, spread 34%, 2/5; inside spread) | 158 → 161 (+2%, spread 27%, 1/5; inside spread) | 89 → 91 (+2%, spread 25%, 1/5; inside spread) |
+| host | economy | 64 KiB | 95 → 94 (-1%, spread 2%, 5/5; inside spread) | 125 → 123 (-2%, spread 4%, 4/5; inside spread) | 109 → 108 (-1%, spread 3%, 3/5; inside spread) |
+| host | economy | 1 MiB | 988 → 992 (+0%, spread 18%, 3/5; inside spread) | 1060 → 1274 (+20%, spread 84%, 2/5; inside spread) | 1140 → 1144 (+0%, spread 12%, 1/5; inside spread) |
+| host | economy | 16 MiB | 14803 → 14867 (+0%, spread 14%, 1/5; inside spread) | 15917 → 15148 (-5%, spread 68%, 2/5; inside spread) | 18376 → 18332 (-0%, spread 15%, 3/5; inside spread) |
+| host | latency | idle | idle CPU core-s/s: 1.001 → 1.000 (-0%, spread 0%, 3/5; inside spread) | | |
+| host | latency | 4 KiB | 52 → 52 (+0%, spread 14%, 3/5; inside spread) | 82 → 81 (-1%, spread 37%, 2/5; inside spread) | 93 → 93 (-1%, spread 8%, 3/5; inside spread) |
+| host | latency | 64 KiB | 132 → 133 (+0%, spread 4%, 3/5; inside spread) | 167 → 168 (+1%, spread 39%, 3/5; inside spread) | 253 → 255 (+1%, spread 5%, 3/5; inside spread) |
+| host | latency | 1 MiB | 1463 → 1466 (+0%, spread 18%, 2/5; inside spread) | 1582 → 1880 (+19%, spread 42%, 1/5; inside spread) | 2917 → 2947 (+1%, spread 8%, 1/5; inside spread) |
+| host | latency | 16 MiB | 22020 → 22162 (+1%, spread 16%, 1/5; inside spread) | 23293 → 28285 (+21%, spread 43%, 0/5; inside spread) | 45939 → 47792 (+4%, spread 14%, 1/5; inside spread) |
+| observe | balanced | idle | idle CPU core-s/s: 0.004 → 0.004 (+2%, spread 13%, 1/5; inside spread) | | |
+| observe | balanced | 4 KiB | 120 → 108 (-10%, spread 20%, 4/5; inside spread) | 328 → 282 (-14%, spread 52%, 4/5; inside spread) | 201 → 185 (-8%, spread 31%, 4/5; inside spread) |
+| observe | balanced | 1 MiB | 1036 → 1014 (-2%, spread 31%, 5/5; inside spread) | 1100 → 1141 (+4%, spread 104%, 2/5; inside spread) | 1212 → 1196 (-1%, spread 26%, 4/5; inside spread) |
+| observe | economy | idle | idle CPU core-s/s: 0.004 → 0.004 (+0%, spread 24%, 2/5; inside spread) | | |
+| observe | economy | 4 KiB | 119 → 104 (-13%, spread 32%, 5/5; inside spread) | 300 → 259 (-14%, spread 47%, 3/5; inside spread) | 181 → 167 (-8%, spread 39%, 3/5; inside spread) |
+| observe | economy | 1 MiB | 1033 → 1011 (-2%, spread 1%, 5/5; win) | 1138 → 1073 (-6%, spread 43%, 4/5; inside spread) | 1189 → 1158 (-3%, spread 3%, 5/5; inside spread) |
+| observe | latency | idle | idle CPU core-s/s: 0.999 → 1.000 (+0%, spread 0%, 0/5; inside spread) | | |
+| observe | latency | 4 KiB | 117 → 102 (-13%, spread 26%, 5/5; inside spread) | 166 → 159 (-4%, spread 57%, 3/5; inside spread) | 240 → 215 (-10%, spread 18%, 5/5; inside spread) |
+| observe | latency | 1 MiB | 1536 → 1496 (-3%, spread 30%, 4/5; inside spread) | 1951 → 1587 (-19%, spread 39%, 5/5; inside spread) | 3078 → 2984 (-3%, spread 24%, 4/5; inside spread) |
+
+### Change 2: remember field names already checked (`04bfc24`): DROPPED (`613a26c`)
+
+`check_record` ran a regular expression and a recursive call for every field of every
+record (H1). Remembering names that passed (bounded) and not recursing into scalars
+cut the pure-Python probe from 32.5 to 24.9 us per 4 KiB observed call (runs within
+±3%). On the pre-registered series, 4 KiB observe p50 fell 6 to 11% under every
+policy in 3 or 4 of 5 pairs, but inside spreads of 17 to 34%, and nothing regressed.
+Rule 2: wins nowhere. Rule 4: not the default; the code is reverted to the original
+check (its refusal test stays). **Deviation proposal for David, not applied:** accept
+the low-noise `python-cost` probe as the deciding measurement for pure-Python changes
+with no regression, which would make change 2 the default. Until approved it stays
+out.
+
+| series | policy | size | p50 us | p99 us | CPU per op us |
+| --- | --- | --- | --- | --- | --- |
+| host | balanced | idle | idle CPU core-s/s: 0.004 → 0.004 (-2%, spread 19%, 4/5; inside spread) | | |
+| host | balanced | 4 KiB | 75 → 67 (-11%, spread 37%, 4/5; inside spread) | 166 → 168 (+1%, spread 37%, 2/5; inside spread) | 109 → 97 (-11%, spread 32%, 3/5; inside spread) |
+| host | balanced | 64 KiB | 97 → 96 (-0%, spread 7%, 3/5; inside spread) | 126 → 125 (-1%, spread 17%, 2/5; inside spread) | 116 → 117 (+0%, spread 6%, 3/5; inside spread) |
+| host | balanced | 1 MiB | 994 → 992 (-0%, spread 1%, 2/5; inside spread) | 1132 → 1065 (-6%, spread 21%, 2/5; inside spread) | 1169 → 1174 (+0%, spread 3%, 2/5; inside spread) |
+| host | balanced | 16 MiB | 14742 → 14829 (+1%, spread 3%, 2/5; inside spread) | 15343 → 15253 (-1%, spread 32%, 2/5; inside spread) | 18496 → 18595 (+1%, spread 3%, 1/5; inside spread) |
+| host | economy | idle | idle CPU core-s/s: 0.004 → 0.004 (+1%, spread 51%, 1/5; inside spread) | | |
+| host | economy | 4 KiB | 70 → 70 (+0%, spread 9%, 4/5; inside spread) | 166 → 155 (-7%, spread 17%, 4/5; inside spread) | 90 → 89 (-1%, spread 10%, 5/5; inside spread) |
+| host | economy | 64 KiB | 94 → 94 (-0%, spread 3%, 2/5; inside spread) | 125 → 122 (-2%, spread 8%, 3/5; inside spread) | 109 → 108 (-0%, spread 2%, 3/5; inside spread) |
+| host | economy | 1 MiB | 989 → 987 (-0%, spread 3%, 3/5; inside spread) | 1035 → 1046 (+1%, spread 27%, 1/5; inside spread) | 1144 → 1142 (-0%, spread 3%, 3/5; inside spread) |
+| host | economy | 16 MiB | 14751 → 14779 (+0%, spread 4%, 0/5; inside spread) | 16806 → 15356 (-9%, spread 72%, 4/5; inside spread) | 18345 → 18383 (+0%, spread 1%, 2/5; inside spread) |
+| host | latency | idle | idle CPU core-s/s: 1.001 → 1.002 (+0%, spread 0%, 1/5; inside spread) | | |
+| host | latency | 4 KiB | 52 → 51 (-1%, spread 3%, 3/5; inside spread) | 80 → 78 (-2%, spread 11%, 3/5; inside spread) | 92 → 92 (+0%, spread 3%, 3/5; inside spread) |
+| host | latency | 64 KiB | 130 → 132 (+2%, spread 2%, 0/5; inside spread) | 167 → 164 (-1%, spread 7%, 3/5; inside spread) | 247 → 252 (+2%, spread 3%, 1/5; inside spread) |
+| host | latency | 1 MiB | 1474 → 1465 (-1%, spread 2%, 3/5; inside spread) | 1571 → 1602 (+2%, spread 22%, 2/5; inside spread) | 2968 → 2921 (-2%, spread 5%, 4/5; inside spread) |
+| host | latency | 16 MiB | 22201 → 22055 (-1%, spread 2%, 2/5; inside spread) | 23003 → 22653 (-2%, spread 23%, 3/5; inside spread) | 45916 → 45684 (-1%, spread 3%, 4/5; inside spread) |
+| observe | balanced | idle | idle CPU core-s/s: 0.004 → 0.004 (-1%, spread 24%, 4/5; inside spread) | | |
+| observe | balanced | 4 KiB | 107 → 97 (-9%, spread 17%, 3/5; inside spread) | 270 → 246 (-9%, spread 49%, 3/5; inside spread) | 183 → 172 (-6%, spread 25%, 3/5; inside spread) |
+| observe | balanced | 1 MiB | 1010 → 1006 (-0%, spread 2%, 3/5; inside spread) | 1081 → 1074 (-1%, spread 20%, 3/5; inside spread) | 1195 → 1188 (-1%, spread 2%, 3/5; inside spread) |
+| observe | economy | idle | idle CPU core-s/s: 0.004 → 0.003 (-5%, spread 18%, 4/5; inside spread) | | |
+| observe | economy | 4 KiB | 96 → 91 (-6%, spread 23%, 4/5; inside spread) | 213 → 243 (+14%, spread 64%, 4/5; inside spread) | 146 → 146 (+1%, spread 34%, 4/5; inside spread) |
+| observe | economy | 1 MiB | 1028 → 1007 (-2%, spread 30%, 5/5; inside spread) | 1201 → 1151 (-4%, spread 111%, 3/5; inside spread) | 1190 → 1160 (-3%, spread 32%, 4/5; inside spread) |
+| observe | latency | idle | idle CPU core-s/s: 1.002 → 1.002 (-0%, spread 0%, 3/5; inside spread) | | |
+| observe | latency | 4 KiB | 104 → 92 (-11%, spread 34%, 4/5; inside spread) | 201 → 140 (-30%, spread 75%, 3/5; inside spread) | 219 → 189 (-14%, spread 29%, 4/5; inside spread) |
+| observe | latency | 1 MiB | 1494 → 1488 (-0%, spread 3%, 3/5; inside spread) | 1638 → 1742 (+6%, spread 249%, 1/5; inside spread) | 2994 → 2968 (-1%, spread 12%, 3/5; inside spread) |
+
+### Tried and discarded without a comparison
+
+- Waking the observation writer once per 64 records instead of every record: the
+  `python-cost` probe, interleaved 3 times per arm, showed no difference (24.5 to
+  25.1 us both ways), so it was not a demonstrated improvement and was not kept.
+- Batching each chunk's receive and send post into one crossing (B2): a crossing
+  costs 1 to 3 us here, under the spread of every series; not attempted.
+
+## 4. Budgets after the changes (default code at `613a26c`)
+
+From the `before` arm of comparison 2 (that code is today's default).
+
+| Budget | Result | Value |
+| --- | --- | --- |
+| B1 registrations per host call after warmup, all policies | PASS | 0 |
+| B2 crossings per 2-leader call <= 2 per chunk + 2 | PASS for 1 chunk, FAIL for several | 3 per chunk: 3 (4 KiB to 1 MiB), 12 at 16 MiB (budget 10) |
+| B3 idle CPU, economy <= 0.02 and balanced <= 0.05 core-s/s | PASS | 0.0037 and 0.0038; latency 1.00 (disclosed: a full core per endpoint, idle included) |
+| B4 observation export: 4 KiB p50 <= +10%, no drops | FAIL (drops: PASS) | +37% economy, +42% balanced, +100% latency at 4 KiB; +1 to +4% at 1 MiB; 0 dropped of 2,920 per run |
+| B5 RSS growth over a timed series <= 2 MiB | FAIL as written at 16 MiB | over both comparisons' 240 runs, 46 of 720 rank-series over, all `host` 16 MiB (up to 4.1 MiB); every other size within it |
+| B6 copies per host call no more than before | PASS | unchanged: the payload once through slots, plus timing-dependent copies of eager messages that arrived before their receive |
+
+B5's failures are max-RSS high-water marks at the largest size after only 3 warmup
+calls; whether they are a leak or allocator growth is not shown (hypothesis: the
+latter, since smaller sizes never exceed the budget). B4 remains the open hot spot:
+the `python-cost` probe puts observation export at 32.5 us of Python per 4 KiB call
+after change 1, against 7.8 us without it (38.6 before change 1; 24.9 with change 2;
+`results/verbs-perf/python-cost-<commit>.json`, the same probe run at each commit).
+
+## 5. What this does not show
+
+No RDMA hardware, GPU or real NIC was used. The mock's own socket I/O dominates its
+wait times, so absolute latencies and throughputs mean nothing for a fabric; only
+the bridge's own costs (Python, crossings, copies, registrations, observation export)
+carry over. The `latency` policy was slower than `economy` here because its spinning
+thread competes with two ranks and the mock's threads on a shared machine; on a node
+with a dedicated core the tradeoff differs, and its affinity and value are
+reservation parameters. The direct GPU path's per-call `register_device`/`release`
+and per-call scratch allocation are counted only on fakes; whether the device cache
+makes them cheap needs a GPU (a hardware check for the reservation).

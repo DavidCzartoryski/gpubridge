@@ -465,7 +465,12 @@ def _values(records: list[dict], size_index: int, metric: str) -> list[float]:
     out = []
     for r in records:
         s = r["ranks"][0]["sizes"][size_index]
-        value = s.get(metric, (s.get("per_call") or {}).get(metric))
+        if metric == "crossings_total_per_call" and "crossings_per_call" in s:
+            # Every crossing, telemetry reads included (the raw record's own total left
+            # them out).
+            value = sum(s["crossings_per_call"].values())
+        else:
+            value = s.get(metric, (s.get("per_call") or {}).get(metric))
         if value is not None:
             out.append(float(value))
     return out
