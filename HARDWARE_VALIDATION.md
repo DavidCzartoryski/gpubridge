@@ -632,6 +632,17 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     the verbs runs' observations (`verbs_observations/`) cover every step.
     *Status: not run.* *BLOCKED: hardware/authorization:* items 38 to 41.
 
+43. **Deterministic numerical comparison before performance.**
+    [NUMERICAL_GATE.md](docs/NUMERICAL_GATE.md) freezes a four-rank native NCCL,
+    equal Gloo-island and staged-verbs comparison with compression off. Exact
+    collective probes, independent FP64 gradient/update/optimizer-state references,
+    cross-arm parameters and reduced bad-reduction/scale/data controls must pass
+    before representative throughput. The actual verbs endpoints must attest
+    non-mock libibverbs, staged traffic and matching native-library hashes.
+    *Status: software-only harness; not validated on GPUs.* Four identical NVIDIA
+    GPUs establish only single-host split-island evidence, not mixed-vendor or
+    cross-node acceptance.
+
 32. **Point-to-point across islands through the backend on GPUs.** `send`,
     `recv`, `isend`, `irecv` and `batch_isend_irecv` on `backend="gpubridge"`
     go native within an island and through the bridge across islands. On GPUs,

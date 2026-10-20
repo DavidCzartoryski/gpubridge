@@ -255,6 +255,13 @@ hardware.
 
 ### Added
 
+- A bounded numerical gate for native NCCL, Gloo islands and staged verbs checks
+  exact collectives, gradients, independent optimizer updates/state and parameters;
+  includes bad-reduction/scale/data controls and actual endpoint/source attestation.
+  `train_bench.py --controlled` resets the seeded model after its compute probe
+  and fingerprints initial state/data for fair fixed-workload comparisons.
+  Software-only validation; GPU gate remains open (item43; PR pending).
+
 - `bridge="verbs"` takes GPU tensors, phase A3 (docs/VERBS_TRANSPORT.md): wire
   protocol 2 adds a rendezvous (an RDMA WRITE into memory registered for one
   receive, from `GPUBRIDGE_VERBS_RNDV_BYTES`, 256 KiB) and sends gathered from
