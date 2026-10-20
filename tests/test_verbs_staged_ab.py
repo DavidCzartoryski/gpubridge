@@ -485,8 +485,10 @@ def test_the_copy_trigger_uses_only_measured_phases():
 def test_candidate_a_runs_only_on_section_5s_measured_trigger():
     status = _section("7.").split("**Status.**", 1)[1].split("\n\n", 1)[0]
     for term in ("P0x2", "(staged_to_host_s / staged_calls) / p50", "0.30",
-                 "compare P0 D3", "not met"):
+                 "compare P0 D3", "not met", "trigger.txt", "ends `TRIGGER MET`"):
         assert term in status, (term, status)
+    # The command it names is section 5's, writing that file.
+    assert 'trigger "$OUT/m1"' in _section("5.") and '"$OUT/m1/trigger.txt"' in _section("5.")
     assert "minus the host phases" not in status.replace(
         "neither is the call latency minus the host phases", ""), status
 
