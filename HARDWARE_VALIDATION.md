@@ -584,13 +584,13 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     the same with async collectives and busy GPUs (`check_verbs`). Same-vendor
     (step 05) and cross-vendor (step 07) separately. The same holds with
     `GPUBRIDGE_VERBS_STAGED_OVERLAP=1` (copies overlapped chunk by chunk, two
-    leaders), with the same messages on the wire; whether it is faster is the
-    conditional A/B of docs/verbs-perf-20261019.md, section 7. *Status: the stream
-    ordering is tested with CPU tensors standing in and lazy copies
-    (`tests/test_verbs_gpu.py`, `tests/test_verbs_staged_overlap.py`), not on a
-    GPU.* *BLOCKED: hardware/authorization:*
-    item 38's prerequisites plus GPUs on those nodes and a CUDA or ROCm build
-    of PyTorch there.
+    leaders), with the same messages on the wire, and a call that fails part way
+    raises only after its copies on the caller's stream have passed; whether it is
+    faster is the conditional A/B of docs/verbs-perf-20261019.md, section 7.
+    *Status: the stream ordering is tested with CPU tensors standing in and lazy
+    copies (`tests/test_verbs_gpu.py`, `tests/test_verbs_staged_overlap.py`), not
+    on a GPU.* *BLOCKED: hardware/authorization:* item 38's prerequisites plus
+    GPUs on those nodes and a CUDA or ROCm build of PyTorch there.
 
 40. **NVIDIA GPU memory direct through the verbs bridge.** With
     `GPUBRIDGE_VERBS_GPU_PATH=direct` on NVIDIA leaders, every call registers the

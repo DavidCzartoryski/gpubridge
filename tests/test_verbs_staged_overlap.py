@@ -419,6 +419,84 @@ def test_on_a_failed_post_queues_no_copy_back_and_keeps_the_previous_one(monkeyp
     assert send["status"] == "error" and "queue pair in state Err" in send["error"]
 
 
+def _log_aborts(t: Staged, log: list) -> None:
+    wire = t.worker.endpoint
+    abort = wire.abort
+    wire.abort = lambda why="aborted": (log.append(("abort",)), abort(why))[1]
+
+
+def test_on_a_failed_wait_part_way_drains_its_copies_before_the_error_reaches_the_caller(
+        monkeypatch):
+    # An async collective: its worker's stream, whose copies the caller's stream is not
+    # ordered after when the call fails. Nothing here waits for a copy after the call.
+    numel = 3 * ELEMS + ELEMS // 2
+    t = _transport(monkeypatch, "1", peer=_theirs(numel))
+    tensor = _mine(numel)
+    staging = t._staging_for(tensor)
+    staging.stream = "other"
+    _log_aborts(t, staging.log)
+    t.worker.endpoint.fail_wait = 3  # chunks 0 and 1 complete, chunk 2's wait fails
+    with pytest.raises(verbs.TransportError, match="retry exhausted"):
+        t.all_reduce(tensor)
+    # The caller reuses its tensor at once: no copy of the failed call writes it later.
+    reset = tensor.clone()
+    tensor.zero_()
+    staging.run_streams()
+    assert torch.equal(tensor, torch.zeros(numel))
+    # When the error reached the caller, chunks 0 and 1 were already back, the rest
+    # untouched, and nothing was still queued: aborted, then the stream drained.
+    reduced = 2 * ELEMS
+    assert torch.equal(reset[:reduced], (_mine(numel) + _theirs(numel))[:reduced])
+    assert torch.equal(reset[reduced:], _mine(numel)[reduced:])
+    log = staging.log
+    drain = log.index(("drain", "other"))
+    assert log.index(("abort",)) < drain
+    assert all(e[0] == "ran" for e in log[drain + 1:]), log[drain:]
+
+
+def test_on_a_copy_out_that_cant_be_queued_aborts_and_drains_those_queued(monkeypatch):
+    numel = 3 * ELEMS
+    t = _transport(monkeypatch, "1", peer=_theirs(numel))
+    first = _mine(numel)
+    t.all_reduce(first)  # its copies back are still queued
+    staging = t._staging[0]
+    previous = staging.copied_back.label
+    _log_aborts(t, staging.log)
+    copy = staging._copy
+
+    def second_copy_out_fails(dst, src, after):
+        if staging.copies == 7:  # copy7 is the second call's first copy out
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+        return copy(dst, src, after)
+
+    monkeypatch.setattr(staging, "_copy", second_copy_out_fails)
+    second = _mine(numel, 1)
+    before = len(staging.log)
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        t.all_reduce(second)
+    # The worker is aborted, so the transport is no longer healthy, and the copy out
+    # already queued (after the previous copies back) was drained; nothing was posted.
+    assert t.worker.failed is not None and t.telemetry()["failed"]
+    assert not staging.streams["caller"].queue and not staging.streams["other"].queue
+    log = staging.log[before:]
+    assert not any(e[0] in ("send", "recv") for e in log), log
+    assert _copies(log) == [("copy", "copy7", previous)]
+    assert log.index(("abort",)) < log.index(("drain", "caller"))
+    assert staging.copied_back.label == previous
+    assert t._keep and t._keep[-1][0].data_ptr() == staging.buffer.data_ptr()
+    assert torch.equal(first, _mine(numel) + _theirs(numel))
+    assert torch.equal(second, _mine(numel, 1))
+    # A later call, on another stream, is refused, and leaves nothing queued either.
+    monkeypatch.setattr(staging, "_copy", copy)
+    staging.stream = "other"
+    again = _mine(numel, 2)
+    with pytest.raises(verbs.TransportError, match="already failed"):
+        t.all_reduce(again)
+    assert not staging.streams["caller"].queue and not staging.streams["other"].queue
+    assert torch.equal(again, _mine(numel, 2))
+    assert torch.equal(first, _mine(numel) + _theirs(numel))
+
+
 def test_on_the_phases_partition_the_call_like_a_whole_call(monkeypatch):
     numel = 4 * ELEMS
     t = _transport(monkeypatch, "1", peer=_theirs(numel))

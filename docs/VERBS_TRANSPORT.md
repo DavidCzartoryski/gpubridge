@@ -500,7 +500,11 @@ two leaders and tensors of one chunk are staged whole; `last_gpu["staging"]` say
 `whole`, `overlapped`, or `whole (<why not>)` when it is on. Two differences: an
 observation's `duration_s` starts before the first chunk's copy out has passed, and
 a call that fails part way may already have copied some reduced chunks back into
-the caller's tensor (it still raises, and the bridge refuses later calls).
+the caller's tensor. It still raises, and the bridge refuses later calls. Whatever
+fails, queueing a copy included, the worker is aborted first, then the host waits
+for every copy the call queued on the caller's stream (that stream only), so none
+still writes the caller's tensor or the staging buffer once the error is raised,
+async collectives included.
 SOFTWARE-VERIFIED (CPU tensors standing in, lazy copies,
 `tests/test_verbs_staged_overlap.py`); not validated on GPUs, and no speedup is
 claimed: docs/verbs-perf-20261019.md, section 7, is the measurement that would show
@@ -884,7 +888,10 @@ messages (buffers, offsets, sizes, tags, per-direction order) and results as off
 sum, max and min from one element to 3.5 chunks, broadcasts, three leaders and one
 chunk staged whole with the reason, a failed wait part way (the last copy back
 queued stays the one waited for, the chunks before it copied back, the rest
-untouched, later calls refused) and a failed post (no copy back), and the phases
+untouched, later calls refused), every copy of a failed call passed when it raises
+(a caller reusing the tensor at once keeps what it wrote), a copy out that can't be
+queued (the worker aborted, the copies queued before it drained, later calls on
+another stream refused) and a failed post (no copy back), and the phases
 splitting the call; on the test fabric, exact with it on, off and on one leader
 only, under every progress policy, with equal wire counts and observations.
 

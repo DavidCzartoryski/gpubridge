@@ -50,8 +50,9 @@ registrations, tags, sizes), so leaders with and without it interoperate. Broadc
 more than two leaders and tensors of one chunk run as without it; ``last_gpu["staging"]``
 says which ran and why. Differences: an observation's ``duration_s`` starts before the
 first chunk's copy out has passed, and a call that fails part way may already have
-copied some reduced chunks back into the caller's tensor (it still raises, and the
-transport refuses later calls). Not validated on GPUs.
+copied some reduced chunks back into the caller's tensor. It still raises, only after
+the worker is aborted and every copy it queued on the caller's stream has passed, and
+the transport refuses later calls. Not validated on GPUs.
 
 Not validated on RDMA hardware or GPUs. ``GPUBRIDGE_VERBS_TEST_FABRIC`` runs it on
 a MOCK fabric for tests (see :mod:`gpubridge.verbs`).
@@ -482,17 +483,25 @@ class VerbsTransport(TaggedBridge):
         messages as TaggedBridge._all_reduce's: the same buffers, tags and pieces. The
         phases are the same partition of the call's host time as a whole call's: copy
         out (queued, then the host's waits for each chunk), copy back (queueing each
-        chunk's), and the bridge step (the rest: posts, library waits, reductions)."""
+        chunk's), and the bridge step (the rest: posts, library waits, reductions).
+
+        If anything fails, queueing the copies included, the worker is aborted (so the
+        NIC no longer touches the buffers) and then every copy queued on the caller's
+        stream is waited for, before the error propagates: none still writes the
+        caller's tensor or the staging buffer after the caller has seen the failure."""
         router = self.worker
         times = {"to_host_s": 0.0, "to_device_s": 0.0}
         t0 = time.perf_counter()
-        host, ready = staging.to_host_chunks(tensor, pieces)  # queued, not waited for
+        host = staging.host_for(tensor)
         times["to_host_s"] += time.perf_counter() - t0
         post, wait = router.post_s, router.wait_s
         router.timed = True
         try:
             self._run("staged", plan, host,
-                      lambda h: self._exchange(h, tensor, staging, pieces, ready, op, times))
+                      lambda h: self._exchange(h, tensor, staging, pieces, op, times))
+        except BaseException:
+            staging.drain()
+            raise
         finally:
             router.timed = False
         total = time.perf_counter() - t0
@@ -506,8 +515,11 @@ class VerbsTransport(TaggedBridge):
         phases["to_device_s"] += times["to_device_s"]
 
     def _exchange(self, host: torch.Tensor, tensor: torch.Tensor, staging: RegisteredStaging,
-                  pieces: list[tuple[int, int]], ready: list, op: ReduceOp.RedOpType,
+                  pieces: list[tuple[int, int]], op: ReduceOp.RedOpType,
                   times: dict[str, float]) -> None:
+        t = time.perf_counter()
+        ready = staging.to_host_chunks(tensor, host, pieces)  # queued, not waited for
+        times["to_host_s"] += time.perf_counter() - t
         seq, deadline, _ = self._start(host)
         (peer,) = self._peers()
         reduce, worker = _REDUCE[op], self.worker

@@ -431,6 +431,13 @@ class LazyRegistered(RegisteredStaging, LazyPinned):
         LazyPinned.__init__(self)
         self.host = host
 
+    def _drain(self):
+        # The host synchronising with the current stream: everything queued on it runs.
+        self.log.append(("drain", self.stream))
+        stream = self.streams[self.stream]
+        if stream.queue:
+            stream.run_through(stream.queue[-1][0])
+
 
 def _stand_in(env, rank):
     """In each rank: GPU tensors are CPU tensors, the direct path is unavailable (with a
