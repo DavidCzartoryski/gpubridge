@@ -305,11 +305,12 @@ hardware.
   membership and island traffic that isn't seen. Records list every socket's class, owners and bytes
   (`local_tcp_attribution`). Ranks snapshot sockets one at a time, all before any
   teardown. Co-resident host leaders can now get a decisive verdict; the first hardware
-  run (without serialized snapshots) stayed `not-decisive`. On one host with 4 GPUs as
-  two 2-GPU CPU/Gloo islands and one HCA, the rerun at `4ffcf93` was decisive: strict
-  host collectives passed (28/28 exact, island TCP attributed and left out, 1728 B
-  counted), both real-TCP negative controls failed on counted TCP over the limit, and
-  staged-GPU strict was unchanged.
+  run (without serialized snapshots) stayed `not-decisive`. On one host with 4 ranks as
+  two 2-rank CPU/Gloo islands over one HCA (loopback; not cross-node, AMD or GPUDirect
+  evidence), the rerun at `4ffcf93` was decisive: strict host collectives passed (28/28
+  exact, island TCP attributed and left out, 1728 B counted), both real-TCP negatives
+  recorded verdict `fail` on counted TCP over the limit, and staged-GPU strict was
+  unchanged.
 
 ### Added
 

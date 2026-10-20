@@ -601,13 +601,14 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     At `c92684b` the staged kit, default-policy check and benchmark passed;
     host collectives failed before payload because CPU tensors met CUDA
     communicators. The `0cf32a3` recheck passed exact host collectives with
-    CPU/Gloo islands. Same-host host-mode no-silent-TCP evidence is
-    `not-decisive`; `--require-no-tcp` fails closed (again at `4c13375`).
-    With the kit's per-process attribution of same-host sockets, the
-    `4ffcf93` rerun on one host was decisive: strict host collectives passed
-    (28/28 exact, verbs evidence passed, 1728 B of counted TCP), and both
-    real-TCP negatives (a flat world-Gloo policy and the Gloo bridge) failed
-    on counted TCP over the limit. That is one-host loopback evidence, not
+    CPU/Gloo islands. Before per-process attribution, same-host host-mode
+    no-silent-TCP evidence was `not-decisive` and `--require-no-tcp` failed
+    closed (at `0cf32a3`, again at `4c13375`). With the kit's per-process
+    attribution of same-host sockets, the `4ffcf93` rerun on one host was
+    decisive: strict host collectives passed (28/28 exact, verbs evidence
+    passed, 1728 B of counted TCP), and both real-TCP negatives (a flat
+    world-Gloo policy and the Gloo bridge) recorded verdict `fail` on counted
+    TCP over the limit. That is one-host loopback evidence, not
     cross-node no-TCP acceptance. Cross-node RDMA,
     hardware failure/teardown cases and transport comparisons beyond the
     measured Gloo/verbs pair remain open. See
@@ -748,6 +749,7 @@ records, not a performance or arbitrary-float correctness gate.
 | 2026-10-20 | `c92684b` | P2P native NCCL and Gloo bridge on separate GPUs | Full default check passed; all 66 benchmark payload rows passed across default, chunked and pinned configurations. No verbs P2P or direct overlap trace. |
 | 2026-10-20 | `0cf32a3` (production fix in `54f701e`) | Host/Gloo-island verbs kit and GPU-staged regression, single-HCA loopback | Host collectives exact, all ranks passed, zero mismatches/completion errors; host TCP evidence `not-decisive`. Strict host run failed closed as intended; GPU-staged strict run passed. `54f701e` adds test isolation only and was not the hardware checkout. |
 | 2026-10-20 | `f4146a4` | Separate bounded tiny gate: native NCCL, Gloo islands and staged verbs, same four-V100 node class | Accepted: 48/48 positive rank records, zero violations; all three bad controls rejected for their intended reasons. This is not representative GPT equivalence. |
+| 2026-10-20 | `4ffcf93` | Host/Gloo-island verbs kit with per-process TCP attribution, and GPU-staged regression, single-HCA loopback | Strict host collectives passed decisively: 28/28 exact, verbs evidence pass, island TCP attributed, 1728 B counted. The flat world-Gloo and Gloo-bridge negatives recorded verdict `fail` on counted TCP over the limit. GPU-staged strict was unchanged. Not cross-node no-TCP acceptance. |
 
 Earlier split-test runs on the same node (2026-10-19, `616f2f7`) passed a
 2-rank (1+1) staged-verbs correctness kit and staged-verbs training comparisons;
@@ -759,7 +761,8 @@ No result here establishes cross-node verbs, AMD/mixed-vendor verbs,
 GPUDirect/direct verbs, UCX, 8-GPU scaling, independent link scaling, statistical
 significance, representative GPT equivalence or a direct copy/communication
 overlap trace. The collective `wait-skips-stream` mutation remains uncaught.
-Host-mode no-silent-TCP evidence cannot be decisive with co-resident leaders.
+Co-resident host leaders get decisive no-silent-TCP evidence only with per-process
+socket attribution (`4ffcf93`, one host).
 Training and pipeline observations corroborate native-library verbs activity,
 but their archives contain no separate in-process provider/completion snapshot
 or strict TCP gate; the staged kit supplies the explicit provider telemetry.

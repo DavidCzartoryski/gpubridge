@@ -10,8 +10,8 @@ At `c92684b`, the staged kit, default-policy check and benchmark passed; the
 original host kit failed before payload due to CPU tensors meeting CUDA
 communicators. At `0cf32a3` (production fix retained by `54f701e`), exact host
 collectives passed with CPU/Gloo islands, and GPU-staged strict checks passed.
-Host-mode no-silent-TCP evidence on one host is `not-decisive`; strict host mode
-fails closed. See [hardware results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
+Host-mode no-silent-TCP evidence on one host was `not-decisive` until per-process
+socket attribution; at `4ffcf93` strict host mode passed decisively on one host. See [hardware results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
 and the [changelog](../CHANGELOG.md#unreleased).
 
 **Integration update (2026-10-18; hardware status updated 2026-10-20):** selectable
@@ -755,8 +755,9 @@ other way: another bridge is only ever chosen explicitly.
 Partially run on single-host loopback: staged-GPU collectives passed at
 `c92684b`, and repaired host collectives passed at `0cf32a3`; see the
 [2026-10-20 results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20).
-Host-mode TCP evidence remains `not-decisive`, with strict host mode failing
-closed. The two-host/cross-node, direct-GPU, mixed-vendor and UCX-comparison
+Host-mode TCP evidence was `not-decisive`, with strict host mode failing closed,
+until per-process attribution; at `4ffcf93` strict host collectives passed
+decisively on one host. The two-host/cross-node, direct-GPU, mixed-vendor and UCX-comparison
 portions remain unrun. The full planned matrix follows
 (`scripts/gpu/verbs_kit.py`; runbook: `VERBS_BRIDGE=1` in steps 05 and 07;
 HARDWARE_VALIDATION.md items 38 to 42). Same-vendor (step 05) and cross-vendor
