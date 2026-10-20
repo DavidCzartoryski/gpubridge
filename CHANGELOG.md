@@ -303,8 +303,9 @@ hardware.
   other leader, other ranks and the store count; unattributed bytes that would exceed
   the unchanged limit keep the evidence `not-decisive`, as do unidentified island
   membership and island traffic that isn't seen. Records list every socket's class, owners and bytes
-  (`local_tcp_attribution`). Co-resident host leaders can now get a decisive verdict;
-  not yet checked on hardware.
+  (`local_tcp_attribution`). Ranks snapshot sockets one at a time, all before any
+  teardown. Co-resident host leaders can now get a decisive verdict; the first hardware
+  run (without serialized snapshots) stayed `not-decisive`.
 
 ### Added
 

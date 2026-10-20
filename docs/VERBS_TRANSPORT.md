@@ -814,6 +814,9 @@ leader, the other island, torchrun's store) count, loopback included; sockets wh
 other end has no owner in the snapshot, or a mix, are `unattributed`. Each record's
 `tcp_evidence.local_tcp_attribution` lists the island pids, every socket's class,
 owners and bytes, and the bytes per class (or why attribution was unavailable).
+Host-mode ranks take their `ss` snapshots one at a time, the others waiting at a
+barrier, and none tears down before every rank's closing snapshot: on one host a
+peer's teardown closes, and its forked `ss` briefly holds, sockets another rank reads.
 
 Leader co-residence is determined from gathered actual hostnames and kernel boot
 IDs, independently of split-test labels. When local TCP is excluded and any bridge

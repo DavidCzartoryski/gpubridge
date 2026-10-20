@@ -451,7 +451,8 @@ class Window:
 
     def __init__(self, telemetry=None, *, exclude_local_tcp: bool = False,
                  peers_co_resident: bool | None = None,
-                 island: frozenset[int] | None = None, island_unknown: str | None = None) -> None:
+                 island: frozenset[int] | None = None, island_unknown: str | None = None,
+                 in_turn=None) -> None:
         #: The bridge's telemetry (a callable), read at both ends; None off the bridge.
         self.telemetry = telemetry
         self.exclude_local_tcp = exclude_local_tcp
@@ -459,13 +460,16 @@ class Window:
         #: Host mode: this rank's island peers' pids (see :func:`island_pids`), or None
         #: and why they're unknown.
         self.island, self.island_unknown = island, island_unknown
+        #: Runs a socket snapshot with every rank of the job in turn (see collectives_mode),
+        #: or here alone.
+        self.in_turn = in_turn or (lambda snapshot: snapshot())
 
     def _tcp(self) -> dict | None:
         return read_process_tcp(exclude_local_tcp=self.exclude_local_tcp, island=self.island)
 
     def __enter__(self) -> Window:
         self.tele0 = self.telemetry() if self.telemetry else None
-        self.tcp0 = self._tcp()
+        self.tcp0 = self.in_turn(self._tcp)
         self.counters0, self.netdev0 = read_counters(), read_netdev()
         self.cpu0, self.wall0 = resource.getrusage(resource.RUSAGE_SELF), time.monotonic()
         return self
@@ -476,7 +480,7 @@ class Window:
         self.cpu = (cpu.ru_utime - self.cpu0.ru_utime) + (cpu.ru_stime - self.cpu0.ru_stime)
         self.counters = window(self.counters0, read_counters())
         self.netdev = window(self.netdev0, read_netdev())
-        tcp1 = self._tcp()
+        tcp1 = self.in_turn(self._tcp)
         self.tcp = tcp_moved(self.tcp0, tcp1)
         self.attribution = None
         if self.exclude_local_tcp:
@@ -633,9 +637,20 @@ def collectives_mode(args, rank: int, world: int) -> dict:
     moved = 0
     leader_telemetry = bridge.telemetry if bridge is not None and hasattr(
         bridge, "telemetry") else None
+    def in_turn(snapshot):
+        """Host mode: ranks read their sockets one at a time, the others waiting at the
+        barrier, so no snapshot sees another rank's sockets closed by its teardown or held by
+        a child it is forking (ss); the last barrier precedes every rank's teardown."""
+        taken = None
+        for r in range(world):
+            if r == rank:
+                taken = snapshot()
+            dist.barrier(group=reference)
+        return taken
+
     with Window(leader_telemetry, exclude_local_tcp=exclude_local_tcp,
                 peers_co_resident=peers_co_resident, island=island,
-                island_unknown=island_unknown) as w:
+                island_unknown=island_unknown, in_turn=in_turn if exclude_local_tcp else None) as w:
         for n in sizes(args.max_bytes):
             numel = max(1, n // 4)
             base = (torch.arange(numel, dtype=torch.float32) % 1024) + rank

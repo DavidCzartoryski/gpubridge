@@ -11,6 +11,7 @@ MOCK test fabric, which must fail.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import shutil
@@ -609,8 +610,20 @@ def pid_of(r):
     with open(os.path.join(pids, str(r))) as f:
         return int(f.read())
 snapshots = 0
+import time
+import gpubridge
+original_destroy = gpubridge.destroy
+def logged_destroy():
+    with open(os.path.join(pids, f"down-{rank}"), "w") as f:
+        f.write(str(time.monotonic()))
+    original_destroy()
+gpubridge.destroy = logged_destroy
 def observed_tcp(*, exclude_local_tcp, island):
     global snapshots
+    began = time.monotonic()
+    time.sleep(0.05)  # an ss run takes a while
+    with open(os.path.join(pids, f"snap-{rank}"), "a") as f:
+        f.write(f"{began} {time.monotonic()}\\n")
     peer = "10.0.0.2" if tcp_case == "remote-tcp" else "10.0.0.1"
     moved = (64 << 20) if snapshots else 0
     text = (f'ESTAB 0 0 10.0.0.1:41000 {peer}:42000 '
@@ -721,6 +734,14 @@ def test_host_tcp_acceptance_on_mock_collectives_with_synthetic_evidence(
     records = [json.loads((tmp_path / f"rank{r}.json").read_text()) for r in range(4)]
     pids = [int((tmp_path / "pids" / str(r)).read_text()) for r in range(4)]
     assert [record["pid"] for record in records] == pids
+    # Socket snapshots run one rank at a time, all before any rank tears down: on one host
+    # a peer's teardown closes, and its forked ss holds, sockets another rank reads.
+    snaps = sorted(tuple(map(float, line.split())) for r in range(4)
+                   for line in (tmp_path / "pids" / f"snap-{r}").read_text().splitlines())
+    assert len(snaps) == 8
+    assert all(end <= began for (_, end), (began, _) in itertools.pairwise(snaps))
+    downs = [float((tmp_path / "pids" / f"down-{r}").read_text()) for r in range(4)]
+    assert snaps[-1][1] <= min(downs)
     for r, (rank, record) in enumerate(zip(done, records)):
         assert record["mismatches"] == 0 and record["leaders"] == 2
         if not record["leader"]:
