@@ -10,8 +10,8 @@ At `c92684b`, the staged kit, default-policy check and benchmark passed; the
 original host kit failed before payload due to CPU tensors meeting CUDA
 communicators. At `0cf32a3` (production fix retained by `54f701e`), exact host
 collectives passed with CPU/Gloo islands, and GPU-staged strict checks passed.
-Host-mode no-silent-TCP evidence on one host is `not-decisive`; strict host mode
-fails closed. See [hardware results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
+Host-mode no-silent-TCP evidence on one host was `not-decisive` until per-process
+socket attribution; at `4ffcf93` strict host mode passed decisively on one host. See [hardware results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
 and the [changelog](../CHANGELOG.md#unreleased).
 
 **Integration update (2026-10-18; hardware status updated 2026-10-20):** selectable
@@ -755,8 +755,9 @@ other way: another bridge is only ever chosen explicitly.
 Partially run on single-host loopback: staged-GPU collectives passed at
 `c92684b`, and repaired host collectives passed at `0cf32a3`; see the
 [2026-10-20 results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20).
-Host-mode TCP evidence remains `not-decisive`, with strict host mode failing
-closed. The two-host/cross-node, direct-GPU, mixed-vendor and UCX-comparison
+Host-mode TCP evidence was `not-decisive`, with strict host mode failing closed,
+until per-process attribution; at `4ffcf93` strict host collectives passed
+decisively on one host. The two-host/cross-node, direct-GPU, mixed-vendor and UCX-comparison
 portions remain unrun. The full planned matrix follows
 (`scripts/gpu/verbs_kit.py`; runbook: `VERBS_BRIDGE=1` in steps 05 and 07;
 HARDWARE_VALIDATION.md items 38 to 42). Same-vendor (step 05) and cross-vendor
@@ -798,23 +799,44 @@ queue pairs; no completion errors), and the process's own counted TCP sockets
 plus 1 MiB. Its RC queue pairs as the kernel lists them (`rdma resource show qp`, by
 pid) are recorded where the `rdma` tool exists, and contradict a pass when it lists
 none. Without `ss` the verdict is `unknown`, never a pass; Gloo reference collectives
-run before the window. The TCP check always excludes loopback. Only host mode with
-CPU-only Gloo islands also excludes peers whose addresses appear as local socket
-endpoints in the same `ss` snapshot. IPv4, IPv4-mapped IPv6 and native IPv6 addresses
+run before the window. The TCP check excludes loopback unless host mode attributes
+it (below). Only host mode with CPU-only Gloo islands also excludes peers whose
+addresses appear as local socket endpoints in the same `ss` snapshot. IPv4, IPv4-mapped IPv6 and native IPv6 addresses
 are normalized; unknown addresses still count. GPU mode with NCCL islands counts
 same-host non-loopback TCP, preserving its existing acceptance check.
+
+Host mode attributes those loopback and same-host sockets by process: both ends of a
+same-host connection are in one `ss` snapshot, each with its owning pids. Every rank
+gathers its hostname, kernel boot ID, pid and pid namespace; when every other rank of
+a leader's island is positively identified as sharing its host and pid namespace (or
+as remote), the leader excludes only sockets whose other end is owned by those island
+peers alone (`island`). Sockets to any other process (`outside island`: the other
+leader, the other island, torchrun's store) count, loopback included; sockets whose
+other end has no owner in the snapshot, or a mix, are `unattributed`. Each record's
+`tcp_evidence.local_tcp_attribution` lists the island pids, every socket's class,
+owners and bytes, and the bytes per class (or why attribution was unavailable).
+Host-mode ranks take their `ss` snapshots one at a time, the others waiting at a
+barrier, and none tears down before every rank's closing snapshot: on one host a
+peer's teardown closes, and its forked `ss` briefly holds, sockets another rank reads.
 
 Leader co-residence is determined from gathered actual hostnames and kernel boot
 IDs, independently of split-test labels. When local TCP is excluded and any bridge
 peer is co-resident or cannot be positively identified as remote, otherwise positive
 evidence is `not-decisive`, with `no_silent_tcp: null` and the reason
 "local bridge: island Gloo traffic and a bridge TCP fallback are indistinguishable
-on one host". The positive verbs checks remain required and are reported separately
-in `verbs_evidence`; any contradictory evidence still yields `fail`. Without
+on one host", unless attribution is available: then the counted sockets decide, and
+the evidence stays `not-decisive` when the unattributed bytes, counted too, would
+exceed the limit (the reason then says how many bytes), or when a leader with island
+peers had none of its TCP attributed to them (its island's Gloo traffic unseen). The
+positive verbs checks remain required and are reported separately in
+`verbs_evidence`; any contradictory evidence still yields `fail`. Without
 `--require-no-tcp`, a correct local host run may succeed while printing and recording
 this limitation. With `--require-no-tcp`, its leaders fail with that reason.
 Cross-node host runs remain decisive: local island TCP is excluded, remote TCP is
-counted. A one-host host run cannot establish cross-node no-TCP acceptance.
+counted. A one-host host run, even a decisive one, cannot establish cross-node no-TCP
+acceptance. Socket attribution has been checked on hardware on one host only: strict host
+collectives passed with island TCP attributed, and real same-host TCP was counted and
+rejected.
 `--require-no-tcp` fails a bridge leader's step unless its decisive
 verdict is `pass`; other ranks record `not applicable`. A job with no bridge leader
 at all (one island: an all-NVIDIA node without `GPUBRIDGE_SPLIT_TEST`, say) never

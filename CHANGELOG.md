@@ -297,6 +297,20 @@ hardware.
   same-host non-loopback TCP only for host/Gloo islands, marks co-resident or unknown
   bridge peers' TCP evidence `not-decisive` (strict mode fails closed), and preserves
   GPU-mode local TCP and cross-node remote TCP checks.
+- The verbs kit's host mode attributes loopback and same-host TCP sockets by the
+  process owning the other end in the same `ss` snapshot (ranks gather host, boot ID,
+  pid and pid namespace). Only sockets to the leader's own island are left out; the
+  other leader, other ranks and the store count; unattributed bytes that would exceed
+  the unchanged limit keep the evidence `not-decisive`, as do unidentified island
+  membership and island traffic that isn't seen. Records list every socket's class, owners and bytes
+  (`local_tcp_attribution`). Ranks snapshot sockets one at a time, all before any
+  teardown. Co-resident host leaders can now get a decisive verdict; the first hardware
+  run (without serialized snapshots) stayed `not-decisive`. On one host with 4 ranks as
+  two 2-rank CPU/Gloo islands over one HCA (loopback; not cross-node, AMD or GPUDirect
+  evidence), the rerun at `4ffcf93` was decisive: strict host collectives passed (28/28
+  exact, island TCP attributed and left out, 1728 B counted), both real-TCP negatives
+  recorded verdict `fail` on counted TCP over the limit, and staged-GPU strict was
+  unchanged.
 
 ### Added
 

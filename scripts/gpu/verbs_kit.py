@@ -33,7 +33,14 @@ OUT/rank<N>.json with what a reviewer needs to judge the run, never a remote key
   GPU/NCCL islands still count non-loopback same-host TCP. When local TCP is
   excluded, co-resident bridge leaders (or unknown host identity) make otherwise
   positive evidence ``not-decisive`` with ``no_silent_tcp: null``: local island Gloo
-  and bridge TCP fallback cannot be distinguished. Positive verbs evidence is
+  and bridge TCP fallback cannot be distinguished by address. Host mode therefore
+  attributes each loopback or same-host socket by the process owning its other end
+  in the same snapshot, when every island peer is identified by host, boot ID and
+  pid namespace: only sockets to this rank's own island are excluded; sockets to
+  any other process (the other leader, the store) count; the bytes of sockets with
+  an unattributed other end are recorded, and keep the evidence ``not-decisive``
+  when, counted too, they would exceed the limit, as does seeing no TCP of the
+  island's own (its Gloo share) attributed to it. Positive verbs evidence is
   reported separately. Gloo reference collectives run before the window, not
   inside it. A decisive pass needs every part shown; ``--require-no-tcp`` fails a
   bridge leader's step unless its evidence is ``pass``. Ranks that aren't bridge
@@ -154,11 +161,24 @@ def window(before: dict, after: dict) -> dict:
     return out
 
 
-def parse_ss(text: str, pid: int, *, exclude_local_tcp: bool = False) -> dict:
+#: Host mode's same-host socket classes that aren't this process's counted TCP: its
+#: own island's (Gloo) sockets, and those whose other end is unattributed (judged apart).
+UNCOUNTED = ("island", "unattributed")
+
+
+def parse_ss(text: str, pid: int, *, exclude_local_tcp: bool = False,
+             island: frozenset[int] | None = None) -> dict:
     """Bytes sent and received by each of ``pid``'s non-loopback TCP sockets, from
     ``ss -tinpH`` (a socket line, then its indented info line), by "local peer".
     Only Gloo islands may exclude peers proven local by this snapshot's endpoints;
-    unknown addresses always count."""
+    unknown addresses always count.
+
+    ``island`` (host mode, with ``exclude_local_tcp``): the pids of this rank's island
+    peers on this host, in its pid namespace. Then every socket of ``pid`` is kept with
+    its ``peer`` class and the ``owners`` of its other end in this snapshot. A loopback
+    or local peer is ``island`` when only those pids own the other end, ``outside
+    island`` when none of them do, else ``unattributed``; any other peer is ``remote``
+    (``unknown address`` when it doesn't parse)."""
     def address(endpoint: str):
         host = endpoint.rsplit(":", 1)[0].strip("[]")
         try:
@@ -167,24 +187,45 @@ def parse_ss(text: str, pid: int, *, exclude_local_tcp: bool = False) -> dict:
             return None
         return getattr(ip, "ipv4_mapped", None) or ip
 
+    def end(endpoint: str) -> tuple:
+        """An endpoint as both ends of one connection list it."""
+        return address(endpoint) or endpoint.rsplit(":", 1)[0], endpoint.rsplit(":", 1)[-1]
+
     # Gloo islands can connect to this host's non-loopback interface. Every
     # local endpoint in ss proves an address belongs to this network namespace,
     # even on a socket owned by another process. Unknown peers still count.
-    local_addresses = {address(fields[3]) for line in text.splitlines()
-                       if line and not line[0].isspace() and len(fields := line.split()) >= 5}
+    sockets = [(line, fields) for line in text.splitlines()
+               if line and not line[0].isspace() and len(fields := line.split()) >= 5]
+    local_addresses = {address(fields[3]) for _, fields in sockets}
     local_addresses.discard(None)
+    # Both ends of a same-host connection are in one snapshot, each with its owners.
+    owners: dict = {}
+    for line, fields in sockets if island is not None else ():
+        owners.setdefault((end(fields[3]), end(fields[4])), set()).update(
+            int(owner) for owner in re.findall(r"\bpid=(\d+)\b", line))
     out: dict = {}
     current = None
     for line in text.splitlines():
         if line and not line[0].isspace():
             fields = line.split()
             current = None
-            peer = address(fields[4]) if len(fields) >= 5 else None
-            if len(fields) >= 5 and re.search(rf"\bpid={pid}\b", line) \
-                    and not (peer is not None and (peer.is_loopback or (
-                        exclude_local_tcp and peer in local_addresses))):
-                current = f"{fields[3]} {fields[4]}"
-                out[current] = {"sent": 0, "received": 0}
+            if len(fields) < 5 or not re.search(rf"\bpid={pid}\b", line):
+                continue
+            peer = address(fields[4])
+            local = peer is not None and (peer.is_loopback or (
+                exclude_local_tcp and peer in local_addresses))
+            entry: dict = {"sent": 0, "received": 0}
+            if island is not None:
+                other = owners.get((end(fields[4]), end(fields[3])), set())
+                entry.update(owners=sorted(other), peer=(
+                    ("remote" if peer is not None else "unknown address") if not local
+                    else "island" if other and other <= island
+                    else "outside island" if other and not other & island
+                    else "unattributed"))
+            elif local:
+                continue
+            current = f"{fields[3]} {fields[4]}"
+            out[current] = entry
         elif current is not None:
             sent = re.search(r"\bbytes_acked:(\d+)", line) or \
                 re.search(r"\bbytes_sent:(\d+)", line)
@@ -195,7 +236,8 @@ def parse_ss(text: str, pid: int, *, exclude_local_tcp: bool = False) -> dict:
 
 
 def read_process_tcp(pid: int | None = None, run=subprocess.run, *,
-                     exclude_local_tcp: bool = False) -> dict | None:
+                     exclude_local_tcp: bool = False,
+                     island: frozenset[int] | None = None) -> dict | None:
     """:func:`parse_ss` of this process, or None where ``ss`` can't say."""
     try:
         done = run(["ss", "-tinpH"], capture_output=True, text=True, timeout=10, check=False)
@@ -204,7 +246,7 @@ def read_process_tcp(pid: int | None = None, run=subprocess.run, *,
     if done.returncode != 0:
         return None
     return parse_ss(done.stdout, os.getpid() if pid is None else pid,
-                    exclude_local_tcp=exclude_local_tcp)
+                    exclude_local_tcp=exclude_local_tcp, island=island)
 
 
 def host_identity() -> dict:
@@ -214,6 +256,39 @@ def host_identity() -> dict:
     except OSError:
         boot_id = ""
     return {"hostname": socket.gethostname(), "boot_id": boot_id}
+
+
+def process_identity() -> dict:
+    """This process's pid and pid namespace ("" where unknown): what ``ss`` names it by."""
+    try:
+        pid_ns = os.readlink("/proc/self/ns/pid")
+    except OSError:
+        pid_ns = ""
+    return {"pid": os.getpid(), "pid_ns": pid_ns}
+
+
+def island_pids(identities: list[dict], rank: int,
+                island: tuple[int, ...]) -> tuple[frozenset[int] | None, str | None]:
+    """The pids of ``rank``'s island peers sharing its host and pid namespace, which
+    ``ss`` attributes sockets to; or None and why, unless every island peer is
+    positively identified as either that or remote (host and boot ID both differ)."""
+    keys = ("hostname", "boot_id", "pid_ns")
+    local = identities[rank]
+    if not all(local.get(key) for key in keys):
+        return None, "this rank's host, boot ID or pid namespace is unknown"
+    pids = set()
+    for r in island:
+        peer = identities[r]
+        if r == rank:
+            continue
+        if not all(peer.get(key) for key in keys) or not isinstance(peer.get("pid"), int):
+            return None, f"island rank {r}'s host, boot ID, pid namespace or pid is unknown"
+        same = [peer[key] == local[key] for key in keys]
+        if all(same):
+            pids.add(peer["pid"])
+        elif same[0] or same[1]:
+            return None, f"island rank {r} shares this host but not its pid namespace"
+    return frozenset(pids), None
 
 
 def bridge_peers_co_resident(identities: list[dict], rank: int) -> bool | None:
@@ -251,27 +326,49 @@ def read_qps(pid: int | None = None, run=subprocess.run) -> list | None:
             for e in entries if isinstance(e, dict) and e.get("pid") == pid]
 
 
-def tcp_moved(before: dict | None, after: dict | None) -> int | None:
-    """Bytes this process's counted TCP sockets moved between two snapshots (a
-    socket opened in between counts in full), or None if either is unknown."""
-    if before is None or after is None:
-        return None
-    total = 0
+def socket_moves(before: dict, after: dict) -> list[dict]:
+    """Each socket's bytes moved between two snapshots (a socket opened in between
+    counts in full), with :func:`parse_ss`'s ``peer`` class where it has one: of
+    the two snapshots', a counted class first, then ``unattributed``, then ``island``."""
+    out = []
     for key, now in after.items():
         then = before.get(key, {"sent": 0, "received": 0})
-        total += max(0, now["sent"] - then["sent"]) + max(0, now["received"] - then["received"])
-    return total
+        classes = {snapshot["peer"] for snapshot in (then, now) if "peer" in snapshot}
+        counted = sorted(classes - set(UNCOUNTED))
+        out.append({"socket": key,
+                    "peer": counted[0] if counted else next(
+                        (c for c in reversed(UNCOUNTED) if c in classes), None),
+                    "owners": now.get("owners"),
+                    "moved": max(0, now["sent"] - then["sent"])
+                    + max(0, now["received"] - then["received"])})
+    return out
+
+
+def tcp_moved(before: dict | None, after: dict | None,
+              peers: tuple[str, ...] | None = None) -> int | None:
+    """Bytes this process's counted TCP sockets (``peers``: those of these classes)
+    moved between two snapshots (a socket opened in between counts in full), or None
+    if either is unknown."""
+    if before is None or after is None:
+        return None
+    return sum(s["moved"] for s in socket_moves(before, after)
+               if (s["peer"] in peers if peers else s["peer"] not in UNCOUNTED))
 
 
 def tcp_evidence(payload: int, tele_before: dict | None, tele_after: dict | None,
                  tcp: int | None, qps: list | None, netdev: dict | None = None,
                  counters: dict | None = None, device: str | None = None, *,
                  exclude_local_tcp: bool = False,
-                 peers_co_resident: bool | None = None) -> dict:
+                 peers_co_resident: bool | None = None,
+                 attribution: dict | None = None) -> dict:
     """Whether this process's payload went by verbs and not over TCP; see the module.
     ``verdict`` is ``pass`` only with every positive part shown, ``fail`` when a part
     contradicts it, else ``unknown``. Excluding local TCP with co-resident or unknown
-    bridge peers makes otherwise positive evidence ``not-decisive`` (JSON null)."""
+    bridge peers makes otherwise positive evidence ``not-decisive`` (JSON null), unless
+    ``attribution`` (host mode's, from :class:`Window`) names this rank's island pids:
+    then ``tcp`` counts every same-host socket but the island's, and unattributed bytes
+    that would take it over the limit, or no island traffic seen where the island has
+    peers, keep the evidence ``not-decisive``."""
     fails, unknown = [], []
     moved = completions = errors = None
     if tele_after is None:
@@ -301,10 +398,26 @@ def tcp_evidence(payload: int, tele_before: dict | None, tele_after: dict | None
         fails.append("the kernel lists no RC queue pair for this process")
     verbs_evidence = {"verdict": "fail" if fails else "unknown" if unknown else "pass",
                       "failures": list(fails), "unknown": list(unknown)}
-    reason = ("local bridge: island Gloo traffic and a bridge TCP fallback are "
-              "indistinguishable on one host"
-              if exclude_local_tcp and peers_co_resident is not False else None)
     limit = TCP_FRACTION * payload + TCP_SLACK
+    reason = None
+    if exclude_local_tcp and peers_co_resident is not False:
+        attributed = bool(attribution) and attribution.get("island_pids") is not None
+        moved_by = (attribution or {}).get("bytes") or {}
+        unattributed = moved_by.get("unattributed", 0)
+        if not attributed:
+            reason = ("local bridge: island Gloo traffic and a bridge TCP fallback are "
+                      "indistinguishable on one host")
+        elif tcp is not None and tcp <= limit < tcp + unattributed:
+            reason = (f"local bridge: {unattributed} bytes on same-host TCP sockets whose "
+                      "other end is unattributed: island Gloo traffic and a bridge TCP "
+                      "fallback are indistinguishable on one host")
+        elif tcp is not None and tcp <= limit and attribution["island_pids"] \
+                and not moved_by.get("island"):
+            # Gloo islands move their share of the payload over TCP: seeing none of it
+            # means the snapshot can't show where this host's traffic went.
+            reason = ("local bridge: no TCP was attributed to this rank's island peers: "
+                      "island Gloo traffic and a bridge TCP fallback are indistinguishable "
+                      "on one host")
     if tcp is None:
         unknown.append("this process's TCP sockets could not be read (no ss): TCP not "
                        "shown idle")
@@ -320,6 +433,7 @@ def tcp_evidence(payload: int, tele_before: dict | None, tele_after: dict | None
     return {"verdict": verdict,
             "no_silent_tcp": None if verdict == "not-decisive" else verdict == "pass",
             "reason": reason, "local_tcp_excluded": exclude_local_tcp,
+            "local_tcp_attribution": attribution,
             "bridge_peers_co_resident": peers_co_resident, "verbs_evidence": verbs_evidence,
             "failures": fails,
             "unknown": unknown, "payload_bytes": payload, "bridge_bytes": moved,
@@ -336,15 +450,26 @@ class Window:
     """Counters, netdev bytes, CPU time and wall time over a measured region."""
 
     def __init__(self, telemetry=None, *, exclude_local_tcp: bool = False,
-                 peers_co_resident: bool | None = None) -> None:
+                 peers_co_resident: bool | None = None,
+                 island: frozenset[int] | None = None, island_unknown: str | None = None,
+                 in_turn=None) -> None:
         #: The bridge's telemetry (a callable), read at both ends; None off the bridge.
         self.telemetry = telemetry
         self.exclude_local_tcp = exclude_local_tcp
         self.peers_co_resident = peers_co_resident
+        #: Host mode: this rank's island peers' pids (see :func:`island_pids`), or None
+        #: and why they're unknown.
+        self.island, self.island_unknown = island, island_unknown
+        #: Runs a socket snapshot with every rank of the job in turn (see collectives_mode),
+        #: or here alone.
+        self.in_turn = in_turn or (lambda snapshot: snapshot())
+
+    def _tcp(self) -> dict | None:
+        return read_process_tcp(exclude_local_tcp=self.exclude_local_tcp, island=self.island)
 
     def __enter__(self) -> Window:
         self.tele0 = self.telemetry() if self.telemetry else None
-        self.tcp0 = read_process_tcp(exclude_local_tcp=self.exclude_local_tcp)
+        self.tcp0 = self.in_turn(self._tcp)
         self.counters0, self.netdev0 = read_counters(), read_netdev()
         self.cpu0, self.wall0 = resource.getrusage(resource.RUSAGE_SELF), time.monotonic()
         return self
@@ -355,7 +480,18 @@ class Window:
         self.cpu = (cpu.ru_utime - self.cpu0.ru_utime) + (cpu.ru_stime - self.cpu0.ru_stime)
         self.counters = window(self.counters0, read_counters())
         self.netdev = window(self.netdev0, read_netdev())
-        self.tcp = tcp_moved(self.tcp0, read_process_tcp(exclude_local_tcp=self.exclude_local_tcp))
+        tcp1 = self.in_turn(self._tcp)
+        self.tcp = tcp_moved(self.tcp0, tcp1)
+        self.attribution = None
+        if self.exclude_local_tcp:
+            self.attribution = {"island_pids": None if self.island is None else sorted(self.island),
+                                "unavailable": self.island_unknown}
+            if self.island is not None and self.tcp is not None:
+                sockets = socket_moves(self.tcp0, tcp1)
+                self.attribution.update(sockets=sockets, bytes={
+                    peer: sum(s["moved"] for s in sockets if s["peer"] == peer)
+                    for peer in ("island", "unattributed", "outside island", "remote",
+                                 "unknown address")})
         self.tele1 = self.telemetry() if self.telemetry else None
         self.qps = read_qps() if self.telemetry else None
 
@@ -365,6 +501,7 @@ class Window:
                 "nic_counters": self.counters, "netdev": self.netdev,
                 "tcp_evidence": tcp_evidence(payload, self.tele0, self.tele1, self.tcp,
                                              self.qps, self.netdev, self.counters, device,
+                                             attribution=self.attribution,
                                              exclude_local_tcp=self.exclude_local_tcp,
                                              peers_co_resident=self.peers_co_resident)}
 
@@ -463,11 +600,14 @@ def collectives_mode(args, rank: int, world: int) -> dict:
     leaders = torch.tensor([int(bridge is not None)])
     dist.all_reduce(leaders, group=reference)
     identities = [None] * world
-    dist.all_gather_object(identities, {**host_identity(), "leader": bridge is not None},
-                           group=reference)
+    dist.all_gather_object(identities, {**host_identity(), **process_identity(),
+                                        "leader": bridge is not None}, group=reference)
     peers_co_resident = bridge_peers_co_resident(identities, rank)
-    out = {"rank": rank, "host": socket.gethostname(), "bridge": args.bridge,
-           "memory": args.memory, "leader": bridge is not None,
+    exclude_local_tcp = args.memory == "host" and topology.config.island_backend == "gloo"
+    island, island_unknown = (island_pids(identities, rank, topology.island.ranks)
+                              if exclude_local_tcp else (None, None))
+    out = {"rank": rank, "host": socket.gethostname(), "pid": os.getpid(),
+           "bridge": args.bridge, "memory": args.memory, "leader": bridge is not None,
            "leaders": int(leaders.item()), "calls": [],
            "mismatches": 0, "path_violations": 0, "bounced_bytes": 0}
     if args.memory == "host":
@@ -497,9 +637,20 @@ def collectives_mode(args, rank: int, world: int) -> dict:
     moved = 0
     leader_telemetry = bridge.telemetry if bridge is not None and hasattr(
         bridge, "telemetry") else None
-    with Window(leader_telemetry,
-                exclude_local_tcp=args.memory == "host" and topology.config.island_backend == "gloo",
-                peers_co_resident=peers_co_resident) as w:
+    def in_turn(snapshot):
+        """Host mode: ranks read their sockets one at a time, the others waiting at the
+        barrier, so no snapshot sees another rank's sockets closed by its teardown or held by
+        a child it is forking (ss); the last barrier precedes every rank's teardown."""
+        taken = None
+        for r in range(world):
+            if r == rank:
+                taken = snapshot()
+            dist.barrier(group=reference)
+        return taken
+
+    with Window(leader_telemetry, exclude_local_tcp=exclude_local_tcp,
+                peers_co_resident=peers_co_resident, island=island,
+                island_unknown=island_unknown, in_turn=in_turn if exclude_local_tcp else None) as w:
         for n in sizes(args.max_bytes):
             numel = max(1, n // 4)
             base = (torch.arange(numel, dtype=torch.float32) % 1024) + rank
@@ -551,7 +702,8 @@ def main() -> int:
     parser.add_argument("--expect-path", choices=["direct", "staged"], default=None)
     parser.add_argument("--require-no-tcp", action="store_true",
                         help="require decisive per-process verbs and TCP evidence; local host-mode "
-                             "Gloo islands cannot distinguish a co-resident bridge TCP fallback")
+                             "Gloo islands distinguish a co-resident bridge TCP fallback only "
+                             "when every same-host socket is attributed to a process")
     args = parser.parse_args()
     rank, world = rank_from_env(), int(os.environ.get("WORLD_SIZE", "1"))
     Path(args.out).mkdir(parents=True, exist_ok=True)

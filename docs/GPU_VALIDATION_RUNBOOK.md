@@ -209,8 +209,11 @@ process's own TCP sockets (`ss -tinp`) stayed idle. Without `ss` on the node it 
 `unknown` and the step fails; install or load iproute2's `ss` before the run.
 Transport observations go to `verbs_observations/rank-<N>.jsonl`
 (`GPUBRIDGE_VERBS_OBSERVE`). Host mode uses CPU/Gloo islands. With co-resident
-leaders its TCP evidence is `not-decisive`, and `--require-no-tcp` fails closed;
-GPU mode still counts same-host non-loopback TCP.
+leaders its TCP evidence is `not-decisive`, and `--require-no-tcp` fails closed,
+unless every same-host socket is attributed by the process at its other end: then
+only the leader's own island's sockets are left out, every other one counts, and the
+record's `local_tcp_attribution` shows each socket (docs/VERBS_TRANSPORT.md); GPU
+mode still counts same-host non-loopback TCP.
 
 On 2026-10-20, `c92684b` passed the staged-verbs kit, default-policy check,
 benchmark and training sweep on two 2-GPU NCCL islands of identical V100s.
