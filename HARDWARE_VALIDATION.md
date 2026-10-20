@@ -642,6 +642,10 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     *Status: software-only harness; not validated on GPUs.* Four identical NVIDIA
     GPUs establish only single-host split-island evidence, not mixed-vendor or
     cross-node acceptance.
+    This is a separate strict comparison report: the legacy kit's tables show
+    item 43 as **not run** rather than inferring acceptance from `train_verbs`,
+    `train_gloo`, or a step exit code. Review the complete numerical-gate records
+    and negative controls before recording its hardware outcome.
 
 32. **Point-to-point across islands through the backend on GPUs.** `send`,
     `recv`, `isend`, `irecv` and `batch_isend_irecv` on `backend="gpubridge"`

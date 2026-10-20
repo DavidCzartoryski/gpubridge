@@ -1823,6 +1823,15 @@ def test_tables_cover_every_hardware_validation_item():
     assert numbers == set(validation_tables.ITEMS)
 
 
+def test_numerical_gate_is_not_inferred_from_successful_legacy_training(tmp_path):
+    job = _job(tmp_path, "legacy-training", [("train_verbs", 0), ("train_gloo", 0)],
+               GPU_ENV, "cuda")
+    rows = validation_tables.item_rows([validation_tables.load_job(job, tmp_path)])
+    numerical = next(row for row in rows if row["item"] == 43)
+    assert numerical["verdict"] == "not run" and numerical["evidence"] == []
+    assert "manual acceptance" in numerical["tested_by"][0]
+
+
 def test_every_step_the_tables_look_for_is_one_a_job_runs():
     runs = [dry_run(KIT / "explorer" / job, UCX_BRIDGE="1", MULTITCP_BRIDGE="1",
                     VERBS_BRIDGE="1") for job in sorted(
@@ -3254,4 +3263,3 @@ def test_stages_follow_the_stage_order_not_the_ranks(tmp_path):
     normal = _train_pipeline(tmp_path, "normal", 2, "--steps", "6", "--backend", "gloo",
                              "--split", "3,1")
     assert reversed_run["losses"] == normal["losses"]  # the same pipeline, bit for bit
-
