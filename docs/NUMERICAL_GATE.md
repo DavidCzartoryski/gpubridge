@@ -1,6 +1,6 @@
 # Deterministic numerical comparison before throughput
 
-Candidate frozen2026-10-20. **Not validated on GPUs.** CPU/Gloo and MOCK verbs
+Candidate frozen2026-10-20. **Tiny GPU gate accepted at `f4146a4`: 48/48 positive rank records, zero violations; all three bad controls rejected. See [hardware record](../CHANGELOG.md#unreleased). Representative GPT equivalence remains unproven.** CPU/Gloo and MOCK verbs
 only test the harness and software paths. A four-V100 split test cannot establish
 mixed-vendor, cross-node or GPU-direct correctness.
 

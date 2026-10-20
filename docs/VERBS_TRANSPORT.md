@@ -1,21 +1,29 @@
 # A raw-verbs bridge transport in Rust
 
 **Status: phases A1 to A3. `bridge="verbs"` exists, opt-in, for host and GPU
-tensors. Not validated on RDMA hardware or GPUs.** Everything above the provider
-(the owned resources, the wire protocol, the completion thread, the registrations,
-the Python bridge) is tested against mock providers: an in-process fabric with a
-mock GPU, and a test-only fabric between processes. The libibverbs provider
-compiles and links against rdma-core's headers on Linux; the GPU driver calls are
-checked against CUDA's, HIP's and ROCr's headers and loaded at run time. None of
-that is a transfer over a real or software RDMA device, or a byte of GPU memory.
+tensors. Host-memory and staged-GPU verbs have passed real-hardware checks on
+single-host, single-HCA loopback; cross-node and direct GPU paths remain open.**
+The 2026-10-20 runs used one node with 4x Tesla V100-SXM2-32GB, driver 545.23.08,
+torch 2.14.1+cu126, NCCL 2.29.3, Mellanox ConnectX (mlx5) HDR InfiniBand.
+GPU bridge runs used two 2-GPU NCCL islands of identical V100s, not mixed vendors.
+At `c92684b`, the staged kit, default-policy check and benchmark passed; the
+original host kit failed before payload due to CPU tensors meeting CUDA
+communicators. At `0cf32a3` (production fix retained by `54f701e`), exact host
+collectives passed with CPU/Gloo islands, and GPU-staged strict checks passed.
+Host-mode no-silent-TCP evidence on one host is `not-decisive`; strict host mode
+fails closed. See [hardware results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
+and the [changelog](../CHANGELOG.md#unreleased).
 
-**Integration update (2026-10-18):** selectable native progress policies,
-operation-specific observations, allocation-window identity checks and bounded
-async submissions are implemented and tested in software. The final Linux
-all-target type-check was killed with SIGKILL on Explorer; Linux Clippy was not
-run after that kill. The native Linux validation gate remains **BLOCKED**, and
-all GPU/RDMA hardware gates remain BLOCKED. See the
-[capability matrix](VERBS_CAPABILITIES.md) for exact evidence and limits.
+**Integration update (2026-10-18; hardware status updated 2026-10-20):** selectable
+native progress policies, operation-specific observations, allocation-window
+identity checks and bounded async submissions are implemented and tested in
+software. The final integration Linux all-target type-check was killed with
+SIGKILL; Linux Clippy was not run after that kill. Those native validation gates
+remain open independently of the successful loopback hardware runs. Progress
+policy timing, hardware failure injection, cross-node, AMD/mixed-vendor,
+GPUDirect, UCX, 8-GPU scaling and statistical significance remain unproven by
+these runs. The collective `wait-skips-stream` mutation remains uncaught.
+See the [capability matrix](VERBS_CAPABILITIES.md) for software coverage.
 
 The plan has three phases, each its own change:
 
@@ -47,6 +55,15 @@ IMPLEMENTED: the code exists. SOFTWARE-VERIFIED: tests pass against a mock
 provider. EMULATED: tested over a software RDMA provider (`rdma_rxe`, `siw`).
 HARDWARE-VERIFIED: tested on RDMA hardware.
 
+The transport-observations row below records the historical MOCK schema audit,
+as does the [2026-10-18 capability matrix](VERBS_CAPABILITIES.md). Separately,
+the [2026-10-20 loopback results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
+include real host/staged kit observations and staged training/pipeline
+observations. Explicit in-process provider/completion telemetry and strict TCP
+gates belong to the kit; training/pipeline observations corroborate activity
+without independently supplying those gates. Cross-node and direct paths
+remain unproven.
+
 | Feature | Status |
 | --- | --- |
 | C shim over libibverbs (open, query, PD, CQ, QP, MR, dma-buf MR, post, poll; completion channels, `ibv_req_notify_cq`, asynchronous events, batched posts) | IMPLEMENTED; compiles and links against rdma-core 57.0 headers and the system `libibverbs.so.1` on Linux (build evidence, not a transfer) |
@@ -55,24 +72,24 @@ HARDWARE-VERIFIED: tested on RDMA hardware.
 | Work tracking: no deregistration while work is outstanding, drain before release | IMPLEMENTED, SOFTWARE-VERIFIED |
 | Bounded registration cache, keyed by allocation identity (buffer ID or owner token) | IMPLEMENTED, SOFTWARE-VERIFIED (mock GPU: invalidation when an address is reused) |
 | Wire protocol v2: handshake, chunking, credits, ordering, goodbye; rendezvous by write grant or "in chunks"; gathered sends from registered memory | IMPLEMENTED, SOFTWARE-VERIFIED (in-process mock; the test fabric carries RDMA WRITE too) |
-| Completion thread on a completion channel, asynchronous events | IMPLEMENTED, SOFTWARE-VERIFIED (the mocks' channels; the shim's `poll(2)` path is compiled only) |
+| Completion thread on a completion channel, asynchronous events | IMPLEMENTED, SOFTWARE-VERIFIED; real libibverbs completions observed in successful host/staged loopback runs; hardware failure cases remain open |
 | Deadlines, completion errors, lost peers, teardown with work outstanding | IMPLEMENTED, SOFTWARE-VERIFIED |
 | Failure is cancellation: once a wait reports a failure, nothing copies to or from the caller's plain memory | IMPLEMENTED, SOFTWARE-VERIFIED (mock: a peer breaks the protocol mid-message) |
 | Sends queued to a member that said goodbye fail at once with "member N closed its end of the bridge" | IMPLEMENTED, SOFTWARE-VERIFIED (mock) |
-| Remote write only through one receive's window: exactly its bytes, registered for it, deregistered once written; cached and send-side registrations local-only | IMPLEMENTED, SOFTWARE-VERIFIED (mock: writes before, after and past "written" fail, for host, dma-buf and peer memory); HARDWARE BLOCKED |
+| Remote write only through one receive's window: exactly its bytes, registered for it, deregistered once written; cached and send-side registrations local-only | IMPLEMENTED, SOFTWARE-VERIFIED (mock: writes before, after and past "written" fail, for host, dma-buf and peer memory); successful host/staged rendezvous exercised on loopback, adversarial hardware tests still open |
 | Fork safety checked at open (`ibv_is_fork_initialized`, `ibv_fork_init` before any registration, or a failure with the reason) | IMPLEMENTED, SOFTWARE-VERIFIED (mock statuses); predecessor native check/Clippy passed at `75922a0`; final integration Linux all-target check was killed with SIGKILL, so its native validation gate remains BLOCKED |
-| Device, port and GID selection | IMPLEMENTED, SOFTWARE-VERIFIED (mock devices) |
-| `bridge="verbs"`: every policy, compression, subgroups, async, bit for bit against `flat-gloo` | IMPLEMENTED, SOFTWARE-VERIFIED (the MOCK test fabric between processes, rendezvous on) |
-| GPU tensors, host-staged: a registered pinned buffer, copies on the caller's stream | IMPLEMENTED, SOFTWARE-VERIFIED (CPU tensors standing in, lazy copies); HARDWARE BLOCKED (item 39) |
+| Device, port and GID selection | IMPLEMENTED, SOFTWARE-VERIFIED; mlx5 InfiniBand endpoint recorded on loopback, other selection cases remain open |
+| `bridge="verbs"`: every policy, compression, subgroups, async, bit for bit against `flat-gloo` | IMPLEMENTED, SOFTWARE-VERIFIED (the MOCK test fabric between processes, rendezvous on); default-policy GPU check passed on loopback; full pipelined/sharded verbs payload suites remain open |
+| GPU tensors, host-staged: a registered pinned buffer, copies on the caller's stream | IMPLEMENTED, SOFTWARE-VERIFIED; staged kit and default-policy GPU correctness passed on the 2026-10-20 split test at `c92684b` (loopback only; item 39) |
 | NVIDIA direct, dma-buf (`cuMemGetHandleForAddressRange`, `ibv_reg_dmabuf_mr`) | IMPLEMENTED (selection, descriptor lifetime and reuse on a mock GPU); HARDWARE BLOCKED (item 40) |
 | NVIDIA direct, peer memory (`ibv_reg_mr` on device memory with `nvidia_peermem`) | IMPLEMENTED (selection on a mock GPU; module detection on fixtures); HARDWARE BLOCKED (item 40) |
 | AMD direct, dma-buf (ROCr `hsa_amd_portable_export_dmabuf`) | IMPLEMENTED (calls checked against ROCm 6.3's headers; selection on a mock GPU); HARDWARE BLOCKED (item 41) |
 | Ordering: stream wait before the NIC touches GPU memory, flush after it wrote there, SYNC_MEMOPS, BUFFER_ID identity | IMPLEMENTED, SOFTWARE-VERIFIED (a recording fake endpoint); HARDWARE BLOCKED |
 | Direct or staged, with the reason, in telemetry; `direct` only when nothing bounced (else `direct+bounce` with the bounced bytes); `GPUBRIDGE_VERBS_GPU_PATH=direct` fails rather than stage | IMPLEMENTED, SOFTWARE-VERIFIED (fake endpoint) |
 | Transport observations (`straggler.transport_observation/1` with `host`, `job`, `nic.pci_bus_id`) | IMPLEMENTED, SOFTWARE-VERIFIED (written on the MOCK test fabric, checked against the schema) |
-| Hardware kit: host verbs, GPU staged and direct, training, against Gloo and UCX | PREPARED, NOT RUN (`scripts/gpu/verbs_kit.py` ran on the MOCK fabric only; items 38 to 42) |
+| Hardware kit: host verbs, GPU staged and direct, training, against Gloo and UCX | PARTIALLY RUN: staged kit/check/benchmark and training passed on identical-V100 split islands; host collectives passed at `0cf32a3`. Cross-node, direct and UCX comparisons remain open (items 38 to 42) |
 | Any of the above on a software RDMA provider | not run: none available, and loading one needs privileges (EMULATED would need it) |
-| Any of the above on RDMA hardware or GPUs | BLOCKED: hardware/authorization. Needs allocated GPU nodes with an RDMA NIC each on one fabric, permission to open the devices from a job, dma-buf support or `nvidia_peermem` (NVIDIA), ROCm dma-buf support (AMD), the library built there, and project authorization. HARDWARE_VALIDATION.md items 38 to 42 |
+| Any of the above on RDMA hardware or GPUs | Host and staged-GPU paths exercised on one HCA on one host; between-host, AMD/mixed-vendor and GPUDirect hardware gates remain open. See the dated hardware results. |
 
 ## Bindings
 
@@ -740,16 +757,24 @@ other way: another bridge is only ever chosen explicitly.
 
 ## Hardware kit
 
-Prepared, not run (`scripts/gpu/verbs_kit.py`; runbook: `VERBS_BRIDGE=1` in
-steps 05 and 07; HARDWARE_VALIDATION.md items 38 to 42). Same-vendor (step 05)
-and cross-vendor (step 07) runs are separate records:
+Partially run on single-host loopback: staged-GPU collectives passed at
+`c92684b`, and repaired host collectives passed at `0cf32a3`; see the
+[2026-10-20 results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20).
+Host-mode TCP evidence remains `not-decisive`, with strict host mode failing
+closed. The two-host/cross-node, direct-GPU, mixed-vendor and UCX-comparison
+portions remain unrun. The full planned matrix follows
+(`scripts/gpu/verbs_kit.py`; runbook: `VERBS_BRIDGE=1` in steps 05 and 07;
+HARDWARE_VALIDATION.md items 38 to 42). Same-vendor (step 05) and cross-vendor
+(step 07) runs are separate records:
 
 1. `verbs_build`, `verbs_rdma_report` (each node's dma-buf options, peer-memory
    modules, `ibv_reg_dmabuf_mr` in its libibverbs, ROCr's dma-buf export);
 2. `verbs_endpoint`: host-to-host verbs between one rank per node: latency,
    bandwidth sweep, SHA-256 of every buffer on both sides, CPU time;
 3. `verbs_host`, `verbs_gpu_staged`, `verbs_gpu_direct`: the collectives on host
-   tensors, then GPU tensors staged and direct, exactly against Gloo, each call's
+   tensors (the kit sets `GPUBRIDGE_CPU_ONLY=1` before importing torch or gpubridge,
+   using CPU/Gloo islands and the verbs bridge between leaders; not NCCL island coverage), then GPU tensors
+   staged and direct, exactly against Gloo, each call's
    path, reason and bounced bytes recorded and the path required. `direct` means
    nothing bounced (`direct+bounce` fails the step), so `verbs_gpu_direct` runs
    with `GPUBRIDGE_VERBS_RNDV_BYTES=1`: every message by rendezvous, written in
@@ -759,6 +784,12 @@ and cross-vendor (step 07) runs are separate records:
    matched references;
 5. `train_verbs`, `train_gloo`: `train_bench.py` over each.
 
+Host collective records include `cpu_only: true` and `island_backend: "gloo"`.
+The kit refuses inherited CPU-only settings that contradict `--memory` (including
+`--memory gpu` with `GPUBRIDGE_CPU_ONLY=1`).
+An inherited `GPUBRIDGE_VERBS_GPU_PATH=staged` is preserved and accepted in host
+mode; CPU tensors still use the verbs host path.
+
 Every `verbs_kit` record holds the endpoint telemetry, completion errors, a window
 of every `/sys/class/infiniband/*/ports/*/{counters,hw_counters}` file and every
 interface's `/proc/net/dev` bytes, and `tcp_evidence`. Port and netdev counters are
@@ -767,12 +798,29 @@ netdev carries traffic that is not TCP, so they can't show which transport carri
 this job's payload. `tcp_evidence` is `pass` only with positive evidence attributable
 to the process: the bridge's own telemetry over the window (provider `libibverbs`, not
 MOCK; its sent plus received bytes at least the payload; completions from its own
-queue pairs; no completion errors), and the process's own TCP sockets to other hosts
+queue pairs; no completion errors), and the process's own counted TCP sockets
 (`ss -tinp`, by pid: Gloo's and the store's) moving no more than 5% of the payload
 plus 1 MiB. Its RC queue pairs as the kernel lists them (`rdma resource show qp`, by
 pid) are recorded where the `rdma` tool exists, and contradict a pass when it lists
 none. Without `ss` the verdict is `unknown`, never a pass; Gloo reference collectives
-run before the window. `--require-no-tcp` fails a bridge leader's step unless its
+run before the window. The TCP check always excludes loopback. Only host mode with
+CPU-only Gloo islands also excludes peers whose addresses appear as local socket
+endpoints in the same `ss` snapshot. IPv4, IPv4-mapped IPv6 and native IPv6 addresses
+are normalized; unknown addresses still count. GPU mode with NCCL islands counts
+same-host non-loopback TCP, preserving its existing acceptance check.
+
+Leader co-residence is determined from gathered actual hostnames and kernel boot
+IDs, independently of split-test labels. When local TCP is excluded and any bridge
+peer is co-resident or cannot be positively identified as remote, otherwise positive
+evidence is `not-decisive`, with `no_silent_tcp: null` and the reason
+"local bridge: island Gloo traffic and a bridge TCP fallback are indistinguishable
+on one host". The positive verbs checks remain required and are reported separately
+in `verbs_evidence`; any contradictory evidence still yields `fail`. Without
+`--require-no-tcp`, a correct local host run may succeed while printing and recording
+this limitation. With `--require-no-tcp`, its leaders fail with that reason.
+Cross-node host runs remain decisive: local island TCP is excluded, remote TCP is
+counted. A one-host host run cannot establish cross-node no-TCP acceptance.
+`--require-no-tcp` fails a bridge leader's step unless its decisive
 verdict is `pass`; other ranks record `not applicable`. A job with no bridge leader
 at all (one island: an all-NVIDIA node without `GPUBRIDGE_SPLIT_TEST`, say) never
 runs the bridge, so `--require-no-tcp` fails every rank of it (each record says
