@@ -1,6 +1,6 @@
 """Hardware checks for the verbs bridge (docs/VERBS_TRANSPORT.md), launched by torchrun.
 
-PREPARED, NOT RUN: nothing here has run on RDMA hardware or GPUs. Every mode writes
+HARDWARE: host/staged loopback checked (2026-10-20); cross-node/direct unproven. Every mode writes
 OUT/rank<N>.json with what a reviewer needs to judge the run, never a remote key:
 
 - the endpoint the library chose (device, port, link layer, GID index and type, MTU,
