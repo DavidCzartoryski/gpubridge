@@ -17,7 +17,7 @@ OUT/rank<N>.json with what a reviewer needs to judge the run, never a remote key
   Ethernet netdev also carries traffic that is not TCP, so neither proves which
   transport carried this job's payload;
 - no-silent-TCP evidence (``tcp_evidence``), positive and attributable to this
-  process, judged ``pass``, ``fail`` or ``unknown``:
+  process, judged ``pass``, ``fail``, ``unknown`` or ``not-decisive``:
 
   1. the bridge's own telemetry over the window: a real provider (``libibverbs``,
      not MOCK), its sent plus received bytes at least the payload, completions
@@ -25,16 +25,21 @@ OUT/rank<N>.json with what a reviewer needs to judge the run, never a remote key
      (``host``/``direct``/``staged``) is in the call records;
   2. this process's RC queue pairs as the kernel lists them (``rdma resource show
      qp``, by pid), where the ``rdma`` tool exists (recorded; not required);
-  3. this process's own TCP sockets to other hosts (``ss -tinp``, by pid: Gloo's,
+  3. this process's own non-loopback TCP sockets (``ss -tinp``, by pid: Gloo's,
      the store's) idle over the window: they moved no more than a small fraction of
      the payload. Without ``ss`` this is ``unknown``, never a pass.
 
-  Gloo reference collectives run before the window, not inside it. A run passes
-  only when every part is shown; ``--require-no-tcp`` fails a bridge leader's step
-  unless its evidence is ``pass``. Ranks that aren't bridge leaders carry no bridge
-  traffic and record ``not applicable``; a job with no leader at all (one island: an
-  all-NVIDIA node without ``GPUBRIDGE_SPLIT_TEST``, say) never runs the bridge, and
-  ``--require-no-tcp`` fails every rank of it.
+  Host/CPU-only Gloo islands exclude peers proven local by the socket snapshot;
+  GPU/NCCL islands still count non-loopback same-host TCP. When local TCP is
+  excluded, co-resident bridge leaders (or unknown host identity) make otherwise
+  positive evidence ``not-decisive`` with ``no_silent_tcp: null``: local island Gloo
+  and bridge TCP fallback cannot be distinguished. Positive verbs evidence is
+  reported separately. Gloo reference collectives run before the window, not
+  inside it. A decisive pass needs every part shown; ``--require-no-tcp`` fails a
+  bridge leader's step unless its evidence is ``pass``. Ranks that aren't bridge
+  leaders carry no bridge traffic and record ``not applicable``; a job with no
+  leader at all (one island: an all-NVIDIA node without ``GPUBRIDGE_SPLIT_TEST``,
+  say) never runs the bridge, and ``--require-no-tcp`` fails every rank of it.
 
 Modes:
 
@@ -45,8 +50,12 @@ through torchrun's store.
 
 ``collectives``: ``gpubridge.init(bridge=...)`` then all_reduce and broadcast at each
 size on ``--memory host`` or ``gpu`` tensors, checked exactly against a Gloo
-all_reduce of the same integer-valued data. With ``--expect-path direct|staged`` every
-GPU call must have taken that path (``GPUBRIDGE_VERBS_GPU_PATH=direct`` makes a
+all_reduce of the same integer-valued data. Host mode sets ``GPUBRIDGE_CPU_ONLY=1``
+before importing torch or gpubridge: CPU tensors and Gloo islands, with the selected
+bridge between leaders, not NCCL island coverage. Contradictory inherited CPU-only
+settings are refused.
+With ``--expect-path direct|staged`` every GPU call must have taken that path
+(``GPUBRIDGE_VERBS_GPU_PATH=direct`` makes a
 direct path that can't run fail loudly rather than stage). ``direct`` means nothing
 bounced: a call with any receive through a host bounce buffer (below
 ``GPUBRIDGE_VERBS_RNDV_BYTES``) is ``direct+bounce``, which fails ``--expect-path
@@ -64,6 +73,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -76,12 +86,28 @@ from datetime import timedelta
 from pathlib import Path
 
 SYSFS = Path("/sys/class/infiniband")
-#: This process's TCP sockets to other hosts are "idle" over a window when they moved no
+#: This process's counted TCP sockets are "idle" over a window when they moved no
 #: more than this fraction of the payload, plus a little for the store's and Gloo's own
 #: control traffic (barriers, keep-alives).
 TCP_FRACTION = 0.05
 TCP_SLACK = 1 << 20
-_LOOPBACK = ("127.", "[::1]", "::1", "[::ffff:127.")
+
+
+def configure_memory(memory: str) -> None:
+    """Select CPU mode before importing torch or gpubridge, including its config."""
+    name = "GPUBRIDGE_CPU_ONLY"
+    raw = os.environ.get(name, "")
+    value = raw.strip().lower()
+    if value not in ("", "0", "false", "no", "off", "1", "true", "yes", "on"):
+        raise ValueError(f"{name}={raw!r} is not a boolean; use 1 or 0")
+    cpu_only = value in ("1", "true", "yes", "on")
+    if memory == "host":
+        if value and not cpu_only:
+            raise ValueError(f"--memory host conflicts with {name}={raw!r}; "
+                             "unset it or use 1 for CPU tensors and Gloo islands")
+        os.environ[name] = "1"
+    elif cpu_only:
+        raise ValueError(f"--memory gpu conflicts with {name}={raw!r}; unset it or use 0")
 
 
 def rank_from_env() -> int:
@@ -128,17 +154,35 @@ def window(before: dict, after: dict) -> dict:
     return out
 
 
-def parse_ss(text: str, pid: int) -> dict:
-    """Bytes sent and received by each of ``pid``'s TCP sockets to another host, from
-    ``ss -tinpH`` (a socket line, then its indented info line), by "local peer"."""
+def parse_ss(text: str, pid: int, *, exclude_local_tcp: bool = False) -> dict:
+    """Bytes sent and received by each of ``pid``'s non-loopback TCP sockets, from
+    ``ss -tinpH`` (a socket line, then its indented info line), by "local peer".
+    Only Gloo islands may exclude peers proven local by this snapshot's endpoints;
+    unknown addresses always count."""
+    def address(endpoint: str):
+        host = endpoint.rsplit(":", 1)[0].strip("[]")
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return None
+        return getattr(ip, "ipv4_mapped", None) or ip
+
+    # Gloo islands can connect to this host's non-loopback interface. Every
+    # local endpoint in ss proves an address belongs to this network namespace,
+    # even on a socket owned by another process. Unknown peers still count.
+    local_addresses = {address(fields[3]) for line in text.splitlines()
+                       if line and not line[0].isspace() and len(fields := line.split()) >= 5}
+    local_addresses.discard(None)
     out: dict = {}
     current = None
     for line in text.splitlines():
         if line and not line[0].isspace():
             fields = line.split()
             current = None
+            peer = address(fields[4]) if len(fields) >= 5 else None
             if len(fields) >= 5 and re.search(rf"\bpid={pid}\b", line) \
-                    and not fields[4].startswith(_LOOPBACK):
+                    and not (peer is not None and (peer.is_loopback or (
+                        exclude_local_tcp and peer in local_addresses))):
                 current = f"{fields[3]} {fields[4]}"
                 out[current] = {"sent": 0, "received": 0}
         elif current is not None:
@@ -150,7 +194,8 @@ def parse_ss(text: str, pid: int) -> dict:
     return out
 
 
-def read_process_tcp(pid: int | None = None, run=subprocess.run) -> dict | None:
+def read_process_tcp(pid: int | None = None, run=subprocess.run, *,
+                     exclude_local_tcp: bool = False) -> dict | None:
     """:func:`parse_ss` of this process, or None where ``ss`` can't say."""
     try:
         done = run(["ss", "-tinpH"], capture_output=True, text=True, timeout=10, check=False)
@@ -158,7 +203,36 @@ def read_process_tcp(pid: int | None = None, run=subprocess.run) -> dict | None:
         return None
     if done.returncode != 0:
         return None
-    return parse_ss(done.stdout, os.getpid() if pid is None else pid)
+    return parse_ss(done.stdout, os.getpid() if pid is None else pid,
+                    exclude_local_tcp=exclude_local_tcp)
+
+
+def host_identity() -> dict:
+    """Actual host identity, independent of simulated topology/split labels."""
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        boot_id = ""
+    return {"hostname": socket.gethostname(), "boot_id": boot_id}
+
+
+def bridge_peers_co_resident(identities: list[dict], rank: int) -> bool | None:
+    """False only when every other leader is positively identified as remote.
+
+    Missing identity (including the boot ID on non-Linux hosts) is undecidable.
+    Matching either identity component is conservatively treated as co-resident.
+    """
+    local = identities[rank]
+    peers = [identity for r, identity in enumerate(identities)
+             if r != rank and identity.get("leader")]
+    unknown = not peers
+    for peer in peers:
+        if any(local.get(key) and local[key] == peer.get(key)
+               for key in ("hostname", "boot_id")):
+            return True
+        if not all(local.get(key) and peer.get(key) for key in ("hostname", "boot_id")):
+            unknown = True
+    return None if unknown else False
 
 
 def read_qps(pid: int | None = None, run=subprocess.run) -> list | None:
@@ -178,7 +252,7 @@ def read_qps(pid: int | None = None, run=subprocess.run) -> list | None:
 
 
 def tcp_moved(before: dict | None, after: dict | None) -> int | None:
-    """Bytes this process's TCP sockets to other hosts moved between two snapshots (a
+    """Bytes this process's counted TCP sockets moved between two snapshots (a
     socket opened in between counts in full), or None if either is unknown."""
     if before is None or after is None:
         return None
@@ -191,10 +265,13 @@ def tcp_moved(before: dict | None, after: dict | None) -> int | None:
 
 def tcp_evidence(payload: int, tele_before: dict | None, tele_after: dict | None,
                  tcp: int | None, qps: list | None, netdev: dict | None = None,
-                 counters: dict | None = None, device: str | None = None) -> dict:
+                 counters: dict | None = None, device: str | None = None, *,
+                 exclude_local_tcp: bool = False,
+                 peers_co_resident: bool | None = None) -> dict:
     """Whether this process's payload went by verbs and not over TCP; see the module.
     ``verdict`` is ``pass`` only with every positive part shown, ``fail`` when a part
-    contradicts it, else ``unknown``; ``no_silent_tcp`` is ``verdict == "pass"``."""
+    contradicts it, else ``unknown``. Excluding local TCP with co-resident or unknown
+    bridge peers makes otherwise positive evidence ``not-decisive`` (JSON null)."""
     fails, unknown = [], []
     moved = completions = errors = None
     if tele_after is None:
@@ -219,23 +296,32 @@ def tcp_evidence(payload: int, tele_before: dict | None, tele_after: dict | None
             fails.append("no completions were polled from the bridge's queue pairs")
         if errors:
             fails.append(f"{errors} completion errors")
+    if qps is not None and tele_after is not None and not any(
+            q.get("type") == "RC" for q in qps):
+        fails.append("the kernel lists no RC queue pair for this process")
+    verbs_evidence = {"verdict": "fail" if fails else "unknown" if unknown else "pass",
+                      "failures": list(fails), "unknown": list(unknown)}
+    reason = ("local bridge: island Gloo traffic and a bridge TCP fallback are "
+              "indistinguishable on one host"
+              if exclude_local_tcp and peers_co_resident is not False else None)
     limit = TCP_FRACTION * payload + TCP_SLACK
     if tcp is None:
         unknown.append("this process's TCP sockets could not be read (no ss): TCP not "
                        "shown idle")
     elif tcp > limit:
-        fails.append(f"this process's TCP sockets to other hosts moved {tcp} bytes "
+        fails.append(f"this process's counted TCP sockets moved {tcp} bytes "
                      f"(limit {int(limit)})")
-    if qps is not None and tele_after is not None and not any(
-            q.get("type") == "RC" for q in qps):
-        fails.append("the kernel lists no RC queue pair for this process")
     words = sum(v or 0 for k, v in (counters or {}).items()
                 if device and k.startswith(f"{device}/")
                 and k.endswith(("/counters/port_xmit_data", "/counters/port_rcv_data")))
     interfaces = max((max(v.get("rx_bytes") or 0, v.get("tx_bytes") or 0)
                       for v in (netdev or {}).values()), default=0)
-    verdict = "fail" if fails else "unknown" if unknown else "pass"
-    return {"verdict": verdict, "no_silent_tcp": verdict == "pass", "failures": fails,
+    verdict = "fail" if fails else "unknown" if unknown else "not-decisive" if reason else "pass"
+    return {"verdict": verdict,
+            "no_silent_tcp": None if verdict == "not-decisive" else verdict == "pass",
+            "reason": reason, "local_tcp_excluded": exclude_local_tcp,
+            "bridge_peers_co_resident": peers_co_resident, "verbs_evidence": verbs_evidence,
+            "failures": fails,
             "unknown": unknown, "payload_bytes": payload, "bridge_bytes": moved,
             "bridge_completions": completions, "bridge_completion_errors": errors,
             "process_tcp_bytes": tcp, "process_tcp_limit": int(limit),
@@ -249,13 +335,16 @@ def tcp_evidence(payload: int, tele_before: dict | None, tele_after: dict | None
 class Window:
     """Counters, netdev bytes, CPU time and wall time over a measured region."""
 
-    def __init__(self, telemetry=None) -> None:
+    def __init__(self, telemetry=None, *, exclude_local_tcp: bool = False,
+                 peers_co_resident: bool | None = None) -> None:
         #: The bridge's telemetry (a callable), read at both ends; None off the bridge.
         self.telemetry = telemetry
+        self.exclude_local_tcp = exclude_local_tcp
+        self.peers_co_resident = peers_co_resident
 
     def __enter__(self) -> Window:
         self.tele0 = self.telemetry() if self.telemetry else None
-        self.tcp0 = read_process_tcp()
+        self.tcp0 = read_process_tcp(exclude_local_tcp=self.exclude_local_tcp)
         self.counters0, self.netdev0 = read_counters(), read_netdev()
         self.cpu0, self.wall0 = resource.getrusage(resource.RUSAGE_SELF), time.monotonic()
         return self
@@ -266,7 +355,7 @@ class Window:
         self.cpu = (cpu.ru_utime - self.cpu0.ru_utime) + (cpu.ru_stime - self.cpu0.ru_stime)
         self.counters = window(self.counters0, read_counters())
         self.netdev = window(self.netdev0, read_netdev())
-        self.tcp = tcp_moved(self.tcp0, read_process_tcp())
+        self.tcp = tcp_moved(self.tcp0, read_process_tcp(exclude_local_tcp=self.exclude_local_tcp))
         self.tele1 = self.telemetry() if self.telemetry else None
         self.qps = read_qps() if self.telemetry else None
 
@@ -275,7 +364,9 @@ class Window:
                 "cpu_per_wall": self.cpu / self.wall if self.wall else None,
                 "nic_counters": self.counters, "netdev": self.netdev,
                 "tcp_evidence": tcp_evidence(payload, self.tele0, self.tele1, self.tcp,
-                                             self.qps, self.netdev, self.counters, device)}
+                                             self.qps, self.netdev, self.counters, device,
+                                             exclude_local_tcp=self.exclude_local_tcp,
+                                             peers_co_resident=self.peers_co_resident)}
 
 
 def sizes(max_bytes: int) -> list[int]:
@@ -371,10 +462,16 @@ def collectives_mode(args, rank: int, world: int) -> dict:
     # How many ranks lead a bridge: none in a job of one island.
     leaders = torch.tensor([int(bridge is not None)])
     dist.all_reduce(leaders, group=reference)
+    identities = [None] * world
+    dist.all_gather_object(identities, {**host_identity(), "leader": bridge is not None},
+                           group=reference)
+    peers_co_resident = bridge_peers_co_resident(identities, rank)
     out = {"rank": rank, "host": socket.gethostname(), "bridge": args.bridge,
            "memory": args.memory, "leader": bridge is not None,
            "leaders": int(leaders.item()), "calls": [],
            "mismatches": 0, "path_violations": 0, "bounced_bytes": 0}
+    if args.memory == "host":
+        out.update(cpu_only=True, island_backend=topology.config.island_backend)
     tele0 = bridge.telemetry() if bridge is not None and hasattr(bridge, "telemetry") else None
 
     def path_of(call: dict) -> None:
@@ -400,7 +497,9 @@ def collectives_mode(args, rank: int, world: int) -> dict:
     moved = 0
     leader_telemetry = bridge.telemetry if bridge is not None and hasattr(
         bridge, "telemetry") else None
-    with Window(leader_telemetry) as w:
+    with Window(leader_telemetry,
+                exclude_local_tcp=args.memory == "host" and topology.config.island_backend == "gloo",
+                peers_co_resident=peers_co_resident) as w:
         for n in sizes(args.max_bytes):
             numel = max(1, n // 4)
             base = (torch.arange(numel, dtype=torch.float32) % 1024) + rank
@@ -451,8 +550,8 @@ def main() -> int:
     parser.add_argument("--memory", choices=["host", "gpu"], default="host")
     parser.add_argument("--expect-path", choices=["direct", "staged"], default=None)
     parser.add_argument("--require-no-tcp", action="store_true",
-                        help="fail unless the window shows the payload on the RDMA port and not "
-                             "on any interface's TCP/IP (verbs runs on hardware)")
+                        help="require decisive per-process verbs and TCP evidence; local host-mode "
+                             "Gloo islands cannot distinguish a co-resident bridge TCP fallback")
     args = parser.parse_args()
     rank, world = rank_from_env(), int(os.environ.get("WORLD_SIZE", "1"))
     Path(args.out).mkdir(parents=True, exist_ok=True)
@@ -466,6 +565,7 @@ def main() -> int:
                                   world, rank == 0, timedelta(seconds=args.timeout))
             result = endpoint_mode(args, store, rank, world)
         else:
+            configure_memory(args.memory)
             result = collectives_mode(args, rank, world)
         if result.get("mismatches") or result.get("path_violations"):
             status = "failed"
@@ -488,7 +588,11 @@ def main() -> int:
                 and evidence.get("verdict") != "pass":
             status, error = "failed", (
                 f"no-silent-TCP evidence is {evidence.get('verdict')}: "
-                + "; ".join(evidence.get("failures", []) + evidence.get("unknown", [])))
+                + "; ".join(evidence.get("failures", []) + evidence.get("unknown", [])
+                            + ([evidence["reason"]] if evidence.get("reason") else [])))
+        if result.get("leader") and evidence.get("reason"):
+            print(f"no-silent-TCP evidence is {evidence.get('verdict')}: {evidence['reason']}",
+                  file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 - recorded, then the exit code says so
         status, error = "error", f"{type(exc).__name__}: {exc}"
     record = {"kit": "verbs_kit", "mode": args.mode, "args": vars(args), "status": status,

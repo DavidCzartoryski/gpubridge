@@ -744,7 +744,9 @@ and cross-vendor (step 07) runs are separate records:
 2. `verbs_endpoint`: host-to-host verbs between one rank per node: latency,
    bandwidth sweep, SHA-256 of every buffer on both sides, CPU time;
 3. `verbs_host`, `verbs_gpu_staged`, `verbs_gpu_direct`: the collectives on host
-   tensors, then GPU tensors staged and direct, exactly against Gloo, each call's
+   tensors (the kit sets `GPUBRIDGE_CPU_ONLY=1` before importing torch or gpubridge,
+   using CPU/Gloo islands and the verbs bridge between leaders; not NCCL island coverage), then GPU tensors
+   staged and direct, exactly against Gloo, each call's
    path, reason and bounced bytes recorded and the path required. `direct` means
    nothing bounced (`direct+bounce` fails the step), so `verbs_gpu_direct` runs
    with `GPUBRIDGE_VERBS_RNDV_BYTES=1`: every message by rendezvous, written in
@@ -754,6 +756,12 @@ and cross-vendor (step 07) runs are separate records:
    matched references;
 5. `train_verbs`, `train_gloo`: `train_bench.py` over each.
 
+Host collective records include `cpu_only: true` and `island_backend: "gloo"`.
+The kit refuses inherited CPU-only settings that contradict `--memory` (including
+`--memory gpu` with `GPUBRIDGE_CPU_ONLY=1`).
+An inherited `GPUBRIDGE_VERBS_GPU_PATH=staged` is preserved and accepted in host
+mode; CPU tensors still use the verbs host path.
+
 Every `verbs_kit` record holds the endpoint telemetry, completion errors, a window
 of every `/sys/class/infiniband/*/ports/*/{counters,hw_counters}` file and every
 interface's `/proc/net/dev` bytes, and `tcp_evidence`. Port and netdev counters are
@@ -762,12 +770,29 @@ netdev carries traffic that is not TCP, so they can't show which transport carri
 this job's payload. `tcp_evidence` is `pass` only with positive evidence attributable
 to the process: the bridge's own telemetry over the window (provider `libibverbs`, not
 MOCK; its sent plus received bytes at least the payload; completions from its own
-queue pairs; no completion errors), and the process's own TCP sockets to other hosts
+queue pairs; no completion errors), and the process's own counted TCP sockets
 (`ss -tinp`, by pid: Gloo's and the store's) moving no more than 5% of the payload
 plus 1 MiB. Its RC queue pairs as the kernel lists them (`rdma resource show qp`, by
 pid) are recorded where the `rdma` tool exists, and contradict a pass when it lists
 none. Without `ss` the verdict is `unknown`, never a pass; Gloo reference collectives
-run before the window. `--require-no-tcp` fails a bridge leader's step unless its
+run before the window. The TCP check always excludes loopback. Only host mode with
+CPU-only Gloo islands also excludes peers whose addresses appear as local socket
+endpoints in the same `ss` snapshot. IPv4, IPv4-mapped IPv6 and native IPv6 addresses
+are normalized; unknown addresses still count. GPU mode with NCCL islands counts
+same-host non-loopback TCP, preserving its existing acceptance check.
+
+Leader co-residence is determined from gathered actual hostnames and kernel boot
+IDs, independently of split-test labels. When local TCP is excluded and any bridge
+peer is co-resident or cannot be positively identified as remote, otherwise positive
+evidence is `not-decisive`, with `no_silent_tcp: null` and the reason
+"local bridge: island Gloo traffic and a bridge TCP fallback are indistinguishable
+on one host". The positive verbs checks remain required and are reported separately
+in `verbs_evidence`; any contradictory evidence still yields `fail`. Without
+`--require-no-tcp`, a correct local host run may succeed while printing and recording
+this limitation. With `--require-no-tcp`, its leaders fail with that reason.
+Cross-node host runs remain decisive: local island TCP is excluded, remote TCP is
+counted. A one-host host run cannot establish cross-node no-TCP acceptance.
+`--require-no-tcp` fails a bridge leader's step unless its decisive
 verdict is `pass`; other ranks record `not applicable`. A job with no bridge leader
 at all (one island: an all-NVIDIA node without `GPUBRIDGE_SPLIT_TEST`, say) never
 runs the bridge, so `--require-no-tcp` fails every rank of it (each record says
