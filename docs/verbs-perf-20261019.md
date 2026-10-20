@@ -50,8 +50,11 @@ next poll, it is not inside `bridge_s`).
 
 **Still unavailable, by design or not measurable from the host:**
 
-- the GPU time of the copy back (the host never waits for it); the A/B harness's
-  CUDA-event latency of the whole call covers it;
+- **H2D, the copy back: UNAVAILABLE.** The host never waits for it, so nothing times
+  it, and `to_device_s` is only its queueing. The A/B harness's CUDA-event latency of
+  the whole call includes it, but also the island broadcast and framework work, and
+  the host's enqueueing can overlap GPU work: that latency minus the host phases is
+  no estimate of the copy back, and nothing in section 5 uses it;
 - inside `to_host_s`, the island reduce's GPU time against the copy out's: the 2-rank
   (1+1) arm has no island step, so there it is the copy out alone;
 - windows of failed receives, released when their queue pair closes (counted in
@@ -257,14 +260,18 @@ no failure.
 | G5 native baseline | N runs; ratios are reported | - | `native` refuses (exit 3) |
 
 The record is what the next change is chosen from, with these thresholds fixed now
-(P0 and P0x2, at 25 and 150 MiB, medians over repeats, per leader):
+(P0 and P0x2, at 25 and 150 MiB, medians over repeats, per leader, except where a row
+names one arm). Every quantity is measured; none is a residual:
 
 | Observation | Next change |
 | --- | --- |
-| `to_host_s` plus the copy back (call latency minus host phases) at least 30% of the call, or D3 beats P0 by more than the spread | overlap the copies with the transfer, chunk by chunk (candidate A, opt-in) |
+| In P0x2, at 25 or 150 MiB, on either leader: the median over its 3 repeats of `(staged_to_host_s / staged_calls) / p50` is at least 0.30, where `staged_to_host_s / staged_calls` is the D2H copy out, queued and waited for (1+1 has no island reduce before it), and p50 is that repeat's call latency (slowest rank, CUDA events); or `compare P0 D3` says `win` at 25 or 150 MiB | overlap the copies with the transfer, chunk by chunk (candidate A, opt-in) |
 | `(write_window_register_ns + write_window_release_ns)` at least 20% of `bridge_s`, or D1 or D2 beats P0 by more than the spread | amortize windows (first the chunk size setting) |
 | `bridge_s - post_s - wait_s` (reductions and Python) at least 30% of `bridge_s` | reduce on the GPU for two staged leaders |
 | none, `wait_s` dominant | the NIC loopback or the island NCCL steps bound it: no bridge change |
+
+P0's `to_host_s` also covers the island reduce it waits for, and the copy back (H2D)
+is not measured (section 2): both are reported and trigger nothing.
 
 Noise and no benefit: a difference inside the spread is "no change", reported with the
 raw samples; load or clock explanations are recorded as hypotheses, not used to drop or

@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 import pytest
-from test_gpu_kit import KIT, torchrun
+from test_gpu_kit import KIT, REPO, torchrun
 from test_verbs import UNAVAILABLE
 
 SCRIPT = KIT / "verbs_staged_ab.py"
@@ -217,3 +217,22 @@ def test_compare_wire_needs_every_leaders_counted_messages(tmp_path):
     result = _compare(tmp_path, "B0", "P0", 3, 3, "--wire")
     assert result.returncode == 4 and "lacks ['write_windows']" in result.stderr, result.stderr
 
+
+DOC = REPO / "docs" / "verbs-perf-20261019.md"
+
+
+def _section(heading: str) -> str:
+    text = DOC.read_text()
+    start = text.index(f"\n## {heading}")
+    return text[start:text.find("\n## ", start + 1)]
+
+
+@pytest.mark.docs
+def test_the_copy_trigger_uses_only_measured_phases():
+    # Call latency minus the host phases also holds the island broadcast and framework
+    # work, and the host's enqueue can overlap GPU work: it is no measure of the copy back.
+    trigger, = [line for line in _section("5.").splitlines()
+                if line.startswith("|") and "candidate A" in line]
+    assert "minus" not in trigger and "copy back" not in trigger, trigger
+    assert "staged_to_host_s / staged_calls" in trigger and "P0x2" in trigger, trigger
+    assert "H2D" in _section("2.") and "UNAVAILABLE" in _section("2."), _section("2.")
