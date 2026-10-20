@@ -5,6 +5,8 @@ time the host path on a MOCK fabric, not the staged GPU path or a NIC."""
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -236,3 +238,36 @@ def test_the_copy_trigger_uses_only_measured_phases():
     assert "minus" not in trigger and "copy back" not in trigger, trigger
     assert "staged_to_host_s / staged_calls" in trigger and "P0x2" in trigger, trigger
     assert "H2D" in _section("2.") and "UNAVAILABLE" in _section("2."), _section("2.")
+
+
+@pytest.mark.docs
+def test_the_setup_makes_every_directory_the_owner_commands_write_to(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("no bash")
+    section = _section("4.")
+    blocks = re.findall(r"```bash\n(.*?)```", section, flags=re.DOTALL)
+    setup = section.split("### Setup", 1)[1]
+    setup = re.search(r"```bash\n(.*?)```", setup, flags=re.DOTALL).group(1)
+    # Stand-ins for the node: a library build, nvidia-smi, two checkouts.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python").write_text('#!/bin/sh\nmkdir -p "$GPUBRIDGE_VERBS_LIB_DIR" && '
+                                    'touch "$GPUBRIDGE_VERBS_LIB_DIR/libgpubridge_verbs-x.so"\n')
+    (bin_dir / "python").chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+           "OUT": str(tmp_path / "out")}
+    for name in ("BASE", "PR0"):
+        tree = tmp_path / name
+        subprocess.run(["git", "init", "-q", str(tree)], check=True)
+        subprocess.run(["git", "-C", str(tree), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-q", "--allow-empty", "-m", "t"], check=True)
+        env[name] = str(tree)
+    script = "set -e\n" + re.sub(r"^export BASE=.*$", "", setup, flags=re.MULTILINE)
+    result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True,
+                            timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    written = {m for block in blocks for m in re.findall(r'"\$OUT/([^"]+)"', block)}
+    assert {"m1/$ARM-r$R.time", "m2/N-r$R.time"} <= written, written
+    for path in written:
+        parent = (tmp_path / "out" / path).parent
+        assert parent.is_dir(), f"{path}: {parent} does not exist after the setup"

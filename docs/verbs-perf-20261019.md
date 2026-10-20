@@ -119,6 +119,7 @@ control (`gloo` over the same split) and matched observation settings.
 # Two checkouts: BASE at cd9fbac, PR0 at this branch's head. No site paths here: set
 # them in your shell. The harness always comes from PR0; each arm imports its tree.
 export BASE=... PR0=... OUT=...      # OUT: an empty results directory
+mkdir -p "$OUT/m1" "$OUT/m2"          # every command below writes into these
 for T in "$BASE" "$PR0"; do
   PYTHONPATH="$T/src" GPUBRIDGE_VERBS_LIB_DIR="$T/.verbs-lib" \
     python -m gpubridge.verbs build                      # prints the library path
