@@ -55,6 +55,15 @@ IMPLEMENTED: the code exists. SOFTWARE-VERIFIED: tests pass against a mock
 provider. EMULATED: tested over a software RDMA provider (`rdma_rxe`, `siw`).
 HARDWARE-VERIFIED: tested on RDMA hardware.
 
+The transport-observations row below records the historical MOCK schema audit,
+as does the [2026-10-18 capability matrix](VERBS_CAPABILITIES.md). Separately,
+the [2026-10-20 loopback results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
+include real host/staged kit observations and staged training/pipeline
+observations. Explicit in-process provider/completion telemetry and strict TCP
+gates belong to the kit; training/pipeline observations corroborate activity
+without independently supplying those gates. Cross-node and direct paths
+remain unproven.
+
 | Feature | Status |
 | --- | --- |
 | C shim over libibverbs (open, query, PD, CQ, QP, MR, dma-buf MR, post, poll; completion channels, `ibv_req_notify_cq`, asynchronous events, batched posts) | IMPLEMENTED; compiles and links against rdma-core 57.0 headers and the system `libibverbs.so.1` on Linux (build evidence, not a transfer) |
@@ -743,9 +752,15 @@ other way: another bridge is only ever chosen explicitly.
 
 ## Hardware kit
 
-Prepared, not run (`scripts/gpu/verbs_kit.py`; runbook: `VERBS_BRIDGE=1` in
-steps 05 and 07; HARDWARE_VALIDATION.md items 38 to 42). Same-vendor (step 05)
-and cross-vendor (step 07) runs are separate records:
+Partially run on single-host loopback: staged-GPU collectives passed at
+`c92684b`, and repaired host collectives passed at `0cf32a3`; see the
+[2026-10-20 results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20).
+Host-mode TCP evidence remains `not-decisive`, with strict host mode failing
+closed. The two-host/cross-node, direct-GPU, mixed-vendor and UCX-comparison
+portions remain unrun. The full planned matrix follows
+(`scripts/gpu/verbs_kit.py`; runbook: `VERBS_BRIDGE=1` in steps 05 and 07;
+HARDWARE_VALIDATION.md items 38 to 42). Same-vendor (step 05) and cross-vendor
+(step 07) runs are separate records:
 
 1. `verbs_build`, `verbs_rdma_report` (each node's dma-buf options, peer-memory
    modules, `ibv_reg_dmabuf_mr` in its libibverbs, ROCr's dma-buf export);

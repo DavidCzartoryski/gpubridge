@@ -259,8 +259,9 @@ hardware.
   torch 2.14.1+cu126, NCCL 2.29.3, Mellanox ConnectX (mlx5) HDR InfiniBand.**
   At GPUBridge **`c92684b`**, two 2-GPU NCCL islands of identical V100s passed
   Gloo correctness in half/alternate layouts, pinned/pipelined/sharded k=2
-  checks, auto-tuned thresholds, DDP and exact FSDP2/HSDP replay; GPU tests
-  had 29 passes and 6 UCX skips. The staged-verbs kit and default-policy
+  checks, auto-tuned thresholds, DDP and exact FSDP2/HSDP replay; GPU tests:
+  29 passed, 6 skipped (2 UCX, 4 inapplicable bf16-compression cases),
+  no failures. The staged-verbs kit and default-policy
   check passed over one HCA on one host (loopback), with non-mock libibverbs,
   zero completion errors and passing GPU strict TCP evidence. Exact kit
   payloads reached 512 MiB; the verbs benchmark reached 1 GiB. The original
@@ -286,7 +287,7 @@ hardware.
   the tiny gate establishes only its bounded workload, not representative
   GPT equivalence. See the scoped
   [hardware results](HARDWARE_VALIDATION.md#split-test-results-2026-10-20),
-  [verbs status](docs/VERBS_TRANSPORT.md#status) and
+  [verbs status](docs/VERBS_TRANSPORT.md) and
   [runbook](docs/GPU_VALIDATION_RUNBOOK.md).
 
 ### Fixed
@@ -527,11 +528,20 @@ hardware.
 - Opt-in P2P pinned staging (`GPUBRIDGE_PINNED_STAGING`) and two-slot chunked
   staging (`GPUBRIDGE_P2P_CHUNK_BYTES`), with lazy-copy ordering mutation tests.
   CPU only; no GPU overlap or speedup measured.
+  **2026-10-20 update:** the
+  [split-test results](HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
+  add GPU payload checks and descriptive timing improvements for pinned/chunked
+  P2P; direct copy/transfer overlap and significant speedups remain unproven.
 
 - Torch backend point-to-point operations: native calls within an island and
   independent host-staged Gloo lanes across islands, including asynchronous
   and batched calls, tag matching, size/dtype checks and bounded teardown.
   CPU only; GPU stream behavior and native GPU batches are not validated.
+  **2026-10-20 update:** the
+  [split-test results](HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
+  add a full default P2P dtype/stream/tag check on separate GPUs over native
+  NCCL and cross-island Gloo. Chunked/pinned benchmarks add payload checks,
+  not the full stream suite; verbs P2P remains unvalidated.
 
 - `scripts/gpu/rdma_report.sh`, a step of the network check (`net-nvidia`,
   `net-amd`): what RDMA from GPU memory would need on the node, one file each

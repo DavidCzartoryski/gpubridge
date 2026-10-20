@@ -387,8 +387,14 @@ copying received chunks back can overlap the following receive. This setting
 must be the same at both endpoints and is checked in the message handshake.
 Unset means one whole message; it does not inherit the collective policy's
 chunk size. CPU tests use the same schedule without pinning. P2P is always
-bit-exact and does not apply collective gradient compression. No GPU overlap
-or speedup has been measured.
+bit-exact and does not apply collective gradient compression. The
+[2026-10-20 split-test results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
+record native NCCL and cross-island Gloo GPU timing comparisons and passing
+payload checks for default, chunked and pinned staging, with descriptive
+large-message timing improvements. The full dtype/stream/tag suite passed
+only in the default configuration. These single-run timings do not directly
+demonstrate copy/transfer overlap or statistically significant speedups;
+verbs P2P remains unvalidated.
 
 - **Matching.** Across islands, a message matches by group, source,
   destination and tag (integer `0` through `2**31 - 1`). Same-tag sends and

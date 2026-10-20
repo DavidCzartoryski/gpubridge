@@ -429,8 +429,14 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     shorter does the `bridge` phase get? The `compress` and `decompress`
     phases show the kernels' share. And the cost in accuracy, from the error
     `bench_compressed` reports, and from loss curves with and without it.
-    *Status: not run; on CPU the PyTorch reference kernels are slower than the
-    bridge they save.* *Step:* `bench_compressed` (`--compression
+    *Status: single-host split-test timings measured on 2026-10-20 at
+    `c92684b`: `bench_compressed` passed with 40 rows and across-rank identity
+    checks; compression kernels passed 3/3 CPU-reference checks. These are
+    descriptive timings, not representative compressed-training accuracy
+    validation. Cross-node and mixed-vendor coverage remain open; on CPU the
+    PyTorch reference kernels are slower than the bridge they save.* See
+    [dated results](#split-test-results-2026-10-20).
+    *Step:* `bench_compressed` (`--compression
     none,bf16,fp8 --phases`) in Explorer steps 04 and 07, `amd/run_all.sh`
     and `mixed/node.sh`; its summary.md says from which size each mode is
     faster.
@@ -616,6 +622,13 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     evidence passed, including the `0cf32a3` regression recheck; this does
     not prove cross-node no-fallback behavior. Cross-node, AMD/mixed-vendor
     and direct/GPUDirect paths remain unproven by these runs.
+    *Prerequisites for the remaining two-host and direct-path checks:* two
+    allocated nodes with an RDMA device each on one fabric, permission to open
+    `/dev/infiniband/uverbs*` from the job, a verbs library built with
+    rdma-core headers (`python -m gpubridge.verbs build` or
+    `GPUBRIDGE_VERBS_INCLUDE_DIR`), GPUs and a CUDA or ROCm build of PyTorch
+    on those nodes, and authorization to run the job. Items 40 and 41 add
+    their vendor-specific direct-memory requirements.
 
 40. **NVIDIA GPU memory direct through the verbs bridge.** With
     `GPUBRIDGE_VERBS_GPU_PATH=direct` on NVIDIA leaders, every call registers the
@@ -722,7 +735,7 @@ records, not a performance or arbitrary-float correctness gate.
 
 | Date | GPUBridge commit tested | Run scope | Outcome |
 | --- | --- | --- | --- |
-| 2026-10-20 | `c92684b` | Gloo bridge, two 2-GPU NCCL islands | All 24 planned steps passed: both layouts, pinned staging, pipelined correctness, sharded k=2, GPU-derived auto-tuned thresholds, DDP and exact FSDP2/HSDP replay. GPU tests: 29 passed, 6 UCX skips, no failures; compression kernels: 3/3 reference checks. Benchmarks through 256 MiB. |
+| 2026-10-20 | `c92684b` | Gloo bridge, two 2-GPU NCCL islands | All 24 planned steps passed: both layouts, pinned staging, pipelined correctness, sharded k=2, GPU-derived auto-tuned thresholds, DDP and exact FSDP2/HSDP replay. GPU tests: 29 passed, 6 skipped (2 UCX, 4 inapplicable bf16-compression cases), no failures; compression kernels: 3/3 reference checks. Benchmarks through 256 MiB. |
 | 2026-10-20 | `c92684b` | Staged verbs, same split, single-HCA loopback | GPU kit and default-policy full check passed; real non-mock libibverbs, zero completion errors, staged paths and GPU strict TCP gate passed. Exact kit payloads through 512 MiB; benchmark through 1 GiB. Original host-mode kit failed before payload (CPU/CUDA topology mismatch); this run remains partial. |
 | 2026-10-20 | `c92684b` | Native/Gloo/staged-verbs GPT-2-small, 10/25/100 MB bucket caps | All nine cells passed execution gates, with finite and rank-identical parameters. Overlap is estimated from separate timed phases; final digests differ between arms, so this is not cross-arm equivalence. |
 | 2026-10-20 | `c92684b` | Gloo and verbs pipeline, 1/4/16/64 MiB chunks | All timing sweeps completed through 1 GiB. Gloo improves at matched 1–256 MiB points; verbs generally regresses. Item 18's unrestricted goal is not established; ordinary timing rows do not replace full verbs-pipeline payload checks. |
