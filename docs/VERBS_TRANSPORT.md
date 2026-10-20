@@ -833,7 +833,9 @@ positive verbs checks remain required and are reported separately in
 this limitation. With `--require-no-tcp`, its leaders fail with that reason.
 Cross-node host runs remain decisive: local island TCP is excluded, remote TCP is
 counted. A one-host host run, even a decisive one, cannot establish cross-node no-TCP
-acceptance. Socket attribution is not yet checked on hardware.
+acceptance. Socket attribution has been checked on hardware on one host only: strict host
+collectives passed with island TCP attributed, and real same-host TCP was counted and
+rejected.
 `--require-no-tcp` fails a bridge leader's step unless its decisive
 verdict is `pass`; other ranks record `not applicable`. A job with no bridge leader
 at all (one island: an all-NVIDIA node without `GPUBRIDGE_SPLIT_TEST`, say) never

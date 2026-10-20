@@ -603,8 +603,12 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     communicators. The `0cf32a3` recheck passed exact host collectives with
     CPU/Gloo islands. Same-host host-mode no-silent-TCP evidence is
     `not-decisive`; `--require-no-tcp` fails closed (again at `4c13375`).
-    The kit's per-process attribution of same-host sockets, which can make
-    that evidence decisive, has not run on hardware yet. Cross-node RDMA,
+    With the kit's per-process attribution of same-host sockets, the
+    `4ffcf93` rerun on one host was decisive: strict host collectives passed
+    (28/28 exact, verbs evidence passed, 1728 B of counted TCP), and both
+    real-TCP negatives (a flat world-Gloo policy and the Gloo bridge) failed
+    on counted TCP over the limit. That is one-host loopback evidence, not
+    cross-node no-TCP acceptance. Cross-node RDMA,
     hardware failure/teardown cases and transport comparisons beyond the
     measured Gloo/verbs pair remain open. See
     [results](#split-test-results-2026-10-20).
