@@ -314,9 +314,15 @@ def test_a_count_missing_from_the_telemetry_is_recorded_missing_never_zero(tmp_p
 
 
 def _trigger(out, *extra: str):
-    return subprocess.run([sys.executable, str(SCRIPT), "trigger", str(out), "--arm", "P0x2",
-                           "--repeats", "3", "--compare", "compare-P0-D3.json", *extra],
-                          capture_output=True, text=True, timeout=60)
+    """Section 5's owner command: stdout and stderr into one trigger.txt (``2>&1``); the
+    file's text as ``stdout``."""
+    path = out / "trigger.txt"
+    with path.open("w") as f:
+        code = subprocess.run([sys.executable, str(SCRIPT), "trigger", str(out), "--arm",
+                               "P0x2", "--repeats", "3", "--compare", "compare-P0-D3.json",
+                               *extra], stdout=f, stderr=subprocess.STDOUT,
+                              timeout=60).returncode
+    return SimpleNamespace(returncode=code, stdout=path.read_text())
 
 
 def _pure_bridge(out, shares, *, d3_p50=1.0):
@@ -334,23 +340,42 @@ def _pure_bridge(out, shares, *, d3_p50=1.0):
     assert _compare(out, "P0", "D3", 3, 2, "--differ", "policy").returncode == 0
 
 
-@pytest.mark.parametrize("shares, d3_p50, met", [
-    ([0.31, 0.29, 0.35], 1.0, "TRIGGER MET: P0x2 leader rank 1 at 26214400 bytes, median 0.310"),
-    ([0.29, 0.31, 0.2], 1.0, "TRIGGER NOT MET"),  # one repeat over, the median not
-    ([0.1, 0.1, 0.1], 0.5, "TRIGGER MET: compare-P0-D3.json says win at 26214400 bytes; "
-                           "compare-P0-D3.json says win at 157286400 bytes"),
+def _edit(out, name: str, change) -> None:
+    record = json.loads((out / name).read_text())
+    change(record)
+    (out / name).write_text(json.dumps(record))
+
+
+def _incomplete(out, reason: str) -> None:
+    result = _trigger(out)
+    lines = result.stdout.splitlines()
+    assert result.returncode == 4 and lines[-1] == "INCOMPLETE", result.stdout
+    assert f"not decided: {reason}" in result.stdout and "TRIGGER" not in result.stdout, \
+        result.stdout
+
+
+@pytest.mark.parametrize("shares, d3_p50, verdict, met", [
+    ([0.31, 0.29, 0.35], 1.0, "TRIGGER MET",
+     ["met: P0x2 leader rank 1 at 26214400 bytes, median 0.310 >= 0.3"]),
+    ([0.29, 0.31, 0.2], 1.0, "TRIGGER NOT MET", []),  # one repeat over, the median not
+    ([0.1, 0.1, 0.1], 0.5, "TRIGGER MET", ["met: compare-P0-D3.json says win at 26214400 bytes",
+                                           "met: compare-P0-D3.json says win at 157286400 bytes"]),
 ])
-def test_trigger_decides_section_5s_copy_overlap_row(tmp_path, shares, d3_p50, met):
+def test_trigger_decides_section_5s_copy_overlap_row(tmp_path, shares, d3_p50, verdict, met):
     _pure_bridge(tmp_path, shares, d3_p50=d3_p50)
     result = _trigger(tmp_path)
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 0, result.stdout
     lines = result.stdout.splitlines()
-    assert lines[-1].startswith(met), result.stdout
+    # The reasons, then the verdict alone on the file's last line.
+    assert lines[-1] == verdict and lines[-1 - len(met):-1] == met, lines
+    assert not any(line.startswith("met: ") for line in lines[:-1 - len(met)]), lines
     per_repeat = " ".join(f"{v:.3f}" for v in shares)
     assert (f"P0x2 26214400 bytes, leader rank 1: (staged_to_host_s / staged_calls) / p50 "
             f"per repeat {per_repeat}, median {sorted(shares)[1]:.3f}") in lines, lines
     # Every leader at both sizes, then the D3 compare's status.
     assert sum(line.startswith("P0x2 ") for line in lines) == 4, lines
+    wins = "[26214400, 157286400]" if d3_p50 < 1 else "[]"
+    assert f"compare-P0-D3.json: judged, win at {wins} bytes" in lines, lines
 
 
 def test_trigger_decides_nothing_on_an_incomplete_record(tmp_path):
@@ -359,17 +384,80 @@ def test_trigger_decides_nothing_on_an_incomplete_record(tmp_path):
     for name, broken in [("P0x2-r2.json", "["), ("compare-P0-D3.json", "")]:
         good = (tmp_path / name).read_text()
         (tmp_path / name).write_text(broken)
-        result = _trigger(tmp_path)
-        assert result.returncode == 4 and "INCOMPLETE" in result.stderr, result.stderr
-        assert "TRIGGER" not in result.stdout and f"{name}: unreadable" in result.stderr
+        _incomplete(tmp_path, f"{name}: unreadable")
         (tmp_path / name).write_text(good)
-    record = json.loads((tmp_path / "P0x2-r1.json").read_text())
-    del record["sizes"][3][1]["verbs_delta"]["staged_calls"]
-    (tmp_path / "P0x2-r1.json").write_text(json.dumps(record))
-    result = _trigger(tmp_path)
-    assert result.returncode == 4 and "rank 1: staged phases missing" in result.stderr
+    _edit(tmp_path, "P0x2-r1.json",
+          lambda r: r["sizes"][3][1]["verbs_delta"].pop("staged_calls"))
+    _incomplete(tmp_path, "P0x2-r1.json: 26214400 bytes, rank 1: staged phases missing")
     (tmp_path / "P0x2-r1.json").unlink()
-    assert _trigger(tmp_path).returncode == 4
+    _incomplete(tmp_path, "P0x2: repeats [0, 2], not the predeclared 0 to 2")
+
+
+def test_trigger_reads_only_a_judged_compare_of_its_arms(tmp_path):
+    _pure_bridge(tmp_path, [0.5, 0.5, 0.5])  # met by the share alone
+    compare = tmp_path / "compare-P0-D3.json"
+    good = compare.read_text()
+    _edit(tmp_path, compare.name, lambda v: v.update(status="REGRESSION"))
+    assert _trigger(tmp_path).stdout.splitlines()[-1] == "TRIGGER MET"  # judged rows
+    for status in ("INCOMPLETE", "UNSUPPORTED", "REFUSED", "FAIL (wrong result)"):
+        compare.write_text(good)
+        _edit(tmp_path, compare.name, lambda v, status=status: v.update(status=status))
+        _incomplete(tmp_path, f"compare-P0-D3.json: {status}, not a judged comparison")
+    compare.write_text(good)
+    _edit(tmp_path, compare.name, lambda v: v.update(after="D1"))
+    _incomplete(tmp_path, "compare-P0-D3.json: holds the compare of 'P0' against 'D1'")
+    compare.write_text(good)
+    _edit(tmp_path, compare.name, lambda v: v.update(rows=v["rows"][:-1]))
+    _incomplete(tmp_path, "compare-P0-D3.json: no row at [157286400] bytes")
+    # The real compare with a D3 repeat gone: INCOMPLETE, and so is the trigger.
+    compare.write_text(good)
+    (tmp_path / "D3-r1.json").unlink()
+    assert _compare(tmp_path, "P0", "D3", 3, 2, "--differ", "policy").returncode == 4
+    _incomplete(tmp_path, "compare-P0-D3.json: INCOMPLETE, not a judged comparison")
+
+
+def test_trigger_needs_three_shares_of_the_same_two_leaders(tmp_path):
+    _pure_bridge(tmp_path, [0.5, 0.5, 0.5])
+    good = {k: (tmp_path / f"P0x2-r{k}.json").read_text() for k in range(3)}
+
+    def restore():
+        for k, text in good.items():
+            (tmp_path / f"P0x2-r{k}.json").write_text(text)
+
+    # A leader that is not the recorded one in one repeat: no median from fewer repeats.
+    _edit(tmp_path, "P0x2-r1.json",
+          lambda r: [ranks[1].update(rank=99) for ranks in r["sizes"]])
+    _incomplete(tmp_path, "P0x2-r1.json: 26214400 bytes: staged phases from ranks [0, 99], "
+                          "the leaders are [0, 1]")
+    assert ("not decided: P0x2 26214400 bytes, leader rank 1: 2 shares, not one per "
+            "predeclared repeat (3)") in _trigger(tmp_path).stdout
+    restore()
+    # Staged phases over fewer calls than were timed: the share would be inflated.
+    for k in range(3):
+        _edit(tmp_path, f"P0x2-r{k}.json", lambda r: [
+            x["verbs_delta"].update(staged_calls=1) for ranks in r["sizes"] for x in ranks])
+    _incomplete(tmp_path, "P0x2-r0.json: 26214400 bytes, rank 0: staged phases missing or "
+                          "partial (staged_calls 1 of 30 calls")
+    restore()
+    # The repeats' workloads differ (another chunk size in one).
+    (tmp_path / "P0x2-r2.json").write_text(json.dumps(_record(
+        "P0x2", 2, 1.0, world=2, table="full", chunk=1 << 20,
+        staged=lambda n, rank, calls: {"staged_calls": calls, "staged_to_host_s": calls})))
+    _incomplete(tmp_path, "P0x2-r2.json differs from P0x2-r0.json in ")
+    # Not the pure bridge: 2+2 ranks.
+    for k in range(3):
+        (tmp_path / f"P0x2-r{k}.json").write_text(json.dumps(_record(
+            "P0x2", k, 1.0, table="full",
+            staged=lambda n, rank, calls: {"staged_calls": calls, "staged_to_host_s": calls})))
+    _incomplete(tmp_path, "P0x2-r0.json: not the pure bridge (op 'gpubridge', bridge 'verbs', "
+                          "islands [[0, 1], [2, 3]]), which is 1+1 on verbs")
+
+
+def test_trigger_rejects_a_file_named_for_the_arm_with_no_record_of_it(tmp_path):
+    _pure_bridge(tmp_path, [0.5, 0.5, 0.5])
+    for text, arm in [("{}", None), (json.dumps({"arm": "P0", "repeat": 3}), "'P0'")]:
+        (tmp_path / "P0x2-r3.json").write_text(text)
+        _incomplete(tmp_path, f"P0x2-r3.json: unreadable (no record of P0x2: arm {arm})")
 
 
 DOC = REPO / "docs" / "verbs-perf-20261019.md"
@@ -402,6 +490,9 @@ def test_section_5s_rows_are_mechanical():
     assert "--arm P0x2 --repeats 3 --compare compare-P0-D3.json" in command, command
     assert ab.TRIGGER_SIZES == (25 * 2**20, 150 * 2**20) and ab.TRIGGER_SHARE == 0.30
     assert "at 25 or 150 MiB" in rows[0] and "at least 0.30" in rows[0], rows[0]
+    # What the trigger tests check of the file: its verdict alone on the last line.
+    assert ("last a line that is exactly `TRIGGER MET`, `TRIGGER NOT MET` or `INCOMPLETE`"
+            in " ".join(section.split())), section
 
 
 @pytest.mark.docs

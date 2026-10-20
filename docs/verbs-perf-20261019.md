@@ -282,12 +282,18 @@ python "$H" trigger "$OUT/m1" --arm P0x2 --repeats 3 --compare compare-P0-D3.jso
   > "$OUT/m1/trigger.txt" 2>&1                                           # first row
 ```
 
-It prints, for each P0x2 leader at 25 and 150 MiB, each repeat's
-`(staged_to_host_s / staged_calls) / p50` and their median, then the D3 compare's
-status and the sizes it says `win` at, and ends `TRIGGER MET` (with the leader and
-size, or the D3 win, that met it) or `TRIGGER NOT MET`. A P0x2 repeat missing, extra,
-unreadable or not whole, a leader's staged phases missing, or the D3 compare JSON
-missing, is `INCOMPLETE` (exit 4): the row is not decided, and candidate A is not run.
+It prints to stdout only (so the file's order is the order printed): for each P0x2
+leader at 25 and 150 MiB, each repeat's `(staged_to_host_s / staged_calls) / p50` and
+their median, then the D3 compare's status and the sizes it says `win` at, then the
+reasons (the leader and size, or the D3 win, that met it; or why nothing is decided),
+and last a line that is exactly `TRIGGER MET`, `TRIGGER NOT MET` or `INCOMPLETE`.
+`INCOMPLETE` (exit 4) decides nothing, and candidate A is not run: a P0x2 repeat
+missing, extra, unreadable or not whole; a file named for P0x2 that holds no P0x2
+record; repeats that differ in workload or are not 1+1 on verbs; staged phases not
+from exactly the recorded leaders, or with `staged_calls` other than the timed calls;
+other than 3 shares for each leader and size; or the D3 compare JSON missing, of other
+arms than its name, not judged (`judged` or `REGRESSION`; `INCOMPLETE`, `UNSUPPORTED`,
+`REFUSED` or a wrong result are not) or without a row at either size.
 
 Noise and no benefit: a difference inside the spread is "no change", reported with the
 raw samples; load or clock explanations are recorded as hypotheses, not used to drop or

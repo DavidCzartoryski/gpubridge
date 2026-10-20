@@ -43,12 +43,17 @@ REFUSED (the arms are not the predeclared comparison). Every outcome writes
 ``compare-<before>-<after>.json`` with its status and reasons.
 
 ``trigger`` decides the plan's first next-change row (section 5): for each leader of
-the pure bridge arm at 25 and 150 MiB, each repeat's ``(staged_to_host_s /
-staged_calls) / p50``, their median, and whether it is at least 0.30; then whether the
-named compare JSON says ``win`` at either size. Its last line is ``TRIGGER MET`` (and
-why) or ``TRIGGER NOT MET``, exit 0; INCOMPLETE (exit 4) when a repeat is missing,
-extra, unreadable or not whole, a leader's staged phases are missing, or the compare
-JSON is: then nothing is decided.
+the pure bridge arm (1+1 on verbs) at 25 and 150 MiB, each repeat's
+``(staged_to_host_s / staged_calls) / p50``, their median, and whether it is at least
+0.30; then whether the named compare JSON, judged, says ``win`` at either size. It
+prints to stdout only: the shares, the compare's status, the reasons, and last a line
+that is exactly ``TRIGGER MET`` or ``TRIGGER NOT MET`` (exit 0) or ``INCOMPLETE``
+(exit 4). INCOMPLETE decides nothing: a repeat missing, extra, unreadable or not whole,
+an arm-named file with no record of the arm, repeats that differ in workload or are not
+1+1, staged phases not from exactly the recorded leaders or not covering every timed
+call, other than one share per repeat for each leader and size, or a compare JSON
+missing, of other arms than its name, not judged (only ``judged`` and ``REGRESSION``
+are) or lacking either size.
 
 Numbers from CPU runs (the tests) are software checks only, never GPU or NIC evidence.
 """
@@ -89,6 +94,8 @@ LABEL_CPU = "CPU run: software check only, not GPU or NIC evidence"
 UNSUPPORTED, INCOMPLETE, REFUSED = 3, 4, 5
 #: Section 5's copy overlap trigger: the sizes it looks at and the copy out's share.
 TRIGGER_SIZES, TRIGGER_SHARE = (25 * 2**20, 150 * 2**20), 0.30
+#: The compare statuses whose rows were judged: the trigger reads only these.
+JUDGED = ("judged", "REGRESSION")
 #: Recorded environment variables that name the code under test (under ``code.``)...
 ENV_CODE = ("GPUBRIDGE_VERBS_LIB", "GPUBRIDGE_VERBS_LIB_DIR", "PYTHONPATH")
 #: ... and the settings compared between arms (under ``env.``), by prefix or name. The
@@ -496,7 +503,8 @@ def compare(args) -> int:
 
 def trigger(args) -> int:
     """Section 5's copy overlap row on the pure bridge arm and the named compare (module
-    docs)."""
+    docs). Everything goes to stdout, the reasons before the verdict, so the verdict is
+    the last line of the file the owner command writes."""
     found, reasons = read_records(args.dir, [args.arm])
     runs: dict[int | str, tuple[str, dict]] = {}
     for name, record in found:
@@ -506,16 +514,32 @@ def trigger(args) -> int:
             if key in runs:
                 reasons.append(f"{name}: a second record of {args.arm} repeat {key}")
             runs[key] = (name, record)
+        elif name.startswith(f"{args.arm}-r"):
+            reasons.append(f"{name}: unreadable (no record of {args.arm}: arm "
+                           f"{record.get('arm')!r})")
     if set(runs) != set(range(args.repeats)):
         reasons.append(f"{args.arm}: repeats {sorted(runs, key=str)}, not the predeclared "
                        f"0 to {args.repeats - 1}")
     shares: dict[tuple[int, int], list[float]] = {}
+    first: tuple[str, dict[str, Any], list[int]] | None = None  # name, workload, leaders
     for key in sorted(runs, key=str):
         name, record = runs[key]
         if bad := problems(record, False):
             reasons += [f"{name}: {p}" for p in bad]
             continue
         try:
+            islands = record["run"]["islands"]
+            if (record["op"], record["bridge"], record["run"]["world_size"],
+                    [len(i["ranks"]) for i in islands]) != ("gpubridge", "verbs", 2, [1, 1]):
+                reasons.append(f"{name}: not the pure bridge (op {record['op']!r}, bridge "
+                               f"{record['bridge']!r}, islands "
+                               f"{[i['ranks'] for i in islands]}), which is 1+1 on verbs")
+                continue
+            want = sorted(i["leader"] for i in islands)
+            if first is None:
+                first = (name, workload(record), want)
+            elif differ := differences(first[1], workload(record)):
+                reasons.append(f"{name} differs from {first[0]} in {differ}")
             p50 = summarize(record)
             for nbytes in TRIGGER_SIZES:
                 if nbytes not in p50:
@@ -523,46 +547,64 @@ def trigger(args) -> int:
                     continue
                 ranks, = (ranks for ranks in record["sizes"] if ranks[0]["bytes"] == nbytes)
                 leads = [r for r in ranks if r["verbs_delta"] is not None]
-                if len(leads) != leaders(record):
-                    reasons.append(f"{name}: {nbytes} bytes: staged phases from {len(leads)} "
-                                   f"of {leaders(record)} leaders")
+                if sorted(r["rank"] for r in leads) != want:
+                    reasons.append(f"{name}: {nbytes} bytes: staged phases from ranks "
+                                   f"{sorted(r['rank'] for r in leads)}, the leaders are {want}")
+                    continue
                 for r in leads:
                     calls, to_host = (r["verbs_delta"].get(k)
                                       for k in ("staged_calls", "staged_to_host_s"))
-                    if type(calls) is not int or calls < 1 or \
+                    if type(calls) is not int or calls != r["calls"] or \
                             not isinstance(to_host, int | float):
                         reasons.append(f"{name}: {nbytes} bytes, rank {r['rank']}: staged "
-                                       f"phases missing (staged_calls {calls!r}, "
-                                       f"staged_to_host_s {to_host!r})")
+                                       f"phases missing or partial (staged_calls {calls!r} "
+                                       f"of {r['calls']} calls, staged_to_host_s {to_host!r})")
                         continue
                     share = to_host / calls / p50[nbytes]["p50_s"]
                     shares.setdefault((nbytes, r["rank"]), []).append(share)
         except (KeyError, IndexError, TypeError, ValueError, AttributeError,
                 ArithmeticError) as e:  # values no whole record holds
             reasons.append(f"{name}: malformed record ({type(e).__name__}: {e})")
+    if first is not None:
+        for nbytes in TRIGGER_SIZES:
+            for rank in first[2]:
+                if len(shares.get((nbytes, rank), [])) != args.repeats:
+                    reasons.append(f"{args.arm} {nbytes} bytes, leader rank {rank}: "
+                                   f"{len(shares.get((nbytes, rank), []))} shares, not one "
+                                   f"per predeclared repeat ({args.repeats})")
+    for (nbytes, rank), values in sorted(shares.items()):
+        print(f"{args.arm} {nbytes} bytes, leader rank {rank}: (staged_to_host_s / "
+              f"staged_calls) / p50 per repeat {' '.join(f'{v:.3f}' for v in values)}, "
+              f"median {statistics.median(values):.3f}")
+    wins: list[int] = []
     try:
         verdict = json.loads(Path(args.dir, args.compare).read_text())
-        wins = sorted({row["bytes"] for row in verdict["rows"]
-                       if row["verdict"] == "win" and row["bytes"] in TRIGGER_SIZES})
-        print(f"{args.compare}: {verdict['status']}, win at {wins} bytes")
+        status, before, after = verdict["status"], verdict["before"], verdict["after"]
+        if args.compare != f"compare-{before}-{after}.json":
+            reasons.append(f"{args.compare}: holds the compare of {before!r} against "
+                           f"{after!r}")
+        if status not in JUDGED:
+            reasons.append(f"{args.compare}: {status}, not a judged comparison")
+        else:
+            rows = {row["bytes"]: row["verdict"] for row in verdict["rows"]}
+            if missing := [nbytes for nbytes in TRIGGER_SIZES if nbytes not in rows]:
+                reasons.append(f"{args.compare}: no row at {missing} bytes")
+            wins = [nbytes for nbytes in TRIGGER_SIZES if rows.get(nbytes) == "win"]
+            print(f"{args.compare}: {status}, win at {wins} bytes")
     except (OSError, ValueError, KeyError, TypeError) as e:
         reasons.append(f"{args.compare}: unreadable ({type(e).__name__}: {e})")
     if reasons:
-        print("INCOMPLETE: the trigger is not decided", file=sys.stderr)
         for reason in reasons:
-            print(f"  {reason}", file=sys.stderr)
+            print(f"not decided: {reason}")
+        print("INCOMPLETE")
         return INCOMPLETE
-    met = []
-    for (nbytes, rank), values in sorted(shares.items()):
-        median = statistics.median(values)
-        print(f"{args.arm} {nbytes} bytes, leader rank {rank}: (staged_to_host_s / "
-              f"staged_calls) / p50 per repeat {' '.join(f'{v:.3f}' for v in values)}, "
-              f"median {median:.3f}")
-        if median >= TRIGGER_SHARE:
-            met.append(f"{args.arm} leader rank {rank} at {nbytes} bytes, median "
-                       f"{median:.3f} >= {TRIGGER_SHARE}")
+    met = [f"{args.arm} leader rank {rank} at {nbytes} bytes, median {median:.3f} >= "
+           f"{TRIGGER_SHARE}" for (nbytes, rank), values in sorted(shares.items())
+           if (median := statistics.median(values)) >= TRIGGER_SHARE]
     met += [f"{args.compare} says win at {nbytes} bytes" for nbytes in wins]
-    print(f"TRIGGER MET: {'; '.join(met)}" if met else "TRIGGER NOT MET")
+    for reason in met:
+        print(f"met: {reason}")
+    print("TRIGGER MET" if met else "TRIGGER NOT MET")
     return 0
 
 
