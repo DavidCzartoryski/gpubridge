@@ -7,7 +7,8 @@ torchrun; ``compare`` reads the runs of two arms and applies the predeclared rul
     GPUBRIDGE_SPLIT_TEST=half GPUBRIDGE_VERBS_GPU_PATH=staged \\
         torchrun --nproc-per-node=4 scripts/gpu/verbs_staged_ab.py run \\
         --op gpubridge --bridge verbs --arm before --repeat 0 --out OUT
-    python scripts/gpu/verbs_staged_ab.py compare OUT --before before --after after
+    python scripts/gpu/verbs_staged_ab.py compare OUT --before before --after after \\
+        --before-repeats 3 --after-repeats 3 [--differ KEY ...] [--wire]
 
 Per size of the fixed table (fp32 integer values, so every sum is exact), ``run``
 does untimed warmup calls, then timed calls. Each timed call starts from the same
@@ -25,6 +26,19 @@ hash, the verbs library's file hash, allowlisted environment).
 the island backend (NCCL), in the same job layout, as the baseline. It refuses to
 run where that is not possible (mixed vendors, shared GPUs) rather than time
 something else.
+
+``compare`` judges only a complete, matched pair of arms. Each arm must have exactly
+its predeclared repeats 0 to N-1, every one a whole record (the table's sizes, every
+rank, every call's samples); with ``--wire``, every island leader's verbs telemetry
+with every counted message. Every run of both arms is checked for wrong results, the
+unpaired repeats of the longer arm too. The arms' settings, topology, table, code
+and host (``workload``) must be equal, repeat to repeat and arm to arm, except the
+keys named by ``--differ`` (a key, or a group: ``--differ code`` allows every
+``code.`` key). Exit codes: 0 judged and no failure; 1 a wrong result or a
+REGRESSION; 3 UNSUPPORTED (``--wire`` with no verbs telemetry in an arm); 4
+INCOMPLETE (a repeat missing, extra or truncated, or telemetry missing); 5 REFUSED
+(the arms are not the predeclared comparison). Every outcome writes
+``compare-<before>-<after>.json`` with its status and reasons.
 
 Numbers from CPU runs (the tests) are software checks only, never GPU or NIC evidence.
 """
@@ -61,6 +75,15 @@ DIRECT_COUNTS = ("write_windows", "write_window_bytes", "write_window_register_n
 WIRE = ("sends", "recvs", "bytes_sent", "bytes_received", "writes_posted", "bytes_written",
         "write_windows", "write_window_bytes")
 LABEL_CPU = "CPU run: software check only, not GPU or NIC evidence"
+#: compare's exit codes besides 0 and 1 (module docs).
+UNSUPPORTED, INCOMPLETE, REFUSED = 3, 4, 5
+#: Recorded environment variables that name the code under test (under ``code.``)...
+ENV_CODE = ("GPUBRIDGE_VERBS_LIB", "GPUBRIDGE_VERBS_LIB_DIR", "PYTHONPATH")
+#: ... and the settings compared between arms (under ``env.``), by prefix or name. The
+#: rest of the recorded environment (ranks, ports, Slurm ids) differs from run to run.
+ENV_SETTINGS = ("GPUBRIDGE_", "NCCL_", "RCCL_", "GLOO_", "UCX_", "TORCH_",
+                "CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",
+                "OMP_NUM_THREADS")
 
 
 def cpu_s() -> float:
@@ -248,25 +271,192 @@ def spread(values: list[float]) -> float:
     return (max(values) - min(values)) / m if m else 0.0
 
 
+def leaders(record: dict) -> int:
+    return len(record["run"]["islands"])
+
+
+def problems(record: dict, wire: bool) -> list[str]:
+    """Why this record is not a whole run of its table (with ``wire``: or lacks a
+    leader's counted messages); empty when it is."""
+    try:
+        workload(record)
+        world, out = record["run"]["world_size"], []
+        table = [tuple(row) for row in TABLES[record["table"]]]
+        got = [(ranks[0]["bytes"], ranks[0]["warmup"], ranks[0]["calls"])
+               for ranks in record["sizes"]]
+        if got != table:
+            out.append(f"sizes {got} are not table {record['table']!r}'s {table}")
+        for ranks in record["sizes"]:
+            nbytes, calls = ranks[0]["bytes"], ranks[0]["calls"]
+            if len(ranks) != world:
+                out.append(f"{nbytes} bytes: {len(ranks)} ranks of {world}")
+            for r in ranks:
+                counts = {len(r["timed_s"]), len(r["host_s"]), len(r["cpu_s"])}
+                if counts != {calls} or (r["bytes"], r["calls"]) != (nbytes, calls):
+                    out.append(f"{nbytes} bytes, rank {r['rank']}: samples {sorted(counts)} "
+                               f"for {calls} calls")
+                if r["payload_bytes"] != nbytes or not isinstance(r["mismatches"], int):
+                    out.append(f"{nbytes} bytes, rank {r['rank']}: payload "
+                               f"{r['payload_bytes']}, mismatches {r['mismatches']!r}")
+            if wire:
+                deltas = [r["verbs_delta"] for r in ranks if r["verbs_delta"] is not None]
+                if len(deltas) != leaders(record):
+                    out.append(f"{nbytes} bytes: verbs telemetry from {len(deltas)} of "
+                               f"{leaders(record)} leaders")
+                for d in deltas:
+                    missing = [k for k in WIRE if not isinstance(d.get(k), int | float)]
+                    if missing:
+                        out.append(f"{nbytes} bytes: a leader's telemetry lacks {missing}")
+        return out
+    except (KeyError, IndexError, TypeError) as e:
+        return [f"malformed record ({type(e).__name__}: {e})"]
+
+
+def wrong_results(record: dict) -> int:
+    """Mismatched calls over every rank and size of a record, whole or not."""
+    return sum(r.get("mismatches") or 0 for ranks in record.get("sizes") or []
+               for r in ranks or [] if isinstance(r, dict))
+
+
+def workload(record: dict) -> dict[str, Any]:
+    """What a comparison holds equal, flattened to ``group.key``: the operation, bridge,
+    policy and table, the sizes, the topology, the verbs settings, the code (commit,
+    source and library hashes) and the host. JSON values, as the record has them."""
+    run, provs = record["run"], record["provenance"]
+    env = provs[0]["environment"]
+    verbs = [p for p in provs if "verbs" in p]
+    out: dict[str, Any] = {
+        "op": record["op"], "bridge.requested": record["bridge"],
+        "bridge.rank0": run["bridge"], "policy.requested": record["policy"],
+        "policy.resolved": run["policy"], "table": record["table"],
+        "sizes": [[r["bytes"], r["payload_bytes"], r["warmup"], r["calls"], r["timer"]]
+                  for r in (ranks[0] for ranks in record["sizes"])],
+        "topology.kind": run["kind"], "topology.split_test": run["split_test"],
+        "topology.world_size": run["world_size"], "topology.islands": run["islands"],
+        "topology.pinned_staging": run["pinned_staging"],
+        "code.git_commit": env["git_commit"], "code.git_dirty": env["git_dirty"],
+        "code.gpubridge": env["gpubridge"], "code.import": env["import"],
+        "code.gpubridge_py_sha256": [p["gpubridge_py_sha256"] for p in provs],
+        "code.verbs.library_sha256": [p["verbs_library_sha256"] for p in verbs],
+        "code.verbs.crate_sha256": [p["verbs_crate_sha256"] for p in verbs],
+        "verbs.leaders": len(verbs)}
+    for key in ("hostname", "platform", "python", "torch", "torch_cuda", "torch_hip",
+                "nccl_version", "driver_version", "devices"):
+        out[f"host.{key}"] = env.get(key)
+    for key in sorted({k for p in verbs for k in p["verbs"]}):
+        name = "code.verbs.library" if key == "library" else f"verbs.{key}"
+        out[name] = [p["verbs"].get(key) for p in verbs]
+    for name, value in env["env"].items():
+        if name in ENV_CODE:
+            out[f"code.env.{name}"] = value
+        elif name.startswith(ENV_SETTINGS):
+            out[f"env.{name}"] = value
+    return out
+
+
+def differences(a: dict[str, Any], b: dict[str, Any]) -> list[str]:
+    return sorted(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
+
+
+def allowed(key: str, differ: list[str]) -> bool:
+    return any(key == d or key.startswith(d + ".") for d in differ)
+
+
 def compare(args) -> int:
-    """The predeclared rules (docs/verbs-perf-20261019.md, "Acceptance"), per size."""
-    runs: dict[str, dict[int, dict]] = {args.before: {}, args.after: {}}
+    """The predeclared rules (docs/verbs-perf-20261019.md, "Acceptance"), per size, on a
+    complete and matched pair of arms only (module docs)."""
+    declared = {args.before: args.before_repeats, args.after: args.after_repeats}
+    records: dict[str, dict[int, tuple[str, dict]]] = {arm: {} for arm in declared}
+    status, reasons, wrong = None, [], []
     for path in sorted(Path(args.dir).glob("*-r*.json")):
         record = json.loads(path.read_text())
-        if record["arm"] in runs:
-            runs[record["arm"]][record["repeat"]] = summarize(record)
-    pairs = sorted(set(runs[args.before]) & set(runs[args.after]))
-    if not pairs:
-        print("UNSUPPORTED: no repeat has both arms", file=sys.stderr)
-        return 3
-    rows, failed = [], False
-    for nbytes in runs[args.before][pairs[0]]:
-        b = [runs[args.before][p][nbytes] for p in pairs]
-        a = [runs[args.after][p][nbytes] for p in pairs]
+        arm = record.get("arm")
+        if arm in records:
+            if record.get("repeat") in records[arm]:
+                reasons.append(f"{path.name}: a second record of {arm} repeat "
+                               f"{record['repeat']}")
+            records[arm][record.get("repeat")] = (path.name, record)
+    for arm, n in declared.items():
+        got, want = set(records[arm]), set(range(n))
+        if want - got:
+            reasons.append(f"{arm}: repeats {sorted(want - got)} of the predeclared {n} "
+                           "missing (a failed run counts as failed, not as absent)")
+        if got - want:
+            reasons.append(f"{arm}: repeats {sorted(got - want, key=str)} outside the "
+                           f"predeclared {n}")
+        for name, record in records[arm].values():
+            reasons += [f"{name}: {p}" for p in problems(record, args.wire)]
+            if wrong_results(record):
+                wrong.append(f"{name}: {wrong_results(record)} wrong results")
+        if args.wire and records[arm] and not any(
+                isinstance(r, dict) and r.get("verbs_delta") is not None
+                for _, record in records[arm].values()
+                for ranks in record.get("sizes") or [] for r in ranks or []):
+            status = "UNSUPPORTED"
+            reasons.append(f"{arm}: no verbs telemetry, which --wire compares")
+    if status is None and reasons:
+        status = "INCOMPLETE"
+    if status is None:
+        works = {arm: {k: workload(rec) for k, (_, rec) in runs.items()}
+                 for arm, runs in records.items()}
+        for arm, by_repeat in works.items():
+            first = by_repeat[0]
+            for k, w in sorted(by_repeat.items()):
+                if differ := differences(first, w):
+                    reasons.append(f"{arm} repeat {k} differs from repeat 0 in {differ}")
+        unexpected = [k for k in differences(works[args.before][0], works[args.after][0])
+                      if not allowed(k, args.differ)]
+        for k in unexpected:
+            reasons.append(f"{k}: {works[args.before][0].get(k)!r} in {args.before}, "
+                           f"{works[args.after][0].get(k)!r} in {args.after}, "
+                           "not declared with --differ")
+        if reasons:
+            status = "REFUSED"
+    rows: list[dict[str, Any]] = []
+    pairs = list(range(min(declared.values())))
+    if status is None:
+        runs = {arm: {k: summarize(rec) for k, (_, rec) in recs.items()}
+                for arm, recs in records.items()}
+        rows = judge(runs[args.before], runs[args.after], pairs, args.wire)
+    if wrong:
+        status = "FAIL (wrong result)"
+        reasons = wrong + reasons
+    elif status is None:
+        status = ("REGRESSION" if any(r["verdict"] == "REGRESSION" for r in rows)
+                  else "judged")
+    Path(args.dir, f"compare-{args.before}-{args.after}.json").write_text(
+        json.dumps({"before": args.before, "after": args.after, "declared": declared,
+                    "differ": args.differ, "wire": args.wire, "status": status,
+                    "reasons": reasons, "pairs": pairs, "rows": rows}, indent=1))
+    if not rows:
+        print(f"{status}: {args.before} against {args.after} not judged", file=sys.stderr)
+        for reason in reasons:
+            print(f"  {reason}", file=sys.stderr)
+        return {"UNSUPPORTED": UNSUPPORTED, "INCOMPLETE": INCOMPLETE,
+                "REFUSED": REFUSED}.get(status, 1)
+    print("| bytes | p50 before | p50 after | change | spread | pairs better | verdict |")
+    print("| --- | --- | --- | --- | --- | --- | --- |")
+    for r in rows:
+        p = r["p50_s"]
+        print(f"| {r['bytes']} | {p['before'] * 1e6:.1f} us | {p['after'] * 1e6:.1f} us | "
+              f"{p['change']:+.1%} | {p['spread']:.1%} | {p['pairs_better']}/{r['pairs']} | "
+              f"{r['verdict']}{' ' + str(r['regressions']) if r.get('regressions') else ''} |")
+    for reason in reasons:
+        print(reason, file=sys.stderr)
+    return 0 if status == "judged" else 1
+
+
+def judge(before: dict[int, dict], after: dict[int, dict], pairs: list[int],
+          wire: bool) -> list[dict[str, Any]]:
+    """Per size, the paired repeats' timing and wire rules, and wrong results in any
+    repeat of either arm."""
+    rows = []
+    for nbytes in before[0]:
+        b = [before[p][nbytes] for p in pairs]
+        a = [after[p][nbytes] for p in pairs]
         row: dict[str, Any] = {"bytes": nbytes, "pairs": len(pairs)}
-        if any(x["mismatches"] for x in a + b):
+        if any(x[nbytes]["mismatches"] for x in [*before.values(), *after.values()]):
             row["verdict"] = "FAIL (wrong result)"
-            failed = True
         for metric in ("p50_s", "p99_s", "cpu_per_call_s"):
             vb, va = [x[metric] for x in b], [x[metric] for x in a]
             s = max(spread(vb), spread(va))
@@ -276,31 +466,20 @@ def compare(args) -> int:
                            "change": change, "spread": s, "pairs_better": better}
             if change > s:
                 row.setdefault("regressions", []).append(metric)
-        if args.wire:
+        if wire:
             differ = sorted({k for x, y in zip(b, a, strict=True) for k in WIRE
-                             if x["counts"].get(k) != y["counts"].get(k)})
+                             if x["counts"][k] != y["counts"][k]})
             if differ:
                 row.setdefault("regressions", []).append(f"wire counts differ: {differ}")
         p50 = row["p50_s"]
         if row.get("regressions") and "verdict" not in row:
             row["verdict"] = "REGRESSION"
-            failed = True
         elif -p50["change"] > p50["spread"] and p50["pairs_better"] >= max(1, len(pairs) - 1):
             row.setdefault("verdict", "win")
         else:
             row.setdefault("verdict", "no change (inside spread)")
         rows.append(row)
-    Path(args.dir, f"compare-{args.before}-{args.after}.json").write_text(
-        json.dumps({"before": args.before, "after": args.after, "pairs": pairs, "rows": rows},
-                   indent=1))
-    print("| bytes | p50 before | p50 after | change | spread | pairs better | verdict |")
-    print("| --- | --- | --- | --- | --- | --- | --- |")
-    for r in rows:
-        p = r["p50_s"]
-        print(f"| {r['bytes']} | {p['before'] * 1e6:.1f} us | {p['after'] * 1e6:.1f} us | "
-              f"{p['change']:+.1%} | {p['spread']:.1%} | {p['pairs_better']}/{r['pairs']} | "
-              f"{r['verdict']}{' ' + str(r['regressions']) if r.get('regressions') else ''} |")
-    return 1 if failed else 0
+    return rows
 
 
 def main() -> int:
@@ -319,9 +498,17 @@ def main() -> int:
     c.add_argument("dir")
     c.add_argument("--before", required=True)
     c.add_argument("--after", required=True)
+    c.add_argument("--before-repeats", type=int, required=True,
+                   help="the before arm's predeclared repeats: exactly 0 to N-1")
+    c.add_argument("--after-repeats", type=int, required=True,
+                   help="the after arm's predeclared repeats: exactly 0 to N-1")
+    c.add_argument("--differ", action="append", default=[], metavar="KEY",
+                   help="a workload key or group the arms differ in by design (repeatable)")
     c.add_argument("--wire", action="store_true",
                    help="the arms must put the same messages on the wire (equal counts)")
     args = parser.parse_args()
+    if args.command == "compare" and min(args.before_repeats, args.after_repeats) < 1:
+        parser.error("--before-repeats and --after-repeats must be at least 1")
     return run(args) if args.command == "run" else compare(args)
 
 

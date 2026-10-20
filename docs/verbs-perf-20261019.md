@@ -201,22 +201,59 @@ error tolerances, never against these rows.
 
 ## 5. Predeclared acceptance and gates
 
-`python "$PR0/scripts/gpu/verbs_staged_ab.py" compare "$OUT/m1" --before B0 --after P0 --wire`
-(and `--before P0 --after D1` and so on for the diagnostics, without `--wire` where the
-messages differ by design) writes `compare-<before>-<after>.json` and a table. Its rules:
+```bash
+H="$PR0/scripts/gpu/verbs_staged_ab.py"
+python "$H" compare "$OUT/m1" --before B0 --after P0 --before-repeats 3 --after-repeats 3 \
+  --differ code --wire                                                   # G4
+python "$H" compare "$OUT/m1" --before P0 --after D1 --before-repeats 3 --after-repeats 2 \
+  --differ env.GPUBRIDGE_VERBS_CHUNK_BYTES --differ verbs.chunk_bytes
+python "$H" compare "$OUT/m1" --before P0 --after D2 --before-repeats 3 --after-repeats 2 \
+  --differ env.GPUBRIDGE_VERBS_RNDV_BYTES --differ verbs.rndv_bytes
+python "$H" compare "$OUT/m1" --before P0 --after D3 --before-repeats 3 --after-repeats 2 \
+  --differ policy
+python "$H" compare "$OUT/m1" --before P0 --after D4 --before-repeats 3 --after-repeats 2 \
+  --differ bridge --differ verbs --differ code.verbs
+python "$H" compare "$OUT/m1" --before N --after P0 --before-repeats 2 --after-repeats 3 \
+  --differ op                                                            # G5 ratios
+```
+
+Each writes `compare-<before>-<after>.json` (its status and reasons, whatever the
+outcome) and, when it judges, a table. It judges only the comparison declared on its
+command line:
+
+- **Complete.** Each arm has exactly its predeclared repeats, 0 to N-1, each a whole
+  record (every size of the table, every rank, every call's samples). A repeat
+  missing, extra or truncated, a run that failed (no record) included, is
+  `INCOMPLETE` (exit 4): no verdict on the repeats that are there. With `--wire`,
+  every island leader's telemetry must hold every counted message (below), else
+  `INCOMPLETE`; an arm with no verbs telemetry at all is `UNSUPPORTED` (exit 3).
+- **Correct.** Every run of both arms is checked for wrong results, the unpaired
+  repeats of the longer arm and incomplete runs included: any is
+  `FAIL (wrong result)` (exit 1), whatever else holds.
+- **Matched.** The arms' operation, bridge, policy (requested and resolved), table,
+  sizes and calls, topology (world size, islands, split), verbs settings, the
+  recorded `GPUBRIDGE_`/`NCCL_`/`GLOO_`/`UCX_`/`TORCH_` and device settings, code
+  (commit, source and library hashes) and host must be equal, every repeat to its
+  arm's repeat 0, and arm to arm except the keys the command declares with
+  `--differ` (a key or its group: `code` is every `code.` key). Anything else is
+  `REFUSED` (exit 5), with the keys and values.
+
+Timing pairs repeat k of one arm with repeat k of the other, for the repeats both
+have (P0's third has no D1 partner). Its rules:
 for each size, the spread is the larger arm's (max - min) / median of the per-repeat p50
 (slowest rank per call); `win` needs the p50 better by more than the spread in all but at
 most one pair; `REGRESSION` is p50, p99 or CPU per call worse by more than the spread, or
 (with `--wire`) any differing count of sends, receives, their bytes, RDMA writes, their
-bytes, write windows or their bytes. `copied_bytes` and `control_sent` depend on timing
-(late receives, credit returns) and are reported, not gated.
+bytes, write windows or their bytes (exit 1). `copied_bytes` and `control_sent` depend
+on timing (late receives, credit returns) and are reported, not gated. Exit 0: judged,
+no failure.
 
 | Gate | PASS | FAIL | UNSUPPORTED |
 | --- | --- | --- | --- |
 | G1 correctness | 0 mismatches in every call of every arm; train_bench `params_identical` true | any mismatch | - |
 | G2 path | every timed call of B0, P0, D1, D2 and P0x2 is `staged` on both leaders (`path_staged` delta = calls), and for P0, D1, D2 and P0x2 `staged_calls` delta = calls; D3 hands the bridge host slots, so its calls are `host` | another path, or phases missing | verbs setup fails (no usable device): the record says why |
 | G3 windows | P0 per leader per call: 0 windows at 64 KiB, 1 at 1 and 4 MiB, 7 at 25 MiB, 38 at 150 MiB; D1: 2 at 25 MiB, 10 at 150 MiB; D2: 0 | any other count | - |
-| G4 instrumentation cost | `compare B0 P0 --wire`: no REGRESSION at any size | any REGRESSION (then the timers are not negligible on this node: report it with the raw data) | - |
+| G4 instrumentation cost | `compare B0 P0 ... --wire` judges (exit 0 or 1): no REGRESSION at any size | any REGRESSION (then the timers are not negligible on this node: report it with the raw data) | the compare is `INCOMPLETE`, `UNSUPPORTED` or `REFUSED`: G4 is not judged, its reasons are in the compare JSON, nothing is rerun |
 | G5 native baseline | N runs; ratios are reported | - | `native` refuses (exit 3) |
 
 The record is what the next change is chosen from, with these thresholds fixed now
@@ -237,7 +274,7 @@ parity.
 ### Expected artifacts
 
 `$OUT/libraries.sha256`, `revs.txt`, `env.txt`, `load.txt`, `clocks.txt`,
-`m1/<arm>-r<k>.json` (19 runs) with `.time` files, `m1/compare-*.json`,
+`m1/<arm>-r<k>.json` (19 runs) with `.time` files, `m1/compare-*.json` (6),
 `m2/<arm>-r<k>.json` (9 runs) with `.time` files. Every JSON string the harness
 writes is redacted of home and project paths (`gpukit.write_json`).
 

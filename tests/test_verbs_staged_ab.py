@@ -64,19 +64,60 @@ def test_a_run_keeps_every_sample_the_leaders_counts_and_its_provenance(tmp_path
     assert all(r["mismatches"] == 0 for ranks in native["sizes"] for r in ranks)
     # The same code in both arms puts the same messages on the wire: compare --wire finds
     # no count differing (timing verdicts on a loaded CPU are noise and not asserted).
-    result = subprocess.run([sys.executable, str(SCRIPT), "compare", str(tmp_path),
-                             "--before", "before", "--after", "after", "--wire"],
-                            capture_output=True, text=True, timeout=60)
+    result = _compare(tmp_path, "before", "after", 1, 1, "--wire")
+    assert result.returncode in (0, 1), result.stdout + result.stderr  # judged
     assert "wire counts differ" not in result.stdout, result.stdout
     assert "FAIL" not in result.stdout, result.stdout
 
 
-def _record(arm: str, repeat: int, p50: float, *, wrong: int = 0, sends: int = 10) -> dict:
-    ranks = [{"bytes": 1024, "payload_bytes": 1024, "calls": 3, "timed_s": [p50] * 3,
-              "cpu_s": [p50 / 2] * 3, "rss_growth_bytes": 0, "mismatches": wrong,
-              "verbs_delta": {"sends": sends} if rank in (0, 2) else None}
-             for rank in range(4)]
-    return {"arm": arm, "repeat": repeat, "sizes": [ranks]}
+def _compare(out, before: str, after: str, nb: int, na: int, *extra: str):
+    return subprocess.run([sys.executable, str(SCRIPT), "compare", str(out), "--before", before,
+                           "--after", after, "--before-repeats", str(nb),
+                           "--after-repeats", str(na), *extra],
+                          capture_output=True, text=True, timeout=60)
+
+
+def _verdict(out, before: str, after: str) -> dict:
+    return json.loads((out / f"compare-{before}-{after}.json").read_text())
+
+
+def _record(arm: str, repeat: int, p50: float, *, wrong: int = 0, sends: int = 10,
+            world: int = 4, policy: str = "reduce-bridge-broadcast", chunk: int = 4 << 20,
+            telemetry: bool = True, code: str = "a" * 64) -> dict:
+    """A whole record of the smoke table as ``run`` writes it, its two leaders ranks 0 and
+    world // 2, every timed call ``p50`` seconds."""
+    lead = (0, world // 2)
+    wire = {k: sends for k in ("sends", "recvs", "bytes_sent", "bytes_received",
+                               "writes_posted", "bytes_written", "write_windows",
+                               "write_window_bytes")}
+    sizes = [[{"rank": rank, "bytes": nbytes, "payload_bytes": nbytes, "warmup": warmup,
+               "calls": calls, "timer": "host", "timed_s": [p50] * calls,
+               "host_s": [p50] * calls, "cpu_s": [p50 / 2] * calls, "rss_growth_bytes": 0,
+               "mismatches": wrong if rank == 1 else 0,
+               "verbs_delta": dict(wire) if telemetry and rank in lead else None}
+              for rank in range(world)] for nbytes, warmup, calls in [(4096, 2, 5),
+                                                                      (2**20, 2, 5)]]
+    environment = {"hostname": "node1", "platform": "Linux", "python": "3.12", "torch": "2.9",
+                   "git_commit": "c0ffee", "git_dirty": False, "gpubridge": "0.1",
+                   "import": {"gpubridge_git_commit": code[:7]},
+                   "env": {"GPUBRIDGE_SPLIT_TEST": "half", "MASTER_PORT": str(29500 + repeat),
+                           "GPUBRIDGE_VERBS_CHUNK_BYTES": str(chunk)}}
+    provenance = [{"environment": environment, "gpubridge_py_sha256": code}
+                  | ({"verbs_library_sha256": code, "verbs_crate_sha256": code,
+                      "verbs": {"chunk_bytes": chunk, "progress": "economy"}}
+                     if rank in lead else {}) for rank in range(world)]
+    islands = [{"vendor": "nvidia", "ranks": list(range(i, i + world // 2)), "leader": i}
+               for i in lead]
+    run = {"kind": "gpu-split", "split_test": True, "world_size": world, "islands": islands,
+           "bridge": "verbs", "policy": policy, "pinned_staging": True}
+    return {"arm": arm, "repeat": repeat, "op": "gpubridge", "bridge": "verbs",
+            "policy": "auto", "table": "smoke", "run": run, "provenance": provenance,
+            "sizes": sizes}
+
+
+def _write(out, arm: str, repeats, p50=1.0, **kwargs) -> None:
+    for i in repeats:
+        (out / f"{arm}-r{i}.json").write_text(json.dumps(_record(arm, i, p50, **kwargs)))
 
 
 @pytest.mark.parametrize("after, wrong, sends, verdict, code", [
@@ -92,9 +133,87 @@ def test_compare_applies_the_predeclared_rules(tmp_path, after, wrong, sends, ve
         (tmp_path / f"before-r{i}.json").write_text(json.dumps(_record("before", i, b)))
         (tmp_path / f"after-r{i}.json").write_text(
             json.dumps(_record("after", i, a, wrong=wrong, sends=sends)))
-    result = subprocess.run([sys.executable, str(SCRIPT), "compare", str(tmp_path),
-                             "--before", "before", "--after", "after", "--wire"],
-                            capture_output=True, text=True, timeout=60)
+    result = _compare(tmp_path, "before", "after", 5, 5, "--wire")
     assert result.returncode == code, result.stdout + result.stderr
-    row, = json.loads((tmp_path / "compare-before-after.json").read_text())["rows"]
-    assert row["verdict"] == verdict, row
+    rows = _verdict(tmp_path, "before", "after")["rows"]
+    assert len(rows) == 2 and {row["verdict"] for row in rows} == {verdict}, rows
+
+
+def test_compare_needs_every_predeclared_repeat_and_checks_every_run(tmp_path):
+    # The review's case: B0's last repeat is wrong and P0's is missing. Pairing the
+    # repeats both arms have used to drop the wrong one and pass.
+    _write(tmp_path, "B0", [0, 1])
+    _write(tmp_path, "B0", [2], wrong=1)
+    _write(tmp_path, "P0", [0, 1])
+    result = _compare(tmp_path, "B0", "P0", 3, 3, "--wire")
+    assert result.returncode == 1, result.stdout + result.stderr
+    verdict = _verdict(tmp_path, "B0", "P0")
+    assert verdict["status"] == "FAIL (wrong result)" and verdict["rows"] == []
+    assert any("B0-r2.json: 2 wrong results" in r for r in verdict["reasons"]), verdict
+    assert any("P0: repeats [2]" in r for r in verdict["reasons"]), verdict
+    # Missing, and nothing wrong: INCOMPLETE, never a verdict on the repeats that are there.
+    (tmp_path / "B0-r2.json").write_text(json.dumps(_record("B0", 2, 1.0)))
+    result = _compare(tmp_path, "B0", "P0", 3, 3, "--wire")
+    assert result.returncode == 4 and "INCOMPLETE" in result.stderr, result.stderr
+    # A repeat outside the predeclared set, or a truncated one, is INCOMPLETE too.
+    _write(tmp_path, "P0", [2, 3])
+    assert _compare(tmp_path, "B0", "P0", 3, 3).returncode == 4
+    (tmp_path / "P0-r3.json").unlink()
+    assert _compare(tmp_path, "B0", "P0", 3, 3).returncode == 0
+    truncated = _record("P0", 2, 1.0)
+    truncated["sizes"][1][3]["timed_s"].pop()
+    (tmp_path / "P0-r2.json").write_text(json.dumps(truncated))
+    result = _compare(tmp_path, "B0", "P0", 3, 3)
+    assert result.returncode == 4 and "samples [4, 5] for 5 calls" in result.stderr
+    # The longer arm's unpaired repeat (P0 has 3, D1 2) is still checked for correctness.
+    _write(tmp_path, "P0", [2], wrong=1)
+    _write(tmp_path, "D1", [0, 1])
+    result = _compare(tmp_path, "P0", "D1", 3, 2)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert _verdict(tmp_path, "P0", "D1")["status"] == "FAIL (wrong result)"
+
+
+@pytest.mark.parametrize("change, differ", [
+    ({"world": 2}, ["topology", "verbs", "code"]),  # 1+1 against 2+2: never comparable
+    ({"policy": "native-only"}, ["policy"]),
+    ({"chunk": 16 << 20}, ["env.GPUBRIDGE_VERBS_CHUNK_BYTES", "verbs.chunk_bytes"]),
+    ({"code": "b" * 64}, ["code"]),
+])
+def test_compare_refuses_arms_that_differ_in_anything_not_declared(tmp_path, change, differ):
+    _write(tmp_path, "B0", range(3))
+    _write(tmp_path, "P0", range(3), p50=0.5, **change)
+    for wire in ([], ["--wire"]):
+        result = _compare(tmp_path, "B0", "P0", 3, 3, *wire)
+        assert result.returncode == 5 and "REFUSED" in result.stderr, result.stderr
+        verdict = _verdict(tmp_path, "B0", "P0")
+        assert verdict["status"] == "REFUSED" and verdict["rows"] == [], verdict
+    if "world" in change:
+        return
+    declared = [arg for key in differ for arg in ("--differ", key)]
+    result = _compare(tmp_path, "B0", "P0", 3, 3, *declared)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {row["verdict"] for row in _verdict(tmp_path, "B0", "P0")["rows"]} == {"win"}
+    # Every repeat of one arm must match its repeat 0, whatever --differ allows.
+    _write(tmp_path, "P0", [1], p50=0.5)
+    assert _compare(tmp_path, "B0", "P0", 3, 3, *declared).returncode == 5
+
+
+def test_compare_wire_needs_every_leaders_counted_messages(tmp_path):
+    _write(tmp_path, "B0", range(3), telemetry=False)
+    _write(tmp_path, "P0", range(3), telemetry=False)
+    result = _compare(tmp_path, "B0", "P0", 3, 3, "--wire")
+    assert result.returncode == 3 and "UNSUPPORTED" in result.stderr, result.stderr
+    _write(tmp_path, "B0", range(3))
+    _write(tmp_path, "P0", range(3))
+    assert _compare(tmp_path, "B0", "P0", 3, 3, "--wire").returncode == 0
+    one = _record("P0", 1, 1.0)
+    one["sizes"][0][2]["verbs_delta"] = None  # one leader's telemetry missing
+    (tmp_path / "P0-r1.json").write_text(json.dumps(one))
+    result = _compare(tmp_path, "B0", "P0", 3, 3, "--wire")
+    assert result.returncode == 4 and "from 1 of 2 leaders" in result.stderr, result.stderr
+    counter = _record("P0", 1, 1.0)
+    del counter["sizes"][1][0]["verbs_delta"]["write_windows"]
+    (tmp_path / "P0-r1.json").write_text(json.dumps(counter))
+    result = _compare(tmp_path, "B0", "P0", 3, 3, "--wire")
+    assert result.returncode == 4 and "lacks ['write_windows']" in result.stderr, result.stderr
+
