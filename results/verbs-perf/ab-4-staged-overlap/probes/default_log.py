@@ -1,16 +1,21 @@
 """Run the staged default path (overlap env unset) over a recording fake wire against the
 tree given as argv[1]; print the full ordered log, wire and results as JSON."""
-import ctypes, json, os, sys
+import ctypes
+import json
+import os
+import sys
+from datetime import timedelta
+
 tree = sys.argv[1]
 sys.path[:0] = [f"{tree}/src", f"{tree}/tests"]
 os.environ.pop("GPUBRIDGE_VERBS_STAGED_OVERLAP", None)
-from datetime import timedelta
-import torch
-from torch.distributed import ReduceOp
-from test_verbs_gpu import LazyRegistered
-from gpubridge.verbs import Registration
-from gpubridge.verbs import transport as vt
-from gpubridge.verbs.gpu import HostBuffer, Router
+import torch  # noqa: E402  (after the tree is on the path)
+from torch.distributed import ReduceOp  # noqa: E402
+from test_verbs_gpu import LazyRegistered  # noqa: E402
+
+from gpubridge.verbs import Registration  # noqa: E402
+from gpubridge.verbs import transport as vt  # noqa: E402
+from gpubridge.verbs.gpu import HostBuffer, Router  # noqa: E402
 print(vt.__file__, file=sys.stderr)
 
 class Wire:

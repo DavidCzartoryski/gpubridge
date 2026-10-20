@@ -20,7 +20,9 @@ Arms are exported trees: before `0a3ffbe` (`src` tree `042b6444`), after `837625
   and library wait in one order, plus the results and the last copy back: 692 entries.
   `python -I default_log.py <tree>` printed the same bytes for both trees
   (sha256 `81d64fc2bd31540e046468ec5f4d00f00bda763c38f24deda43cd5f5153c058d`);
-  `default-path.json` is that output.
+  `default-path.json` is that output. Rerun after the rebase onto the A/B harness
+  fixes and the failure-drain fix: the measurement branch's head against this
+  branch's head (the drain fix included) printed the same bytes again.
 - `python-cost-{before,after}-<k>.json`: `scripts/verbs_perf.py python-cost`, 5 runs per
   arm, interleaved (before after, after before, ...). Python per 2-leader host
   all_reduce against an endpoint that does nothing; the host path gained one keyword
