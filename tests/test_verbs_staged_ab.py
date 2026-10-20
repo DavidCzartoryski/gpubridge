@@ -88,9 +88,11 @@ def _verdict(out, before: str, after: str) -> dict:
 
 def _record(arm: str, repeat: int, p50: float, *, wrong: int = 0, sends: int = 10,
             world: int = 4, policy: str = "reduce-bridge-broadcast", chunk: int = 4 << 20,
-            telemetry: bool = True, code: str = "a" * 64) -> dict:
-    """A whole record of the smoke table as ``run`` writes it, its two leaders ranks 0 and
-    world // 2, every timed call ``p50`` seconds."""
+            telemetry: bool = True, code: str = "a" * 64, table: str = "smoke",
+            staged=None) -> dict:
+    """A whole record of a table as ``run`` writes it, its two leaders ranks 0 and
+    world // 2, every timed call ``p50`` seconds; ``staged(nbytes, rank, calls)`` gives
+    a leader's staged phase deltas."""
     lead = (0, world // 2)
     wire = {k: sends for k in ("sends", "recvs", "bytes_sent", "bytes_received",
                                "writes_posted", "bytes_written", "write_windows",
@@ -99,9 +101,9 @@ def _record(arm: str, repeat: int, p50: float, *, wrong: int = 0, sends: int = 1
                "calls": calls, "timer": "host", "timed_s": [p50] * calls,
                "host_s": [p50] * calls, "cpu_s": [p50 / 2] * calls, "rss_growth_bytes": 0,
                "mismatches": wrong if rank == 1 else 0,
-               "verbs_delta": dict(wire) if telemetry and rank in lead else None}
-              for rank in range(world)] for nbytes, warmup, calls in [(4096, 2, 5),
-                                                                      (2**20, 2, 5)]]
+               "verbs_delta": wire | (staged(nbytes, rank, calls) if staged else {})
+               if telemetry and rank in lead else None}
+              for rank in range(world)] for nbytes, warmup, calls in ab.TABLES[table]]
     environment = {"hostname": "node1", "platform": "Linux", "python": "3.12", "torch": "2.9",
                    "git_commit": "c0ffee", "git_dirty": False, "gpubridge": "0.1",
                    "import": {"gpubridge_git_commit": code[:7]},
@@ -116,7 +118,7 @@ def _record(arm: str, repeat: int, p50: float, *, wrong: int = 0, sends: int = 1
     run = {"kind": "gpu-split", "split_test": True, "world_size": world, "islands": islands,
            "bridge": "verbs", "policy": policy, "pinned_staging": True}
     return {"arm": arm, "repeat": repeat, "op": "gpubridge", "bridge": "verbs",
-            "policy": "auto", "table": "smoke", "run": run, "provenance": provenance,
+            "policy": "auto", "table": table, "run": run, "provenance": provenance,
             "sizes": sizes}
 
 
@@ -311,6 +313,65 @@ def test_a_count_missing_from_the_telemetry_is_recorded_missing_never_zero(tmp_p
     assert _compare(tmp_path, "B0", "P0", 3, 3).returncode == 0
 
 
+def _trigger(out, *extra: str):
+    return subprocess.run([sys.executable, str(SCRIPT), "trigger", str(out), "--arm", "P0x2",
+                           "--repeats", "3", "--compare", "compare-P0-D3.json", *extra],
+                          capture_output=True, text=True, timeout=60)
+
+
+def _pure_bridge(out, shares, *, d3_p50=1.0):
+    """P0x2's 3 repeats of the full table, every call 1 s, leader rank 1's copy out
+    ``shares[k]`` of the call at 25 MiB in repeat k (0.1 everywhere else); then P0 and
+    D3, and section 5's compare P0 D3 (D3 every call ``d3_p50`` s)."""
+    for k, share in enumerate(shares):
+        def staged(nbytes, rank, calls, share=share):
+            s = share if (nbytes, rank) == (25 * 2**20, 1) else 0.1
+            return {"staged_calls": calls, "staged_to_host_s": s * calls}
+        record = _record("P0x2", k, 1.0, world=2, table="full", staged=staged)
+        (out / f"P0x2-r{k}.json").write_text(json.dumps(record))
+    _write(out, "P0", range(3), table="full")
+    _write(out, "D3", range(2), p50=d3_p50, table="full", policy="pipelined")
+    assert _compare(out, "P0", "D3", 3, 2, "--differ", "policy").returncode == 0
+
+
+@pytest.mark.parametrize("shares, d3_p50, met", [
+    ([0.31, 0.29, 0.35], 1.0, "TRIGGER MET: P0x2 leader rank 1 at 26214400 bytes, median 0.310"),
+    ([0.29, 0.31, 0.2], 1.0, "TRIGGER NOT MET"),  # one repeat over, the median not
+    ([0.1, 0.1, 0.1], 0.5, "TRIGGER MET: compare-P0-D3.json says win at 26214400 bytes; "
+                           "compare-P0-D3.json says win at 157286400 bytes"),
+])
+def test_trigger_decides_section_5s_copy_overlap_row(tmp_path, shares, d3_p50, met):
+    _pure_bridge(tmp_path, shares, d3_p50=d3_p50)
+    result = _trigger(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1].startswith(met), result.stdout
+    per_repeat = " ".join(f"{v:.3f}" for v in shares)
+    assert (f"P0x2 26214400 bytes, leader rank 1: (staged_to_host_s / staged_calls) / p50 "
+            f"per repeat {per_repeat}, median {sorted(shares)[1]:.3f}") in lines, lines
+    # Every leader at both sizes, then the D3 compare's status.
+    assert sum(line.startswith("P0x2 ") for line in lines) == 4, lines
+
+
+def test_trigger_decides_nothing_on_an_incomplete_record(tmp_path):
+    _pure_bridge(tmp_path, [0.5, 0.5, 0.5])
+    assert _trigger(tmp_path).returncode == 0
+    for name, broken in [("P0x2-r2.json", "["), ("compare-P0-D3.json", "")]:
+        good = (tmp_path / name).read_text()
+        (tmp_path / name).write_text(broken)
+        result = _trigger(tmp_path)
+        assert result.returncode == 4 and "INCOMPLETE" in result.stderr, result.stderr
+        assert "TRIGGER" not in result.stdout and f"{name}: unreadable" in result.stderr
+        (tmp_path / name).write_text(good)
+    record = json.loads((tmp_path / "P0x2-r1.json").read_text())
+    del record["sizes"][3][1]["verbs_delta"]["staged_calls"]
+    (tmp_path / "P0x2-r1.json").write_text(json.dumps(record))
+    result = _trigger(tmp_path)
+    assert result.returncode == 4 and "rank 1: staged phases missing" in result.stderr
+    (tmp_path / "P0x2-r1.json").unlink()
+    assert _trigger(tmp_path).returncode == 4
+
+
 DOC = REPO / "docs" / "verbs-perf-20261019.md"
 
 
@@ -329,6 +390,18 @@ def test_the_copy_trigger_uses_only_measured_phases():
     assert "minus" not in trigger and "copy back" not in trigger, trigger
     assert "staged_to_host_s / staged_calls" in trigger and "P0x2" in trigger, trigger
     assert "H2D" in _section("2.") and "UNAVAILABLE" in _section("2."), _section("2.")
+
+
+@pytest.mark.docs
+def test_section_5s_rows_are_mechanical():
+    section = _section("5.")
+    rows = [line for line in section.splitlines() if line.startswith("| ")][-4:]
+    assert "write_window_release_ns) / 1e9" in rows[1], rows[1]
+    assert "first row met picks the next change" in section
+    command, = re.findall(r'python "\$H" trigger [^\n]*\\\n[^\n]*', section)
+    assert "--arm P0x2 --repeats 3 --compare compare-P0-D3.json" in command, command
+    assert ab.TRIGGER_SIZES == (25 * 2**20, 150 * 2**20) and ab.TRIGGER_SHARE == 0.30
+    assert "at 25 or 150 MiB" in rows[0] and "at least 0.30" in rows[0], rows[0]
 
 
 @pytest.mark.docs

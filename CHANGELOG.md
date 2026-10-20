@@ -261,7 +261,8 @@ hardware.
   `write_window_release_ns`), the bridge splits each staged call's host time into
   copy out, bridge step (posts, library waits, the rest) and copy back
   (`staged_phases`), and `scripts/gpu/verbs_staged_ab.py` runs one arm of a one-node
-  A/B against the predeclared rules. Measurement only; CPU/MOCK cost checked, not
+  A/B, compares arms against the predeclared rules and decides the plan's copy
+  overlap trigger. Measurement only; CPU/MOCK cost checked, not
   validated on GPUs or RDMA hardware. (PR pending)
 - `bridge="verbs"` takes GPU tensors, phase A3 (docs/VERBS_TRANSPORT.md): wire
   protocol 2 adds a rendezvous (an RDMA WRITE into memory registered for one

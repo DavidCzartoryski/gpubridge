@@ -9,6 +9,8 @@ torchrun; ``compare`` reads the runs of two arms and applies the predeclared rul
         --op gpubridge --bridge verbs --arm before --repeat 0 --out OUT
     python scripts/gpu/verbs_staged_ab.py compare OUT --before before --after after \\
         --before-repeats 3 --after-repeats 3 [--differ KEY ...] [--wire]
+    python scripts/gpu/verbs_staged_ab.py trigger OUT --arm P0x2 --repeats 3 \\
+        --compare compare-P0-D3.json
 
 Per size of the fixed table (fp32 integer values, so every sum is exact), ``run``
 does untimed warmup calls, then timed calls. Each timed call starts from the same
@@ -39,6 +41,14 @@ REGRESSION; 3 UNSUPPORTED (``--wire`` with no verbs telemetry in an arm); 4
 INCOMPLETE (a repeat missing, extra, truncated or unreadable, or telemetry missing); 5
 REFUSED (the arms are not the predeclared comparison). Every outcome writes
 ``compare-<before>-<after>.json`` with its status and reasons.
+
+``trigger`` decides the plan's first next-change row (section 5): for each leader of
+the pure bridge arm at 25 and 150 MiB, each repeat's ``(staged_to_host_s /
+staged_calls) / p50``, their median, and whether it is at least 0.30; then whether the
+named compare JSON says ``win`` at either size. Its last line is ``TRIGGER MET`` (and
+why) or ``TRIGGER NOT MET``, exit 0; INCOMPLETE (exit 4) when a repeat is missing,
+extra, unreadable or not whole, a leader's staged phases are missing, or the compare
+JSON is: then nothing is decided.
 
 Numbers from CPU runs (the tests) are software checks only, never GPU or NIC evidence.
 """
@@ -77,6 +87,8 @@ WIRE = ("sends", "recvs", "bytes_sent", "bytes_received", "writes_posted", "byte
 LABEL_CPU = "CPU run: software check only, not GPU or NIC evidence"
 #: compare's exit codes besides 0 and 1 (module docs).
 UNSUPPORTED, INCOMPLETE, REFUSED = 3, 4, 5
+#: Section 5's copy overlap trigger: the sizes it looks at and the copy out's share.
+TRIGGER_SIZES, TRIGGER_SHARE = (25 * 2**20, 150 * 2**20), 0.30
 #: Recorded environment variables that name the code under test (under ``code.``)...
 ENV_CODE = ("GPUBRIDGE_VERBS_LIB", "GPUBRIDGE_VERBS_LIB_DIR", "PYTHONPATH")
 #: ... and the settings compared between arms (under ``env.``), by prefix or name. The
@@ -258,8 +270,9 @@ def summarize(record: dict) -> dict[int, dict[str, Any]]:
         slowest = [max(r["timed_s"][i] for r in ranks) for i in range(ranks[0]["calls"])]
         p50 = statistics.median(slowest)
         deltas = [r["verbs_delta"] for r in ranks if r["verbs_delta"] is not None]
-        counts = {k: None if any(d[k] is None for d in deltas) else sum(d[k] for d in deltas)
-                  for k in deltas[0]} if deltas else {}
+        counts = {k: None if any(d.get(k) is None for d in deltas)
+                  else sum(d[k] for d in deltas)
+                  for k in dict.fromkeys(k for d in deltas for k in d)}
         out[ranks[0]["bytes"]] = {
             "p50_s": p50, "p99_s": quantile(slowest, 0.99),
             "throughput_GBps": ranks[0]["payload_bytes"] / p50 / 1e9,
@@ -479,6 +492,78 @@ def compare(args) -> int:
     return 0 if status == "judged" else 1
 
 
+def trigger(args) -> int:
+    """Section 5's copy overlap row on the pure bridge arm and the named compare (module
+    docs)."""
+    found, reasons = read_records(args.dir, [args.arm])
+    runs: dict[int | str, tuple[str, dict]] = {}
+    for name, record in found:
+        if record.get("arm") == args.arm:
+            repeat = record.get("repeat")
+            key = repeat if type(repeat) is int else repr(repeat)
+            if key in runs:
+                reasons.append(f"{name}: a second record of {args.arm} repeat {key}")
+            runs[key] = (name, record)
+    if set(runs) != set(range(args.repeats)):
+        reasons.append(f"{args.arm}: repeats {sorted(runs, key=str)}, not the predeclared "
+                       f"0 to {args.repeats - 1}")
+    shares: dict[tuple[int, int], list[float]] = {}
+    for key in sorted(runs, key=str):
+        name, record = runs[key]
+        if bad := problems(record, False):
+            reasons += [f"{name}: {p}" for p in bad]
+            continue
+        try:
+            p50 = summarize(record)
+            for nbytes in TRIGGER_SIZES:
+                if nbytes not in p50:
+                    reasons.append(f"{name}: no {nbytes}-byte row in table {record['table']!r}")
+                    continue
+                ranks, = (ranks for ranks in record["sizes"] if ranks[0]["bytes"] == nbytes)
+                leads = [r for r in ranks if r["verbs_delta"] is not None]
+                if len(leads) != leaders(record):
+                    reasons.append(f"{name}: {nbytes} bytes: staged phases from {len(leads)} "
+                                   f"of {leaders(record)} leaders")
+                for r in leads:
+                    calls, to_host = (r["verbs_delta"].get(k)
+                                      for k in ("staged_calls", "staged_to_host_s"))
+                    if type(calls) is not int or calls < 1 or \
+                            not isinstance(to_host, int | float):
+                        reasons.append(f"{name}: {nbytes} bytes, rank {r['rank']}: staged "
+                                       f"phases missing (staged_calls {calls!r}, "
+                                       f"staged_to_host_s {to_host!r})")
+                        continue
+                    share = to_host / calls / p50[nbytes]["p50_s"]
+                    shares.setdefault((nbytes, r["rank"]), []).append(share)
+        except (KeyError, IndexError, TypeError, ValueError, AttributeError,
+                ArithmeticError) as e:  # values no whole record holds
+            reasons.append(f"{name}: malformed record ({type(e).__name__}: {e})")
+    try:
+        verdict = json.loads(Path(args.dir, args.compare).read_text())
+        wins = sorted({row["bytes"] for row in verdict["rows"]
+                       if row["verdict"] == "win" and row["bytes"] in TRIGGER_SIZES})
+        print(f"{args.compare}: {verdict['status']}, win at {wins} bytes")
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        reasons.append(f"{args.compare}: unreadable ({type(e).__name__}: {e})")
+    if reasons:
+        print("INCOMPLETE: the trigger is not decided", file=sys.stderr)
+        for reason in reasons:
+            print(f"  {reason}", file=sys.stderr)
+        return INCOMPLETE
+    met = []
+    for (nbytes, rank), values in sorted(shares.items()):
+        median = statistics.median(values)
+        print(f"{args.arm} {nbytes} bytes, leader rank {rank}: (staged_to_host_s / "
+              f"staged_calls) / p50 per repeat {' '.join(f'{v:.3f}' for v in values)}, "
+              f"median {median:.3f}")
+        if median >= TRIGGER_SHARE:
+            met.append(f"{args.arm} leader rank {rank} at {nbytes} bytes, median "
+                       f"{median:.3f} >= {TRIGGER_SHARE}")
+    met += [f"{args.compare} says win at {nbytes} bytes" for nbytes in wins]
+    print(f"TRIGGER MET: {'; '.join(met)}" if met else "TRIGGER NOT MET")
+    return 0
+
+
 def judge(before: dict[int, dict], after: dict[int, dict], pairs: list[int],
           wire: bool) -> list[dict[str, Any]]:
     """Per size, the paired repeats' timing and wire rules, and wrong results in any
@@ -539,10 +624,19 @@ def main() -> int:
                    help="a workload key or group the arms differ in by design (repeatable)")
     c.add_argument("--wire", action="store_true",
                    help="the arms must put the same messages on the wire (equal counts)")
+    t = sub.add_parser("trigger", help="section 5's copy overlap trigger (candidate A)")
+    t.add_argument("dir")
+    t.add_argument("--arm", required=True, help="the pure bridge arm (P0x2)")
+    t.add_argument("--repeats", type=int, required=True,
+                   help="its predeclared repeats: exactly 0 to N-1")
+    t.add_argument("--compare", required=True,
+                   help="the D3 compare JSON in DIR (compare-P0-D3.json)")
     args = parser.parse_args()
     if args.command == "compare" and min(args.before_repeats, args.after_repeats) < 1:
         parser.error("--before-repeats and --after-repeats must be at least 1")
-    return run(args) if args.command == "run" else compare(args)
+    if args.command == "trigger" and args.repeats < 1:
+        parser.error("--repeats must be at least 1")
+    return {"run": run, "compare": compare, "trigger": trigger}[args.command](args)
 
 
 if __name__ == "__main__":

@@ -263,17 +263,31 @@ no failure.
 
 The record is what the next change is chosen from, with these thresholds fixed now
 (P0 and P0x2, at 25 and 150 MiB, medians over repeats, per leader, except where a row
-names one arm). Every quantity is measured; none is a residual:
+names one arm). Every quantity is measured; none is a residual. The rows are read top
+to bottom and the first row met picks the next change; the rows below it are reported,
+not acted on. The first row is decided by a command (below):
 
 | Observation | Next change |
 | --- | --- |
 | In P0x2, at 25 or 150 MiB, on either leader: the median over its 3 repeats of `(staged_to_host_s / staged_calls) / p50` is at least 0.30, where `staged_to_host_s / staged_calls` is the D2H copy out, queued and waited for (1+1 has no island reduce before it), and p50 is that repeat's call latency (slowest rank, CUDA events); or `compare P0 D3` says `win` at 25 or 150 MiB | overlap the copies with the transfer, chunk by chunk (candidate A, opt-in) |
-| `(write_window_register_ns + write_window_release_ns)` at least 20% of `bridge_s`, or D1 or D2 beats P0 by more than the spread | amortize windows (first the chunk size setting) |
+| `(write_window_register_ns + write_window_release_ns) / 1e9` (nanoseconds to seconds) at least 20% of `bridge_s`, or D1 or D2 beats P0 by more than the spread | amortize windows (first the chunk size setting) |
 | `bridge_s - post_s - wait_s` (reductions and Python) at least 30% of `bridge_s` | reduce on the GPU for two staged leaders |
 | none, `wait_s` dominant | the NIC loopback or the island NCCL steps bound it: no bridge change |
 
 P0's `to_host_s` also covers the island reduce it waits for, and the copy back (H2D)
 is not measured (section 2): both are reported and trigger nothing.
+
+```bash
+python "$H" trigger "$OUT/m1" --arm P0x2 --repeats 3 --compare compare-P0-D3.json \
+  > "$OUT/m1/trigger.txt" 2>&1                                           # first row
+```
+
+It prints, for each P0x2 leader at 25 and 150 MiB, each repeat's
+`(staged_to_host_s / staged_calls) / p50` and their median, then the D3 compare's
+status and the sizes it says `win` at, and ends `TRIGGER MET` (with the leader and
+size, or the D3 win, that met it) or `TRIGGER NOT MET`. A P0x2 repeat missing, extra,
+unreadable or not whole, a leader's staged phases missing, or the D3 compare JSON
+missing, is `INCOMPLETE` (exit 4): the row is not decided, and candidate A is not run.
 
 Noise and no benefit: a difference inside the spread is "no change", reported with the
 raw samples; load or clock explanations are recorded as hypotheses, not used to drop or
@@ -284,6 +298,7 @@ parity.
 
 `$OUT/libraries.sha256`, `revs.txt`, `env.txt`, `load.txt`, `clocks.txt`,
 `m1/<arm>-r<k>.json` (19 runs) with `.time` files, `m1/compare-*.json` (6),
+`m1/trigger.txt`,
 `m2/<arm>-r<k>.json` (9 runs) with `.time` files. Every JSON string the harness
 writes is redacted of home and project paths (`gpukit.write_json`).
 
