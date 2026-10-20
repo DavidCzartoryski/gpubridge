@@ -25,8 +25,9 @@ failure handling) for the python-cost records.
   `python -I default_log.py <tree>` printed the same bytes for both trees
   (sha256 `81d64fc2bd31540e046468ec5f4d00f00bda763c38f24deda43cd5f5153c058d`);
   `default-path.json` is that output. It was first checked against the first version,
-  then at each rebase: last, `fff639d` against this change's head (both drain fixes
-  included), and before that `820d291` against `4096ba2`.
+  then at each rebase: last, `a06f022` against this change's head (both drain fixes
+  included), before that `fff639d` against its head then, and `820d291` against
+  `4096ba2`.
 - `python-cost-{before,after}-<k>.json`: `scripts/verbs_perf.py python-cost`, 5 runs per
   arm, interleaved (before after, after before, ...). Python per 2-leader host
   all_reduce against an endpoint that does nothing; the host path gained one keyword
