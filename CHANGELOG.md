@@ -297,6 +297,14 @@ hardware.
   same-host non-loopback TCP only for host/Gloo islands, marks co-resident or unknown
   bridge peers' TCP evidence `not-decisive` (strict mode fails closed), and preserves
   GPU-mode local TCP and cross-node remote TCP checks.
+- The verbs kit's host mode attributes loopback and same-host TCP sockets by the
+  process owning the other end in the same `ss` snapshot (ranks gather host, boot ID,
+  pid and pid namespace). Only sockets to the leader's own island are left out; the
+  other leader, other ranks and the store count; unattributed bytes that would exceed
+  the unchanged limit keep the evidence `not-decisive`, as do unidentified island
+  membership and island traffic that isn't seen. Records list every socket's class, owners and bytes
+  (`local_tcp_attribution`). Co-resident host leaders can now get a decisive verdict;
+  not yet checked on hardware.
 
 ### Added
 

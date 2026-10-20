@@ -798,23 +798,39 @@ queue pairs; no completion errors), and the process's own counted TCP sockets
 plus 1 MiB. Its RC queue pairs as the kernel lists them (`rdma resource show qp`, by
 pid) are recorded where the `rdma` tool exists, and contradict a pass when it lists
 none. Without `ss` the verdict is `unknown`, never a pass; Gloo reference collectives
-run before the window. The TCP check always excludes loopback. Only host mode with
-CPU-only Gloo islands also excludes peers whose addresses appear as local socket
-endpoints in the same `ss` snapshot. IPv4, IPv4-mapped IPv6 and native IPv6 addresses
+run before the window. The TCP check excludes loopback unless host mode attributes
+it (below). Only host mode with CPU-only Gloo islands also excludes peers whose
+addresses appear as local socket endpoints in the same `ss` snapshot. IPv4, IPv4-mapped IPv6 and native IPv6 addresses
 are normalized; unknown addresses still count. GPU mode with NCCL islands counts
 same-host non-loopback TCP, preserving its existing acceptance check.
+
+Host mode attributes those loopback and same-host sockets by process: both ends of a
+same-host connection are in one `ss` snapshot, each with its owning pids. Every rank
+gathers its hostname, kernel boot ID, pid and pid namespace; when every other rank of
+a leader's island is positively identified as sharing its host and pid namespace (or
+as remote), the leader excludes only sockets whose other end is owned by those island
+peers alone (`island`). Sockets to any other process (`outside island`: the other
+leader, the other island, torchrun's store) count, loopback included; sockets whose
+other end has no owner in the snapshot, or a mix, are `unattributed`. Each record's
+`tcp_evidence.local_tcp_attribution` lists the island pids, every socket's class,
+owners and bytes, and the bytes per class (or why attribution was unavailable).
 
 Leader co-residence is determined from gathered actual hostnames and kernel boot
 IDs, independently of split-test labels. When local TCP is excluded and any bridge
 peer is co-resident or cannot be positively identified as remote, otherwise positive
 evidence is `not-decisive`, with `no_silent_tcp: null` and the reason
 "local bridge: island Gloo traffic and a bridge TCP fallback are indistinguishable
-on one host". The positive verbs checks remain required and are reported separately
-in `verbs_evidence`; any contradictory evidence still yields `fail`. Without
+on one host", unless attribution is available: then the counted sockets decide, and
+the evidence stays `not-decisive` when the unattributed bytes, counted too, would
+exceed the limit (the reason then says how many bytes), or when a leader with island
+peers had none of its TCP attributed to them (its island's Gloo traffic unseen). The
+positive verbs checks remain required and are reported separately in
+`verbs_evidence`; any contradictory evidence still yields `fail`. Without
 `--require-no-tcp`, a correct local host run may succeed while printing and recording
 this limitation. With `--require-no-tcp`, its leaders fail with that reason.
 Cross-node host runs remain decisive: local island TCP is excluded, remote TCP is
-counted. A one-host host run cannot establish cross-node no-TCP acceptance.
+counted. A one-host host run, even a decisive one, cannot establish cross-node no-TCP
+acceptance. Socket attribution is not yet checked on hardware.
 `--require-no-tcp` fails a bridge leader's step unless its decisive
 verdict is `pass`; other ranks record `not applicable`. A job with no bridge leader
 at all (one island: an all-NVIDIA node without `GPUBRIDGE_SPLIT_TEST`, say) never

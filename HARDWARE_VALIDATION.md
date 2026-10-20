@@ -602,7 +602,9 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     host collectives failed before payload because CPU tensors met CUDA
     communicators. The `0cf32a3` recheck passed exact host collectives with
     CPU/Gloo islands. Same-host host-mode no-silent-TCP evidence is
-    `not-decisive`; `--require-no-tcp` fails closed. Cross-node RDMA,
+    `not-decisive`; `--require-no-tcp` fails closed (again at `4c13375`).
+    The kit's per-process attribution of same-host sockets, which can make
+    that evidence decisive, has not run on hardware yet. Cross-node RDMA,
     hardware failure/teardown cases and transport comparisons beyond the
     measured Gloo/verbs pair remain open. See
     [results](#split-test-results-2026-10-20).
