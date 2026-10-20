@@ -20,9 +20,10 @@ outside the timed region. Each rank keeps every sample, its process CPU around e
 call (all threads: the bridge's progress threads too) and over the whole timed
 region, its max RSS, and on a bridge leader the verbs telemetry's change over the
 timed calls (sends, write windows and their nanoseconds, copies, completions,
-staged phase times). Rank 0 writes ``OUT/<arm>-r<repeat>.json`` with every rank's
-data, the run's full wall time and its provenance (git commit, imported sources'
-hash, the verbs library's file hash, allowlisted environment).
+staged phase times), and the last call's path and, staged, whether it overlapped its
+copies (GPUBRIDGE_VERBS_STAGED_OVERLAP). Rank 0 writes ``OUT/<arm>-r<repeat>.json``
+with every rank's data, the run's full wall time and its provenance (git commit,
+imported sources' hash, the verbs library's file hash, allowlisted environment).
 
 ``--op native`` times torch.distributed.all_reduce on one group of every rank on
 the island backend (NCCL), in the same job layout, as the baseline. It refuses to
@@ -155,7 +156,8 @@ def provenance(topology) -> dict[str, Any]:
         t = bridge.telemetry()
         out["verbs"] = {k: t.get(k) for k in ("provider", "mock", "library", "device", "port",
                                               "link_layer", "progress", "rndv_bytes",
-                                              "chunk_bytes", "gpu_path_setting")}
+                                              "chunk_bytes", "gpu_path_setting",
+                                              "staged_overlap_setting")}
     return out
 
 
@@ -239,8 +241,9 @@ def run(args) -> int:
     for nbytes, warmup, calls in TABLES[args.table]:
         mine = time_size(op, topology, nbytes, warmup, calls)
         mine["rank"] = topology.rank
-        mine["last_path"] = (topology.bridge.telemetry().get("path")
-                             if verbs_counts(topology.bridge) is not None else None)
+        last = topology.bridge.telemetry() if verbs_counts(topology.bridge) is not None else {}
+        mine["last_path"] = last.get("path")
+        mine["last_staging"] = (last.get("last_gpu") or {}).get("staging")
         ranks: list[Any] = [None] * topology.world_size
         dist.all_gather_object(ranks, mine)
         sizes.append(ranks)

@@ -60,10 +60,11 @@ def test_a_run_keeps_every_sample_the_leaders_counts_and_its_provenance(tmp_path
                 # Smoke sizes are under one 4 MiB chunk: one send and one receive per call.
                 assert d["sends"] == d["recvs"] == r["calls"], d
                 # CPU tensors take the host path: no staged call, nothing timed.
-                assert r["last_path"] == "host"
+                assert r["last_path"] == "host" and r["last_staging"] is None
                 assert d["staged_calls"] == d["staged_post_s"] == d["staged_wait_s"] == 0
         leaders = [p for p in record["provenance"] if "verbs_library_sha256" in p]
         assert len(leaders) == 2 and leaders[0]["verbs"]["mock"] is True
+        assert all(p["verbs"]["staged_overlap_setting"] is False for p in leaders)
         assert len({p["gpubridge_py_sha256"] for p in record["provenance"]}) == 1
     assert all(r["verbs_delta"] is None for ranks in native["sizes"] for r in ranks)
     assert all(r["mismatches"] == 0 for ranks in native["sizes"] for r in ranks)
