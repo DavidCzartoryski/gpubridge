@@ -22,8 +22,10 @@ from the steps and stages that test it, and the preflight's network numbers.
 Runs in CPU simulation never count towards an item. The tables number hosts
 instead of naming them and show no paths. See the runbook's
 [The validation tables](docs/GPU_VALIDATION_RUNBOOK.md#the-validation-tables).
-The *Status* lines under each item describe the CPU work; the GPU verdicts are
-in the tables. What the bridge costs is in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+The *Status* lines under each item describe the CPU work and scoped hardware
+updates; the GPU verdicts are in the tables. The
+[2026-10-20 split-test results](#split-test-results-2026-10-20) qualify the older
+step-exit verdicts. What the bridge costs is in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Blocking: can the job start at all?
 
@@ -95,7 +97,9 @@ in the tables. What the bridge costs is in [docs/BENCHMARKS.md](docs/BENCHMARKS.
    only receives, from any stream; on the device from another stream).
    Fixed: the policy keeps each slot's last copy-back event from one
    collective to the next. (c) See item 16: `wait()` was correct, but
-   `is_completed()` was not. All of this is unverified on GPUs.
+   `is_completed()` was not. The 2026-10-20 split test at `c92684b` passed
+   the GPU stream/readiness suite and Gloo/staged-verbs checks; the collective
+   `wait-skips-stream` mutation gap remains (item 16).
    *Step:* `pytest -m gpu tests/test_gpu.py` (Explorer steps 02 and 04, `amd/run_all.sh`):
    `test_bridge_copies_wait_for_the_callers_stream_and_the_island_reduce`
    writes the input at the end of a queue of matmuls on a side stream, sync
@@ -144,7 +148,10 @@ in the tables. What the bridge costs is in [docs/BENCHMARKS.md](docs/BENCHMARKS.
     case)`, since it is not a like-for-like comparison. Where a preflight ran,
     `validation_tables.py` sets the bridge phase against the time the
     preflight's bandwidth predicts (runbook, "Predicted vs measured").
-    *Status: runs on CPU in simulation, host-timed; no GPU numbers yet.*
+    *Status: GPU native/island/Gloo/staged-verbs timing baselines recorded
+    at `c92684b` on the 2026-10-20 split test; see
+    [results](#split-test-results-2026-10-20). Single-run timings do not
+    establish statistical significance or cross-node performance.*
 
 ## Added with later features
 
@@ -167,7 +174,11 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     moves about half the bytes.
     *Status: works on CPU: every layout still matches `flat-gloo` exactly, and
     a test counts one island reduce and one island broadcast per all_reduce.*
-    Still open: the time saved on NCCL and RCCL, by tensor size. Small tensors
+    On GPUs (2026-10-20, `c92684b`): nontrivial two-rank NCCL island-reduce
+    phases and native island all_reduce baselines were measured with Gloo and
+    staged verbs bridges in the [split test](#split-test-results-2026-10-20).
+    This establishes measurement coverage, not a universal time saving; RCCL
+    remains untested in these runs. Small tensors
     may see none, because both ops are latency-bound there. *Step:*
     `bench_all_reduce.py --ops native,island,gpubridge,flat-gloo --phases` puts the
     `island-reduce` phase next to a native island all_reduce (`island:<vendor>`)
@@ -203,7 +214,10 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     asks that event (`test_is_completed_waits_for_the_gpu_work_too`).
     *Status: ordering, results and failure handling work on CPU
     (`tests/test_ops.py`), where there are no streams.* Still open: the
-    events and `record_stream` on real GPUs. *Step:* `check.py` stage `async`
+    decisive coverage of `wait()` stream ordering: the `wait-skips-stream`
+    mutation remains uncaught. The 2026-10-20 split test at `c92684b` passed
+    Gloo and staged-verbs async checks and the GPU stream/readiness suite;
+    these passes do not close that gap. *Step:* `check.py` stage `async`
     queues the all_reduce right behind GPU work and checks the result on the
     caller's stream after `wait()`, with no host sync in between. Also
     `pytest -m gpu tests/test_gpu.py` (Explorer steps 02 and 04, `amd/run_all.sh`), which submits from one non-default stream and waits
@@ -219,20 +233,30 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     so a missing wait corrupts the result (`tests/test_pipelined.py` shows it
     does), and one that leaves copies back queued when a collective returns,
     as a GPU does, so the next collective must wait for them (item 6 (b)).*
-    Still open: the real events, pinned buffers and `record_stream` on
-    GPUs. *Step:* `check.py --policy pipelined-reduce-bridge-broadcast` (its
+    On GPUs (2026-10-20, `c92684b`): the full pipelined Gloo correctness
+    check passed on two 2-GPU NCCL islands. Verbs pipeline timings ran,
+    but a full verbs-pipeline payload correctness suite remains open.
+    *Step:* `check.py --policy pipelined-reduce-bridge-broadcast` (its
     `busy_gpu` stage queues work ahead of the collective), in Explorer steps
     04, 05 and 07 and `amd/run_all.sh` (`OPT_IN_POLICIES`).
 18. **The overlap pays off.** For large tensors the pipelined bridge should
     beat reduce-bridge-broadcast without hurting small ones; the best chunk
     size depends on the machine.
-    *Status: not measurable on CPU.* *Step:* `bench_all_reduce.py
+    *Status: measured on the 2026-10-20 split test at `c92684b`; the full
+    performance goal is not established.* Gloo pipeline timings beat the
+    primary default at matched 1–256 MiB points, but the sweep omitted sub-MiB
+    sizes and the Gloo default at 1 GiB. Candidate timings include small-size
+    regressions. Verbs generally regressed; only 64 MiB chunks at 1 GiB beat
+    default. There is no direct overlap trace or statistical significance.
+    See [results](#split-test-results-2026-10-20). *Step:* `bench_all_reduce.py
     --candidates` (or `--write-thresholds`), rerun with a few
     `GPUBRIDGE_CHUNK_BYTES` values.
 19. **Thresholds measured on GPUs drive `auto-tuned`.**
     *Status: on CPU, a file written by `--write-thresholds` loads, and
     `auto-tuned` routes each size to the rule's policy.* Still open: the
-    thresholds themselves, per cluster. *Step:* the `bench_candidates` and
+    portability of the thresholds to other hardware. The 2026-10-20 split
+    test at `c92684b` wrote GPU-derived thresholds and passed the full
+    `auto-tuned` correctness recheck using them. *Step:* the `bench_candidates` and
     `check_auto_tuned` steps write `thresholds.json` next to the results and
     rerun the check under `auto-tuned` with it.
 20. **The sharded bridge is correct on GPUs.** `sharded-bridge` (opt-in) runs
@@ -242,8 +266,10 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     *Status: works on CPU, bit for bit against `flat-gloo` for every
     supported dtype and SUM/AVG/MAX/MIN, in 2+2, 3+1, 3+2, 2+4, 3+3,
     interleaved and three-island layouts, with sizes that need padding and
-    sizes smaller than k (`tests/test_sharded.py`).* Still open: the native
-    collectives on device tensors, and k bridge groups on separate hosts.
+    sizes smaller than k (`tests/test_sharded.py`).* On GPUs (2026-10-20,
+    `c92684b`): full Gloo-bridge correctness passed with k=2 on two 2-GPU
+    NCCL islands. Earlier GPU checks had k=1. Separate-host bridge groups
+    and verbs-sharded correctness remain open.
     *Step:* `check.py --policy sharded-bridge` in Explorer steps 04, 05 and 07
     and `amd/run_all.sh` (`OPT_IN_POLICIES`).
 21. **More bridge links mean more cross-vendor bandwidth.** Each link carries
@@ -255,7 +281,10 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     bridge phase barely changes with 4 links (10.8 ms against 10.9 ms at
     64 MB). The island steps are Gloo there, and on CPU islands the
     reduce_scatter is an all_reduce plus a slice, which makes them slower.
-    GPU islands use NCCL/RCCL for those steps.
+    GPU islands use NCCL/RCCL for those steps. The 2026-10-20 split test
+    at `c92684b` adds k=2 Gloo candidate timings on one host, but no controlled
+    k=1 versus k=2 scaling study or independent network-link bandwidth result.
+    Earlier GPU step passes used k=1 and did not test this claim.
     *Step:* `bench_candidates` in step 05, where the bridge crosses the
     network, and in step 07: compare the `policy:sharded-bridge` and
     `policy:reduce-bridge-broadcast` columns. Step 05's
@@ -561,19 +590,16 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     libibverbs telemetry moved the payload with completions and no errors, and
     the process's own TCP sockets, by `ss -tinp`, moved no more than 5% of it;
     port and netdev counters are recorded as context, never as proof); then its bridge phase against the Gloo, multitcp and UCX bridges at
-    each size (`bench_verbs`). *Status: works on the mock providers only: the
-    protocol's failure cases and the rendezvous on the in-process mock
-    (`src/gpubridge/verbs/crate/tests/protocol.rs`, `tests/direct.rs`), and
-    every bridge policy, compression, subgroups and async on two, three and four
-    leaders, bit for bit against `flat-gloo`, between processes on the MOCK test
-    fabric (`tests/test_verbs.py`); the kit's `verbs_kit.py` ran on the MOCK
-    fabric only. The libibverbs provider compiles and links on Explorer's login
-    node; it has opened no device. Not validated on RDMA hardware or GPUs.*
-    *BLOCKED: hardware/authorization:* needs two allocated nodes with an RDMA
-    device each on one fabric, permission to open the devices from a job
-    (`/dev/infiniband/uverbs*`), the library built there (`python -m
-    gpubridge.verbs build` with rdma-core's headers, or
-    `GPUBRIDGE_VERBS_INCLUDE_DIR`), and project authorization to run the job.
+    each size (`bench_verbs`). *Status: real libibverbs host and staged-GPU
+    traffic passed on one HCA on one host (loopback), not between hosts.*
+    At `c92684b` the staged kit, default-policy check and benchmark passed;
+    host collectives failed before payload because CPU tensors met CUDA
+    communicators. The `0cf32a3` recheck passed exact host collectives with
+    CPU/Gloo islands. Same-host host-mode no-silent-TCP evidence is
+    `not-decisive`; `--require-no-tcp` fails closed. Cross-node RDMA,
+    hardware failure/teardown cases and transport comparisons beyond the
+    measured Gloo/verbs pair remain open. See
+    [results](#split-test-results-2026-10-20).
 
 39. **GPU tensors staged through the verbs bridge.** With
     `GPUBRIDGE_VERBS_GPU_PATH=staged`, every call on a GPU tensor copies it
@@ -582,11 +608,14 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     (`verbs_gpu_staged`, steps 05 and 07). Every call's record says `path`
     `staged` and its reason; results exact against Gloo; no payload on TCP;
     the same with async collectives and busy GPUs (`check_verbs`). Same-vendor
-    (step 05) and cross-vendor (step 07) separately. *Status: the stream
-    ordering is tested with CPU tensors standing in and lazy copies
-    (`tests/test_verbs_gpu.py`), not on a GPU.* *BLOCKED: hardware/authorization:*
-    item 38's prerequisites plus GPUs on those nodes and a CUDA or ROCm build
-    of PyTorch there.
+    (step 05) and cross-vendor (step 07) separately. *Status: staged GPU
+    kit and default-policy correctness passed on the 2026-10-20 split test
+    at `c92684b`, with two 2-GPU NCCL islands of identical V100s and
+    single-HCA loopback.* The exact kit's largest payload was 512 MiB
+    despite a 1 GiB cap; the benchmark reached 1 GiB. GPU-mode strict TCP
+    evidence passed, including the `0cf32a3` regression recheck; this does
+    not prove cross-node no-fallback behavior. Cross-node, AMD/mixed-vendor
+    and direct/GPUDirect paths remain unproven by these runs.
 
 40. **NVIDIA GPU memory direct through the verbs bridge.** With
     `GPUBRIDGE_VERBS_GPU_PATH=direct` on NVIDIA leaders, every call registers the
@@ -630,7 +659,13 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     nodes (`train_verbs`, `train_gloo`, steps 05 and 07): the loss curves agree
     as the Gloo bridge's runs do, throughput and the step split side by side,
     the verbs runs' observations (`verbs_observations/`) cover every step.
-    *Status: not run.* *BLOCKED: hardware/authorization:* items 38 to 41.
+    *Status: native/Gloo/staged-verbs GPT-2-small training ran on the
+    2026-10-20 split test at `c92684b`, at 10/25/100 MB bucket caps; every
+    cell had finite, rank-identical parameters.* Earlier split-test runs
+    on the same node also exercised staged-verbs training. These are
+    within-run checks and descriptive timings, not cross-arm numerical
+    equivalence or significant speedups. Cross-node and mixed-vendor verbs
+    training remain open. See [results](#split-test-results-2026-10-20).
 
 43. **Deterministic numerical comparison before performance.**
     [NUMERICAL_GATE.md](docs/NUMERICAL_GATE.md) freezes a four-rank native NCCL,
@@ -639,13 +674,15 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     cross-arm parameters and reduced bad-reduction/scale/data controls must pass
     before representative throughput. The actual verbs endpoints must attest
     non-mock libibverbs, staged traffic and matching native-library hashes.
-    *Status: software-only harness; not validated on GPUs.* Four identical NVIDIA
+    *Status: the bounded tiny gate was accepted on real GPUs at `f4146a4`,
+    with 48/48 positive rank records, zero violations and all three bad
+    controls rejected for their intended reasons; recorded in the
+    [changelog](CHANGELOG.md#unreleased).* Four identical NVIDIA
     GPUs establish only single-host split-island evidence, not mixed-vendor or
     cross-node acceptance.
-    This is a separate strict comparison report: the legacy kit's tables show
-    item 43 as **not run** rather than inferring acceptance from `train_verbs`,
-    `train_gloo`, or a step exit code. Review the complete numerical-gate records
-    and negative controls before recording its hardware outcome.
+    This is a separate strict comparison report; legacy kit step-exit tables
+    cannot infer its acceptance from training exits. Representative GPT
+    numerical equivalence remains unproven.
 
 32. **Point-to-point across islands through the backend on GPUs.** `send`,
     `recv`, `isend`, `irecv` and `batch_isend_irecv` on `backend="gpubridge"`
@@ -666,6 +703,50 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     records cannot show whether this test existed in the run.
 
 ## GPU results
+
+### Split-test results, 2026-10-20
+
+Hardware: **one node with 4x Tesla V100-SXM2-32GB, driver 545.23.08,
+torch 2.14.1+cu126, NCCL 2.29.3, Mellanox ConnectX (mlx5) HDR InfiniBand,
+2026-10-20**. Bridge GPU runs split four distinct identical V100s into two
+2-GPU NCCL islands; native baselines use all four GPUs. Both half and alternate
+layouts passed Gloo correctness. Phase medians are independent per-rank
+maxima and cannot be added or treated as pure transport cost. Verbs traffic
+uses one HCA on one host:
+**loopback, not cross-node, mixed-vendor or GPUDirect evidence**. Host-mode
+kit rechecks instead use CPU tensors and two Gloo islands.
+
+These rows summarize recorded checks and timings, separately from the older
+kit-generated counts below. A benchmark pass means execution and expected
+records, not a performance or arbitrary-float correctness gate.
+
+| Date | GPUBridge commit tested | Run scope | Outcome |
+| --- | --- | --- | --- |
+| 2026-10-20 | `c92684b` | Gloo bridge, two 2-GPU NCCL islands | All 24 planned steps passed: both layouts, pinned staging, pipelined correctness, sharded k=2, GPU-derived auto-tuned thresholds, DDP and exact FSDP2/HSDP replay. GPU tests: 29 passed, 6 UCX skips, no failures; compression kernels: 3/3 reference checks. Benchmarks through 256 MiB. |
+| 2026-10-20 | `c92684b` | Staged verbs, same split, single-HCA loopback | GPU kit and default-policy full check passed; real non-mock libibverbs, zero completion errors, staged paths and GPU strict TCP gate passed. Exact kit payloads through 512 MiB; benchmark through 1 GiB. Original host-mode kit failed before payload (CPU/CUDA topology mismatch); this run remains partial. |
+| 2026-10-20 | `c92684b` | Native/Gloo/staged-verbs GPT-2-small, 10/25/100 MB bucket caps | All nine cells passed execution gates, with finite and rank-identical parameters. Overlap is estimated from separate timed phases; final digests differ between arms, so this is not cross-arm equivalence. |
+| 2026-10-20 | `c92684b` | Gloo and verbs pipeline, 1/4/16/64 MiB chunks | All timing sweeps completed through 1 GiB. Gloo improves at matched 1–256 MiB points; verbs generally regresses. Item 18's unrestricted goal is not established; ordinary timing rows do not replace full verbs-pipeline payload checks. |
+| 2026-10-20 | `c92684b` | P2P native NCCL and Gloo bridge on separate GPUs | Full default check passed; all 66 benchmark payload rows passed across default, chunked and pinned configurations. No verbs P2P or direct overlap trace. |
+| 2026-10-20 | `0cf32a3` (production fix in `54f701e`) | Host/Gloo-island verbs kit and GPU-staged regression, single-HCA loopback | Host collectives exact, all ranks passed, zero mismatches/completion errors; host TCP evidence `not-decisive`. Strict host run failed closed as intended; GPU-staged strict run passed. `54f701e` adds test isolation only and was not the hardware checkout. |
+| 2026-10-20 | `f4146a4` | Separate bounded tiny gate: native NCCL, Gloo islands and staged verbs, same four-V100 node class | Accepted: 48/48 positive rank records, zero violations; all three bad controls rejected for their intended reasons. This is not representative GPT equivalence. |
+
+Earlier split-test runs on the same node (2026-10-19, `616f2f7`) passed a
+2-rank (1+1) staged-verbs correctness kit and staged-verbs training comparisons;
+the 1+1 kit did not exercise a nontrivial NCCL island. The separate tiny numerical
+gate on 2026-10-20 at `f4146a4` accepted native NCCL, Gloo-island and staged-verbs arms with
+negative controls (item 43); it establishes only that bounded workload.
+
+No result here establishes cross-node verbs, AMD/mixed-vendor verbs,
+GPUDirect/direct verbs, UCX, 8-GPU scaling, independent link scaling, statistical
+significance, representative GPT equivalence or a direct copy/communication
+overlap trace. The collective `wait-skips-stream` mutation remains uncaught.
+Host-mode no-silent-TCP evidence cannot be decisive with co-resident leaders.
+Training and pipeline observations corroborate native-library verbs activity,
+but their archives contain no separate in-process provider/completion snapshot
+or strict TCP gate; the staged kit supplies the explicit provider telemetry.
+See the [Unreleased hardware record](CHANGELOG.md#unreleased).
+
+### Historical generated results
 
 From `scripts/gpu/validation_tables.py` over every Explorer result of
 2026-10-14 (the kit's `results/explorer`, with tonight's rocm6.3 jobs in
@@ -718,15 +799,15 @@ failures count against all six whichever test failed.
 | 10. `barrier()` on GPUs | check.py `barrier` (gpu-mixed, gpu-single-vendor, split-test) | pass (18) |
 | 11. Bridge throughput and latency against native | step `bench`; step `bench_split_by_node` | FAIL (1 of 2) |
 | 12. A rank whose `LOCAL_RANK` has no GPU fails `init()` | step `local_rank_check` | pass (6) |
-| 13. The island step is a reduce onto the leader | step `bench`; step `bench_split_by_node` | FAIL (1 of 2) |
+| 13. The island step is a reduce onto the leader | step `bench`; step `bench_split_by_node` | Historical FAIL (1 of 2): step-creation failure; nontrivial two-rank measurements now recorded above, no universal speed claim |
 | 14. Where NCCL/RCCL and Gloo agree on reductions | check.py `reduction_agreement` (gpu-mixed, gpu-single-vendor, split-test) | pass (18) |
 | 15. MAX, MIN, AVG, all_gather and reduce_scatter on GPUs | check.py `reductions` (gpu-mixed, gpu-single-vendor, split-test); check.py `all_gather` (gpu-mixed, gpu-single-vendor, split-test); check.py `reduce_scatter` (gpu-mixed, gpu-single-vendor, split-test); step `gpu_tests` | FAIL (7 of 82) |
-| 16. Async collectives keep their stream semantics | check.py `async` (gpu-mixed, gpu-single-vendor, split-test); step `gpu_tests` | FAIL (7 of 46) |
+| 16. Async collectives keep their stream semantics | check.py `async` (gpu-mixed, gpu-single-vendor, split-test); step `gpu_tests` | Historical FAIL (7 of 46); current split async checks pass, wait-stream mutation gap remains |
 | 17. The pipelined bridge is correct on GPUs | step `check_pipelined-reduce-bridge-broadcast`; step `gpu_tests` | FAIL (7 of 30) |
-| 18. The overlap pays off | step `bench_phases_pipelined-reduce-bridge-broadcast`; step `bench_candidates` | pass (2) |
+| 18. The overlap pays off | step `bench_phases_pipelined-reduce-bridge-broadcast`; step `bench_candidates` | Historical step passes (2); unrestricted performance goal not established (see current results) |
 | 19. Thresholds measured on GPUs drive `auto-tuned` | step `bench_candidates`; step `check_auto_tuned` | pass (2) |
-| 20. The sharded bridge is correct on GPUs | step `check_sharded-bridge` | pass (2) |
-| 21. More bridge links mean more cross-vendor bandwidth | step `bench_phases_sharded-bridge`; step `bench_candidates` | pass (2) |
+| 20. The sharded bridge is correct on GPUs | step `check_sharded-bridge` | Historical step passes (2), k=1; current k=2 Gloo correctness passes on 2+2 |
+| 21. More bridge links mean more cross-vendor bandwidth | step `bench_phases_sharded-bridge`; step `bench_candidates` | Historical step passes (2), k=1; k=2 timings now exist, controlled link scaling still unproven |
 | 22. DDP with `gpubridge.ddp_comm_hook` trains correctly | step `train_ddp(_split)?`; step `train_n\d+` | FAIL (2 of 3) |
 | 23. What `gpubridge.in_flight()` shows on GPUs | check.py `in_flight` (gpu-mixed, gpu-single-vendor, split-test) | pass (18) |
 | 24. No island puts two ranks on one GPU | step `shared_gpu_check` | pass (24) |
@@ -742,11 +823,11 @@ failures count against all six whichever test failed.
 | 35. The multitcp bridge against the Gloo bridge | step `multitcp_build`; step `matrix_D-multitcp(-pinned\|-1stream)?` | not run |
 | 36. Automatic stage balancing against even and hand-tuned splits | step `pp_(gpipe\|1f1b)_(even\|auto\|[0-9]+(-[0-9]+)+)` | not run |
 | 37. Megatron-Core's pipeline across vendors tracks one GPU | step `megatron_pp2`; step `megatron_pp1` | not run |
-| 38. The verbs bridge between hosts on RDMA hardware | step `verbs_build`; step `verbs_endpoint`; step `verbs_host`; step `check_verbs`; step `bench_verbs` | not run |
-| 39. GPU tensors staged through the verbs bridge | step `verbs_gpu_staged` | not run |
+| 38. The verbs bridge between hosts on RDMA hardware | step `verbs_build`; step `verbs_endpoint`; step `verbs_host`; step `check_verbs`; step `bench_verbs` | Single-host loopback passed, host recheck qualified above; between-host claim unproven |
+| 39. GPU tensors staged through the verbs bridge | step `verbs_gpu_staged` | Staged split-test kit/check passed; cross-node and mixed-vendor unproven |
 | 40. NVIDIA GPU memory direct through the verbs bridge | step `verbs_gpu_direct` | not run |
 | 41. AMD GPU memory direct through the verbs bridge | step `verbs_gpu_direct` | not run |
-| 42. Training over the verbs bridge against the Gloo bridge | step `train_verbs`; step `train_gloo` | not run |
+| 42. Training over the verbs bridge against the Gloo bridge | step `train_verbs`; step `train_gloo` | Split-test training passed within-run gates; cross-arm equivalence and significance unproven |
 
 Where the FAILs come from:
 

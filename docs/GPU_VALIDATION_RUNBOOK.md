@@ -195,9 +195,10 @@ with its reason instead of staging); `check_verbs` and `bench_verbs` over
 references; `train_verbs` and `train_gloo` (`train_bench.py`, `VERBS_TRAIN_MODEL`).
 The engineering baseline they are compared against is `train_bench.py --grad-sync
 native`: plain DDP on an NCCL (RCCL on ROCm) world group, no gpubridge, same flags;
-one vendor only. It is not wired into a job step yet; run it with the same model,
-batch and bucket flags beside `train_verbs`. On CPU it runs on Gloo and its record
-says `native_stand_in`: never an NCCL/RCCL result.
+one vendor only. The 2026-10-20 split-test sweep ran this native baseline
+beside Gloo and staged verbs at matching model, batch and bucket settings;
+repeat it beside `train_verbs` for future comparisons. On CPU it runs on Gloo
+and its record says `native_stand_in`: never an NCCL/RCCL result.
 Each `verbs_kit` record holds the endpoint telemetry (device, port, GID, provider: it
 must not say MOCK), every call's `path` and `path_reason`, completion errors, a window
 of every NIC counter and every interface's bytes (context only: shared, and RoCE
@@ -205,9 +206,25 @@ netdevs carry non-TCP traffic), CPU time, and `tcp_evidence`; with `--require-no
 bridge leader's step fails unless that evidence is `pass`: the bridge's own telemetry
 (libibverbs, not MOCK) moved the payload with completions and no errors, and the
 process's own TCP sockets (`ss -tinp`) stayed idle. Without `ss` on the node it is
-`unknown` and the step fails; install or load iproute2's `ss` before the run. Transport observations for the straggler detector go to
-`verbs_observations/rank-<N>.jsonl` (`GPUBRIDGE_VERBS_OBSERVE`). None of this has run
-on hardware yet.
+`unknown` and the step fails; install or load iproute2's `ss` before the run.
+Transport observations go to `verbs_observations/rank-<N>.jsonl`
+(`GPUBRIDGE_VERBS_OBSERVE`). Host mode uses CPU/Gloo islands. With co-resident
+leaders its TCP evidence is `not-decisive`, and `--require-no-tcp` fails closed;
+GPU mode still counts same-host non-loopback TCP.
+
+On 2026-10-20, `c92684b` passed the staged-verbs kit, default-policy check,
+benchmark and training sweep on two 2-GPU NCCL islands of identical V100s.
+The original host kit failed before payload; the `0cf32a3` recheck passed exact
+host collectives with CPU/Gloo islands, with the TCP limitation above, and
+passed GPU-staged strict regression checks. Hardware: one node with 4x Tesla
+V100-SXM2-32GB, driver 545.23.08, torch 2.14.1+cu126, NCCL 2.29.3, Mellanox
+ConnectX (mlx5) HDR InfiniBand. Verbs used one HCA on one host: loopback, not
+cross-node, mixed-vendor or GPUDirect. UCX, 8-GPU scaling, statistical
+significance, the unrestricted pipeline speed goal and the collective
+`wait-skips-stream` mutation gap remain open. See
+[hardware results](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
+and the [changelog](../CHANGELOG.md#unreleased).
+
 Steps 04 and 07, the AMD script and `mixed/node.sh` also measure opt-in bridge
 compression (items 28 and 29). `bench_compression_kernels` times the Triton
 kernels against the GPU's memory bandwidth and checks they give the CPU

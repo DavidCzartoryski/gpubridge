@@ -253,6 +253,42 @@ hardware.
 
 ## [Unreleased]
 
+### Hardware validation
+
+- **2026-10-20: one node with 4x Tesla V100-SXM2-32GB, driver 545.23.08,
+  torch 2.14.1+cu126, NCCL 2.29.3, Mellanox ConnectX (mlx5) HDR InfiniBand.**
+  At GPUBridge **`c92684b`**, two 2-GPU NCCL islands of identical V100s passed
+  Gloo correctness in half/alternate layouts, pinned/pipelined/sharded k=2
+  checks, auto-tuned thresholds, DDP and exact FSDP2/HSDP replay; GPU tests
+  had 29 passes and 6 UCX skips. The staged-verbs kit and default-policy
+  check passed over one HCA on one host (loopback), with non-mock libibverbs,
+  zero completion errors and passing GPU strict TCP evidence. Exact kit
+  payloads reached 512 MiB; the verbs benchmark reached 1 GiB. The original
+  host kit failed before payload due to CPU/CUDA topology mismatch.
+  The native/Gloo/staged-verbs GPT-2-small bucket sweep had finite,
+  rank-identical parameters; all pipeline timing sweeps completed and all
+  66 native/Gloo P2P benchmark payload rows passed. Item 18's unrestricted
+  speed goal is not established, especially for verbs; timing passes do not
+  establish significant speedups, direct overlap or cross-arm GPT equivalence.
+- **Host recheck, same date/hardware/driver/torch/NCCL:** GPUBridge
+  **`0cf32a3`**, whose production fix is retained in **`54f701e`** (test
+  isolation only), passed exact host verbs collectives using CPU/Gloo
+  islands and the GPU-staged strict regression check. Host TCP evidence was
+  `not-decisive`; strict host mode failed closed as intended. `54f701e`
+  itself was not the hardware checkout. Cross-node, AMD/mixed-vendor verbs,
+  GPUDirect, UCX and 8-GPU scaling remain unproven by these runs; the
+  collective `wait-skips-stream` mutation remains uncaught.
+- **Earlier split-test runs on the same node:** `616f2f7` (2026-10-19)
+  exercised the 2-rank staged-verbs kit and staged training comparisons;
+  the separate tiny numerical gate (2026-10-20) at **`f4146a4`** accepted 48/48 positive
+  rank records with zero violations and rejected all three bad controls.
+  Same GPU class, driver 545.23.08, torch 2.14.1+cu126, NCCL 2.29.3;
+  the tiny gate establishes only its bounded workload, not representative
+  GPT equivalence. See the scoped
+  [hardware results](HARDWARE_VALIDATION.md#split-test-results-2026-10-20),
+  [verbs status](docs/VERBS_TRANSPORT.md#status) and
+  [runbook](docs/GPU_VALIDATION_RUNBOOK.md).
+
 ### Fixed
 
 - The verbs kit's host collectives configure CPU/Gloo islands before init, record that mode, and refuse contradictory inherited CPU-only settings.
@@ -268,7 +304,8 @@ hardware.
   includes bad-reduction/scale/data controls and actual endpoint/source attestation.
   `train_bench.py --controlled` resets the seeded model after its compute probe
   and fingerprints initial state/data for fair fixed-workload comparisons.
-  Software-only validation; GPU gate remains open (item43; PR pending).
+  The bounded tiny GPU gate passed at `f4146a4`; representative GPT
+  equivalence remains open (item 43; hardware record above).
 
 - `bridge="verbs"` takes GPU tensors, phase A3 (docs/VERBS_TRANSPORT.md): wire
   protocol 2 adds a rendezvous (an RDMA WRITE into memory registered for one
@@ -281,7 +318,8 @@ hardware.
   with `host`, `job` and the NIC's `pci_bus_id`); a prepared hardware kit
   (`VERBS_BRIDGE=1`, `scripts/gpu/verbs_kit.py`, items 38 to 42). Tested on mock
   providers, a mock GPU and CPU stand-ins; built on Explorer's login node (Linux
-  clippy blocked by its limits); not validated on RDMA hardware or GPUs.
+  clippy blocked by its limits). Host/staged loopback hardware results are
+  recorded above; direct GPU and cross-node validation remain open.
   (PR pending)
 - `bridge="verbs"`, opt-in, phase A2 of the raw-verbs bridge
   (docs/VERBS_TRANSPORT.md): a versioned wire protocol of RC SEND/RECV through
@@ -293,7 +331,8 @@ hardware.
   tensors only. The multitcp bridge's collectives moved to a shared
   `TaggedBridge` that both use. Tested on mock providers (bit for bit against
   `flat-gloo` between processes on a test-only fabric) and built on Explorer's
-  login node; not validated on RDMA hardware or GPUs. (PR pending)
+  login node; host/staged loopback hardware results are recorded above,
+  with cross-node validation still open. (PR pending)
 - The foundation of a raw-verbs bridge, phase A1 of the opt-in `bridge="verbs"`
   above (docs/VERBS_TRANSPORT.md): a Rust crate,
   `gpubridge-verbs`, with a C shim compiled against rdma-core's headers and
@@ -304,7 +343,8 @@ hardware.
   bounded registration cache keyed by allocation identity, and a
   deterministic mock fabric with injectable faults. Tested on the mock
   provider (macOS and Linux) and built against rdma-core 57.0 on Explorer's
-  login node; not validated on RDMA hardware or GPUs. A CI job tests the
+  login node; successful host/staged loopback traffic is recorded above.
+  Cross-node and hardware failure cases remain open. A CI job tests the
   crate. (PR pending)
 - Step 07's and the two-machine runner's `DP_RUNS` take `ddp-shares-<rows>`: DDP
   with the rows per rank as given, in rank order (`ddp-shares-5-3` runs
