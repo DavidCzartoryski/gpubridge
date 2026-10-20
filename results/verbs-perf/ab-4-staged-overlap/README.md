@@ -6,8 +6,12 @@ training evidence, and none of it says whether the option is faster: that is the
 conditional on-node A/B in docs/verbs-perf-20261019.md, section 7. Other work shared
 the machine throughout (load average 20 to 25; each python-cost record has `uptime`).
 
-Arms are exported trees: before `0a3ffbe` (`src` tree `042b6444`), after `8376253`
-(`src` tree `d8093332`), the change that adds the option.
+Arms are exported trees. Before is this change's base, the measurement branch's head
+`fff639d`, whose `src` tree (`042b6444`) is unchanged since that branch's first
+version, `0a3ffbe`, where the python-cost records' before arm was exported. After is
+this change: at its head for `probes/default-path.json`, and its first version (`src`
+tree `d8093332`, before the failure-drain fixes, which touch only the overlapped path's
+failure handling) for the python-cost records.
 
 ## probes/
 
@@ -20,9 +24,9 @@ Arms are exported trees: before `0a3ffbe` (`src` tree `042b6444`), after `837625
   and library wait in one order, plus the results and the last copy back: 692 entries.
   `python -I default_log.py <tree>` printed the same bytes for both trees
   (sha256 `81d64fc2bd31540e046468ec5f4d00f00bda763c38f24deda43cd5f5153c058d`);
-  `default-path.json` is that output. Rerun after the rebase onto the A/B harness
-  fixes and the failure-drain fix: the measurement branch's head against this
-  branch's head (the drain fix included) printed the same bytes again.
+  `default-path.json` is that output. It was first checked against the first version,
+  then at each rebase: last, `fff639d` against this change's head (both drain fixes
+  included), and before that `820d291` against `4096ba2`.
 - `python-cost-{before,after}-<k>.json`: `scripts/verbs_perf.py python-cost`, 5 runs per
   arm, interleaved (before after, after before, ...). Python per 2-leader host
   all_reduce against an endpoint that does nothing; the host path gained one keyword

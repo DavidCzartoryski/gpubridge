@@ -371,9 +371,9 @@ waits the overlap didn't hide) and `to_device_s` is queueing each copy back.
 Software evidence (local CPU/MOCK on an Apple M1 Max, never GPU or NIC evidence):
 `tests/test_verbs_staged_overlap.py` (docs/VERBS_TRANSPORT.md, "Tests"); with the
 option unset, a recording of 12 staged scenarios (692 ordered copies, waits and posts,
-with the bytes each send read when it was posted) is byte-identical to the base
-`0a3ffbe`; and `results/verbs-perf/ab-4-staged-overlap/` holds the host-path Python
-cost before and after, inside the run-to-run range.
+with the bytes each send read when it was posted) is byte-identical to its base, the
+measurement branch's head `fff639d`; and `results/verbs-perf/ab-4-staged-overlap/`
+holds the host-path Python cost before and after, inside the run-to-run range.
 
 ### Setup (after section 4's)
 
