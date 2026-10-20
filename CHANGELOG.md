@@ -264,6 +264,13 @@ hardware.
   A/B, compares arms against the predeclared rules and decides the plan's copy
   overlap trigger. Measurement only; CPU/MOCK cost checked, not
   validated on GPUs or RDMA hardware. (PR pending)
+- `GPUBRIDGE_VERBS_STAGED_OVERLAP=1` (opt-in, off by default): a staged two-leader
+  verbs all_reduce of more than one chunk overlaps its copies out and back with its
+  messages, chunk by chunk, with the same messages on the wire
+  (docs/VERBS_TRANSPORT.md, "GPU memory"). `last_gpu["staging"]` and
+  `staged_phases["overlapped_calls"]` say when it ran. A conditional candidate: no
+  speedup is claimed; docs/verbs-perf-20261019.md, section 7, is its A/B. Not
+  validated on GPUs. (PR pending)
 - `bridge="verbs"` takes GPU tensors, phase A3 (docs/VERBS_TRANSPORT.md): wire
   protocol 2 adds a rendezvous (an RDMA WRITE into memory registered for one
   receive, from `GPUBRIDGE_VERBS_RNDV_BYTES`, 256 KiB) and sends gathered from

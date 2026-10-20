@@ -29,7 +29,10 @@ equivalent the UCX bridge uses (:mod:`gpubridge.ucx.gdr`):
 Staged: :class:`RegisteredStaging` is :class:`gpubridge.staging.PinnedBridgeStaging`
 (copies on the caller's stream; the host waits for the copy out before the bridge
 reads; the copy back is queued, and the buffer isn't reused until it has passed)
-with its buffer registered, so the bridge moves it without another host copy.
+with its buffer registered, so the bridge moves it without another host copy. With
+``GPUBRIDGE_VERBS_STAGED_OVERLAP=1`` a two-leader all_reduce copies out and back chunk
+by chunk instead (:meth:`RegisteredStaging.to_host_chunks`), with the same ordering per
+chunk.
 """
 
 from __future__ import annotations
@@ -299,6 +302,41 @@ class RegisteredStaging(PinnedBridgeStaging):
     def _allocate(self, nbytes: int) -> torch.Tensor:
         # PinnedBridgeStaging asks only after the old buffer's copy back has passed.
         return self.host.get(nbytes)
+
+    # ---- chunk by chunk (GPUBRIDGE_VERBS_STAGED_OVERLAP) ------------------------------
+
+    def to_host_chunks(self, tensor: torch.Tensor, pieces: list[tuple[int, int]]
+                       ) -> tuple[torch.Tensor, list]:
+        """Queue the copy out of each piece (start, length in elements) of ``tensor`` on
+        the caller's stream; return the host copy and each piece's event, not waited for:
+        the host waits for a piece's event before the bridge reads that piece. The first
+        copy waits on the device for the last copy back, as :meth:`to_host`'s does, and a
+        larger buffer replaces this one only after that copy back has passed."""
+        nbytes = tensor.numel() * tensor.element_size()
+        if self.buffer is None or self.buffer.numel() < nbytes:
+            if self.copied_back is not None:
+                self._wait(self.copied_back)  # the old buffer may still be read
+            self.buffer = self._allocate(nbytes)
+            self.copied_back = None
+        host = self.buffer[:nbytes].view(tensor.dtype).view(tensor.shape)
+        src, dst = tensor.view(-1), host.view(-1)
+        ready, after = [], self.copied_back
+        for start, length in pieces:
+            ready.append(self._copy(dst[start:start + length], src[start:start + length],
+                                   after=after))
+            after = None  # the stream runs the rest in order after the first
+        return host, ready
+
+    def wait_chunk(self, event) -> None:
+        """Block the host until one piece's copy out (from :meth:`to_host_chunks`) has
+        passed."""
+        self._wait(event)
+
+    def chunk_to_device(self, chunk: torch.Tensor, host: torch.Tensor) -> None:
+        """Queue the copy of one piece of the host copy back into ``chunk``. It is the
+        last copy back queued, so the next call's first copy out waits for it (and, in
+        stream order, every earlier one), even if this call fails before its last."""
+        self.copied_back = self._copy(chunk, host, after=None)
 
     def close(self) -> None:
         super().close()

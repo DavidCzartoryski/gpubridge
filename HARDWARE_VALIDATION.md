@@ -582,9 +582,13 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     (`verbs_gpu_staged`, steps 05 and 07). Every call's record says `path`
     `staged` and its reason; results exact against Gloo; no payload on TCP;
     the same with async collectives and busy GPUs (`check_verbs`). Same-vendor
-    (step 05) and cross-vendor (step 07) separately. *Status: the stream
+    (step 05) and cross-vendor (step 07) separately. The same holds with
+    `GPUBRIDGE_VERBS_STAGED_OVERLAP=1` (copies overlapped chunk by chunk, two
+    leaders), with the same messages on the wire; whether it is faster is the
+    conditional A/B of docs/verbs-perf-20261019.md, section 7. *Status: the stream
     ordering is tested with CPU tensors standing in and lazy copies
-    (`tests/test_verbs_gpu.py`), not on a GPU.* *BLOCKED: hardware/authorization:*
+    (`tests/test_verbs_gpu.py`, `tests/test_verbs_staged_overlap.py`), not on a
+    GPU.* *BLOCKED: hardware/authorization:*
     item 38's prerequisites plus GPUs on those nodes and a CUDA or ROCm build
     of PyTorch there.
 
