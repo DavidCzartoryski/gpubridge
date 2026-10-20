@@ -236,7 +236,7 @@ def test_compare_wire_needs_every_leaders_counted_messages(tmp_path):
     assert result.returncode == 4 and "lacks ['write_windows']" in result.stderr, result.stderr
 
 
-@pytest.mark.parametrize("text", ["", '{"arm": "P0", "rep', "[]", "null", '"P0"', "3"])
+@pytest.mark.parametrize("text", ["", '{"arm": "P0", "rep', "[]", "null", '"P0"', "3", "{}"])
 def test_compare_reports_an_unreadable_run_incomplete_and_writes_its_verdict(tmp_path, text):
     _write(tmp_path, "B0", range(3))
     _write(tmp_path, "P0", range(3))

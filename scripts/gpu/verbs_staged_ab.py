@@ -418,6 +418,8 @@ def compare(args) -> int:
             if key in records[arm]:
                 reasons.append(f"{name}: a second record of {arm} repeat {key}")
             records[arm][key] = (name, record)
+        elif any(name.startswith(f"{a}-r") for a in declared):
+            reasons.append(f"{name}: unreadable (no record of a compared arm: arm {arm!r})")
     for arm, n in declared.items():
         got, want = set(records[arm]), set(range(n))
         if want - got:
