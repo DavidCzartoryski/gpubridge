@@ -11,10 +11,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 from test_gpu_kit import KIT, REPO, torchrun
 from test_verbs import UNAVAILABLE
+
+import verbs_staged_ab as ab  # on the path once test_gpu_kit is imported
 
 SCRIPT = KIT / "verbs_staged_ab.py"
 needs_library = pytest.mark.skipif(UNAVAILABLE is not None,
@@ -229,6 +232,54 @@ def test_compare_wire_needs_every_leaders_counted_messages(tmp_path):
     (tmp_path / "P0-r1.json").write_text(json.dumps(counter))
     result = _compare(tmp_path, "B0", "P0", 3, 3, "--wire")
     assert result.returncode == 4 and "lacks ['write_windows']" in result.stderr, result.stderr
+
+
+class _Bridge:
+    """A verbs bridge whose telemetry lacks the WIRE count ``writes_posted`` and the
+    direct count ``write_window_release_ns``, and counts one send per telemetry read."""
+
+    name = "verbs"
+
+    def __init__(self):
+        self.reads = 0
+
+    def telemetry(self) -> dict:
+        self.reads += 1
+        wire = {k: self.reads for k in ab.COUNTS if k != "writes_posted"}
+        direct = {k: self.reads for k in ab.DIRECT_COUNTS if k != "write_window_release_ns"}
+        return {**wire, "direct": direct, "staged_phases": {"calls": 0}}
+
+
+def test_a_count_missing_from_the_telemetry_is_recorded_missing_never_zero(tmp_path):
+    # Through run's own code: verbs_counts and time_size's delta on a one-rank group.
+    import torch
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'store'}", rank=0,
+                            world_size=1)
+    try:
+        topology = SimpleNamespace(device=torch.device("cpu"), world_size=1, rank=0,
+                                   bridge=_Bridge())
+        assert ab.verbs_counts(topology.bridge)["writes_posted"] is None
+        size = ab.time_size(lambda t: None, topology, 4096, 1, 5)
+    finally:
+        dist.destroy_process_group()
+    delta = size["verbs_delta"]
+    assert delta["writes_posted"] is None and delta["write_window_release_ns"] is None
+    assert delta["sends"] == 1 and delta["write_windows"] == 1, delta
+    # That delta as both leaders' at 4 KiB: compare --wire finds the WIRE count missing.
+    _write(tmp_path, "B0", range(3))
+    _write(tmp_path, "P0", range(3))
+    record = _record("P0", 1, 1.0)
+    for leader in (0, 2):
+        record["sizes"][0][leader]["verbs_delta"] = delta
+    (tmp_path / "P0-r1.json").write_text(json.dumps(record))
+    result = _compare(tmp_path, "B0", "P0", 3, 3, "--wire")
+    assert result.returncode == 4 and "lacks ['writes_posted']" in result.stderr, result.stderr
+    assert _verdict(tmp_path, "B0", "P0")["status"] == "INCOMPLETE"
+    # Without --wire it is not gated, and a summed count with a missing part is missing.
+    assert ab.summarize(record)[4096]["counts"]["writes_posted"] is None
+    assert _compare(tmp_path, "B0", "P0", 3, 3).returncode == 0
 
 
 DOC = REPO / "docs" / "verbs-perf-20261019.md"

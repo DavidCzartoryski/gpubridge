@@ -103,14 +103,14 @@ def sha256_files(paths) -> str:
     return h.hexdigest()
 
 
-def verbs_counts(bridge) -> dict[str, float] | None:
+def verbs_counts(bridge) -> dict[str, float | None] | None:
     """The recorded verbs telemetry counts of this rank's bridge, or None (no verbs
-    bridge here)."""
+    bridge here). A count the telemetry lacks is None, never 0."""
     if bridge is None or getattr(bridge, "name", None) != "verbs":
         return None
     t = bridge.telemetry()
-    out = {k: t.get(k, 0) for k in COUNTS}
-    out.update({k: (t.get("direct") or {}).get(k, 0) for k in DIRECT_COUNTS})
+    out = {k: t.get(k) for k in COUNTS}
+    out.update({k: (t.get("direct") or {}).get(k) for k in DIRECT_COUNTS})
     for k, v in (t.get("staged_phases") or {}).items():
         out[f"staged_{k}"] = v
     for k, v in (t.get("paths") or {}).items():
@@ -183,7 +183,9 @@ def time_size(op, topology, nbytes: int, warmup: int, calls: int) -> dict[str, A
         wrong += not torch.equal(tensor, want)
     region_s, region_cpu = time.perf_counter() - t0, cpu_s() - region_cpu0
     after = verbs_counts(topology.bridge)
-    delta = None if before is None else {k: after[k] - before[k] for k in after}
+    delta = None if before is None else {
+        k: None if after[k] is None or before.get(k) is None else after[k] - before[k]
+        for k in after}
     return {"bytes": nbytes, "payload_bytes": numel * 4, "warmup": warmup, "calls": calls,
             "timer": "cuda_events" if events else "host", "timed_s": timed, "host_s": host,
             "cpu_s": cpu, "mismatches": wrong, "warmup_wall_s": warm_s,
@@ -250,13 +252,14 @@ def quantile(values: list[float], q: float) -> float:
 def summarize(record: dict) -> dict[int, dict[str, Any]]:
     """Per size: the slowest rank's latency per call, then p50, p99, throughput, mean CPU
     per call and max RSS growth over the ranks, mismatches over every rank, and the
-    leaders' summed verbs deltas."""
+    leaders' summed verbs deltas (None where a leader's telemetry lacks the count)."""
     out = {}
     for ranks in record["sizes"]:
         slowest = [max(r["timed_s"][i] for r in ranks) for i in range(ranks[0]["calls"])]
         p50 = statistics.median(slowest)
         deltas = [r["verbs_delta"] for r in ranks if r["verbs_delta"] is not None]
-        counts = {k: sum(d[k] for d in deltas) for k in deltas[0]} if deltas else {}
+        counts = {k: None if any(d[k] is None for d in deltas) else sum(d[k] for d in deltas)
+                  for k in deltas[0]} if deltas else {}
         out[ranks[0]["bytes"]] = {
             "p50_s": p50, "p99_s": quantile(slowest, 0.99),
             "throughput_GBps": ranks[0]["payload_bytes"] / p50 / 1e9,
