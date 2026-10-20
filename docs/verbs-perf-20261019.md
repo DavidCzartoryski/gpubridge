@@ -6,6 +6,8 @@ below that this change produced is a **local CPU/MOCK measurement on an Apple M1
 (a MacBook Pro, a shared machine with a load average of 35 to 54 from other work
 throughout), never GPU or NIC evidence. No verbs run on GPU or RDMA hardware is
 recorded in this repository (HARDWARE_VALIDATION.md, items 38 to 42: not run).
+Section 7 is the conditional A/B of one opt-in change built on these measurements
+(`GPUBRIDGE_VERBS_STAGED_OVERLAP`); it claims no speedup.
 
 ## 1. Why: what is not measured today
 
@@ -318,3 +320,183 @@ no RDMA device, no rxe): `cargo fmt --check`, `clippy --all-targets -D warnings`
 `cargo test` with no feature, `test-fabric` and `ibverbs`, and a release build with
 `ibverbs` that links `libibverbs.so.1`. The cluster nodes are x86_64: their library
 is built there.
+
+## 7. Candidate A, conditional: chunk-by-chunk staged copies (`GPUBRIDGE_VERBS_STAGED_OVERLAP=1`)
+
+**Status.** Opt-in, off by default. Software-verified only (CPU tensors standing in,
+lazy copies, the MOCK fabric). **No speedup is claimed.** Run this A/B only if the
+section 4 records meet section 5's first threshold, which uses measured phases only:
+in P0x2, at 25 or 150 MiB, on either leader, the median over its 3 repeats of
+`(staged_to_host_s / staged_calls) / p50` (the copy out's share of the call) is at
+least 0.30, or `compare P0 D3` says `win` at 25 or 150 MiB. The copy back (H2D) is not
+measured and is not part of it; neither is the call latency minus the host phases.
+If the threshold is not met, or G1, G2 or G4 failed or was not judged, or the section 4
+run didn't happen, record "not run: threshold not met" (or why) with those numbers
+and stop.
+No benefit, or a regression, is a result to record, not a reason to rerun.
+
+### What it changes, and what it doesn't
+
+The serialization it removes is certain from the code. How much it costs is not
+known; finding that out is the point of this A/B. Without the option, a staged
+two-leader all_reduce (a) blocks the host until the whole tensor's copy out has
+passed before posting anything, (b) posts every chunk's receive, each making its
+write window, before the first send, and (c) queues the whole copy back only after the
+last chunk is reduced. With it, every chunk's copy out is queued at once; per chunk
+the receive is posted, the host waits for that chunk's copy out, its send is posted;
+per chunk, once both have completed, it is reduced and its copy back queued. All of
+it stays on the caller's stream (no new streams, no device-wide waits). The trade
+it makes: receives are now posted one chunk at a time, so the peer's write of chunk
+k + 1 can wait for this leader's copy out of chunk k, and on one stream the copies
+out and back still run one after another on the GPU. Either can cancel the gain,
+which is why only the A/B decides.
+
+Unchanged: the messages (the same buffers, registrations, tags and sizes, each
+direction in the same order, so G3's window counts hold), the reductions and their
+order (the same bits), the progress policy, and every call the option doesn't cover:
+broadcasts, more than two leaders, and tensors of one chunk. **At the default 4 MiB
+chunk, the 64 KiB, 1 MiB and 4 MiB rows run the unchanged code with the option on**:
+those rows are an A/A control inside the A arm. Behaviour that differs: an
+observation's `duration_s` starts before the first chunk's copy out has passed, and a
+call that fails part way may already have copied some reduced chunks back into the
+caller's tensor (it still raises, and the bridge refuses later calls).
+`staged_phases` keeps its meaning as a split of the call's host time: for overlapped
+calls `to_host_s` is queueing the copies out plus the host's waits for them (the
+waits the overlap didn't hide) and `to_device_s` is queueing each copy back.
+
+Software evidence (local CPU/MOCK on an Apple M1 Max, never GPU or NIC evidence):
+`tests/test_verbs_staged_overlap.py` (docs/VERBS_TRANSPORT.md, "Tests"); with the
+option unset, a recording of 12 staged scenarios (692 ordered copies, waits and posts,
+with the bytes each send read when it was posted) is byte-identical to the base
+`0a3ffbe`; and `results/verbs-perf/ab-4-staged-overlap/` holds the host-path Python
+cost before and after, inside the run-to-run range.
+
+### Setup (after section 4's)
+
+```bash
+export PRA=...    # a checkout of this change; same shell as section 4 (BASE, PR0, OUT)
+PYTHONPATH="$PRA/src" GPUBRIDGE_VERBS_LIB_DIR="$PRA/.verbs-lib" python -m gpubridge.verbs build
+export LIB_PRA=$(ls "$PRA"/.verbs-lib/libgpubridge_verbs-*.so)
+sha256sum "$LIB_PRA" >> "$OUT/libraries.sha256"  # crate unchanged: same name and hash as LIB_PR0
+(cd "$PRA" && git rev-parse HEAD) >> "$OUT/revs.txt"
+unset GPUBRIDGE_VERBS_STAGED_OVERLAP            # set per run below, never exported
+env | grep -E '^(GPUBRIDGE|NCCL|CUDA)_' | sort > "$OUT/env-a.txt"
+mkdir -p "$OUT/m1a" "$OUT/m2a"
+export H="$PRA/scripts/gpu/verbs_staged_ab.py"  # one harness for every M1-A run
+```
+
+### M1-A: collectives
+
+One run (`ARM`, `TREE`, `LIB`, `OVERLAP`, `NPROC`, `GPUS`, `OP`, `R` per row):
+
+```bash
+uptime >> "$OUT/load.txt"; nvidia-smi -q -d CLOCK >> "$OUT/clocks.txt"
+CUDA_VISIBLE_DEVICES="$GPUS" PYTHONPATH="$TREE/src" GPUBRIDGE_VERBS_LIB="$LIB" \
+  GPUBRIDGE_VERBS_STAGED_OVERLAP="$OVERLAP" /usr/bin/time -v -o "$OUT/m1a/$ARM-r$R.time" \
+  torchrun --nproc-per-node="$NPROC" "$H" run \
+  --out "$OUT/m1a" --arm "$ARM" --repeat "$R" --op "$OP" --bridge verbs
+```
+
+| Arm | `TREE`, `LIB` | `OVERLAP` | `NPROC`, `GPUS` | `OP` | Repeats |
+| --- | --- | --- | --- | --- | --- |
+| `Na` native NCCL | `PRA`, `LIB_PRA` | `0` | 4, `0,1,2,3` | `native` | 2 |
+| `P0a` staged, before | `PR0`, `LIB_PR0` | `0` (PR0 has no such option) | 4, `0,1,2,3` | `gpubridge` | 5 |
+| `A1` staged, overlapped | `PRA`, `LIB_PRA` | `1` | 4, `0,1,2,3` | `gpubridge` | 5 |
+| `P0ax2` pure bridge step, before | `PR0`, `LIB_PR0` | `0` | 2, `0,1` | `gpubridge` | 3 |
+| `A1x2` pure bridge step, overlapped | `PRA`, `LIB_PRA` | `1` | 2, `0,1` | `gpubridge` | 3 |
+
+Order (fixed now): `Na` r0; r0 `P0a A1`, r1 `A1 P0a`, r2 `P0a A1`, r3 `A1 P0a`, r4
+`P0a A1`; r0 `P0ax2 A1x2`, r1 `A1x2 P0ax2`, r2 `P0ax2 A1x2`; `Na` r1. 18 runs, sizes,
+warmup and timed calls as section 4's table. Section 4's records are never edited or
+reused as these arms; `P0a` is rerun here so both arms of each pair run minutes apart
+with the same harness.
+
+```bash
+# The arms differ by design in the code, the option and its recorded setting only.
+D="--differ code --differ env.GPUBRIDGE_VERBS_STAGED_OVERLAP --differ verbs.staged_overlap_setting"
+python "$H" compare "$OUT/m1a" --before P0a --after A1 --before-repeats 5 --after-repeats 5 $D --wire
+python "$H" compare "$OUT/m1a" --before P0ax2 --after A1x2 --before-repeats 3 --after-repeats 3 $D --wire
+# GA2: which code each timed call ran, on both leaders
+python - "$OUT/m1a" > "$OUT/m1a/ga2.txt" <<'PY'
+import json, pathlib, sys
+bad = 0
+for p in sorted(pathlib.Path(sys.argv[1]).glob("*-r*.json")):
+    record = json.loads(p.read_text())
+    if record["op"] != "gpubridge":
+        continue
+    on = record["arm"].startswith("A1")
+    settings = [v["verbs"].get("staged_overlap_setting")
+                for v in record["provenance"] if "verbs" in v]
+    if settings != [True, True] if on else any(settings):
+        bad += 1
+        print(p.name, "staged_overlap_setting", settings, "FAIL")
+    for ranks in record["sizes"]:
+        for x in (x for x in ranks if x["verbs_delta"] is not None):
+            d, many = x["verbs_delta"], x["bytes"] > 4 * 2**20
+            ok = d["path_staged"] == x["calls"] == d["staged_calls"] and \
+                d.get("staged_overlapped_calls", 0) == (x["calls"] if on and many else 0) and \
+                x["last_staging"] == (("overlapped" if many else "whole (one chunk)") if on
+                                      else None)
+            bad += not ok
+            print(p.name, x["bytes"], x["rank"], x["last_staging"], "ok" if ok else "FAIL")
+print("GA2", "PASS" if bad == 0 else f"FAIL ({bad})")
+PY
+```
+
+### M2-A: the training workload
+
+Section 4's M2 command, `--grad-sync gpubridge --bridge verbs`, as two arms:
+
+- `S`: `PYTHONPATH="$PR0/src" GPUBRIDGE_VERBS_LIB="$LIB_PR0"`, scripts from `PR0`;
+- `SA`: `PYTHONPATH="$PRA/src" GPUBRIDGE_VERBS_LIB="$LIB_PRA" GPUBRIDGE_VERBS_STAGED_OVERLAP=1`,
+  scripts from `PRA`;
+
+each `--json "$OUT/m2a/<arm>-r$R.json"` under `/usr/bin/time -v -o "$OUT/m2a/<arm>-r$R.time"`.
+Order: r0 `S SA`, r1 `SA S`, r2 `S SA`. GPT-2 small's 25 MiB buckets are many chunks,
+so `SA` overlaps nearly every gradient byte. Section 4's `N` runs are its native
+reference, reported as a ratio from another block of the same session.
+
+**Budget**: M1-A about 45 minutes, M2-A about 18. Hard stop at 80 minutes: cut M2-A
+from its end, then the 2-rank pairs from theirs. A failed run is recorded with its
+error, counted as failed, and not rerun.
+
+### Predeclared gates and outcomes (`P0a` against `A1`; section 5's rules)
+
+| Gate | PASS | FAIL |
+| --- | --- | --- |
+| GA1 correctness | 0 mismatches in every call of `A1`, `A1x2`, `P0a`, `P0ax2`; `SA` and `S` `params_identical` true | any mismatch |
+| GA2 code path | `ga2.txt` ends `GA2 PASS`: every timed call staged on both leaders; overlapped exactly at 25 and 150 MiB in `A1`/`A1x2`, `whole (one chunk)` below; never in `P0a`/`P0ax2`; provenance `staged_overlap_setting` true on both `A1` leaders | anything else: the arm did not test what it says |
+| GA3 wire | both compares: no `wire counts differ` at any size; G3's window counts hold in `A1` | any differing count |
+| GA4 no regression | both compares judge (exit 0 or 1): no `REGRESSION` (p50, p99, CPU per call) at any size, including the 64 KiB to 4 MiB A/A rows | any `REGRESSION` |
+| GA5 benefit | the 4-rank compare says `win` at 25 MiB or 150 MiB | - |
+
+UNSUPPORTED: verbs setup fails on the node (the record says why), or a compare is
+`INCOMPLETE`, `UNSUPPORTED` or `REFUSED` (its reasons are in its JSON); then nothing
+here is judged and nothing is rerun.
+
+- **GA1 to GA4 pass and GA5 wins**: "helped on this node at these sizes". It stays
+  opt-in; the records go to the maintainer as evidence for any default change. M2-A
+  is reported beside it: `samples_per_s` counts as a win only if `SA` beats `S` by more
+  than the larger arm's (max - min) / median in 3 of 3 rotations; else it is reported
+  as no change.
+- **GA1 to GA4 pass, no win**: "no benefit", recorded with every raw sample. The
+  option stays off by default (the maintainer may drop it). Not rerun, not retuned.
+- **Any FAIL**: recorded as a regression (or a wrong result); the change is dropped.
+
+Load and clock differences are recorded as hypotheses only. CPU per call is gated
+(GA4), so a lower median bought with more CPU fails. All arms use `economy` progress
+(no busy polling). Ratios against `Na`, section 4's `N` and D4 are reported with
+section 5's definitions; no parity with NCCL is claimed, and every arm is `staged`
+(host-staged through pinned memory), never GPUDirect.
+
+### Expected artifacts
+
+`$OUT/m1a/<arm>-r<k>.json` (18) with `.time` files, `compare-P0a-A1.json`,
+`compare-P0ax2-A1x2.json`, `ga2.txt`; `$OUT/m2a/<arm>-r<k>.json` (6) with `.time`
+files; `env-a.txt` and the appended `libraries.sha256`, `revs.txt`, `load.txt` and
+`clocks.txt`.
+
+### Build impact
+
+Python only: no crate, dependency or build change. `LIB_PRA` is built from the same
+sources as `LIB_PR0` and has the same cache name.

@@ -28,6 +28,9 @@ the same machine throughout; every record has `uptime` before and after its run.
   - `ab-2-key-check/`: before `b89b4d9`, after `04bfc24` (dropped by the rule; reverted in `613a26c`).
   - `ab-3-phase-timers/`: before `cd9fbac`, after the staged-path timers; on an Apple M1
     Max, with its own README (docs/verbs-perf-20261019.md).
+  - `ab-4-staged-overlap/`: `GPUBRIDGE_VERBS_STAGED_OVERLAP` off against its base
+    `0a3ffbe`: the staged call's recorded steps and the host path's Python cost; on an
+    Apple M1 Max, with its own README. Not a speed measurement of the option.
 
 **Labelled deviations (after the perf review).** The `summary.*` verdicts are the
 harness's, kept as recorded, and depart from docs/VERBS_PERF.md rule 3 in two ways:
