@@ -66,12 +66,22 @@ class Stage:
         return f"check.py `{self.name}` ({', '.join(sorted(self.kinds))})"
 
 
+@dataclass(frozen=True)
+class Manual:
+    """A separate strict gate whose result the legacy kit does not ingest."""
+
+    report: str
+
+    def label(self) -> str:
+        return f"separate `{self.report}` report (manual acceptance)"
+
+
 def stage(name: str, kinds: set[str]) -> Stage:
     return Stage(name, frozenset(kinds))
 
 
 #: HARDWARE_VALIDATION.md item number: (short title, what tests it).
-ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
+ITEMS: dict[int, tuple[str, list[Step | Stage | Manual]]] = {
     1: ("CUDA and ROCm processes rendezvous in one job", [stage("init", MIXED)]),
     2: ("Version matching between builds", [stage("init", MIXED)]),
     3: ('`new_group(backend="nccl")` on ranks outside the group',
@@ -138,6 +148,8 @@ ITEMS: dict[int, tuple[str, list[Step | Stage]]] = {
     41: ("AMD GPU memory direct through the verbs bridge", [Step("verbs_gpu_direct")]),
     42: ("Training over the verbs bridge against the Gloo bridge",
          [Step("train_verbs"), Step("train_gloo")]),
+    43: ("Deterministic numerical comparison before performance",
+         [Manual("numerical_gate.py --compare")]),
 }
 
 
@@ -324,7 +336,10 @@ def run_row(job: Job, hosts: Hosts) -> dict[str, Any]:
 
 # ---- items --------------------------------------------------------------------------
 
-def evidence_for(test: Step | Stage, jobs: list[Job]) -> list[Evidence]:
+def evidence_for(test: Step | Stage | Manual, jobs: list[Job]) -> list[Evidence]:
+    if isinstance(test, Manual):
+        # A successful legacy training step is not the new cross-arm numerical gate.
+        return []
     found = []
     for job in jobs:
         if isinstance(test, Step):

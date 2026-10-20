@@ -491,6 +491,15 @@ def batch_sizes(args: argparse.Namespace, world: int) -> tuple[list[int], str]:
     return [args.batch_size or DEFAULT_BATCH[args.model]] * world, "per-rank"
 
 
+def tensor_digest(tensors) -> str:
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        value = tensor.detach().cpu().contiguous()
+        digest.update(str((tuple(value.shape), value.dtype)).encode())
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--model", choices=MODELS, default="gpt2-small")
@@ -517,6 +526,9 @@ def main() -> int:
     parser.add_argument("--comm-trials", type=int, default=5)
     parser.add_argument("--bucket-mb", type=float, default=25.0, help="DDP's bucket_cap_mb")
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--controlled", action="store_true",
+                        help="deterministic FP32, fingerprint inputs/initial state, and rebuild "
+                        "the seeded model after the compute probe before DDP")
     parser.add_argument("--json", type=Path, help="rank 0 writes the result here")
     parser.add_argument("--grad-sync", choices=["gpubridge", "native"], default="gpubridge",
                         help="gpubridge.ddp_comm_hook, or plain DDP on NCCL/RCCL (the native "
@@ -528,6 +540,14 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=default_timeout(600),
                         help="process-group timeout (s); default KIT_TIMEOUT, else 600")
     args = parser.parse_args()
+    if args.controlled:
+        if args.balance:
+            parser.error("--controlled uses fixed batches and cannot be combined with --balance")
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
     if args.balance and not args.global_batch:
         raise SystemExit("--balance needs --global-batch")
     if args.accumulate < 1:
@@ -585,6 +605,9 @@ def main() -> int:
     batch = shares[rank]
     micro = [even_split(n, accumulate) for n in shares]
     data = micro_batches(batches(args.model, batch, seq, rank, device), micro[rank])
+    initial_digest = tensor_digest(model.parameters()) if args.controlled else None
+    data_digest = tensor_digest(t for step in data for pair in step for t in pair) \
+        if args.controlled else None
 
     # 1. compute: this rank's GPU alone. Its optimizer state is thrown away; DDP below
     # starts again from rank 0's parameters.
@@ -599,11 +622,21 @@ def main() -> int:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    if args.controlled:
+        # The compute probe trained locally. Its updated weights must not become
+        # the next arm's implicit initial state. Rebuild without retaining a huge copy.
+        del model
+        torch.manual_seed(0)
+        model = build(args.model).to(device)
+
     # 2. ddp: the gradient sync through gpubridge, overlapping backward.
     mark = memory_mark(device)
     ddp = DistributedDataParallel(model, device_ids=[device.index] if device.type == "cuda"
                                   else None, bucket_cap_mb=args.bucket_mb,
                                   broadcast_buffers=False, process_group=native)
+    ddp_initial_digest = tensor_digest(model.parameters()) if args.controlled else None
+    if args.controlled and ddp_initial_digest != initial_digest:
+        raise RuntimeError("controlled DDP initial parameters differ from the seeded model")
     sizes: list[tuple[int, torch.dtype]] = []
     exchanges = [0]
     if native is None:
@@ -637,6 +670,8 @@ def main() -> int:
     everyone = gather({"compute": compute, "ddp": ddp_times, "alone": alone,
                        "digest": digest.hexdigest(), "sum": total, "finite": finite,
                        "vendor": topology.vendor,
+                       "initial_digest": initial_digest, "ddp_initial_digest": ddp_initial_digest,
+                       "data_digest": data_digest,
                        "device": torch.cuda.get_device_name(device) if gpu else str(device),
                        "memory": ({"total_mib": mib(torch.cuda.get_device_properties(device)
                                                     .total_memory), **memory}
@@ -646,6 +681,9 @@ def main() -> int:
                        [e["alone"] for e in everyone], shares)
     for entry, mine in zip(result["ranks"], everyone, strict=True):
         entry.update(vendor=mine["vendor"], device=mine["device"],
+                     final_sha256=mine["digest"],
+                     initial_sha256=mine["initial_digest"], ddp_initial_sha256=mine["ddp_initial_digest"],
+                     data_sha256=mine["data_digest"],
                      compute_ms_all=[ms(t) for t in mine["compute"]],
                      ddp_step_ms_all=[ms(t) for t in mine["ddp"]], memory=mine["memory"])
     ok = all(e["finite"] for e in everyone)
@@ -657,6 +695,7 @@ def main() -> int:
                           else f"native: plain DistributedDataParallel on a {native_backend} "
                           "world group, no gpubridge"),
             "native_backend": native_backend,
+            "controlled": args.controlled,
             "exchanges_counted": native is None,
             "policy": topology.policy_name,
             "model": {"name": args.model, "config": asdict(config), "parameters": parameters,
