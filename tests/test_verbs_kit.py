@@ -501,7 +501,10 @@ def test_host_config_at_init_with_inherited_staged(tmp_path, monkeypatch, rank):
     import gpubridge
     from gpubridge.config import resolve_config
 
-    monkeypatch.delenv("GPUBRIDGE_CPU_ONLY", raising=False)
+    # The kit writes GPUBRIDGE_CPU_ONLY itself: set it through monkeypatch first, so teardown
+    # restores its original state (a bare delenv of an absent variable records no undo).
+    monkeypatch.setenv("GPUBRIDGE_CPU_ONLY", "")
+    monkeypatch.delenv("GPUBRIDGE_CPU_ONLY")
     monkeypatch.delenv("GPUBRIDGE_VENDOR", raising=False)
     monkeypatch.setenv("GPUBRIDGE_VERBS_GPU_PATH", "staged")
     monkeypatch.setenv("GPUBRIDGE_SPLIT_TEST", "half")
