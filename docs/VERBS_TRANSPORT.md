@@ -770,15 +770,29 @@ netdev carries traffic that is not TCP, so they can't show which transport carri
 this job's payload. `tcp_evidence` is `pass` only with positive evidence attributable
 to the process: the bridge's own telemetry over the window (provider `libibverbs`, not
 MOCK; its sent plus received bytes at least the payload; completions from its own
-queue pairs; no completion errors), and the process's own TCP sockets to other hosts
+queue pairs; no completion errors), and the process's own counted TCP sockets
 (`ss -tinp`, by pid: Gloo's and the store's) moving no more than 5% of the payload
 plus 1 MiB. Its RC queue pairs as the kernel lists them (`rdma resource show qp`, by
 pid) are recorded where the `rdma` tool exists, and contradict a pass when it lists
 none. Without `ss` the verdict is `unknown`, never a pass; Gloo reference collectives
-run before the window. The TCP check excludes loopback and peers whose addresses
-appear as local socket endpoints in the same `ss` snapshot. This excludes same-node
-Gloo island traffic through non-loopback interfaces; unknown peers still count.
-`--require-no-tcp` fails a bridge leader's step unless its
+run before the window. The TCP check always excludes loopback. Only host mode with
+CPU-only Gloo islands also excludes peers whose addresses appear as local socket
+endpoints in the same `ss` snapshot. IPv4, IPv4-mapped IPv6 and native IPv6 addresses
+are normalized; unknown addresses still count. GPU mode with NCCL islands counts
+same-host non-loopback TCP, preserving its existing acceptance check.
+
+Leader co-residence is determined from gathered actual hostnames and kernel boot
+IDs, independently of split-test labels. When local TCP is excluded and any bridge
+peer is co-resident or cannot be positively identified as remote, otherwise positive
+evidence is `not-decisive`, with `no_silent_tcp: null` and the reason
+"local bridge: island Gloo traffic and a bridge TCP fallback are indistinguishable
+on one host". The positive verbs checks remain required and are reported separately
+in `verbs_evidence`; any contradictory evidence still yields `fail`. Without
+`--require-no-tcp`, a correct local host run may succeed while printing and recording
+this limitation. With `--require-no-tcp`, its leaders fail with that reason.
+Cross-node host runs remain decisive: local island TCP is excluded, remote TCP is
+counted. A one-host host run cannot establish cross-node no-TCP acceptance.
+`--require-no-tcp` fails a bridge leader's step unless its decisive
 verdict is `pass`; other ranks record `not applicable`. A job with no bridge leader
 at all (one island: an all-NVIDIA node without `GPUBRIDGE_SPLIT_TEST`, say) never
 runs the bridge, so `--require-no-tcp` fails every rank of it (each record says
