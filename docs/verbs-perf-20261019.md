@@ -226,9 +226,10 @@ outcome) and, when it judges, a table. It judges only the comparison declared on
 command line:
 
 - **Complete.** Each arm has exactly its predeclared repeats, 0 to N-1, each a whole
-  record (every size of the table, every rank, every call's samples). A repeat
-  missing, extra or truncated, a run that failed (no record) included, is
-  `INCOMPLETE` (exit 4): no verdict on the repeats that are there. With `--wire`,
+  record (every size of the table, every rank, every call's samples, integer
+  mismatch counts). A repeat missing, extra or truncated, a run that failed (no
+  record) included, or an arm's file (`<arm>-r<k>.json`) that is not a readable JSON
+  object, is `INCOMPLETE` (exit 4): no verdict on the repeats that are there. With `--wire`,
   every island leader's telemetry must hold every counted message (below), else
   `INCOMPLETE`; an arm with no verbs telemetry at all is `UNSUPPORTED` (exit 3).
 - **Correct.** Every run of both arms is checked for wrong results, the unpaired

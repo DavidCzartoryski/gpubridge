@@ -234,6 +234,35 @@ def test_compare_wire_needs_every_leaders_counted_messages(tmp_path):
     assert result.returncode == 4 and "lacks ['write_windows']" in result.stderr, result.stderr
 
 
+@pytest.mark.parametrize("text", ["", '{"arm": "P0", "rep', "[]", "null", '"P0"', "3"])
+def test_compare_reports_an_unreadable_run_incomplete_and_writes_its_verdict(tmp_path, text):
+    _write(tmp_path, "B0", range(3))
+    _write(tmp_path, "P0", range(3))
+    (tmp_path / "D1-r0.json").write_text("")  # another arm's: not this comparison's
+    assert _compare(tmp_path, "B0", "P0", 3, 3, "--wire").returncode == 0
+    (tmp_path / "P0-r2.json").write_text(text)
+    result = _compare(tmp_path, "B0", "P0", 3, 3, "--wire")
+    assert result.returncode == 4 and "Traceback" not in result.stderr, result.stderr
+    verdict = _verdict(tmp_path, "B0", "P0")
+    assert verdict["status"] == "INCOMPLETE" and verdict["rows"] == [], verdict
+    assert any(r.startswith("P0-r2.json: unreadable (") for r in verdict["reasons"]), verdict
+    assert any("P0: repeats [2]" in r for r in verdict["reasons"]), verdict
+
+
+@pytest.mark.parametrize("mismatches", ["3", True, 1.0, None, [1]])
+def test_compare_counts_only_integer_mismatches_and_reports_the_rest(tmp_path, mismatches):
+    _write(tmp_path, "B0", range(3))
+    _write(tmp_path, "P0", range(3))
+    record = _record("P0", 2, 1.0)
+    record["sizes"][0][1]["mismatches"] = mismatches
+    (tmp_path / "P0-r2.json").write_text(json.dumps(record))
+    result = _compare(tmp_path, "B0", "P0", 3, 3)
+    assert result.returncode == 4 and "Traceback" not in result.stderr, result.stderr
+    verdict = _verdict(tmp_path, "B0", "P0")
+    assert verdict["status"] == "INCOMPLETE", verdict
+    assert any(f"mismatches {mismatches!r}" in r for r in verdict["reasons"]), verdict
+
+
 class _Bridge:
     """A verbs bridge whose telemetry lacks the WIRE count ``writes_posted`` and the
     direct count ``write_window_release_ns``, and counts one send per telemetry read."""

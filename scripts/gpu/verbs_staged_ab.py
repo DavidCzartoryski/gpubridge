@@ -36,8 +36,8 @@ and host (``workload``) must be equal, repeat to repeat and arm to arm, except t
 keys named by ``--differ`` (a key, or a group: ``--differ code`` allows every
 ``code.`` key). Exit codes: 0 judged and no failure; 1 a wrong result or a
 REGRESSION; 3 UNSUPPORTED (``--wire`` with no verbs telemetry in an arm); 4
-INCOMPLETE (a repeat missing, extra or truncated, or telemetry missing); 5 REFUSED
-(the arms are not the predeclared comparison). Every outcome writes
+INCOMPLETE (a repeat missing, extra, truncated or unreadable, or telemetry missing); 5
+REFUSED (the arms are not the predeclared comparison). Every outcome writes
 ``compare-<before>-<after>.json`` with its status and reasons.
 
 Numbers from CPU runs (the tests) are software checks only, never GPU or NIC evidence.
@@ -298,7 +298,7 @@ def problems(record: dict, wire: bool) -> list[str]:
                 if counts != {calls} or (r["bytes"], r["calls"]) != (nbytes, calls):
                     out.append(f"{nbytes} bytes, rank {r['rank']}: samples {sorted(counts)} "
                                f"for {calls} calls")
-                if r["payload_bytes"] != nbytes or not isinstance(r["mismatches"], int):
+                if r["payload_bytes"] != nbytes or type(r["mismatches"]) is not int:
                     out.append(f"{nbytes} bytes, rank {r['rank']}: payload "
                                f"{r['payload_bytes']}, mismatches {r['mismatches']!r}")
             if wire:
@@ -311,14 +311,40 @@ def problems(record: dict, wire: bool) -> list[str]:
                     if missing:
                         out.append(f"{nbytes} bytes: a leader's telemetry lacks {missing}")
         return out
-    except (KeyError, IndexError, TypeError) as e:
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
         return [f"malformed record ({type(e).__name__}: {e})"]
 
 
+def rank_entries(record: dict):
+    """Every rank's entry of every size of a record, whole or not, skipping what isn't one."""
+    sizes = record.get("sizes")
+    for ranks in sizes if isinstance(sizes, list) else []:
+        yield from (r for r in ranks if isinstance(r, dict)) if isinstance(ranks, list) else ()
+
+
 def wrong_results(record: dict) -> int:
-    """Mismatched calls over every rank and size of a record, whole or not."""
-    return sum(r.get("mismatches") or 0 for ranks in record.get("sizes") or []
-               for r in ranks or [] if isinstance(r, dict))
+    """Mismatched calls over every rank and size of a record, whole or not. Only integer
+    counts are summed: any other value is a malformed record, which problems() reports."""
+    return sum(r["mismatches"] for r in rank_entries(record)
+               if type(r.get("mismatches")) is int)
+
+
+def read_records(directory, arms) -> tuple[list[tuple[str, dict]], list[str]]:
+    """The run records in a directory, and why the files named for one of ``arms``
+    (``<arm>-r<k>.json``) that hold no record could not be read."""
+    records, reasons = [], []
+    for path in sorted(Path(directory).glob("*-r*.json")):
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError) as e:
+            record, why = None, f"{type(e).__name__}: {e}"
+        else:
+            why = f"not a JSON object but {type(record).__name__}"
+        if isinstance(record, dict):
+            records.append((path.name, record))
+        elif any(path.name.startswith(f"{arm}-r") for arm in arms):
+            reasons.append(f"{path.name}: unreadable ({why})")
+    return records, reasons
 
 
 def workload(record: dict) -> dict[str, Any]:
@@ -369,16 +395,16 @@ def compare(args) -> int:
     """The predeclared rules (docs/verbs-perf-20261019.md, "Acceptance"), per size, on a
     complete and matched pair of arms only (module docs)."""
     declared = {args.before: args.before_repeats, args.after: args.after_repeats}
-    records: dict[str, dict[int, tuple[str, dict]]] = {arm: {} for arm in declared}
-    status, reasons, wrong = None, [], []
-    for path in sorted(Path(args.dir).glob("*-r*.json")):
-        record = json.loads(path.read_text())
-        arm = record.get("arm")
-        if arm in records:
-            if record.get("repeat") in records[arm]:
-                reasons.append(f"{path.name}: a second record of {arm} repeat "
-                               f"{record['repeat']}")
-            records[arm][record.get("repeat")] = (path.name, record)
+    records: dict[str, dict[int | str, tuple[str, dict]]] = {arm: {} for arm in declared}
+    status, wrong = None, []
+    found, reasons = read_records(args.dir, declared)
+    for name, record in found:
+        arm, repeat = record.get("arm"), record.get("repeat")
+        if isinstance(arm, str) and arm in records:
+            key = repeat if type(repeat) is int else repr(repeat)
+            if key in records[arm]:
+                reasons.append(f"{name}: a second record of {arm} repeat {key}")
+            records[arm][key] = (name, record)
     for arm, n in declared.items():
         got, want = set(records[arm]), set(range(n))
         if want - got:
@@ -392,9 +418,8 @@ def compare(args) -> int:
             if wrong_results(record):
                 wrong.append(f"{name}: {wrong_results(record)} wrong results")
         if args.wire and records[arm] and not any(
-                isinstance(r, dict) and r.get("verbs_delta") is not None
-                for _, record in records[arm].values()
-                for ranks in record.get("sizes") or [] for r in ranks or []):
+                r.get("verbs_delta") is not None
+                for _, record in records[arm].values() for r in rank_entries(record)):
             status = "UNSUPPORTED"
             reasons.append(f"{arm}: no verbs telemetry, which --wire compares")
     if status is None and reasons:
@@ -418,9 +443,14 @@ def compare(args) -> int:
     rows: list[dict[str, Any]] = []
     pairs = list(range(min(declared.values())))
     if status is None:
-        runs = {arm: {k: summarize(rec) for k, (_, rec) in recs.items()}
-                for arm, recs in records.items()}
-        rows = judge(runs[args.before], runs[args.after], pairs, args.wire)
+        try:
+            runs = {arm: {k: summarize(rec) for k, (_, rec) in recs.items()}
+                    for arm, recs in records.items()}
+            rows = judge(runs[args.before], runs[args.after], pairs, args.wire)
+        except (KeyError, IndexError, TypeError, ValueError, AttributeError,
+                ArithmeticError) as e:  # values no whole record holds
+            status, rows = "INCOMPLETE", []
+            reasons.append(f"malformed record ({type(e).__name__}: {e})")
     if wrong:
         status = "FAIL (wrong result)"
         reasons = wrong + reasons
