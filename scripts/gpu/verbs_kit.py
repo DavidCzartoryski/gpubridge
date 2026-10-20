@@ -46,8 +46,9 @@ through torchrun's store.
 ``collectives``: ``gpubridge.init(bridge=...)`` then all_reduce and broadcast at each
 size on ``--memory host`` or ``gpu`` tensors, checked exactly against a Gloo
 all_reduce of the same integer-valued data. Host mode sets ``GPUBRIDGE_CPU_ONLY=1``
-before init: CPU tensors and Gloo islands, with the selected bridge between leaders,
-not NCCL island coverage. Contradictory inherited CPU-only settings are refused.
+before importing torch or gpubridge: CPU tensors and Gloo islands, with the selected
+bridge between leaders, not NCCL island coverage. Contradictory inherited CPU-only
+settings are refused.
 With ``--expect-path direct|staged`` every GPU call must have taken that path
 (``GPUBRIDGE_VERBS_GPU_PATH=direct`` makes a
 direct path that can't run fail loudly rather than stage). ``direct`` means nothing
@@ -67,6 +68,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -84,7 +86,23 @@ SYSFS = Path("/sys/class/infiniband")
 #: control traffic (barriers, keep-alives).
 TCP_FRACTION = 0.05
 TCP_SLACK = 1 << 20
-_LOOPBACK = ("127.", "[::1]", "::1", "[::ffff:127.")
+
+
+def configure_memory(memory: str) -> None:
+    """Select CPU mode before importing torch or gpubridge, including its config."""
+    name = "GPUBRIDGE_CPU_ONLY"
+    raw = os.environ.get(name, "")
+    value = raw.strip().lower()
+    if value not in ("", "0", "false", "no", "off", "1", "true", "yes", "on"):
+        raise ValueError(f"{name}={raw!r} is not a boolean; use 1 or 0")
+    cpu_only = value in ("1", "true", "yes", "on")
+    if memory == "host":
+        if value and not cpu_only:
+            raise ValueError(f"--memory host conflicts with {name}={raw!r}; "
+                             "unset it or use 1 for CPU tensors and Gloo islands")
+        os.environ[name] = "1"
+    elif cpu_only:
+        raise ValueError(f"--memory gpu conflicts with {name}={raw!r}; unset it or use 0")
 
 
 def rank_from_env() -> int:
@@ -133,15 +151,32 @@ def window(before: dict, after: dict) -> dict:
 
 def parse_ss(text: str, pid: int) -> dict:
     """Bytes sent and received by each of ``pid``'s TCP sockets to another host, from
-    ``ss -tinpH`` (a socket line, then its indented info line), by "local peer"."""
+    ``ss -tinpH`` (a socket line, then its indented info line), by "local peer".
+    Loopback and addresses proven local by this snapshot's endpoints are excluded;
+    unknown addresses still count as remote."""
+    def address(endpoint: str):
+        host = endpoint.rsplit(":", 1)[0].strip("[]")
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return None
+        return getattr(ip, "ipv4_mapped", None) or ip
+
+    # Gloo islands can connect to this host's non-loopback interface. Every
+    # local endpoint in ss proves an address belongs to this network namespace,
+    # even on a socket owned by another process. Unknown peers still count.
+    local_addresses = {address(fields[3]) for line in text.splitlines()
+                       if line and not line[0].isspace() and len(fields := line.split()) >= 5}
+    local_addresses.discard(None)
     out: dict = {}
     current = None
     for line in text.splitlines():
         if line and not line[0].isspace():
             fields = line.split()
             current = None
+            peer = address(fields[4]) if len(fields) >= 5 else None
             if len(fields) >= 5 and re.search(rf"\bpid={pid}\b", line) \
-                    and not fields[4].startswith(_LOOPBACK):
+                    and not (peer is not None and (peer.is_loopback or peer in local_addresses)):
                 current = f"{fields[3]} {fields[4]}"
                 out[current] = {"sent": 0, "received": 0}
         elif current is not None:
@@ -363,17 +398,6 @@ def collectives_mode(args, rank: int, world: int) -> dict:
     import torch.distributed as dist
 
     import gpubridge
-    from gpubridge.config import CPU_ONLY_ENV, is_cpu_only
-
-    cpu_only = is_cpu_only()
-    if args.memory == "host":
-        if os.environ.get(CPU_ONLY_ENV, "").strip() and not cpu_only:
-            raise ValueError(f"--memory host conflicts with {CPU_ONLY_ENV}={os.environ[CPU_ONLY_ENV]!r}; "
-                             "unset it or use 1 for CPU tensors and Gloo islands")
-        os.environ[CPU_ONLY_ENV] = "1"
-    elif cpu_only:
-        raise ValueError(f"--memory gpu conflicts with {CPU_ONLY_ENV}={os.environ[CPU_ONLY_ENV]!r}; "
-                         "unset it or use 0")
 
     topology = gpubridge.init(timeout=timedelta(seconds=args.timeout), bridge=args.bridge,
                               policy=args.policy)
@@ -482,6 +506,7 @@ def main() -> int:
                                   world, rank == 0, timedelta(seconds=args.timeout))
             result = endpoint_mode(args, store, rank, world)
         else:
+            configure_memory(args.memory)
             result = collectives_mode(args, rank, world)
         if result.get("mismatches") or result.get("path_violations"):
             status = "failed"

@@ -744,8 +744,8 @@ and cross-vendor (step 07) runs are separate records:
 2. `verbs_endpoint`: host-to-host verbs between one rank per node: latency,
    bandwidth sweep, SHA-256 of every buffer on both sides, CPU time;
 3. `verbs_host`, `verbs_gpu_staged`, `verbs_gpu_direct`: the collectives on host
-   tensors (the kit sets `GPUBRIDGE_CPU_ONLY=1` before init, using CPU/Gloo islands
-   and the verbs bridge between leaders; not NCCL island coverage), then GPU tensors
+   tensors (the kit sets `GPUBRIDGE_CPU_ONLY=1` before importing torch or gpubridge,
+   using CPU/Gloo islands and the verbs bridge between leaders; not NCCL island coverage), then GPU tensors
    staged and direct, exactly against Gloo, each call's
    path, reason and bounced bytes recorded and the path required. `direct` means
    nothing bounced (`direct+bounce` fails the step), so `verbs_gpu_direct` runs
@@ -759,6 +759,8 @@ and cross-vendor (step 07) runs are separate records:
 Host collective records include `cpu_only: true` and `island_backend: "gloo"`.
 The kit refuses inherited CPU-only settings that contradict `--memory` (including
 `--memory gpu` with `GPUBRIDGE_CPU_ONLY=1`).
+An inherited `GPUBRIDGE_VERBS_GPU_PATH=staged` is preserved and accepted in host
+mode; CPU tensors still use the verbs host path.
 
 Every `verbs_kit` record holds the endpoint telemetry, completion errors, a window
 of every `/sys/class/infiniband/*/ports/*/{counters,hw_counters}` file and every
@@ -773,7 +775,10 @@ queue pairs; no completion errors), and the process's own TCP sockets to other h
 plus 1 MiB. Its RC queue pairs as the kernel lists them (`rdma resource show qp`, by
 pid) are recorded where the `rdma` tool exists, and contradict a pass when it lists
 none. Without `ss` the verdict is `unknown`, never a pass; Gloo reference collectives
-run before the window. `--require-no-tcp` fails a bridge leader's step unless its
+run before the window. The TCP check excludes loopback and peers whose addresses
+appear as local socket endpoints in the same `ss` snapshot. This excludes same-node
+Gloo island traffic through non-loopback interfaces; unknown peers still count.
+`--require-no-tcp` fails a bridge leader's step unless its
 verdict is `pass`; other ranks record `not applicable`. A job with no bridge leader
 at all (one island: an all-NVIDIA node without `GPUBRIDGE_SPLIT_TEST`, say) never
 runs the bridge, so `--require-no-tcp` fails every rank of it (each record says

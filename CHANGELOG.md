@@ -256,6 +256,9 @@ hardware.
 ### Fixed
 
 - The verbs kit's host collectives configure CPU/Gloo islands before init, record that mode, and refuse contradictory inherited CPU-only settings.
+- Host mode selects CPU-only operation before runtime imports. The verbs kit's TCP
+  evidence excludes same-host sockets on non-loopback interfaces while continuing
+  to count remote or unknown peers.
 
 ### Added
 

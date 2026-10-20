@@ -19,7 +19,6 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -118,6 +117,42 @@ def test_ss_parsing_keeps_this_processs_sockets_to_other_hosts():
                            {"sent": 0, "received": 40}}
 
 
+@pytest.mark.parametrize(("local", "peer"), [
+    ("10.0.0.1:41000", "10.0.0.1:29500"),
+    ("[::ffff:10.0.0.1]:41000", "10.0.0.1:29500"),
+    ("[2001:db8::1]:41000", "[2001:db8::1]:29500"),
+])
+def test_same_host_island_tcp_does_not_fail_remote_tcp_evidence(local, peer):
+    before = (f'ESTAB 0 0 {local} {peer} users:(("python",pid=123,fd=7))\n'
+              '\t cubic bytes_acked:100 bytes_received:100\n' + SS)
+    after = before.replace("bytes_acked:100 bytes_received:100",
+                           "bytes_acked:1600928576 bytes_received:1600928576")
+    tcp = verbs_kit.tcp_moved(verbs_kit.parse_ss(before, 123), verbs_kit.parse_ss(after, 123))
+    assert tcp == 0
+    assert evidence(moved(PAYLOAD, PAYLOAD), tcp=tcp)["verdict"] == "pass"
+
+
+def test_ss_uses_all_local_endpoints_but_keeps_unknown_peers():
+    # A second interface is known local even when only another process uses it.
+    text = SS + '''\
+ESTAB 0 0 10.0.0.5:41000 10.0.0.2:29500 users:(("python",pid=456,fd=7))
+\t cubic bytes_acked:900
+ESTAB 0 0 10.0.0.1:41004 [::ffff:10.0.0.5]:29500 users:(("python",pid=123,fd=9))
+\t cubic bytes_acked:3201856952
+ESTAB 0 0 10.0.0.1:41005 *:29500 users:(("python",pid=123,fd=10))
+\t cubic bytes_acked:700
+'''
+    parsed = verbs_kit.parse_ss(text, 123)
+    assert "10.0.0.1:41004 [::ffff:10.0.0.5]:29500" not in parsed
+    assert parsed["10.0.0.1:41005 *:29500"]["sent"] == 700
+    # Actual remote payload still fails, even when a local socket has large traffic.
+    assert evidence(moved(PAYLOAD, PAYLOAD), tcp=verbs_kit.tcp_moved({}, parsed))[
+        "verdict"] == "pass"
+    remote = text.replace("bytes_acked:800", f"bytes_acked:{PAYLOAD}")
+    assert evidence(moved(PAYLOAD, PAYLOAD), tcp=verbs_kit.tcp_moved(
+        {}, verbs_kit.parse_ss(remote, 123)))["verdict"] == "fail"
+
+
 def test_tcp_moved_counts_new_sockets_in_full_and_unknown_as_unknown():
     before = {"a": {"sent": 10, "received": 10}}
     after = {"a": {"sent": 15, "received": 12}, "b": {"sent": 3, "received": 0}}
@@ -163,28 +198,36 @@ def _kit(mode: str, out: Path, fabric: str, *extra: str,
             # configuration would select NCCL and cuda:LOCAL_RANK, even on CPU CI.
             env.pop("GPUBRIDGE_VENDOR", None)
             env.pop("GPUBRIDGE_CPU_ONLY", None)
+            env["GPUBRIDGE_VERBS_GPU_PATH"] = "staged"
             command += ["-c", """
 import os
 import runpy
 import sys
 import torch
-from types import SimpleNamespace
+import torch.distributed as dist
+import gpubridge
 from gpubridge.config import resolve_config
-from gpubridge.collectives import _check_tensor
+from gpubridge.verbs.transport import VerbsTransport
 
 torch.version.cuda = "12.6"
 torch.version.hip = None
 torch.cuda.is_available = lambda: True
 torch.cuda.device_count = lambda: 4
-config = resolve_config()
-assert config.device == torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-assert config.island_backend == "nccl"
-try:
-    _check_tensor(torch.ones(1), SimpleNamespace(device=config.device, simulated=False))
-except ValueError as exc:
-    assert "tensor is on cpu but this rank communicates on cuda:" in str(exc)
-else:
-    raise AssertionError("expected the original host tensor/device mismatch")
+original_init = gpubridge.init
+def checked_init(**kwargs):
+    assert os.environ["GPUBRIDGE_CPU_ONLY"] == "1"
+    assert os.environ["GPUBRIDGE_VERBS_GPU_PATH"] == "staged"
+    assert kwargs["bridge"] == "verbs" and kwargs["policy"] == "auto"
+    config = resolve_config()
+    assert config.device == torch.device("cpu") and config.island_backend == "gloo"
+    assert not dist.is_initialized()
+    topology = original_init(**kwargs)
+    assert dist.get_backend() == "gloo"
+    assert dist.get_backend(topology.island_group) == "gloo"
+    assert topology.config == config
+    assert topology.transport is VerbsTransport
+    return topology
+gpubridge.init = checked_init
 sys.argv = sys.argv[1:]
 runpy.run_path(sys.argv[0], run_name="__main__")
 """]
@@ -225,7 +268,80 @@ def test_host_mode_uses_cpu_islands_with_a_cuda_like_build_on_the_mock_fabric(tm
         assert all(call["exact"] for call in record["calls"])
         if record["leader"]:
             assert record["telemetry_after"]["mock"] is True
+            assert record["telemetry_after"]["gpu_path_setting"] == "staged"
+            assert {call["path"] for call in record["calls"]} == {"host"}
             assert record["window"]["tcp_evidence"]["bridge_bytes"] > 0
+
+
+def test_host_selection_precedes_the_first_torch_or_gpubridge_import(tmp_path):
+    env = {**os.environ}
+    env.pop("GPUBRIDGE_CPU_ONLY", None)
+    done = subprocess.run([sys.executable, "-c", '''
+import builtins
+import os
+import runpy
+import sys
+
+original_import = builtins.__import__
+seen = []
+def checked_import(name, *args, **kwargs):
+    if name.split(".")[0] in ("torch", "gpubridge"):
+        assert os.environ.get("GPUBRIDGE_CPU_ONLY") == "1"
+        seen.append(name)
+        raise RuntimeError("startup ordering checked")
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = checked_import
+sys.argv = sys.argv[1:]
+try:
+    runpy.run_path(sys.argv[0], run_name="__main__")
+except SystemExit as exc:
+    assert exc.code == 1
+assert seen, "the kit never reached its first runtime import"
+''', str(ROOT / "scripts/gpu/verbs_kit.py"), "collectives", "--memory", "host",
+        "--out", str(tmp_path)], env=env, capture_output=True, text=True, timeout=30, check=False)
+    assert done.returncode == 0, done.stderr
+    record = json.loads((tmp_path / f"rank{env.get('RANK', '0')}.json").read_text())
+    assert record["error"] == "RuntimeError: startup ordering checked"
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_host_config_at_init_with_inherited_staged(tmp_path, monkeypatch, rank):
+    import torch
+    import torch.distributed as dist
+
+    import gpubridge
+    from gpubridge.config import resolve_config
+
+    monkeypatch.delenv("GPUBRIDGE_CPU_ONLY", raising=False)
+    monkeypatch.delenv("GPUBRIDGE_VENDOR", raising=False)
+    monkeypatch.setenv("GPUBRIDGE_VERBS_GPU_PATH", "staged")
+    monkeypatch.setenv("GPUBRIDGE_SPLIT_TEST", "half")
+    monkeypatch.setenv("LOCAL_RANK", str(rank))
+    monkeypatch.setenv("RANK", str(rank))
+    monkeypatch.setattr(torch.version, "cuda", "12.6")
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    assert resolve_config().island_backend == "nccl"
+    observed = []
+
+    def check_init(**kwargs):
+        config = resolve_config()
+        assert config.device == torch.device("cpu")
+        assert config.island_backend == "gloo" and config.simulated
+        assert kwargs["bridge"] == "verbs" and kwargs["policy"] == "auto"
+        assert not dist.is_initialized()
+        assert os.environ["GPUBRIDGE_VERBS_GPU_PATH"] == "staged"
+        observed.append(config)
+        raise RuntimeError("host configuration checked")
+
+    monkeypatch.setattr(gpubridge, "init", check_init)
+    monkeypatch.setattr(sys, "argv", ["verbs_kit.py", "collectives", "--memory", "host",
+                                      "--out", str(tmp_path)])
+    assert verbs_kit.main() == 1
+    assert len(observed) == 1
+    record = json.loads((tmp_path / f"rank{rank}.json").read_text())
+    assert record["error"] == "RuntimeError: host configuration checked"
 
 
 @pytest.mark.parametrize(("memory", "setting"), [
@@ -251,7 +367,7 @@ def test_memory_conflicts_are_refused_before_init(tmp_path, monkeypatch, memory,
 
 
 @pytest.mark.parametrize("setting", [None, "", "0", "false"])
-def test_gpu_mode_preserves_the_environment_and_init_arguments(monkeypatch, setting):
+def test_gpu_mode_preserves_the_environment_and_init_arguments(tmp_path, monkeypatch, setting):
     import gpubridge
 
     monkeypatch.delenv("GPUBRIDGE_CPU_ONLY", raising=False)
@@ -266,9 +382,12 @@ def test_gpu_mode_preserves_the_environment_and_init_arguments(monkeypatch, sett
         raise RuntimeError("stop before GPU initialization")
 
     monkeypatch.setattr(gpubridge, "init", check_init)
-    args = SimpleNamespace(memory="gpu", timeout=60, bridge="verbs", policy="auto")
-    with pytest.raises(RuntimeError, match="stop before GPU initialization"):
-        verbs_kit.collectives_mode(args, 0, 4)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setattr(sys, "argv", ["verbs_kit.py", "collectives", "--memory", "gpu",
+                                      "--timeout", "60", "--out", str(tmp_path)])
+    assert verbs_kit.main() == 1
+    record = json.loads((tmp_path / "rank0.json").read_text())
+    assert record["error"] == "RuntimeError: stop before GPU initialization"
 
 
 @pytest.mark.parametrize("mode", ["endpoint", "collectives"])
