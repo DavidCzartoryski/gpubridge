@@ -330,8 +330,10 @@ in P0x2, at 25 or 150 MiB, on either leader, the median over its 3 repeats of
 `(staged_to_host_s / staged_calls) / p50` (the copy out's share of the call) is at
 least 0.30, or `compare P0 D3` says `win` at 25 or 150 MiB. The copy back (H2D) is not
 measured and is not part of it; neither is the call latency minus the host phases.
-Section 5's `trigger` command decides it: run this A/B only if `$OUT/m1/trigger.txt`
-ends `TRIGGER MET`. If it ends `TRIGGER NOT MET` or `INCOMPLETE` (not decided), or G1,
+Section 5's `trigger` command decides it: run this A/B only if the last line of
+`$OUT/m1/trigger.txt` is exactly `TRIGGER MET`, that is only if
+`test "$(tail -n 1 "$OUT/m1/trigger.txt")" = "TRIGGER MET"` succeeds. If that line is
+`TRIGGER NOT MET` or `INCOMPLETE` (not decided), or anything else, or G1,
 G2 or G4 failed or was not judged, or the section 4 run didn't happen, record "not
 run: threshold not met" (or why) with that file and stop.
 No benefit, or a regression, is a result to record, not a reason to rerun.

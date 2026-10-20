@@ -485,12 +485,34 @@ def test_the_copy_trigger_uses_only_measured_phases():
 def test_candidate_a_runs_only_on_section_5s_measured_trigger():
     status = _section("7.").split("**Status.**", 1)[1].split("\n\n", 1)[0]
     for term in ("P0x2", "(staged_to_host_s / staged_calls) / p50", "0.30",
-                 "compare P0 D3", "not met", "trigger.txt", "ends `TRIGGER MET`"):
-        assert term in status, (term, status)
+                 "compare P0 D3", "not met", "trigger.txt",
+                 "the last line of `$OUT/m1/trigger.txt` is exactly `TRIGGER MET`"):
+        assert term in " ".join(status.split()), (term, status)
     # The command it names is section 5's, writing that file.
     assert 'trigger "$OUT/m1"' in _section("5.") and '"$OUT/m1/trigger.txt"' in _section("5.")
     assert "minus the host phases" not in status.replace(
         "neither is the call latency minus the host phases", ""), status
+
+
+@pytest.mark.docs
+def test_section_7s_check_passes_only_on_a_met_trigger(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("no bash")
+    check, = re.findall(r'`(test "\$\(tail -n 1 [^`]*)`', _section("7."))
+    _pure_bridge(tmp_path, [0.5, 0.5, 0.5])
+    met = _trigger(tmp_path).stdout
+    (tmp_path / "P0x2-r3.json").write_text("{}")
+    incomplete = _trigger(tmp_path).stdout
+    (tmp_path / "P0x2-r3.json").unlink()
+    _pure_bridge(tmp_path, [0.1, 0.1, 0.1])
+    not_met = _trigger(tmp_path).stdout
+    for text, runs in [(met, True), (not_met, False), (incomplete, False),
+                       ("TRIGGER MET: rank 1\n", False), ("TRIGGER MET\nINCOMPLETE\n", False)]:
+        (tmp_path / "m1").mkdir(exist_ok=True)
+        (tmp_path / "m1" / "trigger.txt").write_text(text)
+        result = subprocess.run(["bash", "-c", check], env={**os.environ, "OUT": str(tmp_path)},
+                                capture_output=True, text=True, timeout=30)
+        assert (result.returncode == 0) is runs, (text, result.stderr)
 
 
 @pytest.mark.docs
