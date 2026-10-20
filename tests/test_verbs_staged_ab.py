@@ -481,6 +481,15 @@ def test_the_copy_trigger_uses_only_measured_phases():
     assert "H2D" in _section("2.") and "UNAVAILABLE" in _section("2."), _section("2.")
 
 
+def test_candidate_a_runs_only_on_section_5s_measured_trigger():
+    status = _section("7.").split("**Status.**", 1)[1].split("\n\n", 1)[0]
+    for term in ("P0x2", "(staged_to_host_s / staged_calls) / p50", "0.30",
+                 "compare P0 D3", "not met"):
+        assert term in status, (term, status)
+    assert "minus the host phases" not in status.replace(
+        "neither is the call latency minus the host phases", ""), status
+
+
 @pytest.mark.docs
 def test_section_5s_rows_are_mechanical():
     section = _section("5.")
