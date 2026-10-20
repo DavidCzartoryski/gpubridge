@@ -253,6 +253,10 @@ hardware.
 
 ## [Unreleased]
 
+### Fixed
+
+- The verbs kit's host collectives configure CPU/Gloo islands before init, record that mode, and refuse contradictory inherited CPU-only settings.
+
 ### Added
 
 - A bounded numerical gate for native NCCL, Gloo islands and staged verbs checks

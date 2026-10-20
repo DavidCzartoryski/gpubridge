@@ -744,7 +744,9 @@ and cross-vendor (step 07) runs are separate records:
 2. `verbs_endpoint`: host-to-host verbs between one rank per node: latency,
    bandwidth sweep, SHA-256 of every buffer on both sides, CPU time;
 3. `verbs_host`, `verbs_gpu_staged`, `verbs_gpu_direct`: the collectives on host
-   tensors, then GPU tensors staged and direct, exactly against Gloo, each call's
+   tensors (the kit sets `GPUBRIDGE_CPU_ONLY=1` before init, using CPU/Gloo islands
+   and the verbs bridge between leaders; not NCCL island coverage), then GPU tensors
+   staged and direct, exactly against Gloo, each call's
    path, reason and bounced bytes recorded and the path required. `direct` means
    nothing bounced (`direct+bounce` fails the step), so `verbs_gpu_direct` runs
    with `GPUBRIDGE_VERBS_RNDV_BYTES=1`: every message by rendezvous, written in
@@ -753,6 +755,10 @@ and cross-vendor (step 07) runs are separate records:
    over `bridge="verbs"`, the Gloo and UCX bridges' runs in the same job as the
    matched references;
 5. `train_verbs`, `train_gloo`: `train_bench.py` over each.
+
+Host collective records include `cpu_only: true` and `island_backend: "gloo"`.
+The kit refuses inherited CPU-only settings that contradict `--memory` (including
+`--memory gpu` with `GPUBRIDGE_CPU_ONLY=1`).
 
 Every `verbs_kit` record holds the endpoint telemetry, completion errors, a window
 of every `/sys/class/infiniband/*/ports/*/{counters,hw_counters}` file and every

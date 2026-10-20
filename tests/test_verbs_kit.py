@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -140,23 +141,55 @@ def _free_port() -> int:
 
 
 def _kit(mode: str, out: Path, fabric: str, *extra: str,
-         split: str | None = "half") -> list[subprocess.CompletedProcess]:
-    """Both ranks as plain processes. Under torchrun the agent SIGTERMs the other rank as
+         split: str | None = "half", cuda_like: bool = False) -> list[subprocess.CompletedProcess]:
+    """Ranks as plain processes. Under torchrun the agent SIGTERMs the other ranks as
     soon as one exits nonzero, so when every rank fails only the first one's record is
     sure to be written. ``split=None``: one NVIDIA island, so no bridge leader."""
     port = _free_port()
     procs = []
-    for rank in (0, 1):
+    world = 4 if cuda_like else 2
+    for rank in range(world):
         env = {**os.environ, "GPUBRIDGE_VERBS_TEST_FABRIC": fabric,
                "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), os.environ.get("PYTHONPATH", "")]),
                "GPUBRIDGE_VENDOR": "nvidia",
                "MASTER_ADDR": "127.0.0.1", "MASTER_PORT": str(port), "RANK": str(rank),
-               "LOCAL_RANK": str(rank), "WORLD_SIZE": "2", "LOCAL_WORLD_SIZE": "2"}
+               "LOCAL_RANK": str(rank), "WORLD_SIZE": str(world), "LOCAL_WORLD_SIZE": str(world)}
         env.pop("GPUBRIDGE_SPLIT_TEST", None)
         if split is not None:
             env["GPUBRIDGE_SPLIT_TEST"] = split
+        command = [sys.executable]
+        if cuda_like:
+            # No vendor simulation: without the kit's CPU-only selection this
+            # configuration would select NCCL and cuda:LOCAL_RANK, even on CPU CI.
+            env.pop("GPUBRIDGE_VENDOR", None)
+            env.pop("GPUBRIDGE_CPU_ONLY", None)
+            command += ["-c", """
+import os
+import runpy
+import sys
+import torch
+from types import SimpleNamespace
+from gpubridge.config import resolve_config
+from gpubridge.collectives import _check_tensor
+
+torch.version.cuda = "12.6"
+torch.version.hip = None
+torch.cuda.is_available = lambda: True
+torch.cuda.device_count = lambda: 4
+config = resolve_config()
+assert config.device == torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+assert config.island_backend == "nccl"
+try:
+    _check_tensor(torch.ones(1), SimpleNamespace(device=config.device, simulated=False))
+except ValueError as exc:
+    assert "tensor is on cpu but this rank communicates on cuda:" in str(exc)
+else:
+    raise AssertionError("expected the original host tensor/device mismatch")
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""]
         procs.append(subprocess.Popen(
-            [sys.executable, str(ROOT / "scripts" / "gpu" / "verbs_kit.py"), mode,
+            [*command, str(ROOT / "scripts" / "gpu" / "verbs_kit.py"), mode,
              "--out", str(out), "--max-bytes", "4096", "--iters", "5", "--timeout", "60", *extra],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
     done = []
@@ -169,6 +202,73 @@ def _kit(mode: str, out: Path, fabric: str, *extra: str,
             if proc.poll() is None:
                 proc.kill()
     return done
+
+
+def test_host_mode_uses_cpu_islands_with_a_cuda_like_build_on_the_mock_fabric(tmp_path):
+    from test_verbs import UNAVAILABLE
+
+    if UNAVAILABLE is not None:
+        pytest.skip(f"verbs test library unavailable: {UNAVAILABLE}")
+    fabric = tempfile.mkdtemp(prefix="gbvk-", dir="/tmp")
+    try:
+        done = _kit("collectives", tmp_path, fabric, "--memory", "host", cuda_like=True)
+    finally:
+        shutil.rmtree(fabric, ignore_errors=True)
+    assert all(rank.returncode == 0 for rank in done), [rank.stderr[-2000:] for rank in done]
+    for r in range(4):
+        record = json.loads((tmp_path / f"rank{r}.json").read_text())
+        assert record["status"] == "ok", record.get("error")
+        assert record["memory"] == "host" and record["cpu_only"] is True
+        assert record["island_backend"] == "gloo" and record["leaders"] == 2
+        assert record["mismatches"] == 0
+        assert {call["op"] for call in record["calls"]} == {"all_reduce", "broadcast"}
+        assert all(call["exact"] for call in record["calls"])
+        if record["leader"]:
+            assert record["telemetry_after"]["mock"] is True
+            assert record["window"]["tcp_evidence"]["bridge_bytes"] > 0
+
+
+@pytest.mark.parametrize(("memory", "setting"), [
+    ("gpu", "1"), ("gpu", " true "), ("gpu", "yes"), ("gpu", "on"),
+    ("host", "0"), ("host", "false"), ("host", "no"), ("host", "off"),
+])
+def test_memory_conflicts_are_refused_before_init(tmp_path, monkeypatch, memory, setting):
+    import gpubridge
+
+    def unexpected_init(**kwargs):
+        pytest.fail("a contradictory setting must fail before initializing collectives")
+
+    monkeypatch.setattr(gpubridge, "init", unexpected_init)
+    monkeypatch.setenv("GPUBRIDGE_CPU_ONLY", setting)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setattr(sys, "argv", ["verbs_kit.py", "collectives", "--memory", memory,
+                                      "--out", str(tmp_path)])
+    assert verbs_kit.main() == 1
+    record = json.loads((tmp_path / "rank0.json").read_text())
+    assert record["status"] == "error"
+    assert f"--memory {memory} conflicts with GPUBRIDGE_CPU_ONLY={setting!r}" in record["error"]
+    assert os.environ["GPUBRIDGE_CPU_ONLY"] == setting
+
+
+@pytest.mark.parametrize("setting", [None, "", "0", "false"])
+def test_gpu_mode_preserves_the_environment_and_init_arguments(monkeypatch, setting):
+    import gpubridge
+
+    monkeypatch.delenv("GPUBRIDGE_CPU_ONLY", raising=False)
+    if setting is not None:
+        monkeypatch.setenv("GPUBRIDGE_CPU_ONLY", setting)
+
+    def check_init(**kwargs):
+        from datetime import timedelta
+
+        assert os.environ.get("GPUBRIDGE_CPU_ONLY") == setting
+        assert kwargs == {"timeout": timedelta(seconds=60), "bridge": "verbs", "policy": "auto"}
+        raise RuntimeError("stop before GPU initialization")
+
+    monkeypatch.setattr(gpubridge, "init", check_init)
+    args = SimpleNamespace(memory="gpu", timeout=60, bridge="verbs", policy="auto")
+    with pytest.raises(RuntimeError, match="stop before GPU initialization"):
+        verbs_kit.collectives_mode(args, 0, 4)
 
 
 @pytest.mark.parametrize("mode", ["endpoint", "collectives"])

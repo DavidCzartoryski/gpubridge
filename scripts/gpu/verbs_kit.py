@@ -45,8 +45,11 @@ through torchrun's store.
 
 ``collectives``: ``gpubridge.init(bridge=...)`` then all_reduce and broadcast at each
 size on ``--memory host`` or ``gpu`` tensors, checked exactly against a Gloo
-all_reduce of the same integer-valued data. With ``--expect-path direct|staged`` every
-GPU call must have taken that path (``GPUBRIDGE_VERBS_GPU_PATH=direct`` makes a
+all_reduce of the same integer-valued data. Host mode sets ``GPUBRIDGE_CPU_ONLY=1``
+before init: CPU tensors and Gloo islands, with the selected bridge between leaders,
+not NCCL island coverage. Contradictory inherited CPU-only settings are refused.
+With ``--expect-path direct|staged`` every GPU call must have taken that path
+(``GPUBRIDGE_VERBS_GPU_PATH=direct`` makes a
 direct path that can't run fail loudly rather than stage). ``direct`` means nothing
 bounced: a call with any receive through a host bounce buffer (below
 ``GPUBRIDGE_VERBS_RNDV_BYTES``) is ``direct+bounce``, which fails ``--expect-path
@@ -360,6 +363,17 @@ def collectives_mode(args, rank: int, world: int) -> dict:
     import torch.distributed as dist
 
     import gpubridge
+    from gpubridge.config import CPU_ONLY_ENV, is_cpu_only
+
+    cpu_only = is_cpu_only()
+    if args.memory == "host":
+        if os.environ.get(CPU_ONLY_ENV, "").strip() and not cpu_only:
+            raise ValueError(f"--memory host conflicts with {CPU_ONLY_ENV}={os.environ[CPU_ONLY_ENV]!r}; "
+                             "unset it or use 1 for CPU tensors and Gloo islands")
+        os.environ[CPU_ONLY_ENV] = "1"
+    elif cpu_only:
+        raise ValueError(f"--memory gpu conflicts with {CPU_ONLY_ENV}={os.environ[CPU_ONLY_ENV]!r}; "
+                         "unset it or use 0")
 
     topology = gpubridge.init(timeout=timedelta(seconds=args.timeout), bridge=args.bridge,
                               policy=args.policy)
@@ -375,6 +389,8 @@ def collectives_mode(args, rank: int, world: int) -> dict:
            "memory": args.memory, "leader": bridge is not None,
            "leaders": int(leaders.item()), "calls": [],
            "mismatches": 0, "path_violations": 0, "bounced_bytes": 0}
+    if args.memory == "host":
+        out.update(cpu_only=True, island_backend=topology.config.island_backend)
     tele0 = bridge.telemetry() if bridge is not None and hasattr(bridge, "telemetry") else None
 
     def path_of(call: dict) -> None:
