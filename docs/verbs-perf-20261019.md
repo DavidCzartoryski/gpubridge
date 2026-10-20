@@ -359,8 +359,11 @@ chunk, the 64 KiB, 1 MiB and 4 MiB rows run the unchanged code with the option o
 those rows are an A/A control inside the A arm. Behaviour that differs: an
 observation's `duration_s` starts before the first chunk's copy out has passed, and a
 call that fails part way may already have copied some reduced chunks back into the
-caller's tensor (it still raises, once the worker is aborted and every copy it queued
-on the caller's stream has passed, and the bridge refuses later calls).
+caller's tensor (it still raises its own error, once the worker is aborted and every
+copy it queued on the caller's stream has passed, and the bridge refuses later calls;
+if waiting for those copies fails too, as a sticky GPU error would make it, the
+call's error is raised with the wait's chained to it, and its copies may still be
+pending).
 `staged_phases` keeps its meaning as a split of the call's host time: for overlapped
 calls `to_host_s` is queueing the copies out plus the host's waits for them (the
 waits the overlap didn't hide) and `to_device_s` is queueing each copy back.

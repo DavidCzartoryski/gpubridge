@@ -497,6 +497,33 @@ def test_on_a_copy_out_that_cant_be_queued_aborts_and_drains_those_queued(monkey
     assert torch.equal(first, _mine(numel) + _theirs(numel))
 
 
+def test_on_a_drain_that_fails_too_the_calls_own_error_reaches_the_caller(monkeypatch):
+    # On a GPU a sticky error fails the stream wait as well: the caller must still see
+    # why the call failed, not the wait's error with the call's only as its context.
+    numel = 3 * ELEMS + ELEMS // 2
+    t = _transport(monkeypatch, "1", peer=_theirs(numel))
+    staging = t._staging_for(_mine(numel))
+    _log_aborts(t, staging.log)
+
+    def sticky():
+        staging.log.append(("drain failed",))
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    monkeypatch.setattr(staging, "_drain", sticky)
+    t.worker.endpoint.fail_wait = 3  # chunk 2's wait fails
+    with pytest.raises(verbs.TransportError, match="retry exhausted") as info:
+        t.all_reduce(_mine(numel))
+    assert isinstance(info.value.__cause__, RuntimeError), info.value.__cause__
+    assert "illegal memory access" in str(info.value.__cause__)
+    log = staging.log
+    assert log.index(("abort",)) < log.index(("drain failed",))
+    # Its copies may still be pending: the buffer stays kept, and later calls are refused.
+    assert t._keep and t._keep[-1][0].data_ptr() == staging.buffer.data_ptr()
+    assert t.worker.failed is not None and t.telemetry()["failed"]
+    with pytest.raises(verbs.TransportError, match="already failed"):
+        t.all_reduce(_mine(numel, 1))
+
+
 def test_on_the_phases_partition_the_call_like_a_whole_call(monkeypatch):
     numel = 4 * ELEMS
     t = _transport(monkeypatch, "1", peer=_theirs(numel))

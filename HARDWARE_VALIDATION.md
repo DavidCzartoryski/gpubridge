@@ -585,7 +585,8 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     (step 05) and cross-vendor (step 07) separately. The same holds with
     `GPUBRIDGE_VERBS_STAGED_OVERLAP=1` (copies overlapped chunk by chunk, two
     leaders), with the same messages on the wire, and a call that fails part way
-    raises only after its copies on the caller's stream have passed; whether it is
+    raises its own error only after its copies on the caller's stream have passed
+    (or, if that wait fails too, with the wait's error chained); whether it is
     faster is the conditional A/B of docs/verbs-perf-20261019.md, section 7.
     *Status: the stream ordering is tested with CPU tensors standing in and lazy
     copies (`tests/test_verbs_gpu.py`, `tests/test_verbs_staged_overlap.py`), not

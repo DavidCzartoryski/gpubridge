@@ -50,9 +50,11 @@ registrations, tags, sizes), so leaders with and without it interoperate. Broadc
 more than two leaders and tensors of one chunk run as without it; ``last_gpu["staging"]``
 says which ran and why. Differences: an observation's ``duration_s`` starts before the
 first chunk's copy out has passed, and a call that fails part way may already have
-copied some reduced chunks back into the caller's tensor. It still raises, only after
-the worker is aborted and every copy it queued on the caller's stream has passed, and
-the transport refuses later calls. Not validated on GPUs.
+copied some reduced chunks back into the caller's tensor. It still raises its own
+error, after the worker is aborted and after waiting for every copy it queued on the
+caller's stream, and the transport refuses later calls. If that wait fails too (on a
+GPU, a sticky error), its copies may still be pending: the call's error is raised with
+the wait's as its ``__cause__``, and the staging buffer is kept. Not validated on GPUs.
 
 Not validated on RDMA hardware or GPUs. ``GPUBRIDGE_VERBS_TEST_FABRIC`` runs it on
 a MOCK fabric for tests (see :mod:`gpubridge.verbs`).
@@ -488,7 +490,9 @@ class VerbsTransport(TaggedBridge):
         If anything fails, queueing the copies included, the worker is aborted (so the
         NIC no longer touches the buffers) and then every copy queued on the caller's
         stream is waited for, before the error propagates: none still writes the
-        caller's tensor or the staging buffer after the caller has seen the failure."""
+        caller's tensor or the staging buffer after the caller has seen the failure.
+        If that wait fails too, that is not known: the call's error propagates with the
+        wait's as its ``__cause__``, the buffer stays kept and later calls are refused."""
         router = self.worker
         times = {"to_host_s": 0.0, "to_device_s": 0.0}
         t0 = time.perf_counter()
@@ -499,8 +503,14 @@ class VerbsTransport(TaggedBridge):
         try:
             self._run("staged", plan, host,
                       lambda h: self._exchange(h, tensor, staging, pieces, op, times))
-        except BaseException:
-            staging.drain()
+        except BaseException as exc:
+            try:
+                staging.drain()
+            except BaseException as drain_error:
+                # On a GPU a sticky error fails the drain too: the caller still sees
+                # the call's own error, the drain's chained to it. The buffer stays
+                # kept and the aborted worker refuses later calls, as on any failure.
+                raise exc from drain_error
             raise
         finally:
             router.timed = False
