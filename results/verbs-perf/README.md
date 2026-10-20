@@ -26,6 +26,8 @@ the same machine throughout; every record has `uptime` before and after its run.
   and the rule verdict of docs/VERBS_PERF.md, section 1, for every metric.
   - `ab-1-mock-flag/`: before `49a6ad7`, after `b89b4d9`.
   - `ab-2-key-check/`: before `b89b4d9`, after `04bfc24` (dropped by the rule; reverted in `613a26c`).
+  - `ab-3-phase-timers/`: before `cd9fbac`, after the staged-path timers; on an Apple M1
+    Max, with its own README (docs/verbs-perf-20261019.md).
 
 **Labelled deviations (after the perf review).** The `summary.*` verdicts are the
 harness's, kept as recorded, and depart from docs/VERBS_PERF.md rule 3 in two ways:
