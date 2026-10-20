@@ -321,6 +321,22 @@ def test_native_control_is_plain_ddp_without_gpubridge_labelled_on_cpu(tmp_path)
     assert bridged["buckets"] == record["buckets"]  # the same buckets, from DDP itself
 
 
+def test_controlled_benchmark_starts_ddp_from_the_fresh_model_after_compute(tmp_path):
+    extra = ("--controlled", "--batch-size", "2", "--seq-len", "8")
+    native = _bench(tmp_path, *extra, "--grad-sync", "native")
+    bridged = _bench(tmp_path, *extra)
+    torch.manual_seed(0)
+    fresh = train_bench.build("tiny-gpt")
+    x, y = train_bench.batches("tiny-gpt", 2, 8, 0, torch.device("cpu"))[0]
+    expected_loss = round(float(train_bench.loss_of(fresh, x, y).detach()), 4)
+    for record in (native, bridged):
+        assert record["controlled"]
+        assert record["loss_first"] == expected_loss
+        assert len({r["initial_sha256"] for r in record["ranks"]}) == 1
+        assert all(r["initial_sha256"] == r["ddp_initial_sha256"] for r in record["ranks"])
+    assert [r["data_sha256"] for r in native["ranks"]] == [r["data_sha256"] for r in bridged["ranks"]]
+
+
 def test_gpubridge_bridge_verbs_trains_over_the_verbs_bridge(tmp_path):
     """GPUBRIDGE_BRIDGE reaches gpubridge.init: two islands on the MOCK verbs test fabric
     (tests/test_verbs.py) train over verbs, and both leaders observe the bridge's calls."""
