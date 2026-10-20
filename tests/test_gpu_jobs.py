@@ -39,6 +39,10 @@ END_TO_END = {
     "bench_compression.py": "test_step_04, 07, the node pair, test_amd_node_job",
     "bench_matrix.py": "test_step_08_*, test_net_check_job, test_gpu_kit.py",
     "train_bench.py": "test_step_07_*, test_train_bench_job, test_gpu_kit.py",
+    "numerical_gate.py": "test_numerical_gate.py: four-rank software gates, negative controls, "
+                         "provenance comparison and hardware-entrypoint refusal",
+    "verbs_kit.py": "test_verbs_kit.py: actual MOCK CLI runs refuse no-TCP acceptance, "
+                    "missing leaders and incomplete native evidence",
     "train_dp.py": "test_step_07_data_parallel, test_dp_baseline_job, test_gpu_kit.py",
     "llama.py": "imported by train_dp.py: the same tests",
     "dp_report.py": "test_step_07_data_parallel, test_gpu_kit.py",

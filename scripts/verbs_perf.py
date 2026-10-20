@@ -36,7 +36,6 @@ import tempfile
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Self
 
 LABEL = "CPU/MOCK, not a GPU or RDMA speedup"
 KiB, MiB = 1024, 1024 * 1024
@@ -100,7 +99,7 @@ class Counter:
     def __init__(self, lib) -> None:
         self.lib, self.counts, self.seconds, self.saved = lib, {}, {}, {}
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> Counter:
         # Every function the binding declared (ctypes caches each on the library object).
         for name in [n for n in vars(self.lib) if n.startswith("gb_verbs_")]:
             fn = getattr(self.lib, name)
