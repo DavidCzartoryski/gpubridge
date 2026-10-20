@@ -723,6 +723,62 @@ fn a_failed_wait_stops_every_granted_write() {
     drop((b, c));
 }
 
+/// The number after `"name":` in a telemetry object.
+fn telemetry_number(t: &str, name: &str) -> u64 {
+    let key = format!("\"{name}\":");
+    let at = t.find(&key).unwrap_or_else(|| panic!("no {name} in {t}")) + key.len();
+    let digits: String = t[at..].chars().take_while(char::is_ascii_digit).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} isn't a number in {t}"))
+}
+
+/// What write windows cost is measured: the time spent making each one (on the posting
+/// thread) and releasing it once written (on the completion thread), with the windows
+/// released counted. A window still granted is neither released nor in the release time.
+#[test]
+fn the_time_to_make_and_release_write_windows_is_counted() {
+    for kind in ["host", "dmabuf", "peer"] {
+        let mut g = granted(kind);
+        let t = g.a.telemetry();
+        assert_eq!(telemetry_number(&t, "write_windows"), 1, "{kind}: {t}");
+        assert!(
+            telemetry_number(&t, "write_window_register_ns") > 0,
+            "{kind}: {t}"
+        );
+        assert_eq!(
+            telemetry_number(&t, "write_windows_released"),
+            0,
+            "{kind}: {t}"
+        );
+        assert_eq!(
+            telemetry_number(&t, "write_window_release_ns"),
+            0,
+            "{kind}: {t}"
+        );
+        let data = pattern(g.len as usize, 3);
+        assert_eq!(g.b.write(&data, g.addr, g.key), WcStatus::Success);
+        let fin = g.b.header(Kind::Fin, 5, g.len).encode();
+        assert_eq!(g.b.send(&fin), WcStatus::Success);
+        g.a.wait(&[g.recv], LONG).unwrap();
+        eventually(LONG, "the window is released", || {
+            telemetry_number(&g.a.telemetry(), "write_windows_released") == 1
+        });
+        let t = g.a.telemetry();
+        assert!(
+            telemetry_number(&t, "write_window_release_ns") > 0,
+            "{kind}: {t}"
+        );
+        assert_eq!(
+            telemetry_number(&t, "write_windows_closed"),
+            1,
+            "{kind}: {t}"
+        );
+        g.a.close(LONG).ok();
+        assert!(g.gpu.violations().is_empty(), "{:?}", g.gpu.violations());
+    }
+}
+
 #[test]
 fn cached_registrations_are_never_remotely_writable() {
     let gpu = MockGpu::new();
