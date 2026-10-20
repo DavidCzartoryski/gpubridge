@@ -4,8 +4,11 @@
 bridge and a harness to run on one GPU node; it changes no data path. Every number
 below that this change produced is a **local CPU/MOCK measurement on an Apple M1 Max**
 (a MacBook Pro, a shared machine with a load average of 35 to 54 from other work
-throughout), never GPU or NIC evidence. No verbs run on GPU or RDMA hardware is
-recorded in this repository (HARDWARE_VALIDATION.md, items 38 to 42: not run).
+throughout), never GPU or NIC evidence. The repository records real verbs runs on one
+GPU node through its NIC's loopback (HARDWARE_VALIDATION.md items 38, 39 and 42, the
+2026-10-20 results): host and staged-GPU traffic, staged correctness and GPT-2-small
+training. None of them used this change's timers, so the phase and window costs it
+measures have not been measured on hardware.
 
 ## 1. Why: what is not measured today
 
