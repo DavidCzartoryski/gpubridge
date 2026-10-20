@@ -173,6 +173,17 @@ def test_compare_needs_every_predeclared_repeat_and_checks_every_run(tmp_path):
     result = _compare(tmp_path, "P0", "D1", 3, 2)
     assert result.returncode == 1, result.stdout + result.stderr
     assert _verdict(tmp_path, "P0", "D1")["status"] == "FAIL (wrong result)"
+    # So is an incomplete one: its wrong result fails the comparison, not only INCOMPLETE.
+    _write(tmp_path, "P0", [2])
+    broken = _record("D1", 1, 1.0, wrong=1)
+    broken["sizes"][0][3]["timed_s"].pop()
+    (tmp_path / "D1-r1.json").write_text(json.dumps(broken))
+    result = _compare(tmp_path, "P0", "D1", 3, 2)
+    assert result.returncode == 1, result.stdout + result.stderr
+    verdict = _verdict(tmp_path, "P0", "D1")
+    assert verdict["status"] == "FAIL (wrong result)" and verdict["rows"] == [], verdict
+    assert any("D1-r1.json: 2 wrong results" in r for r in verdict["reasons"]), verdict
+    assert any("samples [4, 5] for 5 calls" in r for r in verdict["reasons"]), verdict
 
 
 @pytest.mark.parametrize("change, differ", [
