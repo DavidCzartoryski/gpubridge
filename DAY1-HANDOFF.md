@@ -3,7 +3,8 @@
 2026-10-21. Branch `day1/bridge-baseline-personal-20261020`, starting from reviewed `main`
 **`38b1e2017c07541cd57f0eeb9d05cd7288b94ae2`** (PR #102), integrated through normal
 merge with upstream `main` **`26da9f9a12f762bd49f135c2a7167431a0317fc4`** (PR #101, #103)
-at merge commit **`34fed0fa81d8ae79887532258e24c3e763e8e1f3`**. Everything here ran
+at merge commit **`34fed0fa81d8ae79887532258e24c3e763e8e1f3`**, with Enterprise review
+findings resolved at **`910aa96e488ce5f1e590def48e9e8c83fdf6cb25`**. Everything here ran
 on CPU on the Mac mini: **no GPU, RDMA, Slurm or cloud job was run**, and a pass on the
 MOCK verbs fabric is not native GPU or RDMA validation.
 
@@ -72,6 +73,8 @@ MOCK verbs fabric is not native GPU or RDMA validation.
 | `938f5c9` | Reconcile upstream PR 101/103 in runtime inventory and handle redacted test path | `docs/RUNTIME_INVENTORY.md`, `tests/test_gpu_kit.py`, ruff, full suite |
 | `899d4a9` | Document Day 1 reproducible baseline audit and handoff | full documentation and JUnit record |
 | `34fed0f` | Merge remote-tracking branch 'origin/main' into day1/bridge-baseline-personal-20261020 | 147 focused tests, 96 Rust tests, ruff, shellcheck |
+| `ce33d4d` | Update handoff and inventory with integrated HEAD trees, requalification and attribution | `docs/RUNTIME_INVENTORY.md`, `DAY1-HANDOFF.md` |
+| `910aa96` | Address Enterprise review findings: ENV_CODE variable, RST docstrings, completion record and BSD cache fill test | `scripts/gpu/verbs_staged_ab.py`, `tests/test_gpu_kit.py`, `scripts/baseline.sh`, `src/gpubridge/transport.py` |
 
 Detector source, its environment and its jobs were not touched. Nothing from the
 earlier Personal detector branch is integrated. No shared venv was changed; rustup's
@@ -89,6 +92,7 @@ global default was not set (the toolchain is pinned per command).
 | Lint | ruff 0.17.0 (CI's rule set), shellcheck 0.11.0 (`shellcheck-py`), in `.day1/venv-tools` |
 | Trees at `38b1e20` | `src` `ea6c77b9`, verbs crate `63a58a08`, multitcp crate `9b3e9cdb` |
 | Trees at `34fed0f` | `src` `fcc9e50e`, verbs crate `afb1034c`, multitcp crate `9b3e9cdb` |
+| Trees at `910aa96` | `src` `93b34ecd`, verbs crate `afb1034c`, multitcp crate `9b3e9cdb` |
 | Built at `38b1e20` | `libgpubridge_multitcp-afcdd80dde3353f2.dylib` sha256 `97fbfbcc…17235ed`; `libgpubridge_verbs-test-8de9ec89bae1dfcd.dylib` sha256 `080ab804…2a042e` |
 | Built at `34fed0f` | `libgpubridge_verbs-test-0406e9b4d36d053a.dylib` |
 
@@ -165,7 +169,7 @@ Fresh interpreter runs alternating between `38b1e20`'s `src` and this branch:
 - **With bytecode (30 runs)**: 25 → 15 gpubridge modules (-10), **7.04 → 4.75 ms** median (-2.29 ms, -33%), -0.45 MiB peak RSS.
 - **Without bytecode (20 runs)**: 25 → 15 gpubridge modules (-10), **31.31 → 19.57 ms** median (-11.74 ms, -37%), -0.59 MiB peak RSS.
 
-### Requalification on integrated HEAD (`34fed0f`, including PR #101 & PR #103)
+### Requalification on integrated HEAD (`34fed0f` and `910aa96`, including PR #101 & PR #103)
 
 - **Rust Verbs Crate Checks**:
   - `cargo fmt --check --manifest-path src/gpubridge/verbs/crate/Cargo.toml`: pass.
@@ -218,7 +222,7 @@ None of these can be settled on this machine; each needs the hardware named.
 | Verbs between two hosts, host and staged GPU, with a decisive no-silent-TCP verdict and real-TCP negatives | two RDMA-connected nodes | items 38, 39 |
 | Verbs direct GPU memory: NVIDIA dma-buf or peer memory, AMD dma-buf | nodes with dma-buf support or `nvidia_peermem` (the 4-V100 node had neither) | items 40, 41 |
 | Training over verbs against Gloo across nodes; the matched native-DDP vs gpubridge 1/2/4-GPU series | multi-node GPUs | item 42; BENCHMARKS.md |
-| Mixed vendor over verbs (NVIDIA + AMD leaders on one fabric) | an RDMA path between an NVIDIA and an AMD node (none between Explorer's V100 and MI50 nodes) | items 38, 41; BENCHMARKS.md "RDMA between the node types" |
+| Mixed vendor over verbs (NVIDIA + AMD leaders on one fabric) | an RDMA path between an NVIDIA and an AMD node (none between Explorer's V100 and MI50 nodes) | items 38, 41; BENCHMARKS.md \"RDMA between the node types\" |
 | UCX bridge on GPUs and RDMA | UCX on GPU nodes | items 26, 27 |
 | More than 4 GPUs; representative-model numerical equivalence over the bridge | 8+ GPUs; a frozen representative workload | NUMERICAL_GATE.md |
 
@@ -238,4 +242,16 @@ Upstream `main` was checked at commit `26da9f9`, incorporating:
 **Architectural Reconciliation:**
 1. **Isolated Opt-in Scope**: Both changes live strictly inside the opt-in `verbs` transport path. Neither impacts default `gpubridge` initialization, discovery, barriers, or the default `gloo` transport.
 2. **Import Integrity & Evidence Attribution**: Staged timers and copy overlap do not alter the lazy import boundaries established in this branch. Opt-in transports continue to load only when requested. Default-off bit-for-bit identity of staged copy overlap was verified upstream in PR #103 (`results/verbs-perf/ab-4-staged-overlap/probes/default-path.json`, commit `d153bf3`), and is attributed to that run rather than re-executed on hardware here.
-3. **Qualification Boundaries**: Neither PR constitutes multi-node, cross-node, or cross-vendor hardware qualification. The `38b1e20` baseline remains the reproducible reference point for this audit, and the integrated HEAD `34fed0f` preserves all Day 1 audit guarantees and evidence.
+3. **Qualification Boundaries**: Neither PR constitutes multi-node, cross-node, or cross-vendor hardware qualification. The `38b1e20` baseline remains the reproducible reference point for this audit, and the integrated HEAD `910aa96` preserves all Day 1 audit guarantees and evidence.
+
+## 8. Enterprise Review Resolution (`DAY1-GPUBRIDGE-REVIEW.md`)
+
+The independent read-only review from Enterprise Opus (`DAY1-GPUBRIDGE-REVIEW.md`) confirmed:
+- "Verdict: For 899d4a9, there is no blocking defect in its own scope... For 34fed0f, the merge resolution is sound."
+- All concrete in-scope suggestions were addressed at `910aa96`:
+  1. **Finding 1 (Cross-repo pin bump)**: Noted for detector pin-bump owner (`GPUBRIDGE_VERBS_CACHE_DIR` usage).
+  2. **Finding 2 (`verbs_staged_ab.py`)**: `ENV_CODE` updated to include `GPUBRIDGE_VERBS_CACHE_DIR`; `GPUBRIDGE_VERBS_LIB_DIR` falls under `ENV_SETTINGS`.
+  3. **Finding 3 (Doc precision)**: Comment in `src/gpubridge/transport.py` clarifies verbs coupling to `ucx.transport` helpers.
+  4. **Finding 5 (BSD `cp` fill test)**: Added `test_triton_cache_begin_fills_node_local_cache_portably_from_store` in `tests/test_gpu_kit.py`, providing automated coverage of the portable `cp -a "${entry%/}"` fill on BSD without requiring GNU `mv -T`.
+  5. **Finding 6 (`steps.jsonl` self-attestation)**: Appended final `{"completed": true, "failed": ...}` completion record in `scripts/baseline.sh`.
+  6. **Finding 7 (RST docstrings)**: Restored double backticks around `telemetry()["staged_phases"]` in `src/gpubridge/verbs/transport.py`.
