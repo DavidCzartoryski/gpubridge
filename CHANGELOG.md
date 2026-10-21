@@ -323,6 +323,11 @@ hardware.
 
 ### Added
 
+- `scripts/baseline.sh OUT_DIR`: the CPU baseline in one command, CI's crate checks,
+  native builds, the test suite and the simulation example, every step's exit code in
+  `steps.jsonl`; `scripts/baseline_identity.py` records the git trees, packages, Rust
+  and C toolchains and the SHA-256 of each built library. Its pass is not GPU or RDMA
+  validation (the verbs bridge runs on its MOCK fabric).
 - A bounded numerical gate for native NCCL, Gloo islands and staged verbs checks
   exact collectives, gradients, independent optimizer updates/state and parameters;
   includes bad-reduction/scale/data controls and actual endpoint/source attestation.
