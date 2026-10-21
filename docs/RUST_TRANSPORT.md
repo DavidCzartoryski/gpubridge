@@ -164,6 +164,13 @@ get written up and the work stops there; it doesn't go on to stage 2 on that
 basis alone. Either way the numbers go in
 [BENCHMARKS.md](BENCHMARKS.md) and the CHANGELOG, measured, not predicted.
 
+**Outcome: the gate was not met.** In the two step-08 jobs (a V100 and an MI50,
+commit 23180fe of #66's branch), pinned multitcp took 1.07 and 1.02 times the
+pinned Gloo bridge's time at 64 MB, 0.90 and 0.90 at 256 MB and 0.88 and 0.88 at
+1 GB ([BENCHMARKS.md](BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype)). Stage 1
+stays opt-in as it is, stage 2 does not start on this basis, and `import gpubridge`
+loads the transport only when a job names it.
+
 ## Not done
 
 - Stage 2 (ibverbs with GPUDirect RDMA on NVIDIA and dma-buf on AMD, with

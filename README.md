@@ -10,9 +10,15 @@ native NCCL or RCCL, and a bridge joins them.**
 **Status:** alpha. Validated on CPU, in simulation and with CUDA and ROCm
 builds of PyTorch joined in one job. On GPUs since 2026-10-14: single-vendor
 runs on NVIDIA V100, T4, L40S, A100 and H200 and an AMD MI50, and mixed jobs of
-one V100 and one MI50 (one GPU per vendor) over TCP. The
-[CHANGELOG](CHANGELOG.md)'s header lists every GPU run, and
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md) what the bridge costs.
+one V100 and one MI50 (one GPU per vendor) over TCP. On 2026-10-20, split tests
+on one node of four V100s: two 2-GPU NCCL islands joined by the Gloo bridge,
+and by the opt-in verbs bridge on real libibverbs through one InfiniBand HCA in
+loopback, staged through host memory. Not yet: verbs between machines, AMD or
+mixed-vendor verbs, GPU memory direct to the NIC (GPUDirect), or more than four
+GPUs. The [CHANGELOG](CHANGELOG.md) lists every GPU run,
+[HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
+what each one showed, and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) what the
+bridge costs.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/architecture-dark.svg">
@@ -51,15 +57,16 @@ its own vendor. No GPUs? See [Simulation mode](#simulation-mode-no-gpus-needed).
 
 | Feature | Status |
 | --- | --- |
-| Collectives: `all_reduce`, `broadcast`, `all_gather_into_tensor`, `reduce_scatter_tensor`, `barrier` | tested on CPU · passed on a V100 + MI50, one GPU each, and in split tests (two processes on one NVIDIA or AMD GPU, labeled as two vendors) |
+| Collectives: `all_reduce`, `broadcast`, `all_gather_into_tensor`, `reduce_scatter_tensor`, `barrier` | tested on CPU · passed on a V100 + MI50, one GPU each, and in split tests (two processes on one NVIDIA or AMD GPU, labeled as two vendors), and with two 2-GPU NCCL islands of V100s on one node (`c92684b`) |
 | Async collectives (`async_op=True`) and a DDP comm hook | tested on CPU · passed on a V100 + MI50; DDP with the hook trained there with torch 2.9.1+rocm6.3 on the MI50 |
-| `torch.distributed` backend: DDP, FSDP2, HSDP through subgroups | experimental · tested on CPU · DDP and FSDP2 trained on a V100 + MI50 (torch 2.9.1+rocm6.3 on the MI50), FSDP2 bit for bit against a replay; HSDP passed there with torch 2.14.1 on the V100 (since #80) |
-| Point-to-point through the backend: `send`, `recv`, `isend`, `irecv`, `batch_isend_irecv` | experimental · tested on CPU · passed on a V100 + MI50 and on a V100 split test (commit 1c7d107), through the Gloo link; not yet the UCX lanes or native GPU batches |
-| Pipelined and sharded bridge policies | opt-in · tested on CPU · correct and benchmarked on a V100 + MI50 (one GPU each, so the sharded bridge had one link) |
+| `torch.distributed` backend: DDP, FSDP2, HSDP through subgroups | experimental · tested on CPU · DDP and FSDP2 trained on a V100 + MI50 (torch 2.9.1+rocm6.3 on the MI50), FSDP2 bit for bit against a replay; HSDP passed there with torch 2.14.1 on the V100 (since #80); with two 2-GPU V100 islands (`c92684b`), DDP trained and FSDP2 and HSDP matched a replay bit for bit |
+| Point-to-point through the backend: `send`, `recv`, `isend`, `irecv`, `batch_isend_irecv` | experimental · tested on CPU · passed on a V100 + MI50, on a V100 split test (commit 1c7d107) and with two 2-GPU V100 islands (`c92684b`, all 66 benchmark payload rows), through the Gloo link; not yet the UCX lanes, verbs or native GPU batches |
+| Pipelined and sharded bridge policies | opt-in · tested on CPU · correct and benchmarked on a V100 + MI50 (one GPU each, so the sharded bridge had one link); correct with two links on two 2-GPU V100 islands (`c92684b`), where pipelining helped the Gloo bridge from 1 to 256 MiB and generally slowed the verbs bridge |
 | UCX bridge transport (RDMA where available) | opt-in · tested on CPU over TCP · not yet on GPU or RDMA |
-| Multi-stream TCP bridge transport (Rust) | opt-in · tested on CPU over loopback TCP · not yet between two machines |
+| Multi-stream TCP bridge transport (Rust) | opt-in · tested on CPU over loopback TCP · between two machines it missed its own speed gate against the pinned Gloo bridge (docs/BENCHMARKS.md), so the prototype stops there |
+| Raw-verbs bridge transport (Rust, libibverbs) | opt-in · tested on mock fabrics · on one node through one InfiniBand HCA in loopback, with real libibverbs: GPU tensors staged through host memory and host tensors exact, and the no-silent-TCP gate passed (`4ffcf93`); not yet between machines, on AMD, GPU memory direct or point-to-point |
 | bf16 / fp8 bridge compression with Triton kernels | opt-in · kernels match the CPU reference on V100, H200 and MI50 (on the MI50 with Triton 3.8.0; torch 2.9.1+rocm6.3's own Triton 3.5.1 can't compile them); benchmarked on a V100 + MI50 |
-| GPU validation kit: Slurm job scripts, checks, benchmarks | every script runs end to end on CPU against a fake Slurm · run on Explorer: steps 01, 02, `amd`, 07, 08, the network checks and the training benchmarks; not the multi-GPU steps 03 to 06 |
+| GPU validation kit: Slurm job scripts, checks, benchmarks | every script runs end to end on CPU against a fake Slurm · run on Explorer: steps 01, 02, `amd`, 07, 08, the network checks and the training benchmarks; on 2026-10-20, step 04's split-test checks and the verbs kit on one 4-V100 node; not steps 03, 05 and 06 |
 
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) lists what each one still
 needs from real GPUs.
@@ -455,7 +462,7 @@ The hook covers DDP only. For FSDP2, or to change a training script only by
 its backend name and `import gpubridge`, use gpubridge as the backend instead
 (below).
 
-### As a torch.distributed backend (experimental, not validated on GPUs)
+### As a torch.distributed backend (experimental)
 
 An existing DDP or FSDP2 script runs on a mixed NVIDIA + AMD cluster by
 changing the backend name and importing gpubridge:
@@ -605,7 +612,7 @@ size. On CPU it is tested over UCX's TCP transport with every bridge policy;
 the design, the GPU-memory rules and what's still open are in
 [docs/RDMA_TRANSPORT.md](docs/RDMA_TRANSPORT.md).
 
-#### The multitcp bridge (experimental, **not run between two machines yet**)
+#### The multitcp bridge (experimental prototype, **missed its speed gate**)
 
 `init(bridge="multitcp")` carries the bridge over several TCP connections per
 pair of leaders (`GPUBRIDGE_MULTITCP_STREAMS`, default 4), in chunks of
@@ -622,12 +629,14 @@ python -m gpubridge.multitcp info
 It takes host tensors only, so GPU tensors are staged exactly as for the Gloo
 bridge. Leaders connect on `GPUBRIDGE_MULTITCP_IFNAME`'s address, else
 `GLOO_SOCKET_IFNAME`'s. On CPU it is tested with every bridge policy at two to
-four leaders, bit for bit against `flat-gloo`; whether it beats the pinned
-Gloo bridge on a real network is what Explorer's step 08 with
-`MULTITCP_BRIDGE=1` measures. The design and the gate are in
-[docs/RUST_TRANSPORT.md](docs/RUST_TRANSPORT.md).
+four leaders, bit for bit against `flat-gloo`. Between a V100 node and an MI50
+node (Explorer's step 08 with `MULTITCP_BRIDGE=1`, two jobs) it did not meet the
+gate set before the runs, at most 0.8 times the pinned Gloo bridge's time from
+64 MB to 1 GB: with pinned staging it took 0.88 to 1.07 times as long, so the
+prototype stops there ([docs/BENCHMARKS.md](docs/BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype)).
+The design and the gate are in [docs/RUST_TRANSPORT.md](docs/RUST_TRANSPORT.md).
 
-#### The verbs bridge (experimental, **not validated on RDMA hardware or GPUs**)
+#### The verbs bridge (experimental, **run on one host only, over one HCA in loopback**)
 
 `init(bridge="verbs")` carries the bridge over RDMA reliable connections with
 raw libibverbs: a Rust library (a C shim compiled against rdma-core's headers)
@@ -649,10 +658,18 @@ else through a registered pinned buffer on the caller's stream;
 `GPUBRIDGE_VERBS_GPU_PATH` forces `staged` or refuses to stage (`direct`).
 `topology.bridge.telemetry()` reports the device, port, link layer, protocol,
 counts, and each call's path and why. `GPUBRIDGE_VERBS_OBSERVE=<file>` writes
-transport observations for the straggler detector. So far it is tested only on
-mock fabrics (with a mock GPU and CPU tensors standing in), including a test-only
-one between processes where every bridge policy matches `flat-gloo` bit for bit;
-the hardware kit (`VERBS_BRIDGE=1`) is prepared, not run.
+transport observations for the straggler detector. It is tested on mock fabrics
+(with a mock GPU and CPU tensors standing in), including a test-only one between
+processes where every bridge policy matches `flat-gloo` bit for bit. On real
+hardware it has run on one node only (four V100s as two 2-GPU islands, one
+Mellanox HDR InfiniBand HCA in loopback, 2026-10-20). With real libibverbs, the
+kit's staged-GPU collectives were exact with payloads up to 512 MiB (`c92684b`);
+its host collectives were exact (28 of 28 calls) and its no-silent-TCP gate passed
+(`4ffcf93`), while both real-TCP negative controls, flat Gloo and the Gloo bridge,
+failed it as required. In one end-to-end sample at `4c13375`, the verbs bridge ran
+at 0.80 times the Gloo bridge's speed at 1 KiB and at 2.1 to 2.7 times its speed
+from 1 to 256 MiB ([docs/BENCHMARKS.md](docs/BENCHMARKS.md#the-verbs-bridge-on-one-node-split-test)).
+GPU memory direct to the NIC, two machines, AMD and point-to-point have not run.
 The protocol, the status of each part and what hardware validation needs are
 in [docs/VERBS_TRANSPORT.md](docs/VERBS_TRANSPORT.md).
 
@@ -777,18 +794,30 @@ mixed hardware, such as monitoring or profiling tools:
 - On the default path, cross-vendor traffic goes through one leader per
   island, its CPU and Gloo, with no chunking, overlap or pinned memory. The
   opt-in `pipelined-reduce-bridge-broadcast` and `sharded-bridge` policies
-  and `GPUBRIDGE_PINNED_STAGING` address that, but they are not validated on
-  GPUs and may not be faster there (HARDWARE_VALIDATION.md items 17 to 21 and
-  25). None of them changes the limit above: all still go through host
-  memory and Gloo.
+  and `GPUBRIDGE_PINNED_STAGING` address that. On GPUs they have been checked
+  and timed only on one V100 + MI50 pair and on two 2-GPU V100 islands of one
+  node, where pipelining helped the Gloo bridge from 1 to 256 MiB; no general
+  speedup is established (HARDWARE_VALIDATION.md items 17 to 21 and 25). None
+  of them changes the limit above: all still go through host memory and Gloo.
+- The opt-in verbs bridge (`bridge="verbs"`) carries the leaders' step over
+  RDMA instead, but it has run on one host only, over one HCA in loopback, with
+  GPU tensors staged through host memory: between machines, on AMD and with GPU
+  memory direct to the NIC it is unvalidated (HARDWARE_VALIDATION.md items 38
+  to 42). In both samples there, it was slower than the Gloo bridge for
+  messages up to 64 KiB.
 - The experimental UCX bridge (`bridge="ucx"`) is meant to move GPU memory
   over RDMA, but it has run only on CPU over TCP so far (HARDWARE_VALIDATION.md
   items 26 and 27).
-- Bridge compression's Triton kernels have run only in Triton's CPU
-  interpreter, and whole compressed jobs only in simulation mode
-  (HARDWARE_VALIDATION.md items 28 and 29).
-- No GPU numbers yet: everything above is tested on CPU (see
-  [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)).
+- Bridge compression changes results by design. Its Triton kernels matched
+  the CPU reference bit for bit on a V100, an H200 and an MI50, and compressed
+  DDP trained for 1,000 steps on a V100 + MI50, but it is not shown to be
+  accuracy-neutral on representative training (HARDWARE_VALIDATION.md items 28
+  and 29).
+- GPU evidence is still narrow: single-vendor nodes, one V100 + MI50 pair over
+  TCP, and one node of four V100s in split tests. Nothing has run across more
+  than two machines or on more than four GPUs, and no representative model is
+  shown to train to the same numbers over the bridge as on native NCCL
+  ([HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)).
   [docs/ROADMAP.md](docs/ROADMAP.md) lists what each experimental design
   still waits for from GPU runs.
 

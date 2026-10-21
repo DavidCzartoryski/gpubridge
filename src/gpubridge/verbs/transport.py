@@ -35,8 +35,11 @@ and the transport refuses later calls.
 ``GPUBRIDGE_VERBS_OBSERVE=<file>`` emits transport observations for the straggler
 detector (:mod:`gpubridge.verbs.observe`: one record per call, per peer and direction).
 
-Not validated on RDMA hardware or GPUs. ``GPUBRIDGE_VERBS_TEST_FABRIC`` runs it on
-a MOCK fabric for tests (see :mod:`gpubridge.verbs`).
+On hardware it has run on one host only, through one HCA in loopback, for host
+tensors and staged GPU tensors (HARDWARE_VALIDATION.md, split-test results of
+2026-10-20): not between hosts, on AMD, or on the direct path.
+``GPUBRIDGE_VERBS_TEST_FABRIC`` runs it on a MOCK fabric for tests (see
+:mod:`gpubridge.verbs`).
 """
 
 from __future__ import annotations
