@@ -177,6 +177,7 @@ cargo test --features test-fabric   # also the cross-process test fabric (any Un
 | --- | --- |
 | `GPUBRIDGE_VERBS_INCLUDE_DIR` | a directory holding `infiniband/verbs.h` (and `rdma/`), when the headers aren't in the compiler's default path; rdma-core's source tree has them in `libibverbs/` and `kernel-headers/rdma/` |
 | `GPUBRIDGE_VERBS_LIB_DIR` | where `libibverbs.so.1` is, when not in the linker's default path |
+| `GPUBRIDGE_VERBS_CACHE_DIR` | where `python -m gpubridge.verbs build` (and the first `load()`) puts the built library: `~/.cache/gpubridge` by default. (The Python side used to read `GPUBRIDGE_VERBS_LIB_DIR` for this too, so setting it as above also put the build in the `libibverbs` directory.) |
 | `CC`, `AR` | the C compiler and archiver (`cc` and `ar` by default) |
 
 Without the headers, `--features ibverbs` fails at build time and says

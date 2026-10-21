@@ -242,7 +242,8 @@ with per-backend policy lists kept in one header
    `native-only`, `flat-gloo` and `auto` (the default, which keeps the
    earlier behaviour). The "later" variants below now exist as opt-in
    policies, `pipelined-reduce-bridge-broadcast`, `sharded-bridge` and
-   `auto-tuned`, tested on CPU and not validated on GPUs. There is no
+   `auto-tuned`, tested on CPU and checked correct on GPUs (a V100 + MI50, two
+   2-GPU V100 islands), with no speedup established. There is no
    per-call override: a mismatch between ranks there would hang with no cheap
    way to detect it.*
    - Make the composition a policy object chosen at `init()`, with an
@@ -576,8 +577,10 @@ job.
    *Status: implemented as the opt-in policy `sharded-bridge`, with extra
    links from `BridgeTransport.create_groups`. Tested on CPU, bit for bit
    against `flat-gloo` in uneven and three-island layouts. Slower than
-   reduce-bridge-broadcast in CPU simulation; not validated on GPUs
-   (HARDWARE_VALIDATION.md items 20 and 21).*
+   reduce-bridge-broadcast in CPU simulation. On GPUs it was checked correct
+   with two links on two 2-GPU V100 islands of one node (`c92684b`); whether more
+   links mean more bandwidth is not established (HARDWARE_VALIDATION.md items 20
+   and 21).*
    - Success: with the bridge crossing the network (Explorer step 05), the
      bridge phase shrinks as k grows, and the whole all_reduce beats
      reduce-bridge-broadcast for large tensors.

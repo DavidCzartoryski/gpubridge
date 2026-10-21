@@ -54,10 +54,14 @@ copied some reduced chunks back into the caller's tensor. It still raises its ow
 error, after the worker is aborted and after waiting for every copy it queued on the
 caller's stream, and the transport refuses later calls. If that wait fails too (on a
 GPU, a sticky error), its copies may still be pending: the call's error is raised with
-the wait's as its ``__cause__``, and the staging buffer is kept. Not validated on GPUs.
+the wait's as its ``__cause__``, and the staging buffer is kept.
 
-Not validated on RDMA hardware or GPUs. ``GPUBRIDGE_VERBS_TEST_FABRIC`` runs it on
-a MOCK fabric for tests (see :mod:`gpubridge.verbs`).
+On hardware it has run on one host only, through one HCA in loopback, for host
+tensors and staged GPU tensors (HARDWARE_VALIDATION.md, split-test results of
+2026-10-20): not between hosts, on AMD, or on the direct path. The staged copy overlap
+and phase timers are not validated on GPUs or RDMA hardware.
+``GPUBRIDGE_VERBS_TEST_FABRIC`` runs it on a MOCK fabric for tests (see
+:mod:`gpubridge.verbs`).
 """
 
 from __future__ import annotations

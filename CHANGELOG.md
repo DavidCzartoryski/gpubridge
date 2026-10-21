@@ -292,6 +292,15 @@ hardware.
 
 ### Fixed
 
+- The verbs library's build cache has its own variable, `GPUBRIDGE_VERBS_CACHE_DIR`.
+  `GPUBRIDGE_VERBS_LIB_DIR` keeps the meaning the crate's build script and
+  docs/VERBS_TRANSPORT.md give it, the directory of `libibverbs.so.1`; the Python side
+  also used it as the cache, so setting it as documented put the built library (and
+  its temporary build directories) into the libibverbs directory. The crate is unchanged.
+- The kit's Triton cache fill copies each stored kernel directory whole on BSD `cp` too
+  (macOS), and two kit tests no longer depend on GNU-only behaviour of the test host:
+  the mount-table test resolves its own paths, and the store test skips where `mv`
+  lacks GNU's `-T`.
 - The verbs kit's host collectives configure CPU/Gloo islands before init, record that mode, and refuse contradictory inherited CPU-only settings.
 - Host mode selects CPU-only operation before runtime imports. The verbs kit excludes
   same-host non-loopback TCP only for host/Gloo islands, marks co-resident or unknown
@@ -314,6 +323,15 @@ hardware.
 
 ### Added
 
+- `scripts/baseline.sh OUT_DIR`: the CPU baseline in one command, CI's crate checks,
+  native builds, the test suite and the simulation example, every step's exit code in
+  `steps.jsonl`; `scripts/baseline_identity.py` records the git trees, packages, Rust
+  and C toolchains and the SHA-256 of each built library. Its pass is not GPU or RDMA
+  validation (the verbs bridge runs on its MOCK fabric). `scripts/bench_import.py`
+  compares `import gpubridge` between two source trees.
+- docs/RUNTIME_INVENTORY.md: where Python and Gloo run in a job, and a keep, demote or
+  remove decision for each part with its callers and measurements;
+  docs/BENCHMARKS.md has the single-node verbs-against-Gloo timings.
 - The staged verbs path's costs are measured (docs/verbs-perf-20261019.md): the
   library times its write windows' registration and release
   (`direct.write_window_register_ns`, `write_windows_released`,
@@ -322,14 +340,14 @@ hardware.
   (`staged_phases`), and `scripts/gpu/verbs_staged_ab.py` runs one arm of a one-node
   A/B, compares arms against the predeclared rules and decides the plan's copy
   overlap trigger. Measurement only; CPU/MOCK cost checked, not
-  validated on GPUs or RDMA hardware. (PR pending)
+  validated on GPUs or RDMA hardware.
 - `GPUBRIDGE_VERBS_STAGED_OVERLAP=1` (opt-in, off by default): a staged two-leader
   verbs all_reduce of more than one chunk overlaps its copies out and back with its
   messages, chunk by chunk, with the same messages on the wire
   (docs/VERBS_TRANSPORT.md, "GPU memory"). `last_gpu["staging"]` and
   `staged_phases["overlapped_calls"]` say when it ran. A conditional candidate: no
   speedup is claimed; docs/verbs-perf-20261019.md, section 7, is its A/B. Not
-  validated on GPUs. (PR pending)
+  validated on GPUs.
 - A bounded numerical gate for native NCCL, Gloo islands and staged verbs checks
   exact collectives, gradients, independent optimizer updates/state and parameters;
   includes bad-reduction/scale/data controls and actual endpoint/source attestation.
@@ -668,6 +686,15 @@ hardware.
 
 ### Changed
 
+- `import gpubridge` no longer imports the opt-in bridges (`ucx`, `multitcp`,
+  `verbs`): each registers itself when a job first names it (`init(bridge=...)`,
+  `GPUBRIDGE_BRIDGE`, `resolve_transport`). The default Gloo job loads 15 gpubridge
+  modules instead of 25; measured on CPU with `scripts/bench_import.py`, `import
+  gpubridge` takes 4.75 ms instead of 7.04 ms with compiled bytecode and 19.6 ms
+  instead of 31.3 ms without (torch's own import: about 390 ms). A built-in name
+  still can't be registered by another class,
+  and a built-in that fails to import is a `ValueError` like an unknown name
+  (docs/RUNTIME_INVENTORY.md).
 - On Explorer, the AMD side's default venv (`VENV_ROCM`) is now the MI50's
   Triton overlay, `venv-rocm63-triton38`: torch 2.9.1+rocm6.3, whose rocBLAS
   trains on gfx906, with Triton 3.8.0 in front, which compiles the compression

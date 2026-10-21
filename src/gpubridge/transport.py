@@ -3,9 +3,11 @@
 By default the bridge moves CPU tensors between island leaders, so anything
 that can sum and broadcast a CPU tensor among a fixed set of processes can
 carry it (a transport with ``device_tensors`` also takes GPU tensors). Gloo is
-the default; ``bridge="ucx"`` (:mod:`gpubridge.ucx.transport`) and
-``bridge="multitcp"`` (:mod:`gpubridge.multitcp.transport`) are the other
-built-in ones. Another transport (MPI, an RDMA path) plugs in by subclassing
+the default; ``bridge="ucx"`` (:mod:`gpubridge.ucx.transport`),
+``bridge="multitcp"`` (:mod:`gpubridge.multitcp.transport`) and ``bridge="verbs"``
+(:mod:`gpubridge.verbs.transport`) are the other built-in ones, each imported
+the first time its name is asked for, so a job on the default bridge never loads
+them. Another transport (MPI, an RDMA path) plugs in by subclassing
 :class:`BridgeTransport` and registering it, without touching the
 reduce-bridge-broadcast logic in ``collectives.py``.
 """
@@ -14,6 +16,7 @@ from __future__ import annotations
 
 import abc
 import contextvars
+import importlib
 from collections.abc import Callable, Sequence
 from datetime import timedelta
 from typing import ClassVar
@@ -154,6 +157,30 @@ DEFAULT_TRANSPORT = GlooTransport.name
 
 _TRANSPORTS: dict[str, type[BridgeTransport]] = {GlooTransport.name: GlooTransport}
 
+#: The opt-in transports gpubridge ships, by name, and the module whose import registers
+#: each. A name's module is imported at its first use (resolve_transport,
+#: register_transport): ``import gpubridge`` doesn't load them, and a job loads only the
+#: one it names (verbs still imports shared helpers from ucx.transport).
+_BUILT_IN = {"ucx": "gpubridge.ucx.transport", "multitcp": "gpubridge.multitcp.transport",
+             "verbs": "gpubridge.verbs.transport"}
+
+
+def _load_built_in(name: str) -> None:
+    """Register the built-in transport called ``name`` by importing its module, if it is
+    one and isn't registered yet.
+
+    Raises:
+        ValueError: if the module can't be imported, as for an unknown name, so that
+            the torch.distributed backend reports it from every rank.
+    """
+    module = _BUILT_IN.get(name)
+    if module is None or name in _TRANSPORTS:
+        return
+    try:
+        importlib.import_module(module)
+    except ImportError as exc:
+        raise ValueError(f"bridge transport {name!r} can't be loaded: {exc}") from exc
+
 
 def register_transport(transport: type[BridgeTransport]) -> type[BridgeTransport]:
     """Make ``transport`` selectable by name in ``gpubridge.init(bridge=...)``.
@@ -166,6 +193,8 @@ def register_transport(transport: type[BridgeTransport]) -> type[BridgeTransport
     """
     if not (isinstance(transport, type) and issubclass(transport, BridgeTransport)):
         raise TypeError(f"expected a BridgeTransport subclass, got {transport!r}")
+    if _BUILT_IN.get(transport.name) not in (None, transport.__module__):
+        _load_built_in(transport.name)  # a built-in's name stays the built-in's
     existing = _TRANSPORTS.get(transport.name)
     if existing is not None and existing is not transport:
         raise ValueError(f"a different transport is already registered as {transport.name!r}")
@@ -177,14 +206,15 @@ def resolve_transport(bridge: str | type[BridgeTransport]) -> type[BridgeTranspo
     """Turn a transport name or class into a class.
 
     Raises:
-        ValueError: for an unknown name.
+        ValueError: for an unknown name, or a built-in one whose module can't be imported.
         TypeError: for anything that is neither a name nor a transport class.
     """
     if isinstance(bridge, str):
+        _load_built_in(bridge)
         try:
             return _TRANSPORTS[bridge]
         except KeyError:
-            known = ", ".join(sorted(_TRANSPORTS))
+            known = ", ".join(sorted({*_TRANSPORTS, *_BUILT_IN}))
             raise ValueError(f"unknown bridge transport {bridge!r}; known: {known}") from None
     if isinstance(bridge, type) and issubclass(bridge, BridgeTransport):
         return bridge

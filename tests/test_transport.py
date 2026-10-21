@@ -1,5 +1,9 @@
 """The bridge transport is swappable, and Gloo stays the default."""
 
+import json
+import subprocess
+import sys
+
 import pytest
 import torch
 from _harness import expected_sum, rank_tensor, run_failing_init, run_ranks
@@ -28,6 +32,62 @@ def test_resolve_accepts_names_and_classes():
         resolve_transport("carrier-pigeon")
     with pytest.raises(TypeError):
         resolve_transport(42)
+
+
+#: Modules of the opt-in bridges, which ``import gpubridge`` doesn't load.
+OPT_IN = ("gpubridge.ucx", "gpubridge.multitcp", "gpubridge.verbs", "gpubridge.tagged")
+
+
+def _fresh(code: str) -> list:
+    """Run ``code`` in a new interpreter and return the JSON it prints: this one has
+    imported every bridge already (pytest imports every test module)."""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                            timeout=120)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_importing_gpubridge_loads_no_opt_in_bridge_and_a_name_loads_its_own():
+    before, module, after, registered = _fresh(f"""
+import json, sys
+import gpubridge
+loaded = lambda: sorted(m for m in sys.modules if m.startswith({OPT_IN!r}))
+before = loaded()
+module = gpubridge.resolve_transport("verbs").__module__
+print(json.dumps([before, module, loaded(), sorted(gpubridge.transport._TRANSPORTS)]))
+""")
+    assert before == []
+    assert module == "gpubridge.verbs.transport"
+    assert "gpubridge.verbs.transport" in after
+    assert not [m for m in after if m.startswith("gpubridge.multitcp")]
+    # verbs still imports helpers from the UCX bridge's module, which registers "ucx".
+    assert "multitcp" not in registered and {"gloo", "verbs"} <= set(registered)
+
+
+@pytest.mark.parametrize("name", ["ucx", "multitcp", "verbs"])
+def test_a_built_in_name_stays_the_built_ins_before_it_loads(name):
+    refused, owner = _fresh(f"""
+import json
+from gpubridge.transport import BridgeTransport, register_transport, resolve_transport
+class Mine(BridgeTransport):
+    name = {name!r}
+try:
+    register_transport(Mine)
+    refused = None
+except ValueError as exc:
+    refused = str(exc)
+print(json.dumps([refused, resolve_transport({name!r}).__module__]))
+""")
+    assert "already registered" in refused
+    assert owner == f"gpubridge.{name}.transport"
+
+
+def test_unknown_names_list_the_built_ins_and_a_broken_one_is_a_value_error(monkeypatch):
+    with pytest.raises(ValueError, match="known: gloo, multitcp, .*ucx, verbs"):
+        resolve_transport("carrier-pigeon")
+    monkeypatch.setitem(gpubridge.transport._BUILT_IN, "broken", "gpubridge._no_such_module")
+    with pytest.raises(ValueError, match="bridge transport 'broken' can't be loaded"):
+        resolve_transport("broken")
 
 
 def test_register_rejects_non_transports_and_name_clashes():

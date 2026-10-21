@@ -5,8 +5,9 @@ compiled against rdma-core's headers, with the bridge's wire protocol and a
 completion thread. Nothing is compiled at install time. ``python -m
 gpubridge.verbs build`` compiles it with cargo on Linux (its ``ibverbs`` feature
 needs rdma-core's headers: the development package, or
-``GPUBRIDGE_VERBS_INCLUDE_DIR``), and :func:`load` does on first use, into
-``GPUBRIDGE_VERBS_LIB_DIR`` (default ``~/.cache/gpubridge``).
+``GPUBRIDGE_VERBS_INCLUDE_DIR``; ``GPUBRIDGE_VERBS_LIB_DIR`` says where
+``libibverbs.so.1`` is), and :func:`load` does on first use, into
+``GPUBRIDGE_VERBS_CACHE_DIR`` (default ``~/.cache/gpubridge``).
 ``GPUBRIDGE_VERBS_LIB`` points at a library built elsewhere instead. Without
 either, :class:`Unavailable` says what is missing; the rest of gpubridge never
 needs this module.
@@ -39,14 +40,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CRATE = Path(__file__).with_name("crate")
-#: Where the compiled library goes (``~/.cache/gpubridge`` by default).
-LIB_DIR_ENV = "GPUBRIDGE_VERBS_LIB_DIR"
+#: Where the compiled library goes (``~/.cache/gpubridge`` by default). Not
+#: ``GPUBRIDGE_VERBS_LIB_DIR``, which the crate's build script and docs/VERBS_TRANSPORT.md
+#: give another meaning: the directory of ``libibverbs.so.1`` to link against.
+CACHE_DIR_ENV = "GPUBRIDGE_VERBS_CACHE_DIR"
+#: Where ``libibverbs.so.1`` is, when not in the linker's default path (read by build.rs).
+LINK_DIR_ENV = "GPUBRIDGE_VERBS_LIB_DIR"
 #: A library built elsewhere (``python -m gpubridge.verbs build`` prints its path).
 LIB_ENV = "GPUBRIDGE_VERBS_LIB"
 #: A directory: run on the MOCK test fabric there (tests only; see the module docstring).
 TEST_FABRIC_ENV = "GPUBRIDGE_VERBS_TEST_FABRIC"
 #: Passed to the build (see docs/VERBS_TRANSPORT.md, "Building").
-BUILD_ENVS = ("GPUBRIDGE_VERBS_INCLUDE_DIR", "GPUBRIDGE_VERBS_LIB_DIR", "CC", "AR")
+BUILD_ENVS = ("GPUBRIDGE_VERBS_INCLUDE_DIR", LINK_DIR_ENV, "CC", "AR")
 
 TIMED_OUT, PEER_FAILED = -2, -3
 
@@ -97,7 +102,7 @@ def library_path(*, test_fabric: bool = False) -> Path:
              sys.platform.encode(), ",".join(features(test_fabric)).encode(),
              *(os.environ.get(v, "").encode() for v in BUILD_ENVS)]
     key = hashlib.sha256(b"\0".join(parts)).hexdigest()
-    base = Path(os.environ.get(LIB_DIR_ENV) or Path.home() / ".cache" / "gpubridge")
+    base = Path(os.environ.get(CACHE_DIR_ENV) or Path.home() / ".cache" / "gpubridge")
     kind = "-test" if test_fabric else ""
     return base / f"libgpubridge_verbs{kind}-{key[:16]}{_suffix()}"
 

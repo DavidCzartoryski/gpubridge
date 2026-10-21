@@ -2,7 +2,8 @@
 
 What gpubridge costs, measured on GPUs. Every number here comes from the GPU kit's
 records on the Explorer cluster on 2026-10-14, at commit 934f87c unless
-a row says otherwise. Host names, user names and paths are left out; the raw
+a row or section says otherwise; [the verbs bridge on one node](#the-verbs-bridge-on-one-node-split-test)
+is from 2026-10-20. Host names, user names and paths are left out; the raw
 records keep them.
 
 The plan was a comparison of NVIDIA with NVIDIA, AMD with AMD and NVIDIA with AMD.
@@ -19,6 +20,7 @@ intended use (see [Waiting on Research Computing](#waiting-on-research-computing
 | C, C-amd | two V100s (two MI50s) through gpubridge's bridge, one island each: gpubridge's own cost without vendor mixing | waiting on Research Computing |
 | D | a V100 and an MI50 through gpubridge: every policy | ran |
 | E | the same two ranks as one flat Gloo group | ran |
+| Verbs, one node | four V100s as two 2-GPU islands (split test): the verbs bridge against the Gloo bridge, through one HCA in loopback | ran 2026-10-20: [below](#the-verbs-bridge-on-one-node-split-test) |
 | Training | DDP with `gpubridge.ddp_comm_hook` on GPT-2 small and ResNet-50: each GPU alone, then both | ran: the V100 alone, the MI50 alone (torch 2.9.1+rocm6.3) and both together, uncompressed and with fp8 on the bridge (GPT-2 small at batches 4 to 32) |
 | Data-parallel training | `train_dp.py` on a LLaMA-style model: DDP uncompressed, bf16 and fp8, FSDP2, shares by speed, bucket sizes; one V100 alone | ran: [below](#data-parallel-training-on-a-llama-style-model) |
 | One model, every way | the same LLaMA-style model on one V100, one MI50, a V100 + MI50 pipeline and V100 + MI50 data parallelism, twice each; the same-vendor pairs | ran, but the pairs wait on Research Computing: [What mixing vendors costs](#what-mixing-vendors-costs-and-whether-it-helps) |
@@ -546,6 +548,57 @@ these 4-CPU jobs, torch's intra-op threads (`OMP_NUM_THREADS=4`) competed with t
 transport's network threads; with one torch thread for the duration of the
 collective it ran as above. The UCX transport also reduces with torch ops in Python
 and may meet the same contention on GPU nodes; that isn't measured.
+
+## The verbs bridge on one node (split test)
+
+One node of four Tesla V100-SXM2-32GB (driver 545.23.08, torch 2.14.1+cu126,
+NCCL 2.29.3) with one Mellanox ConnectX HDR InfiniBand HCA (`mlx5_0`), 2026-10-20.
+`GPUBRIDGE_SPLIT_TEST=half` makes ranks 0-1 and 2-3 two 2-GPU NCCL islands (both
+V100s), so the bridge joins two leaders on the same host: verbs traffic goes
+through the one HCA in loopback. GPU tensors were staged through registered pinned
+host memory (no dma-buf or peer-memory path on that node). This is **not**
+cross-node, mixed-vendor or GPUDirect evidence.
+
+`bench_all_reduce.py`, float32, default policy (reduce-bridge-broadcast): the
+CUDA-event median of each trial's slowest rank, for the whole collective (island
+reduce, staging, the bridge, island broadcast and gpubridge's Python), not the
+NIC's own latency. Two samples, separate jobs: `4c13375` and `c92684b`, whose
+`src/` and benchmark scripts are identical. Native is one NCCL group of all four
+GPUs, the homogeneous baseline; it has no bridge.
+
+| Size | Native NCCL, 4 GPUs | Gloo bridge | Verbs bridge | Verbs speedup over Gloo, `4c13375` | Same, `c92684b` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 KiB | 0.093 ms | 0.557 ms | 0.696 ms | 0.80x | 0.85x |
+| 4 KiB | - | - | - | 0.79x | 0.82x |
+| 16 KiB | - | - | - | 0.78x | 0.87x |
+| 64 KiB | - | - | - | 0.82x | 0.80x |
+| 256 KiB | - | - | - | 1.05x | 0.93x |
+| 1 MiB | 0.130 ms | 2.247 ms | 1.087 ms | 2.07x | 1.74x |
+| 4 MiB | - | - | - | 2.48x | 2.42x |
+| 16 MiB | 0.344 ms | 20.21 ms | 7.42 ms | 2.72x | 2.73x |
+| 64 MiB | - | - | - | 2.70x | 2.68x |
+| 256 MiB | 3.52 ms | 286.3 ms | 106.3 ms | 2.69x | 3.07x |
+| 1 GiB | - | not run | 420.8 ms | - | - |
+
+Times are `4c13375`'s (job 11259197; the Gloo bridge from its Gloo step, verbs
+from its verbs step, native from the Gloo step's control). A dash is a size whose
+times aren't repeated here. The Gloo bridge step stopped at 256 MiB by plan, so
+there is no 1 GiB ratio. One sample per configuration and job: the two samples'
+speedups differ by up to 18.5% (at 1 MiB), so these are descriptive, not a
+significant or general speedup. Verbs is slower than the Gloo bridge up to 64 KiB
+in both samples and faster from 1 MiB on; native NCCL on the same four GPUs is 6
+to 81 times faster than either bridge at these sizes.
+
+Each sample also had a companion job (11259198 at `4c13375`), so the following
+are separate launches from the table above. There, the pipelined policy (1, 4, 16
+and 64 MiB chunks) helped the Gloo bridge at every matched size from 1 to 256 MiB
+and generally slowed the verbs bridge. GPT-2 small DDP training (global batch 32,
+50 steps, 25 MB buckets) took 301.6 ms a step on native NCCL, 741.2 ms over the
+Gloo bridge and 419.4 ms over the verbs bridge (one run each); `train_bench.py`
+estimated 19% of the Gloo bridge's time and 41% of the verbs bridge's hidden
+behind backward. Those are estimates from separately timed phases, not traces. Correctness, the no-silent-TCP
+gate and what remains open are in
+[HARDWARE_VALIDATION.md](../HARDWARE_VALIDATION.md#split-test-results-2026-10-20).
 
 ## Training throughput
 

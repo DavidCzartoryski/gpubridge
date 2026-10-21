@@ -1,6 +1,8 @@
 # gpubridge as a torch.distributed backend
 
-**Status: experimental, tested on CPU only.** The goal is for a DDP or FSDP2
+**Status: experimental.** Tested on CPU; on GPUs, DDP, FSDP2 and HSDP have run
+through it on a V100 + MI50 and on two 2-GPU V100 islands of one node
+(HARDWARE_VALIDATION.md items 30 and 31). The goal is for a DDP or FSDP2
 training script to run on a mixed NVIDIA + AMD cluster by naming the backend:
 
 ```python

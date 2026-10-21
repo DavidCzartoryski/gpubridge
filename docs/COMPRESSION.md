@@ -1,6 +1,6 @@
 # Bridge compression
 
-**Opt-in, changes results, not validated on GPUs.** On the first GPU run, a
+**Opt-in, changes results; its kernels are checked on GPUs, its effect on representative training accuracy is not established.** On the first GPU run, a
 V100, two of the kernel tests failed: the fp8 error-feedback residual
 differed from the reference, from a codec overflow and a fused multiply-add,
 both fixed in #50. Since then the kernels have matched the CPU reference on

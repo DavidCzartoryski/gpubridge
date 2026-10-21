@@ -1,10 +1,10 @@
 # A multi-stream TCP bridge transport in Rust
 
 **Status: stage 1 implemented as an opt-in transport, `bridge="multitcp"`,
-tested on CPU only (loopback TCP between processes). Nothing here has run on
-GPUs or between two machines yet; the comparison that decides whether it is
-worth keeping is step 08 with `MULTITCP_BRIDGE=1` (below).** The Gloo bridge
-stays the default and the reference.
+tested on CPU (loopback TCP between processes) and compared with the Gloo
+bridge in two step-08 jobs between a V100 node and an MI50 node, where it
+missed the gate set for keeping it ([below](#stage-1-on-hardware-and-the-gate)):
+the work stops at stage 1.** The Gloo bridge stays the default and the reference.
 
 ## Why
 
@@ -163,6 +163,13 @@ times `D-pinned`'s time at every one of those sizes. Otherwise the measurements
 get written up and the work stops there; it doesn't go on to stage 2 on that
 basis alone. Either way the numbers go in
 [BENCHMARKS.md](BENCHMARKS.md) and the CHANGELOG, measured, not predicted.
+
+**Outcome: the gate was not met.** In the two step-08 jobs (a V100 and an MI50,
+commit 23180fe of #66's branch), pinned multitcp took 1.07 and 1.02 times the
+pinned Gloo bridge's time at 64 MB, 0.90 and 0.90 at 256 MB and 0.88 and 0.88 at
+1 GB ([BENCHMARKS.md](BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype)). Stage 1
+stays opt-in as it is, stage 2 does not start on this basis, and `import gpubridge`
+loads the transport only when a job names it.
 
 ## Not done
 

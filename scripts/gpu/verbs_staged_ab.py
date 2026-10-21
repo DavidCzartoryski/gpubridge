@@ -98,7 +98,7 @@ TRIGGER_SIZES, TRIGGER_SHARE = (25 * 2**20, 150 * 2**20), 0.30
 #: The compare statuses whose rows were judged: the trigger reads only these.
 JUDGED = ("judged", "REGRESSION")
 #: Recorded environment variables that name the code under test (under ``code.``)...
-ENV_CODE = ("GPUBRIDGE_VERBS_LIB", "GPUBRIDGE_VERBS_LIB_DIR", "PYTHONPATH")
+ENV_CODE = ("GPUBRIDGE_VERBS_LIB", "GPUBRIDGE_VERBS_CACHE_DIR", "PYTHONPATH")
 #: ... and the settings compared between arms (under ``env.``), by prefix or name. The
 #: rest of the recorded environment (ranks, ports, Slurm ids) differs from run to run.
 ENV_SETTINGS = ("GPUBRIDGE_", "NCCL_", "RCCL_", "GLOO_", "UCX_", "TORCH_",

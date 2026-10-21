@@ -1589,13 +1589,16 @@ def test_time_triton_cache_finds_each_directorys_filesystem(tmp_path):
     sys.path.insert(0, str(KIT))
     import time_triton_cache
 
-    mounts = ("sysfs /sys sysfs rw 0 0\n/dev/sda1 / xfs rw 0 0\n"
-              "tmpfs /tmp tmpfs rw 0 0\nnas:/home /home nfs4 rw 0 0\n"
-              "vast:/projects /projects nfs rw 0 0\n")
-    assert time_triton_cache.filesystem(Path("/home/someuser/.triton"), mounts) == "nfs4"
-    assert time_triton_cache.filesystem(Path("/tmp/x"), mounts) == "tmpfs"
-    assert time_triton_cache.filesystem(Path("/projects/lab/user"), mounts) == "nfs"
-    assert time_triton_cache.filesystem(Path("/opt/x"), mounts) == "xfs"
+    # Mount points under a resolved directory of our own: filesystem() resolves the path
+    # first, and on some hosts /home or /tmp is a symlink (macOS: /tmp -> /private/tmp).
+    root = tmp_path.resolve()
+    mounts = (f"sysfs /sys sysfs rw 0 0\n/dev/sda1 / xfs rw 0 0\n"
+              f"tmpfs {root}/tmp tmpfs rw 0 0\nnas:/home {root}/home nfs4 rw 0 0\n"
+              f"vast:/projects {root}/projects nfs rw 0 0\n")
+    assert time_triton_cache.filesystem(root / "home/someuser/.triton", mounts) == "nfs4"
+    assert time_triton_cache.filesystem(root / "tmp/x", mounts) == "tmpfs"
+    assert time_triton_cache.filesystem(root / "projects/lab/user", mounts) == "nfs"
+    assert time_triton_cache.filesystem(root / "opt/x", mounts) == "xfs"
     assert len(time_triton_cache.VARIANTS) == 12  # bf16 mode skips 16-bit inputs
 
 
@@ -1633,6 +1636,33 @@ echo "local_left=$left"
     return result.stdout
 
 
+def _gnu_mv() -> bool:
+    """Whether mv has GNU's -T, as on the Linux nodes the kit runs on (BSD mv hasn't)."""
+    result = subprocess.run(["mv", "--version"], capture_output=True, text=True)
+    return result.returncode == 0 and "GNU" in result.stdout
+
+
+def test_triton_cache_begin_fills_node_local_cache_portably_from_store(tmp_path):
+    store = tmp_path / "store"
+    (store / "oldkernel").mkdir(parents=True)
+    (store / "oldkernel" / "k.json").write_text("{}")
+    local = tmp_path / "node" / "triton"
+    script = f"""
+source {KIT}/common.sh
+RESULTS={tmp_path}
+TRITON_CACHE_STORE={store}
+TRITON_CACHE_LOCAL={local}
+triton_cache_begin
+echo "dir=${{TRITON_CACHE_DIR:-}}"
+"""
+    result = subprocess.run(["bash", "-e", "-c", script], env=clean_env(), capture_output=True,
+                            text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert f"dir={local}" in result.stdout
+    assert (local / "oldkernel" / "k.json").exists()
+
+
+@pytest.mark.skipif(not _gnu_mv(), reason="triton_cache_end renames with GNU mv -T")
 def test_a_job_builds_triton_kernels_in_a_node_local_cache_kept_in_the_store(tmp_path):
     store = tmp_path / "store"
     (store / "oldkernel").mkdir(parents=True)
@@ -2752,7 +2782,8 @@ def test_import_check_passes_for_this_checkout_and_names_a_foreign_import(tmp_pa
                          text=True, timeout=120)
     assert bad.returncode == 1
     assert "gpubridge-kit: import check failed" in bad.stderr
-    assert str(other / "gpubridge") in bad.stderr and "PYTHONPATH is" in bad.stderr
+    import gpukit
+    assert (str(other / "gpubridge") in bad.stderr or gpukit.redact(str(other / "gpubridge")) in bad.stderr) and "PYTHONPATH is" in bad.stderr
 
 
 def test_probe_records_where_gpubridge_came_from_and_fails_on_a_foreign_import(tmp_path):
