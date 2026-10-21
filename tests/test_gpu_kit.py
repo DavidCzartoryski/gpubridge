@@ -2762,7 +2762,8 @@ def test_import_check_passes_for_this_checkout_and_names_a_foreign_import(tmp_pa
                          text=True, timeout=120)
     assert bad.returncode == 1
     assert "gpubridge-kit: import check failed" in bad.stderr
-    assert str(other / "gpubridge") in bad.stderr and "PYTHONPATH is" in bad.stderr
+    import gpukit
+    assert (str(other / "gpubridge") in bad.stderr or gpukit.redact(str(other / "gpubridge")) in bad.stderr) and "PYTHONPATH is" in bad.stderr
 
 
 def test_probe_records_where_gpubridge_came_from_and_fails_on_a_foreign_import(tmp_path):

@@ -62,9 +62,9 @@ although the default bridge is Gloo.
 | torch's own import, for scale | 389 ms | 389 ms | - |
 
 So the repair is small: about 0.6% of a process's import time with bytecode. Its
-value is that a Gloo job no longer runs, and a verbs job no longer loads, the
-multitcp prototype's code, and that a broken optional bridge can no longer break
-`import gpubridge` for jobs that don't use it. (An earlier single-tree reading of
+value is that a Gloo job loads no opt-in bridge, a verbs job no longer loads the
+multitcp prototype, and a broken optional bridge can no longer break `import
+gpubridge` for jobs that don't use it. (An earlier single-tree reading of
 13.6 of 36 ms was taken while the test suite ran, with stale bytecode; it is not
 used.)
 
@@ -96,6 +96,8 @@ somewhere else in the repository, except four that torch calls by name
 | Verbs bridge (Rust, libibverbs) | **Keep; the preferred bulk bridge to qualify** | Only native RDMA path that has moved payload on hardware; faster than Gloo from 1 MiB on one node; slower up to 64 KiB | Cross-node, AMD and direct-GPU qualification (items 38 to 42); a small-message measure before it becomes any default |
 | Python reductions in `tagged.py` (verbs, multitcp) | **Keep for now; measure** | Each chunk is reduced with torch ops in Python, on one torch thread | Profile at 1 to 64 KiB, where verbs loses to Gloo, before moving reductions native |
 | Verbs observation export (`GPUBRIDGE_VERBS_OBSERVE`) | **Keep, opt-in** | The detector's transport channel; its cost was A/B-measured and trimmed (docs/VERBS_PERF.md) | - |
+| Verbs phase timers & write window tracking (PR #101, `195d7b9`) | **Keep, opt-in in telemetry** | `staged_phases` in `VerbsTransport.telemetry()` and write window timing in `direct.rs`; `scripts/gpu/verbs_staged_ab.py` harness | Host clocks and flag check only; default path unchanged |
+| Staged copy overlap (PR #103, `26da9f9`) | **Keep, opt-in (`GPUBRIDGE_VERBS_STAGED_OVERLAP`)** | Opt-in overlap of D2H/H2D copies with 2-leader verbs all_reduce; default-off identity verified | Multi-node GPU benchmark required before considering enabled by default |
 | Opt-in bridges' eager import | **Demote: lazy (done on this branch)** | Ten modules in every process for code a Gloo job never runs; lazy: 2.3 ms (33%) less import with bytecode, 11.7 ms without | Kept: a built-in name can't be taken by another class, and a broken built-in is a `ValueError`, as an unknown name is, which the torch.distributed backend reports from every rank (`tests/test_transport.py`) |
 | UCX bridge | **Demote: opt-in, lazy, unrecommended** | Never run on a GPU or RDMA (items 26, 27); verbs covers the RDMA goal | Keep loadable; decide after one hardware run or a usage check |
 | multitcp bridge | **Demote: opt-in, lazy; deprecate after a usage check** | Missed its own gate (0.88 to 1.07 times pinned Gloo's time, needed ≤ 0.8; BENCHMARKS.md); not a negative control | A deprecation notice, then removal in a later release, if no user needs it |
@@ -114,3 +116,15 @@ somewhere else in the repository, except four that torch calls by name
 - Whether gpubridge's cost on one vendor justifies it against plain DDP on NCCL: the
   matched 1/2/4-GPU series is missing.
 - The straggler detector's own Python/Rust split: a separate repository.
+
+## 5. Upstream PR #101 and PR #103 reconciliation (`26da9f9`)
+
+Between the baseline at `38b1e20` and upstream `main` (`26da9f9`), two pull requests merged:
+- **PR #101** (`195d7b9`, `friend/verbs-measure-20261019`): Added instrumentation for verbs write window registration and release timing (`direct.rs`), breakdown of host staged collective time into phases (`staged_phases` in `verbs/transport.py`, `verbs/gpu.py`), and a matched one-node A/B benchmark harness (`scripts/gpu/verbs_staged_ab.py`).
+- **PR #103** (`26da9f9`, `friend/verbs-pipeline-20261019`): Added opt-in staged copy overlap (`GPUBRIDGE_VERBS_STAGED_OVERLAP=1`) for the two-leader verbs `all_reduce` path, overlapping host-to-device and device-to-host copies with bridge execution where streams permit.
+
+**Runtime impact on this audit:**
+1. Both features operate exclusively under the opt-in `verbs` transport (`bridge="verbs"`). Neither is loaded by default jobs nor affects the default Gloo bridge (`bridge="gloo"`).
+2. Default-off behavior of staged overlap was verified bit-for-bit against the unoverlapped path; timers add one flag check to staged calls and two clock reads per write window only when a completion releases memory.
+3. Neither PR alters the lazy import boundaries, dependency inventory, or Python/Gloo execution boundaries established here.
+4. Neither PR provides cross-node, multi-node, or multi-vendor hardware qualification; the qualification boundaries in Section 4 and [DAY1-HANDOFF.md](../DAY1-HANDOFF.md) remain intact.
