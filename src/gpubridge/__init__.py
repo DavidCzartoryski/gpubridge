@@ -60,9 +60,8 @@ from gpubridge.transport import (
 )
 from gpubridge.work import Work
 
-from gpubridge.ucx import transport as _ucx_transport  # noqa: E402,F401 - registers bridge="ucx"
-from gpubridge.multitcp import transport as _multitcp_transport  # noqa: E402,F401 - bridge="multitcp"
-from gpubridge.verbs import transport as _verbs_transport  # noqa: E402,F401 - bridge="verbs"
+# bridge="ucx", "multitcp" and "verbs" register themselves when a job first names them
+# (gpubridge.transport._BUILT_IN): importing gpubridge doesn't load them.
 from gpubridge import torch_backend as _torch_backend  # noqa: E402
 
 _torch_backend.register()  # backend="gpubridge" for torch.distributed

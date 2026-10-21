@@ -652,6 +652,14 @@ hardware.
 
 ### Changed
 
+- `import gpubridge` no longer imports the opt-in bridges (`ucx`, `multitcp`,
+  `verbs`): each registers itself when a job first names it (`init(bridge=...)`,
+  `GPUBRIDGE_BRIDGE`, `resolve_transport`). The default Gloo job loads 15 gpubridge
+  modules instead of 25; measured on CPU, `import gpubridge` takes 4.8 ms instead of
+  7.1 ms with compiled bytecode and 19.6 ms instead of 31.4 ms without (torch's own
+  import: about 390 ms). A built-in name still can't be registered by another class,
+  and a built-in that fails to import is a `ValueError` like an unknown name
+  (docs/RUNTIME_INVENTORY.md).
 - On Explorer, the AMD side's default venv (`VENV_ROCM`) is now the MI50's
   Triton overlay, `venv-rocm63-triton38`: torch 2.9.1+rocm6.3, whose rocBLAS
   trains on gfx906, with Triton 3.8.0 in front, which compiles the compression
