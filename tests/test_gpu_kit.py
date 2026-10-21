@@ -1642,6 +1642,26 @@ def _gnu_mv() -> bool:
     return result.returncode == 0 and "GNU" in result.stdout
 
 
+def test_triton_cache_begin_fills_node_local_cache_portably_from_store(tmp_path):
+    store = tmp_path / "store"
+    (store / "oldkernel").mkdir(parents=True)
+    (store / "oldkernel" / "k.json").write_text("{}")
+    local = tmp_path / "node" / "triton"
+    script = f"""
+source {KIT}/common.sh
+RESULTS={tmp_path}
+TRITON_CACHE_STORE={store}
+TRITON_CACHE_LOCAL={local}
+triton_cache_begin
+echo "dir=${{TRITON_CACHE_DIR:-}}"
+"""
+    result = subprocess.run(["bash", "-e", "-c", script], env=clean_env(), capture_output=True,
+                            text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert f"dir={local}" in result.stdout
+    assert (local / "oldkernel" / "k.json").exists()
+
+
 @pytest.mark.skipif(not _gnu_mv(), reason="triton_cache_end renames with GNU mv -T")
 def test_a_job_builds_triton_kernels_in_a_node_local_cache_kept_in_the_store(tmp_path):
     store = tmp_path / "store"

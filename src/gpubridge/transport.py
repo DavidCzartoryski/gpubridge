@@ -160,7 +160,7 @@ _TRANSPORTS: dict[str, type[BridgeTransport]] = {GlooTransport.name: GlooTranspo
 #: The opt-in transports gpubridge ships, by name, and the module whose import registers
 #: each. A name's module is imported at its first use (resolve_transport,
 #: register_transport): ``import gpubridge`` doesn't load them, and a job loads only the
-#: one it names.
+#: one it names (verbs still imports shared helpers from ucx.transport).
 _BUILT_IN = {"ucx": "gpubridge.ucx.transport", "multitcp": "gpubridge.multitcp.transport",
              "verbs": "gpubridge.verbs.transport"}
 

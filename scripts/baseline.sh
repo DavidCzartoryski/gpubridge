@@ -92,5 +92,6 @@ step pytest "$python" -m pytest -rs --durations=30 -p no:cacheprovider \
     --junitxml="$out/junit.xml" ${PYTEST_ARGS:-}
 step simulate "$python" examples/simulate_two_islands.py
 
+printf '{"completed": true, "failed": %d}\n' "$failed" >>"$out/steps.jsonl"
 echo "steps: $out/steps.jsonl"
 exit "$failed"

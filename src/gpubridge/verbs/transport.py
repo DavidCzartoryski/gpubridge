@@ -35,7 +35,7 @@ and the transport refuses later calls.
 ``GPUBRIDGE_VERBS_OBSERVE=<file>`` emits transport observations for the straggler
 detector (:mod:`gpubridge.verbs.observe`: one record per call, per peer and direction).
 
-telemetry()["staged_phases"] splits the host time of the staged calls that
+``telemetry()["staged_phases"]`` splits the host time of the staged calls that
 succeeded: the copy out (queued, then waited for: it includes the work queued before
 it on the stream), the bridge step, inside it the posts and the library's waits (the
 rest is the reductions and Python), and queueing the copy back (not the copy itself,
