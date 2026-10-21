@@ -327,7 +327,11 @@ hardware.
   native builds, the test suite and the simulation example, every step's exit code in
   `steps.jsonl`; `scripts/baseline_identity.py` records the git trees, packages, Rust
   and C toolchains and the SHA-256 of each built library. Its pass is not GPU or RDMA
-  validation (the verbs bridge runs on its MOCK fabric).
+  validation (the verbs bridge runs on its MOCK fabric). `scripts/bench_import.py`
+  compares `import gpubridge` between two source trees.
+- docs/RUNTIME_INVENTORY.md: where Python and Gloo run in a job, and a keep, demote or
+  remove decision for each part with its callers and measurements;
+  docs/BENCHMARKS.md has the single-node verbs-against-Gloo timings.
 - A bounded numerical gate for native NCCL, Gloo islands and staged verbs checks
   exact collectives, gradients, independent optimizer updates/state and parameters;
   includes bad-reduction/scale/data controls and actual endpoint/source attestation.
@@ -669,9 +673,10 @@ hardware.
 - `import gpubridge` no longer imports the opt-in bridges (`ucx`, `multitcp`,
   `verbs`): each registers itself when a job first names it (`init(bridge=...)`,
   `GPUBRIDGE_BRIDGE`, `resolve_transport`). The default Gloo job loads 15 gpubridge
-  modules instead of 25; measured on CPU, `import gpubridge` takes 4.8 ms instead of
-  7.1 ms with compiled bytecode and 19.6 ms instead of 31.4 ms without (torch's own
-  import: about 390 ms). A built-in name still can't be registered by another class,
+  modules instead of 25; measured on CPU with `scripts/bench_import.py`, `import
+  gpubridge` takes 4.75 ms instead of 7.04 ms with compiled bytecode and 19.6 ms
+  instead of 31.3 ms without (torch's own import: about 390 ms). A built-in name
+  still can't be registered by another class,
   and a built-in that fails to import is a `ValueError` like an unknown name
   (docs/RUNTIME_INVENTORY.md).
 - On Explorer, the AMD side's default venv (`VENV_ROCM`) is now the MI50's
