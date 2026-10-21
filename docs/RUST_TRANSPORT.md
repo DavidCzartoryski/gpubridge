@@ -1,10 +1,10 @@
 # A multi-stream TCP bridge transport in Rust
 
 **Status: stage 1 implemented as an opt-in transport, `bridge="multitcp"`,
-tested on CPU only (loopback TCP between processes). Nothing here has run on
-GPUs or between two machines yet; the comparison that decides whether it is
-worth keeping is step 08 with `MULTITCP_BRIDGE=1` (below).** The Gloo bridge
-stays the default and the reference.
+tested on CPU (loopback TCP between processes) and compared with the Gloo
+bridge in two step-08 jobs between a V100 node and an MI50 node, where it
+missed the gate set for keeping it ([below](#stage-1-on-hardware-and-the-gate)):
+the work stops at stage 1.** The Gloo bridge stays the default and the reference.
 
 ## Why
 

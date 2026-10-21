@@ -1,7 +1,8 @@
 # Roadmap: designs waiting on GPU results
 
 These are designs, not commitments. All three now have experimental
-implementations, tested on CPU only. Each one
+implementations, tested on CPU and, so far, on few and narrow GPU runs (each
+status below says which). Each one
 waits for specific results from the GPU validation kit
 ([GPU_VALIDATION_RUNBOOK.md](GPU_VALIDATION_RUNBOOK.md)). Without those
 results there is no way to tell whether the problem it solves is the one that
@@ -29,7 +30,10 @@ Gloo over TCP. If GPU runs show the bridge step dominates large all_reduces,
 sending fewer bytes over the bridge alone would help without touching the
 fast island links.
 
-**Status: implemented, opt-in, tested on CPU only.** `GPUBRIDGE_BRIDGE_COMPRESSION=bf16|fp8`;
+**Status: implemented, opt-in.** On GPUs its kernels matched the CPU reference on a
+V100, an H200 and an MI50, and compressed DDP trained on a V100 + MI50
+([BENCHMARKS.md](BENCHMARKS.md)); its accuracy on representative training is not
+established (HARDWARE_VALIDATION.md items 28 and 29). `GPUBRIDGE_BRIDGE_COMPRESSION=bf16|fp8`;
 design, numerics and error bounds in [COMPRESSION.md](COMPRESSION.md). It
 differs from the design first sketched here in three ways:
 
@@ -138,11 +142,16 @@ None of them publishes code today.
   13 (how much of a bridged all_reduce the bridge takes): RDMA only pays off
   where the bridge dominates.
 
-**Status: implemented as an experimental UCX transport, `bridge="ucx"`,
-tested on CPU over TCP only.** UCX instead of raw verbs, and a ctypes-loaded
-library instead of a torch extension; the design and why are in
-[RDMA_TRANSPORT.md](RDMA_TRANSPORT.md). Nothing has run on RDMA hardware or a
-GPU (HARDWARE_VALIDATION.md items 26 and 27).
+**Status: implemented twice, both opt-in.** First as `bridge="ucx"`: UCX instead
+of raw verbs, and a ctypes-loaded library instead of a torch extension; the design
+and why are in [RDMA_TRANSPORT.md](RDMA_TRANSPORT.md). It is tested on CPU over TCP
+only, never on RDMA hardware or a GPU (HARDWARE_VALIDATION.md items 26 and 27). Then
+as `bridge="verbs"`: raw libibverbs in a Rust library
+([VERBS_TRANSPORT.md](VERBS_TRANSPORT.md)). On 2026-10-20 it ran on one node of four
+V100s through one InfiniBand HCA in loopback, host and staged GPU tensors exact and
+the no-silent-TCP gate passed; GPU memory direct (dma-buf, peer memory), two hosts,
+AMD and point-to-point have not run (items 38 to 42). Explorer's V100 and MI50 nodes
+have no RDMA path between them ([BENCHMARKS.md](BENCHMARKS.md#rdma-between-the-node-types)).
 
 ## 3. A torch.distributed backend for FSDP2 and DeviceMesh
 
@@ -150,7 +159,9 @@ GPU (HARDWARE_VALIDATION.md items 26 and 27).
 FSDP2, DeviceMesh and DTensor have no hook point: they call a process group's
 collectives directly. That takes a `torch.distributed` backend.
 
-**Status: implemented, experimental, tested on CPU only.**
+**Status: implemented, experimental.** On GPUs, DDP, FSDP2 and HSDP ran through it
+on a V100 + MI50 and on two 2-GPU V100 islands of one node; FSDP2 matched a replay
+bit for bit on both, HSDP on the V100 node (HARDWARE_VALIDATION.md items 30 and 31).
 `dist.init_process_group(backend="gpubridge")`; design, measurements and limits in
 [TORCH_BACKEND.md](TORCH_BACKEND.md). DDP and FSDP2 scripts train through it
 with the backend name and `import gpubridge`, bit for bit like Gloo on

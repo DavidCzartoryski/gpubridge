@@ -289,9 +289,9 @@ policies that do.
 | `native-only` | 1 island | one native NCCL/RCCL (or CPU Gloo) collective |
 | `flat-gloo` | any | every rank copies to CPU and uses the world Gloo group: slow but obviously correct, so it's the test reference and a debugging fallback that never touches NCCL/RCCL |
 | `auto` (default) | any | `native-only` for one island, `reduce-bridge-broadcast` otherwise; today's behaviour |
-| `pipelined-reduce-bridge-broadcast` (opt-in, **not validated on GPUs**) | 2+ islands | reduce-bridge-broadcast with the leaders' bridge step cut into chunks: on GPUs the copy of chunk k+1 to pinned host memory, the bridge step of chunk k and the copy of chunk k-1 back overlap, ordered with CUDA events. Chunk size: `GPUBRIDGE_CHUNK_BYTES` (default `4M`) |
-| `sharded-bridge` (opt-in, **not validated on GPUs**) | 2+ islands | k ranks per island share the bridge step instead of one leader, where k is the size of the smallest island: each island reduce_scatters (or reduces) the tensor onto k ranks, rank j of every island all_reduces segment j over its own bridge link, and each island all_gathers (or broadcasts) the result. With an island of one rank, k is 1 and it is reduce-bridge-broadcast. On CPU it is slower than reduce-bridge-broadcast; GPU numbers are HARDWARE_VALIDATION.md item 21 |
-| `auto-tuned` (opt-in, **not validated on GPUs**) | any | picks one of the above by message size, from a thresholds file measured on the cluster (`GPUBRIDGE_THRESHOLDS`, written by `bench_all_reduce.py --write-thresholds`); without a file, it does what `auto` does |
+| `pipelined-reduce-bridge-broadcast` (opt-in, **checked on GPUs, speedup not established**) | 2+ islands | reduce-bridge-broadcast with the leaders' bridge step cut into chunks: on GPUs the copy of chunk k+1 to pinned host memory, the bridge step of chunk k and the copy of chunk k-1 back overlap, ordered with CUDA events. Chunk size: `GPUBRIDGE_CHUNK_BYTES` (default `4M`) |
+| `sharded-bridge` (opt-in, **checked on GPUs, speedup not established**) | 2+ islands | k ranks per island share the bridge step instead of one leader, where k is the size of the smallest island: each island reduce_scatters (or reduces) the tensor onto k ranks, rank j of every island all_reduces segment j over its own bridge link, and each island all_gathers (or broadcasts) the result. With an island of one rank, k is 1 and it is reduce-bridge-broadcast. On CPU it is slower than reduce-bridge-broadcast; GPU numbers are HARDWARE_VALIDATION.md item 21 |
+| `auto-tuned` (opt-in, **checked on GPUs, speedup not established**) | any | picks one of the above by message size, from a thresholds file measured on the cluster (`GPUBRIDGE_THRESHOLDS`, written by `bench_all_reduce.py --write-thresholds`); without a file, it does what `auto` does |
 
 The opt-in policies are never chosen by `auto`, and the default path is the
 same as without them. Their settings (the chunk size, the thresholds) decide
@@ -299,7 +299,7 @@ how many messages a collective sends, so every rank reports them during
 discovery, and `init()` fails on every rank if they differ or if one is
 invalid.
 
-**Pinned staging (opt-in, not validated on GPUs).** By default the leaders of
+**Pinned staging (opt-in, checked on GPUs, speedup not established).** By default the leaders of
 `reduce-bridge-broadcast` copy to host memory with `.cpu()`, into pageable
 memory. With `GPUBRIDGE_PINNED_STAGING=1` they copy into one pinned host
 buffer per leader instead, grown to the largest tensor bridged so far and
@@ -314,7 +314,7 @@ policies ignore the setting. Every rank must set the same value; `init()`
 fails on every rank otherwise. It exists so one GPU allocation can compare
 the two (the GPU kit's `check_pinned` and `bench_pinned` steps).
 
-**Bridge compression (opt-in, changes results, not validated on GPUs).**
+**Bridge compression (opt-in, changes results; kernels checked on GPUs, training accuracy not established).**
 `GPUBRIDGE_BRIDGE_COMPRESSION=bf16` or `fp8` makes the bridged policies
 (`reduce-bridge-broadcast`, pipelined, sharded) send fewer bytes over the
 bridge for floating-point SUM and AVG. Leaders quantize their island's sum on
