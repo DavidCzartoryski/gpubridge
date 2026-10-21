@@ -1,10 +1,11 @@
 # GPUBridge Day 1 handoff: reproducible baseline and native-runtime audit
 
-2026-10-20. Branch `day1/bridge-baseline-personal-20261020`, from the reviewed `main`
-**`38b1e2017c07541cd57f0eeb9d05cd7288b94ae2`** (PR #102). Local commits only: not
-pushed, no pull request, `main` not merged. Everything here ran on CPU on the Mac
-mini: **no GPU, RDMA, Slurm or cloud job was run**, and a pass on the MOCK verbs
-fabric is not native GPU or RDMA validation.
+2026-10-21. Branch `day1/bridge-baseline-personal-20261020`, starting from reviewed `main`
+**`38b1e2017c07541cd57f0eeb9d05cd7288b94ae2`** (PR #102), integrated through normal
+merge with upstream `main` **`26da9f9a12f762bd49f135c2a7167431a0317fc4`** (PR #101, #103)
+at merge commit **`34fed0fa81d8ae79887532258e24c3e763e8e1f3`**. Everything here ran
+on CPU on the Mac mini: **no GPU, RDMA, Slurm or cloud job was run**, and a pass on the
+MOCK verbs fabric is not native GPU or RDMA validation.
 
 ## 1. Findings
 
@@ -20,7 +21,7 @@ fabric is not native GPU or RDMA validation.
 2. **The source that ran on hardware is the source tested here.** `38b1e20`'s `src/`
    tree is `ea6c77b9` and its verbs crate `63a58a08`, the trees of the single-host
    hardware runs at `c92684b`/`4c13375`/`4ffcf93`. This branch changes Python under
-   `src/` only; both crate trees are unchanged.
+   `src/` only; both crate trees are unchanged prior to PR #101 integration.
 3. **A genuine build defect, fixed:** `GPUBRIDGE_VERBS_LIB_DIR` meant both "where
    `libibverbs.so.1` is" (build.rs, docs) and "where the built library goes" (Python).
    Following the docs built into the rdma-core directory. The cache is now
@@ -47,11 +48,15 @@ fabric is not native GPU or RDMA validation.
    They now state the accepted single-host evidence with its boundaries (`c0b27d5`,
    `e676acc`). HARDWARE_VALIDATION.md and the CHANGELOG were already current and keep
    their per-item rule (status lines describe CPU work; GPU verdicts are in tables).
-7. **Upstream PR #101 / #103 reconciled.** Merged upstream at `26da9f9`, PR #101 adds
-   staged phase timers and direct write-window telemetry, while PR #103 introduces
-   opt-in staged copy overlap (`GPUBRIDGE_VERBS_STAGED_OVERLAP=1`). Both are opt-in
-   under the verbs transport, do not affect Gloo or default imports, leave the
-   `38b1e20` baseline intact, and do not introduce multi-node hardware qualification.
+7. **Upstream PR #101 / #103 reconciled & integrated.** Merged upstream at `26da9f9`
+   and integrated here at `34fed0f`. PR #101 adds staged phase timers and direct
+   write-window telemetry, while PR #103 introduces opt-in staged copy overlap
+   (`GPUBRIDGE_VERBS_STAGED_OVERLAP=1`). Both are opt-in under the verbs transport,
+   do not affect Gloo or default imports, leave the `38b1e20` baseline intact, and
+   do not introduce multi-node hardware qualification. Default-off bit-for-bit
+   identity of staged overlap was verified upstream in PR #103
+   (`results/verbs-perf/ab-4-staged-overlap/probes/default-path.json`, commit `d153bf3`),
+   not re-executed on hardware here.
 
 ## 2. Commits
 
@@ -65,6 +70,8 @@ fabric is not native GPU or RDMA validation.
 | `7d89e18` | Map where Python and Gloo run, with a keep, demote or remove inventory; `scripts/bench_import.py` | `tests/test_baseline.py` |
 | `e676acc` | Retire the remaining blanket "tested on CPU only" status labels | as `c0b27d5`; documentation only |
 | `938f5c9` | Reconcile upstream PR 101/103 in runtime inventory and handle redacted test path | `docs/RUNTIME_INVENTORY.md`, `tests/test_gpu_kit.py`, ruff, full suite |
+| `899d4a9` | Document Day 1 reproducible baseline audit and handoff | full documentation and JUnit record |
+| `34fed0f` | Merge remote-tracking branch 'origin/main' into day1/bridge-baseline-personal-20261020 | 147 focused tests, 96 Rust tests, ruff, shellcheck |
 
 Detector source, its environment and its jobs were not touched. Nothing from the
 earlier Personal detector branch is integrated. No shared venv was changed; rustup's
@@ -81,7 +88,9 @@ global default was not set (the toolchain is pinned per command).
 | C | Apple clang 17.0.0 (clang-1700.0.13.5) |
 | Lint | ruff 0.17.0 (CI's rule set), shellcheck 0.11.0 (`shellcheck-py`), in `.day1/venv-tools` |
 | Trees at `38b1e20` | `src` `ea6c77b9`, verbs crate `63a58a08`, multitcp crate `9b3e9cdb` |
+| Trees at `34fed0f` | `src` `fcc9e50e`, verbs crate `afb1034c`, multitcp crate `9b3e9cdb` |
 | Built at `38b1e20` | `libgpubridge_multitcp-afcdd80dde3353f2.dylib` sha256 `97fbfbcc…17235ed`; `libgpubridge_verbs-test-8de9ec89bae1dfcd.dylib` sha256 `080ab804…2a042e` |
+| Built at `34fed0f` | `libgpubridge_verbs-test-0406e9b4d36d053a.dylib` |
 
 The multitcp build has the same content key as one cached on Oct 18 but not the same
 bytes (different LC_UUID; cargo builds from a temporary copy of the crate, and the
@@ -118,7 +127,7 @@ The 62 skips, all kept: UCX bridge is Linux only (39: 36 in `test_ucx.py`, 3 in
 bf16 doesn't compress 16-bit inputs, by design (8); Triton isn't installed (2: one test
 and the kernel module); shellcheck not on PATH (1).
 
-### After this branch
+### After this branch (pre-merge baseline)
 
 #### PyTorch 2.14.1 (CPython 3.12.15, `.venv`)
 
@@ -155,6 +164,19 @@ Checked against modified/new transport, baseline, and verbs tests:
 Fresh interpreter runs alternating between `38b1e20`'s `src` and this branch:
 - **With bytecode (30 runs)**: 25 → 15 gpubridge modules (-10), **7.04 → 4.75 ms** median (-2.29 ms, -33%), -0.45 MiB peak RSS.
 - **Without bytecode (20 runs)**: 25 → 15 gpubridge modules (-10), **31.31 → 19.57 ms** median (-11.74 ms, -37%), -0.59 MiB peak RSS.
+
+### Requalification on integrated HEAD (`34fed0f`, including PR #101 & PR #103)
+
+- **Rust Verbs Crate Checks**:
+  - `cargo fmt --check --manifest-path src/gpubridge/verbs/crate/Cargo.toml`: pass.
+  - `cargo clippy --offline --manifest-path src/gpubridge/verbs/crate/Cargo.toml --all-targets --features test-fabric -- -D warnings`: pass.
+  - `cargo test --offline --manifest-path src/gpubridge/verbs/crate/Cargo.toml --features test-fabric`: **96 tests passed** (including write window timing in `direct.rs`).
+- **Verbs Test-Fabric Build**: Built `libgpubridge_verbs-test-0406e9b4d36d053a.dylib`.
+- **Focused Python Integration Suite**:
+  - `pytest tests/test_transport.py tests/test_verbs_staged_ab.py tests/test_verbs_staged_overlap.py tests/test_verbs_gpu.py tests/test_verbs.py tests/test_baseline.py`:
+  - **147 passed, 0 failed in 97.13 s**.
+  - Requalifies: lazy default loading, opt-in transport resolution, verbs staged phase breakdown, copy overlap, cache/link-dir separation, and identity verification.
+- **Linters**: `ruff` and `shellcheck` pass with 0 warnings.
 
 ## 5. Reproducing it
 
@@ -215,5 +237,5 @@ Upstream `main` was checked at commit `26da9f9`, incorporating:
 
 **Architectural Reconciliation:**
 1. **Isolated Opt-in Scope**: Both changes live strictly inside the opt-in `verbs` transport path. Neither impacts default `gpubridge` initialization, discovery, barriers, or the default `gloo` transport.
-2. **Import Integrity**: Staged timers and copy overlap do not alter the lazy import boundaries established in this branch. Opt-in transports continue to load only when requested.
-3. **Qualification Boundaries**: Neither PR constitutes multi-node, cross-node, or cross-vendor hardware qualification. The `38b1e20` baseline remains the reproducible reference point for this audit.
+2. **Import Integrity & Evidence Attribution**: Staged timers and copy overlap do not alter the lazy import boundaries established in this branch. Opt-in transports continue to load only when requested. Default-off bit-for-bit identity of staged copy overlap was verified upstream in PR #103 (`results/verbs-perf/ab-4-staged-overlap/probes/default-path.json`, commit `d153bf3`), and is attributed to that run rather than re-executed on hardware here.
+3. **Qualification Boundaries**: Neither PR constitutes multi-node, cross-node, or cross-vendor hardware qualification. The `38b1e20` baseline remains the reproducible reference point for this audit, and the integrated HEAD `34fed0f` preserves all Day 1 audit guarantees and evidence.
