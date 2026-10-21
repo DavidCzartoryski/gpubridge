@@ -1672,7 +1672,7 @@ impl Shared {
         let release = std::mem::take(&mut st.release);
         drop(st);
         self.changed.notify_all();
-        drop(release);
+        self.registrar.release(release);
         n
     }
 

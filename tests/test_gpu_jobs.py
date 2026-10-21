@@ -65,6 +65,8 @@ END_TO_END = {
     "triage.py": "test_triage.py: Explorer, Kaggle and CPU-simulation results trees, and tarballs",
     "setup_env.sh": "test_setup_job_creates_the_cuda_venv",
     "bench_p2p.py": "test_gpu_kit.py: test_bench_p2p_*, test_step_02 and 07",
+    "verbs_staged_ab.py": "test_verbs_staged_ab.py: a run of each kind on CPU over the MOCK "
+                          "fabric, and compare's rules (the staged path itself needs a GPU)",
     "rocm_triton_overlay.sh": "test_gpu_kit.py: test_rocm_triton_overlay_*",
     "megatron_pp.py": "test_gpu_kit.py: its tokens, weights and step 07's dry run (Megatron-Core's "
                       "pipeline needs CUDA, so no run on CPU)",

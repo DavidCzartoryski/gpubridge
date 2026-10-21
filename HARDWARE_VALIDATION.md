@@ -636,6 +636,16 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     `GPUBRIDGE_VERBS_INCLUDE_DIR`), GPUs and a CUDA or ROCm build of PyTorch
     on those nodes, and authorization to run the job. Items 40 and 41 add
     their vendor-specific direct-memory requirements.
+    `GPUBRIDGE_VERBS_STAGED_OVERLAP=1` (copies overlapped chunk by chunk, two
+    leaders) must pass the same checks with the same messages on the wire, and a
+    call that fails part way raises its own error only after its copies on the
+    caller's stream have passed (or, if that wait fails too, with the wait's
+    error chained); whether it is faster is the conditional A/B of
+    docs/verbs-perf-20261019.md, section 7. *Status of the option: not run on
+    hardware; the 2026-10-20 results above predate it. Its stream ordering is
+    tested with CPU tensors standing in and lazy copies
+    (`tests/test_verbs_staged_overlap.py`), not on a GPU.* Its GPU check needs
+    the GPUs, RDMA device, verbs library and authorization listed above.
 
 40. **NVIDIA GPU memory direct through the verbs bridge.** With
     `GPUBRIDGE_VERBS_GPU_PATH=direct` on NVIDIA leaders, every call registers the

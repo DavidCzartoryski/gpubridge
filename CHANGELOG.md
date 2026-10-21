@@ -332,6 +332,22 @@ hardware.
 - docs/RUNTIME_INVENTORY.md: where Python and Gloo run in a job, and a keep, demote or
   remove decision for each part with its callers and measurements;
   docs/BENCHMARKS.md has the single-node verbs-against-Gloo timings.
+- The staged verbs path's costs are measured (docs/verbs-perf-20261019.md): the
+  library times its write windows' registration and release
+  (`direct.write_window_register_ns`, `write_windows_released`,
+  `write_window_release_ns`), the bridge splits each staged call's host time into
+  copy out, bridge step (posts, library waits, the rest) and copy back
+  (`staged_phases`), and `scripts/gpu/verbs_staged_ab.py` runs one arm of a one-node
+  A/B, compares arms against the predeclared rules and decides the plan's copy
+  overlap trigger. Measurement only; CPU/MOCK cost checked, not
+  validated on GPUs or RDMA hardware.
+- `GPUBRIDGE_VERBS_STAGED_OVERLAP=1` (opt-in, off by default): a staged two-leader
+  verbs all_reduce of more than one chunk overlaps its copies out and back with its
+  messages, chunk by chunk, with the same messages on the wire
+  (docs/VERBS_TRANSPORT.md, "GPU memory"). `last_gpu["staging"]` and
+  `staged_phases["overlapped_calls"]` say when it ran. A conditional candidate: no
+  speedup is claimed; docs/verbs-perf-20261019.md, section 7, is its A/B. Not
+  validated on GPUs.
 - A bounded numerical gate for native NCCL, Gloo islands and staged verbs checks
   exact collectives, gradients, independent optimizer updates/state and parameters;
   includes bad-reduction/scale/data controls and actual endpoint/source attestation.

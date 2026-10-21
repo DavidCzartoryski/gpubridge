@@ -431,6 +431,13 @@ class LazyRegistered(RegisteredStaging, LazyPinned):
         LazyPinned.__init__(self)
         self.host = host
 
+    def _drain(self):
+        # The host synchronising with the current stream: everything queued on it runs.
+        self.log.append(("drain", self.stream))
+        stream = self.streams[self.stream]
+        if stream.queue:
+            stream.run_through(stream.queue[-1][0])
+
 
 def _stand_in(env, rank):
     """In each rank: GPU tensors are CPU tensors, the direct path is unavailable (with a
@@ -452,6 +459,24 @@ def _stand_in(env, rank):
     vt.VerbsTransport._staging_for = staging_for
 
 
+PHASES = ("to_host_s", "bridge_s", "post_s", "wait_s", "to_device_s")
+WINDOW_TIMES = ("write_windows", "write_window_register_ns", "write_windows_released",
+                "write_window_release_ns")
+
+
+def _check_phases(before, after):
+    """The staged phase timers and the window counters only grow, by sane amounts."""
+    then, now = before["staged_phases"], after["staged_phases"]
+    assert now["calls"] == then["calls"] + 1, (then, now)
+    grew = {k: now[k] - then[k] for k in PHASES}
+    assert all(v >= 0 for v in grew.values()), grew
+    # The posts and the library's waits happen inside the bridge step.
+    assert grew["post_s"] + grew["wait_s"] <= grew["bridge_s"] + 1e-9, grew
+    assert grew["post_s"] > 0 and grew["wait_s"] > 0, grew
+    for k in WINDOW_TIMES:
+        assert after["direct"][k] >= before["direct"][k], (k, before["direct"], after["direct"])
+
+
 def _check_staged(obs_dir, topology):
     bridge = topology.bridge
     rank = topology.rank
@@ -463,14 +488,18 @@ def _check_staged(obs_dir, topology):
             tensor = rank_tensor((numel,), torch.float32, rank)
             want = sum(rank_tensor((numel,), torch.float32, bridge.members[i])
                        for i in range(members))
+            before = bridge.telemetry()
             bridge.all_reduce(tensor)
             bridge._staging[0].run_streams()  # the device gets to the queued copy back
             assert torch.equal(tensor, want), numel
             t = bridge.telemetry()
             assert (t["path"], t["path_reason"]) == ("staged", "standing in: no GPU in this test")
+            _check_phases(before, t)
             src = bridge.members[0]
             tensor = rank_tensor((numel,), torch.float32, rank)
+            before = bridge.telemetry()
             bridge.broadcast(tensor, src)
+            _check_phases(before, bridge.telemetry())
             bridge._staging[0].run_streams()
             assert torch.equal(tensor, rank_tensor((numel,), torch.float32, src)), numel
         log = bridge._staging[0].log
@@ -482,6 +511,13 @@ def _check_staged(obs_dir, topology):
         assert t["paths"]["staged"] == 6
         assert t["direct"]["registered"]["host"] >= 1, t["direct"]
         assert t["in_place_ops"] > 0 and t["bytes_written"] > 0, t
+        assert t["staged_phases"]["calls"] == 6, t["staged_phases"]
+        # Windows were made (the 300_000-element calls use the rendezvous), each made in
+        # measured time; a window is released by the completion thread after its
+        # receive completed, so the last ones may still be on their way.
+        direct = t["direct"]
+        assert direct["write_windows"] > 0 and direct["write_window_register_ns"] > 0, direct
+        assert direct["write_windows_released"] <= direct["write_windows"], direct
         assert "key" not in json.dumps(t).lower()
     dist.barrier()
 
@@ -518,6 +554,40 @@ def test_the_staged_path_with_cpu_tensors_standing_in_and_its_observations(tmp_p
             assert r["path"] == "staged" and r["bytes"] > 0 and r["duration_s"] >= 0
             assert r["t_wall"] > 1.7e9 and isinstance(r["rank"], int)
             assert r["peer"] != r["rank"]
+
+
+def test_the_router_times_posts_and_waits_only_when_asked_failed_ones_too():
+    endpoint = FakeEndpoint()
+    router = Router(endpoint)
+    router.begin([])
+    a = router.send(1, 0, 64, 1)
+    router.wait([a], 0)
+    # Off unless a staged call turns it on: nothing is added up.
+    assert (router.post_s, router.wait_s) == (0.0, 0.0)
+    router.timed = True
+    a = router.send(1, 0, 64, 1)
+    b = router.recv(1, 0, 64, 2)
+    posted = router.post_s
+    router.wait([a, b], 0)
+    waited = router.wait_s
+    assert posted > 0 and waited > 0
+
+    def reject(*args):
+        raise verbs.TransportError("posting failed")
+
+    endpoint.send = reject
+    with pytest.raises(verbs.TransportError):
+        router.send(1, 0, 64, 3)
+    assert router.post_s > posted
+
+    def fail(ids, deadline):
+        raise verbs.TransportError("wait failed")
+
+    endpoint.wait = fail
+    with pytest.raises(verbs.TransportError):
+        router.wait([a], 0)
+    assert router.wait_s > waited
+    router.end()
 
 
 def test_observations_keep_root_failure_separate_from_cancelled_and_completed_work(monkeypatch):
