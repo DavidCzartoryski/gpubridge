@@ -25,11 +25,22 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
+from gpubridge.work import Work
 from gpubridge.config import parse_size
 from gpubridge.staging import make_staging
-from gpubridge.work import Work
 
 CHUNK_BYTES_ENV = "GPUBRIDGE_P2P_CHUNK_BYTES"
+
+#: How long ``Engine.match`` pauses between looks for the peer's descriptor: from
+#: ``MATCH_POLL_FIRST`` seconds, doubling up to ``MATCH_POLL_MAX``, the fixed interval it
+#: used to have, so a long wait costs the Store no more calls than before. Each look is one
+#: short Store call: a lane never holds the Store client that every lane shares while it
+#: waits, as a blocking ``store.wait`` would (TCPStore serializes a client's requests).
+MATCH_POLL_FIRST = 50e-6
+MATCH_POLL_MAX = 0.002
+#: How often the health watcher asks the Store for a published failure while operations
+#: are pending. With none pending it asks nothing: ``submit`` wakes it again.
+WATCH_INTERVAL = 0.05
 
 
 def chunk_bytes_setting() -> int:
@@ -163,10 +174,6 @@ class Engine:
                  timeout: timedelta | None, *, pinned: bool = False,
                  chunk_bytes: int = 0) -> None:
         self.link, self.device, self.rank, self.store = link, device, rank, store
-        root = store
-        while hasattr(root, "underlying_store"):
-            root = root.underlying_store
-        self._is_file_store = isinstance(root, dist.FileStore)
         self.timeout = (timeout or timedelta(minutes=30)).total_seconds()
         self.pinned, self.chunk_bytes = pinned, chunk_bytes
         self._lock = threading.RLock()
@@ -177,14 +184,29 @@ class Engine:
         self._failed: BaseException | None = None
         self._completer = _Completer()
         self._stop = threading.Event()
+        #: Set by submit() and close(): wakes a watcher parked with nothing pending.
+        self._wake = threading.Event()
         self._watcher = threading.Thread(target=self._watch, name="gpubridge-p2p-health",
                                          daemon=True)
         self._watcher.start()
 
     def _watch(self) -> None:
-        while not self._stop.wait(0.05 if self._pending else 0.5):
-            if not self._pending:
+        """While operations are pending, look for a failure every WATCH_INTERVAL seconds;
+        with none, park until submit() or close(). A request already posted to the link
+        learns of a remote failure only from here."""
+        while not self._stop.is_set():
+            with self._lock:  # the lock submit() adds under: no wake-up is lost
+                idle = not self._pending
+                if idle:
+                    self._wake.clear()
+            if idle:
+                self._wake.wait()
                 continue
+            # On a fixed grid of the monotonic clock, not from the wake-up: a failure
+            # published right after submit() is seen as soon as it was when this thread
+            # polled all the time, at most WATCH_INTERVAL later.
+            if self._stop.wait(WATCH_INTERVAL - time.monotonic() % WATCH_INTERVAL):
+                return
             try:
                 self.check()
             except BaseException as exc:  # noqa: BLE001 - fail pending handles on store loss too
@@ -219,6 +241,7 @@ class Engine:
             self._pending[work] = None
             self._lanes[key].queue.put((work, tensor, ready, time.monotonic() + self.timeout,
                                         sequence))
+        self._wake.set()  # an idle watcher starts watching this operation
         return work
 
     def _complete(self, works, error: BaseException | None) -> None:
@@ -246,56 +269,6 @@ class Engine:
             self._pending.clear()
         self._complete(pending, error)
 
-    def _wait_key(self, key: str, deadline: float, timeout_msg: str) -> str:
-        if self.store.check([key]):
-            val = self.store.get(key).decode()
-            self.store.delete_key(key)
-            return val
-
-        if self._is_file_store:
-            # FileStore: PyTorch c10d FileStore::wait sleeps in 1-second chunks on cache miss.
-            # An adaptive sub-millisecond check avoids this 1-second block while cutting latency
-            # from the historical 2ms fixed sleep to ~50-100us when the peer posts quickly.
-            sleep_sec = 0.00005
-            while True:
-                self.check()
-                now = time.monotonic()
-                if now >= deadline:
-                    raise TimeoutError(timeout_msg)
-                if self.store.check([key]):
-                    val = self.store.get(key).decode()
-                    self.store.delete_key(key)
-                    return val
-                if self._closed or self._stop.is_set():
-                    raise RuntimeError("gpubridge point-to-point group was destroyed")
-                time.sleep(min(sleep_sec, max(0.0, deadline - now)))
-                sleep_sec = min(sleep_sec * 1.5, 0.001)
-        else:
-            # TCPStore / HashStore: cancellation-aware blocking notification/wait in bounded slices.
-            # When the peer sets the key, store.wait unblocks immediately (< 200us).
-            # Bounded slices ensure prompt reaction to engine.close() or peer failure.
-            while True:
-                self.check()
-                now = time.monotonic()
-                remaining = deadline - now
-                if remaining <= 0:
-                    raise TimeoutError(timeout_msg)
-                if self.store.check([key]):
-                    val = self.store.get(key).decode()
-                    self.store.delete_key(key)
-                    return val
-                if self._closed or self._stop.is_set():
-                    raise RuntimeError("gpubridge point-to-point group was destroyed")
-                slice_sec = min(0.01, remaining)
-                try:
-                    self.store.wait([key], timedelta(seconds=slice_sec))
-                    val = self.store.get(key).decode()
-                    self.store.delete_key(key)
-                    return val
-                except (RuntimeError, dist.DistStoreError) as exc:
-                    if "timeout" not in str(exc).lower():
-                        raise
-
     def match(self, tensor: torch.Tensor, peer: int, tag: int, seq: int,
               sending: bool, deadline: float) -> None:
         self.check()
@@ -308,8 +281,21 @@ class Engine:
                                  self.chunk_bytes])
         self.store.set(f"{prefix}/{mine}", descriptor)
         key = f"{prefix}/{theirs}"
-        timeout_msg = f"point-to-point {mine} with rank {peer}, tag {tag} timed out"
-        other = self._wait_key(key, deadline, timeout_msg)
+        timed_out = f"point-to-point {mine} with rank {peer}, tag {tag} timed out"
+        pause = MATCH_POLL_FIRST
+        while not self.store.check([key]):
+            self.check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(timed_out)
+            # time.sleep, not an Event wait, which costs about twice the CPU per pause;
+            # check() sees close() one pause later, as before.
+            time.sleep(min(pause, remaining))
+            pause = min(2 * pause, MATCH_POLL_MAX)
+        other = self.store.get(key).decode()
+        self.store.delete_key(key)
+        if time.monotonic() >= deadline:  # Store calls can block (a slow or busy server)
+            raise TimeoutError(timed_out)
         if descriptor != other:
             raise ValueError(f"point-to-point payload mismatch with rank {peer}, tag {tag}: "
                              f"local {descriptor}, peer {other}")
@@ -325,6 +311,7 @@ class Engine:
                 return
             self._closed = True
             self._stop.set()
+            self._wake.set()
             pending = list(self._pending)
             self._pending.clear()
             lanes = list(self._lanes.values())

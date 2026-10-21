@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import collections
 import gc
+import json
 import os
 import threading
 import time
@@ -18,7 +20,10 @@ import torch.multiprocessing as mp
 from _staging import LazyStaging
 from test_ucx import TCP, needs_ucx
 
-from gpubridge import batch_isend_irecv, p2p, topology, torch_backend
+from gpubridge import topology
+from gpubridge import p2p
+from gpubridge import torch_backend
+from gpubridge import batch_isend_irecv
 from gpubridge.config import VENDOR_ENV
 from gpubridge.torch_backend import GpubridgeProcessGroup
 
@@ -29,13 +34,8 @@ def _main(rank, vendors, labels, fn, rendezvous, seconds):
     if labels:
         original = topology.plan_topology
         topology.plan_topology = lambda vendors: original(labels)
-    dist.init_process_group(
-        "gpubridge",
-        init_method=f"file://{rendezvous}",
-        rank=rank,
-        world_size=len(vendors),
-        timeout=timedelta(seconds=seconds),
-    )
+    dist.init_process_group("gpubridge", init_method=f"file://{rendezvous}", rank=rank,
+                            world_size=len(vendors), timeout=timedelta(seconds=seconds))
     try:
         fn(rank, len(vendors))
     finally:
@@ -44,27 +44,13 @@ def _main(rank, vendors, labels, fn, rendezvous, seconds):
 
 
 def run(vendors, fn, tmp_path, *, labels=None, seconds=15):
-    mp.spawn(
-        _main,
-        nprocs=len(vendors),
-        args=(vendors, labels, fn, str(tmp_path / "rendezvous"), seconds),
-    )
+    mp.spawn(_main, nprocs=len(vendors), args=(vendors, labels, fn,
+                                             str(tmp_path / "rendezvous"), seconds))
 
 
-DTYPES = (
-    torch.bool,
-    torch.uint8,
-    torch.int8,
-    torch.int16,
-    torch.int32,
-    torch.int64,
-    torch.float16,
-    torch.bfloat16,
-    torch.float32,
-    torch.float64,
-    torch.complex64,
-    torch.complex128,
-)
+DTYPES = (torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
+          torch.float16, torch.bfloat16, torch.float32, torch.float64,
+          torch.complex64, torch.complex128)
 
 
 def _payload(n, dtype, src, seq=0):
@@ -79,35 +65,22 @@ def _all_pairs(rank, world):
                 continue
             for i, dtype in enumerate(DTYPES):
                 for n in (0, 1, 31, 4097):
-                    t = (
-                        _payload(n, dtype, src)
-                        if rank == src
-                        else torch.empty(n, dtype=dtype)
-                    )
+                    t = _payload(n, dtype, src) if rank == src else torch.empty(n, dtype=dtype)
                     if rank == src:
                         dist.send(t, dst, tag=i)
                     elif rank == dst:
                         assert dist.recv(t, src, tag=i) == src
-                        assert torch.equal(t, _payload(n, dtype, src)), (
-                            src,
-                            dst,
-                            dtype,
-                            n,
-                        )
+                        assert torch.equal(t, _payload(n, dtype, src)), (src, dst, dtype, n)
     # Gloo native path and bridge path both ran, including non-leader ranks.
     dist.barrier()
 
 
-@pytest.mark.parametrize(
-    ("vendors", "labels"),
-    [
-        (["nvidia", "amd"], None),
-        (["nvidia", "nvidia", "amd", "amd"], None),
-        (["nvidia", "amd", "nvidia", "nvidia"], None),
-        (["nvidia"] * 4, ["nvidia", "amd", "third", "nvidia"]),
-    ],
-    ids=["1+1", "2+2", "uneven", "three-islands"],
-)
+@pytest.mark.parametrize(("vendors", "labels"), [
+    (["nvidia", "amd"], None),
+    (["nvidia", "nvidia", "amd", "amd"], None),
+    (["nvidia", "amd", "nvidia", "nvidia"], None),
+    (["nvidia"] * 4, ["nvidia", "amd", "third", "nvidia"]),
+], ids=["1+1", "2+2", "uneven", "three-islands"])
 def test_every_pair_sizes_and_dtypes(vendors, labels, tmp_path):
     run(vendors, _all_pairs, tmp_path, labels=labels)
 
@@ -118,10 +91,8 @@ def _tags_and_batches(rank, world, helper=False):
     # Different tags may be received in the opposite order. A single worker
     # waiting for the first receive would deadlock this exchange.
     if rank == 0:
-        sends = [
-            dist.isend(_payload(4097, torch.int64, rank, tag), peer, tag=tag)
-            for tag in (2**31 - 1, 12, 3)
-        ]
+        sends = [dist.isend(_payload(4097, torch.int64, rank, tag), peer, tag=tag)
+                 for tag in (2**31 - 1, 12, 3)]
         for work in sends:
             work.wait()
     else:
@@ -133,14 +104,8 @@ def _tags_and_batches(rank, world, helper=False):
     receive = [torch.empty(257, dtype=torch.int64) for _ in range(12)]
     ops = []
     for seq in range(12):
-        ops.extend(
-            [
-                dist.P2POp(dist.irecv, receive[seq], peer, tag=99),
-                dist.P2POp(
-                    dist.isend, _payload(257, torch.int64, rank, seq), peer, tag=99
-                ),
-            ]
-        )
+        ops.extend([dist.P2POp(dist.irecv, receive[seq], peer, tag=99),
+                    dist.P2POp(dist.isend, _payload(257, torch.int64, rank, seq), peer, tag=99)])
     for work in (batch_isend_irecv if helper else dist.batch_isend_irecv)(ops):
         work.wait()
     for seq, t in enumerate(receive):
@@ -156,11 +121,8 @@ def test_explicit_batch_helper_on_old_and_new_torch(tmp_path):
     run(["nvidia", "amd"], partial(_tags_and_batches, helper=True), tmp_path)
 
 
-@pytest.mark.parametrize(
-    "settings",
-    [{"GPUBRIDGE_PINNED_STAGING": "1"}, {p2p.CHUNK_BYTES_ENV: "128"}],
-    ids=["pinned", "chunks"],
-)
+@pytest.mark.parametrize("settings", [{"GPUBRIDGE_PINNED_STAGING": "1"},
+                                      {p2p.CHUNK_BYTES_ENV: "128"}], ids=["pinned", "chunks"])
 def test_staging_options_keep_tag_and_fifo_matching(settings, tmp_path, monkeypatch):
     for key, value in settings.items():
         monkeypatch.setenv(key, value)
@@ -213,15 +175,11 @@ def test_lazy_staging_preserves_bytes(sending, monkeypatch):
     _check_lazy_pipeline(monkeypatch, sending, "")
 
 
-@pytest.mark.parametrize(
-    ("sending", "mutation"),
-    [
-        (True, "skip-host-wait"),
-        (False, "skip-host-wait"),
-        (False, "skip-final-stream-wait"),
-    ],
-    ids=["copy-out-before-send", "copy-back-before-slot-reuse", "output-stream-wait"],
-)
+@pytest.mark.parametrize(("sending", "mutation"), [
+    (True, "skip-host-wait"),
+    (False, "skip-host-wait"),
+    (False, "skip-final-stream-wait"),
+], ids=["copy-out-before-send", "copy-back-before-slot-reuse", "output-stream-wait"])
 def test_staging_ordering_mutations_are_detected(sending, mutation, monkeypatch):
     with pytest.raises(AssertionError, match="incorrect bytes"):
         _check_lazy_pipeline(monkeypatch, sending, mutation)
@@ -271,7 +229,7 @@ def _slow_receiver(rank, world):
     dist.barrier()
     if rank == 0:
         slow = dist.isend(torch.ones(11), 1, tag=7)
-        fast = dist.isend(torch.full((9,), 2.0), 2, tag=8)
+        fast = dist.isend(torch.full((9,), 2.), 2, tag=8)
         fast.wait()
         assert not slow.is_completed(), "the slow receive must still be waiting"
         slow.wait()
@@ -283,7 +241,7 @@ def _slow_receiver(rank, world):
     else:
         t = torch.empty(9)
         dist.recv(t, 0, tag=8)
-        assert torch.equal(t, torch.full((9,), 2.0))
+        assert torch.equal(t, torch.full((9,), 2.))
     dist.barrier()
 
 
@@ -329,10 +287,8 @@ def test_refusals_do_not_start_communication(tmp_path):
 
 def _mismatch(rank, world, dtype):
     dist.barrier()
-    t = torch.ones(
-        4 if rank == 0 or dtype else 3,
-        dtype=torch.int64 if rank == 0 or not dtype else torch.float64,
-    )
+    t = torch.ones(4 if rank == 0 or dtype else 3,
+                   dtype=torch.int64 if rank == 0 or not dtype else torch.float64)
     work = dist.isend(t, 1) if rank == 0 else dist.irecv(t, 0)
     with pytest.raises(RuntimeError, match="payload mismatch"):
         work.wait()
@@ -399,9 +355,7 @@ class _BlockedLink:
 
 def test_teardown_fails_handle_without_waiting_for_inflight_transport(monkeypatch):
     link = _BlockedLink()
-    engine = p2p.Engine(
-        link, torch.device("cpu"), 0, dist.HashStore(), timedelta(seconds=5)
-    )
+    engine = p2p.Engine(link, torch.device("cpu"), 0, dist.HashStore(), timedelta(seconds=5))
     monkeypatch.setattr(engine, "match", lambda *args: None)
     work = engine.submit(torch.ones(3), 1, 0, True)
     assert link.entered.wait(2)
@@ -420,9 +374,7 @@ def test_torch_work_wait_and_future_both_report_transfer_failure(monkeypatch):
         raise ValueError("injected transfer failure")
 
     monkeypatch.setattr(link, "wait", fail)
-    engine = p2p.Engine(
-        link, torch.device("cpu"), 0, dist.HashStore(), timedelta(seconds=5)
-    )
+    engine = p2p.Engine(link, torch.device("cpu"), 0, dist.HashStore(), timedelta(seconds=5))
     monkeypatch.setattr(engine, "match", lambda *args: None)
     work = p2p.TorchWork(engine.submit(torch.ones(3), 1, 0, True), 0)
     try:
@@ -445,9 +397,7 @@ def _check_lane_fifo(monkeypatch, mutation):
         return original_post(tensor, peer, tag, sending)
 
     monkeypatch.setattr(link, "post", post)
-    engine = p2p.Engine(
-        link, torch.device("cpu"), 0, dist.HashStore(), timedelta(seconds=5)
-    )
+    engine = p2p.Engine(link, torch.device("cpu"), 0, dist.HashStore(), timedelta(seconds=5))
     monkeypatch.setattr(engine, "match", lambda *args: None)
     try:
         works = [engine.submit(torch.tensor([0], dtype=torch.uint8), 1, 9, True)]
@@ -457,9 +407,7 @@ def _check_lane_fifo(monkeypatch, mutation):
                 # Remove lane reuse, the fix that keeps repeated same-tag
                 # requests behind their predecessor rather than posting at once.
                 engine._lanes.clear()
-            works.append(
-                engine.submit(torch.tensor([i], dtype=torch.uint8), 1, 9, True)
-            )
+            works.append(engine.submit(torch.tensor([i], dtype=torch.uint8), 1, 9, True))
         time.sleep(0.03)
         assert posted == [0], "a later same-tag request overtook its predecessor"
         link.release.set()
@@ -482,7 +430,7 @@ def _callback_dependency(rank, world, tags):
     store = dist.distributed_c10d._get_default_store()
     if rank == 1:
         a = dist.isend(torch.ones(5), 3, tag=tags[0])
-        b = dist.isend(torch.full((5,), 2.0), 3, tag=tags[1])
+        b = dist.isend(torch.full((5,), 2.), 3, tag=tags[1])
 
         def callback(future):
             store.set("callback-entered", "1")
@@ -501,17 +449,13 @@ def _callback_dependency(rank, world, tags):
         assert torch.equal(t, torch.ones(5))
         store.wait(["callback-entered"])
         dist.recv(t, 1, tag=tags[1])
-        assert torch.equal(t, torch.full((5,), 2.0))
+        assert torch.equal(t, torch.full((5,), 2.))
     dist.barrier()
 
 
 @pytest.mark.parametrize("tags", [(0, 1), (4, 4)], ids=["another-tag", "same-tag"])
 def test_future_callback_can_wait_for_a_later_message(tags, tmp_path):
-    run(
-        ["nvidia", "nvidia", "amd", "amd"],
-        partial(_callback_dependency, tags=tags),
-        tmp_path,
-    )
+    run(["nvidia", "nvidia", "amd", "amd"], partial(_callback_dependency, tags=tags), tmp_path)
 
 
 def _blocked_callback_teardown(rank, world):
@@ -520,9 +464,7 @@ def _blocked_callback_teardown(rank, world):
     chained = None
     if rank == 0:
         work = dist.isend(torch.ones(7), 1, tag=3)
-        chained = work.get_future().then(
-            lambda future: (entered.set(), release.wait(10))
-        )
+        chained = work.get_future().then(lambda future: (entered.set(), release.wait(10)))
         work.wait()
     else:
         dist.recv(torch.empty(7), 0, tag=3)
@@ -540,9 +482,7 @@ def _blocked_callback_teardown(rank, world):
         for thread in threading.enumerate():
             if thread.name == "gpubridge-p2p-completion":
                 thread.join(5)
-    assert elapsed < 3, (
-        f"barrier and teardown waited {elapsed:.1f} s for a blocked callback"
-    )
+    assert elapsed < 3, f"barrier and teardown waited {elapsed:.1f} s for a blocked callback"
 
 
 def test_teardown_does_not_wait_for_a_blocked_callback(tmp_path):
@@ -554,17 +494,10 @@ def _released_payloads(rank, world):
     references = []
     peer = 1 - rank
     for tag in range(8):
-        tensor = (
-            _payload(2**20, torch.float32, rank, tag)
-            if rank == 0
-            else torch.empty(2**20)
-        )
+        tensor = (_payload(2**20, torch.float32, rank, tag) if rank == 0
+                  else torch.empty(2**20))
         references.append(weakref.ref(tensor))
-        work = (
-            dist.isend(tensor, peer, tag=tag)
-            if rank == 0
-            else dist.irecv(tensor, peer, tag=tag)
-        )
+        work = dist.isend(tensor, peer, tag=tag) if rank == 0 else dist.irecv(tensor, peer, tag=tag)
         if tag % 2:
             work.get_future().wait()
         else:
@@ -578,9 +511,7 @@ def _released_payloads(rank, world):
         gc.collect()
         time.sleep(0.01)
     alive = sum(ref() is not None for ref in references)
-    assert alive == 0, (
-        f"{alive}/8 completed payloads retained after the caller dropped them"
-    )
+    assert alive == 0, f"{alive}/8 completed payloads retained after the caller dropped them"
     dist.barrier()
 
 
@@ -629,13 +560,12 @@ def test_fresh_tags_do_not_accumulate_threads_and_sequences_survive(tmp_path):
 def _self_wait_callback(rank, world):
     dist.barrier()
     peer = 1 - rank
-    t = torch.full((4,), 6.0) if rank == 0 else torch.empty(4)
+    t = torch.full((4,), 6.) if rank == 0 else torch.empty(4)
     work = dist.isend(t, peer, tag=2) if rank == 0 else dist.irecv(t, peer, tag=2)
     chained = work.get_future().then(
-        lambda future: (work.wait(timedelta(seconds=2)), work.is_completed())
-    )
+        lambda future: (work.wait(timedelta(seconds=2)), work.is_completed()))
     assert chained.wait() == (True, True)
-    assert torch.equal(t, torch.full((4,), 6.0))
+    assert torch.equal(t, torch.full((4,), 6.))
     dist.barrier()
 
 
@@ -644,9 +574,8 @@ def test_future_callback_sees_its_own_work_completed(tmp_path):
 
 
 def test_cpu_request_on_a_lane_that_has_a_stream_uses_no_stream(monkeypatch):
-    engine = p2p.Engine(
-        _BlockedLink(), torch.device("cpu"), 0, dist.HashStore(), timedelta(seconds=5)
-    )
+    engine = p2p.Engine(_BlockedLink(), torch.device("cpu"), 0, dist.HashStore(),
+                        timedelta(seconds=5))
     entered, release = threading.Event(), threading.Event()
 
     def match(*args):
@@ -692,13 +621,10 @@ def _check_native_grouping(monkeypatch, mutation):
 
     native = Native()
     device = torch.device("cuda:0")
-    tensor = SimpleNamespace(
-        device=device, layout=torch.strided, is_contiguous=lambda: True
-    )
+    tensor = SimpleNamespace(device=device, layout=torch.strided, is_contiguous=lambda: True)
     pg = GpubridgeProcessGroup(0, 2, "unit-native", None)
-    topo = SimpleNamespace(
-        device=device, island=SimpleNamespace(ranks=(0, 1)), island_group=native
-    )
+    topo = SimpleNamespace(device=device, island=SimpleNamespace(ranks=(0, 1)),
+                           island_group=native)
     monkeypatch.setattr(torch_backend, "_owner", pg)
     monkeypatch.setattr(pg, "_topology", lambda: topo)
 
@@ -724,7 +650,6 @@ def test_native_gpu_posts_are_grouped_and_mutation_is_detected(monkeypatch):
 
 # ---- batches and callbacks (review round 2 of the lifecycle fix) -----------------------------
 
-
 def _within(fn, seconds: float) -> bool:
     """Run ``fn`` on a helper thread; whether it returned within ``seconds``."""
     done = threading.Event()
@@ -737,16 +662,12 @@ def _callback_waits_on_a_batch(rank, world):
     store = dist.distributed_c10d._get_default_store()
     if rank == 0:
         a = dist.isend(torch.ones(5), 1, tag=0)
-        b = batch_isend_irecv(
-            [dist.P2POp(dist.isend, torch.full((5,), 2.0), 1, tag=1)]
-        )[0]
+        b = batch_isend_irecv([dist.P2POp(dist.isend, torch.full((5,), 2.0), 1, tag=1)])[0]
         seen = {}
 
         def callback(future):
             store.set("entered", "1")
-            store.wait(
-                ["received-b"], timedelta(seconds=10)
-            )  # the peer has b's payload
+            store.wait(["received-b"], timedelta(seconds=10))  # the peer has b's payload
             seen["b"] = _within(b.wait, 5)
 
         chained = a.get_future().then(callback)
@@ -777,14 +698,10 @@ def _slow_callback_and_a_batch(rank, world):
         a.get_future().then(lambda _: time.sleep(2))
         a.wait()
         start = time.monotonic()
-        for work in batch_isend_irecv(
-            [dist.P2POp(dist.isend, torch.ones(3), 1, tag=1)]
-        ):
+        for work in batch_isend_irecv([dist.P2POp(dist.isend, torch.ones(3), 1, tag=1)]):
             work.wait()
         elapsed = time.monotonic() - start
-        assert elapsed < 1, (
-            f"a batch's wait() took {elapsed:.2f} s behind a slow callback"
-        )
+        assert elapsed < 1, f"a batch's wait() took {elapsed:.2f} s behind a slow callback"
     else:
         dist.recv(torch.empty(3), 0, tag=0)
         dist.recv(torch.empty(3), 0, tag=1)
@@ -820,12 +737,8 @@ def _batch_with_a_same_island_peer(rank, world):
     dist.barrier()
     if rank == 0:
         start = time.monotonic()
-        works = batch_isend_irecv(
-            [
-                dist.P2POp(dist.isend, torch.ones(3), 1, tag=2),
-                dist.P2POp(dist.isend, torch.full((3,), 2.0), 2, tag=2),
-            ]
-        )
+        works = batch_isend_irecv([dist.P2POp(dist.isend, torch.ones(3), 1, tag=2),
+                                   dist.P2POp(dist.isend, torch.full((3,), 2.0), 2, tag=2)])
         for work in works:
             work.wait()
         assert time.monotonic() - start < 5, "a batch with a same-island peer stalled"
@@ -840,126 +753,142 @@ def _batch_with_a_same_island_peer(rank, world):
 def test_a_batch_with_a_same_island_peer_completes(tmp_path):
     # A batch Work once waited a second time on the same-island Gloo send, which then
     # waited for a transfer that never came, until the group's timeout.
-    run(
-        ["nvidia", "nvidia", "amd"],
-        _batch_with_a_same_island_peer,
-        tmp_path,
-        seconds=15,
-    )
+    run(["nvidia", "nvidia", "amd"], _batch_with_a_same_island_peer, tmp_path, seconds=15)
 
 
-# ---- cancellation-aware blocking wait on FileStore and TCPStore ------------------------------
+# ---- the descriptor handshake on a shared Store ---------------------------------------------
+
+class _InstantLink:
+    """Transfers that complete at once: what is left to time is the Store handshake."""
+
+    def post(self, tensor, peer, tag, sending):
+        return self
+
+    def wait(self, timeout):
+        pass
+
+    def close(self):
+        pass
 
 
-def test_p2p_filestore_wait_key_late_peer_missing_and_cancel(tmp_path):
-    DummyLink = type("DummyLink", (), {"close": lambda self: None})
-    fs1 = dist.FileStore(str(tmp_path / "store"), 2)
-    fs2 = dist.FileStore(str(tmp_path / "store"), 2)
-    engine = p2p.Engine(DummyLink(), torch.device("cpu"), 0, fs1, timedelta(seconds=1))
+def _two_clients(kind, tmp_path):
+    """Two clients of one Store, one per engine, as each rank has its own."""
+    if kind == "tcp":
+        server = dist.TCPStore("127.0.0.1", 0, 1, True, timedelta(seconds=10))
+        return server, dist.TCPStore("127.0.0.1", server.port, 1, False, timedelta(seconds=10))
+    return dist.FileStore(str(tmp_path / "store"), 2), dist.FileStore(str(tmp_path / "store"), 2)
+
+
+@pytest.mark.parametrize("kind", ["tcp", "file"])
+def test_waiting_lanes_do_not_hold_up_ready_ones_and_every_wait_ends(kind, tmp_path, capfd):
+    # Every lane of an engine shares its Store client. Lanes waiting for peers that never
+    # come (there is no rank 2) or come late must not delay pairs that are ready, on
+    # either Store; then each wait ends by its deadline, and no Store timeout is logged.
+    mine, theirs = _two_clients(kind, tmp_path)
+    a = p2p.Engine(_InstantLink(), torch.device("cpu"), 0, mine, timedelta(seconds=3))
+    b = p2p.Engine(_InstantLink(), torch.device("cpu"), 1, theirs, timedelta(seconds=3))
     try:
-        # Late peer
-        def set_late():
-            time.sleep(0.02)
-            fs2.set("late_key", "late_val")
+        missing = [a.submit(torch.ones(1), 2, tag, tag % 2 == 0) for tag in range(8)]
+        late = a.submit(torch.ones(3), 1, 20, True)
+        time.sleep(0.05)  # the missing and late lanes are waiting
+        start = time.monotonic()
+        ready = [a.submit(torch.ones(2), 1, 10 + i, i % 2 == 0) for i in range(4)]
+        peers = [b.submit(torch.empty(2), 0, 10 + i, i % 2 == 1) for i in range(4)]
+        for work in ready + peers:
+            assert work.wait(timedelta(seconds=2))
+        elapsed = time.monotonic() - start
+        assert elapsed < 1, f"ready pairs took {elapsed:.2f} s behind waiting lanes"
+        b.submit(torch.empty(3), 0, 20, False).wait(timedelta(seconds=2))  # a late peer
+        assert late.wait(timedelta(seconds=2))
+        assert not any(work.is_completed() for work in missing)
+        for work in missing:  # rank 2 never comes: each fails by its deadline
+            with pytest.raises(RuntimeError, match="timed out"):
+                work.wait(timedelta(seconds=4))
+        assert time.monotonic() - start < 4.5
+    finally:
+        a.close()
+        b.close()
+    assert "waitForInput" not in capfd.readouterr().err
 
-        threading.Thread(target=set_late).start()
-        val = engine._wait_key("late_key", time.monotonic() + 0.5, "timed out")
-        assert val == "late_val"
 
-        # Missing peer
-        with pytest.raises(TimeoutError, match="missing"):
-            engine._wait_key("missing_key", time.monotonic() + 0.05, "missing")
-
-        # Cancellation via close
-        def close_engine():
-            time.sleep(0.01)
-            engine.close(timeout=0.05)
-
-        threading.Thread(target=close_engine).start()
+@pytest.mark.parametrize("kind", ["tcp", "file"])
+def test_close_ends_waiting_lanes_at_once(kind, tmp_path):
+    mine, _ = _two_clients(kind, tmp_path)
+    engine = p2p.Engine(_InstantLink(), torch.device("cpu"), 0, mine, timedelta(seconds=30))
+    works = [engine.submit(torch.ones(1), 1, tag, True) for tag in range(4)]
+    time.sleep(0.05)
+    lanes = list(engine._lanes.values())
+    assert len(lanes) == 4
+    start = time.monotonic()
+    engine.close(timeout=0.5)
+    for work in works:
         with pytest.raises(RuntimeError, match="destroyed"):
-            engine._wait_key("cancel_key", time.monotonic() + 0.5, "cancel")
+            work.wait(timedelta(seconds=1))
+    assert not any(lane.thread.is_alive() for lane in lanes), "a waiting lane outlived close()"
+    assert time.monotonic() - start < 0.5
+
+
+class _SlowGet:
+    """A Store whose get() takes ``delay`` seconds, like a busy server."""
+
+    def __init__(self, store, delay):
+        self.store, self.delay = store, delay
+
+    def get(self, key):
+        time.sleep(self.delay)
+        return self.store.get(key)
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
+
+def test_a_deadline_passed_in_a_store_call_fails_even_when_the_peer_was_ready():
+    store = dist.HashStore()
+    engine = p2p.Engine(_InstantLink(), torch.device("cpu"), 0, _SlowGet(store, 0.2),
+                        timedelta(seconds=5))
+    try:
+        store.set("0/1/7/0/recv", json.dumps([4, str(torch.float32), 0]))  # the peer is ready
+        with pytest.raises(TimeoutError, match="timed out"):
+            engine.match(torch.ones(1), 1, 7, 0, True, time.monotonic() + 0.1)
     finally:
         engine.close()
 
 
-def test_p2p_tcpstore_wait_key_late_peer_failure_and_cancel():
-    DummyLink = type("DummyLink", (), {"close": lambda self: None})
-    srv = dist.TCPStore("127.0.0.1", 0, 1, True, timedelta(seconds=5))
-    cli = dist.TCPStore("127.0.0.1", srv.port, 1, False, timedelta(seconds=5))
-    engine = p2p.Engine(DummyLink(), torch.device("cpu"), 0, srv, timedelta(seconds=1))
+class _Counted:
+    """A Store that counts each method's calls."""
+
+    def __init__(self, store):
+        self.store, self.calls = store, collections.Counter()
+
+    def __getattr__(self, name):
+        method = getattr(self.store, name)
+
+        def counted(*args, **kwargs):
+            self.calls[name] += 1
+            return method(*args, **kwargs)
+
+        return counted
+
+
+def test_an_idle_watcher_asks_nothing_and_wakes_for_a_posted_request(monkeypatch):
+    # With nothing pending the health watcher makes no Store call. A request submitted
+    # then, already posted to the link, still learns of a remote failure within the
+    # watch interval: submit() wakes the watcher.
+    store = _Counted(dist.HashStore())
+    link = _BlockedLink()
+    engine = p2p.Engine(link, torch.device("cpu"), 0, store, timedelta(seconds=5))
     try:
-        # Late peer
-        def set_late():
-            time.sleep(0.01)
-            cli.set("tcp_late", "tcp_val")
-
-        threading.Thread(target=set_late).start()
-        val = engine._wait_key("tcp_late", time.monotonic() + 0.5, "timed out")
-        assert val == "tcp_val"
-
-        # Missing peer
-        with pytest.raises(TimeoutError, match="tcp_missing"):
-            engine._wait_key("tcp_missing", time.monotonic() + 0.03, "tcp_missing")
-
-        # Remote failure
-        def fail_remote():
-            time.sleep(0.01)
-            cli.set("failure", "peer failed")
-
-        threading.Thread(target=fail_remote).start()
-        with pytest.raises(RuntimeError, match="peer failed"):
-            engine._wait_key("tcp_waiting", time.monotonic() + 0.5, "timeout")
-
-        # Cancellation via close on fresh engine
-        srv2 = dist.TCPStore("127.0.0.1", 0, 1, True, timedelta(seconds=5))
-        engine2 = p2p.Engine(
-            DummyLink(), torch.device("cpu"), 0, srv2, timedelta(seconds=1)
-        )
-
-        def close_engine2():
-            time.sleep(0.01)
-            engine2.close(timeout=0.05)
-
-        threading.Thread(target=close_engine2).start()
-        with pytest.raises(RuntimeError, match="destroyed"):
-            engine2._wait_key("tcp_cancel", time.monotonic() + 0.5, "cancel")
+        time.sleep(0.55)  # eleven of the 50 ms intervals at which the watcher used to poll
+        assert store.calls["check"] == 0, "an idle watcher polled the Store"
+        monkeypatch.setattr(engine, "match", lambda *args: None)
+        work = engine.submit(torch.ones(1), 1, 0, True)
+        assert link.entered.wait(2)  # the transfer is posted and blocks
+        store.store.set("failure", "remote failure")
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match="remote failure"):
+            work.wait(timedelta(seconds=2))
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.3, f"the watcher noticed the failure only after {elapsed:.2f} s"
     finally:
+        link.release.set()
         engine.close()
-
-
-@pytest.mark.parametrize("store_type", ["file", "tcp"])
-def test_p2p_concurrent_ordering_and_descriptor_match(store_type, tmp_path):
-    DummyLink = type("DummyLink", (), {"close": lambda self: None})
-    if store_type == "file":
-        s0 = dist.FileStore(str(tmp_path / "store_ord"), 2)
-        s1 = dist.FileStore(str(tmp_path / "store_ord"), 2)
-    else:
-        s0 = dist.TCPStore("127.0.0.1", 0, 1, True, timedelta(seconds=5))
-        s1 = dist.TCPStore("127.0.0.1", s0.port, 1, False, timedelta(seconds=5))
-    e0 = p2p.Engine(DummyLink(), torch.device("cpu"), 0, s0, timedelta(seconds=2))
-    e1 = p2p.Engine(DummyLink(), torch.device("cpu"), 1, s1, timedelta(seconds=2))
-    try:
-        # Match across multiple tags and sequences concurrently
-        def rank1_work():
-            for seq in range(5):
-                t = torch.ones(10, dtype=torch.float32)
-                e1.match(
-                    t,
-                    peer=0,
-                    tag=42,
-                    seq=seq,
-                    sending=False,
-                    deadline=time.monotonic() + 2,
-                )
-
-        t1 = threading.Thread(target=rank1_work)
-        t1.start()
-        for seq in range(5):
-            t = torch.ones(10, dtype=torch.float32)
-            e0.match(
-                t, peer=1, tag=42, seq=seq, sending=True, deadline=time.monotonic() + 2
-            )
-        t1.join()
-    finally:
-        e0.close()
-        e1.close()
