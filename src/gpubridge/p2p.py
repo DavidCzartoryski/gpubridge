@@ -196,6 +196,8 @@ class Engine:
         learns of a remote failure only from here."""
         while not self._stop.is_set():
             with self._lock:  # the lock submit() adds under: no wake-up is lost
+                if self._closed or self._stop.is_set():
+                    return
                 idle = not self._pending
                 if idle:
                     self._wake.clear()

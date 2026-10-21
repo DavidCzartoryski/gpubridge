@@ -892,3 +892,33 @@ def test_an_idle_watcher_asks_nothing_and_wakes_for_a_posted_request(monkeypatch
     finally:
         link.release.set()
         engine.close()
+
+
+def test_watcher_exits_when_closed_between_stop_check_and_lock():
+    # If close() runs after the watcher has evaluated _stop.is_set() outside the lock,
+    # the watcher must check for stop/closed under the lock before clearing _wake,
+    # exiting cleanly without clearing close()'s wake or leaking the daemon thread.
+    engine = p2p.Engine(_InstantLink(), torch.device("cpu"), 0, dist.HashStore(),
+                        timedelta(seconds=2))
+    entered = threading.Event()
+    release = threading.Event()
+    original_is_set = engine._stop.is_set
+    paused = False
+
+    def paused_is_set():
+        nonlocal paused
+        value = original_is_set()
+        if threading.current_thread() is engine._watcher and not value and not paused:
+            paused = True
+            entered.set()
+            assert release.wait(2), "test timed out waiting to release watcher"
+        return value
+
+    engine._stop.is_set = paused_is_set
+    engine._wake.set()
+    assert entered.wait(2), "watcher did not reach between stop check and lock"
+    engine.close()
+    release.set()
+    engine._watcher.join(0.5)
+    assert not engine._watcher.is_alive(), "watcher thread leaked after close()"
+    assert engine._wake.is_set(), "close()'s wake signal was cleared by watcher"

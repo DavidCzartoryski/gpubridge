@@ -702,7 +702,7 @@ hardware.
   wait, 7 runs; within run-to-run spread over 1 s). A blocking
   `store.wait` was tried and rejected: TCPStore serializes a client's requests, so one
   lane's wait held up the others past their deadlines and logged every timed-out slice.
-  CPU evidence only, not GPU, RDMA or cross-node.
+  CPU evidence only, not GPU, RDMA or cross-node. On teardown, Engine._watch rechecks stop/closed state under lock before clearing the idle wake, preventing a concurrent close() wake from being cleared.
 - `import gpubridge` no longer imports the opt-in bridges (`ucx`, `multitcp`,
   `verbs`): each registers itself when a job first names it (`init(bridge=...)`,
   `GPUBRIDGE_BRIDGE`, `resolve_transport`). The default Gloo job loads 15 gpubridge
