@@ -1,6 +1,8 @@
 """CPU contract tests for benchmark timing, input bounds and payload generation."""
 
+import json
 import queue
+import subprocess
 import sys
 import threading
 from collections import Counter
@@ -117,3 +119,22 @@ def test_pattern_uses_bounded_chunks_including_the_tail(monkeypatch):
     result = bench_p2p.pattern(31, torch.device("cpu"))
     assert calls == [(0, 7), (7, 7), (14, 7), (21, 7), (28, 3)]
     assert result.tolist() == list(range(31))
+
+
+def test_the_handshake_benchmark_runs_every_phase_on_both_stores():
+    # scripts/bench_p2p_handshake.py, this p2p.py against itself, one short run per arm.
+    repo = Path(__file__).resolve().parents[1]
+    for store in ("tcp", "file"):
+        result = subprocess.run(
+            [sys.executable, str(repo / "scripts" / "bench_p2p_handshake.py"), "--before",
+             str(repo / "src" / "gpubridge" / "p2p.py"), "--store", store, "--iterations", "5",
+             "--warmup", "1", "--idle", "0.1", "--missing", "2", "--hold", "0.1",
+             "--repeats", "1"], cwd=repo, capture_output=True, text=True, timeout=300)
+        assert result.returncode == 0, result.stderr
+        out = json.loads(result.stdout)
+        assert out["sources"]["before"]["sha256"] == out["sources"]["after"]["sha256"]
+        for arm in ("before", "after"):
+            summary = out["summary"][arm]
+            assert summary["pingpong"]["one_way_us_median"] > 0
+            assert summary["pingpong"]["store_calls"] > 0
+            assert summary["missing"]["waiting_ended_by_close"] == [2]  # close() ends them
