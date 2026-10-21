@@ -1589,13 +1589,16 @@ def test_time_triton_cache_finds_each_directorys_filesystem(tmp_path):
     sys.path.insert(0, str(KIT))
     import time_triton_cache
 
-    mounts = ("sysfs /sys sysfs rw 0 0\n/dev/sda1 / xfs rw 0 0\n"
-              "tmpfs /tmp tmpfs rw 0 0\nnas:/home /home nfs4 rw 0 0\n"
-              "vast:/projects /projects nfs rw 0 0\n")
-    assert time_triton_cache.filesystem(Path("/home/someuser/.triton"), mounts) == "nfs4"
-    assert time_triton_cache.filesystem(Path("/tmp/x"), mounts) == "tmpfs"
-    assert time_triton_cache.filesystem(Path("/projects/lab/user"), mounts) == "nfs"
-    assert time_triton_cache.filesystem(Path("/opt/x"), mounts) == "xfs"
+    # Mount points under a resolved directory of our own: filesystem() resolves the path
+    # first, and on some hosts /home or /tmp is a symlink (macOS: /tmp -> /private/tmp).
+    root = tmp_path.resolve()
+    mounts = (f"sysfs /sys sysfs rw 0 0\n/dev/sda1 / xfs rw 0 0\n"
+              f"tmpfs {root}/tmp tmpfs rw 0 0\nnas:/home {root}/home nfs4 rw 0 0\n"
+              f"vast:/projects {root}/projects nfs rw 0 0\n")
+    assert time_triton_cache.filesystem(root / "home/someuser/.triton", mounts) == "nfs4"
+    assert time_triton_cache.filesystem(root / "tmp/x", mounts) == "tmpfs"
+    assert time_triton_cache.filesystem(root / "projects/lab/user", mounts) == "nfs"
+    assert time_triton_cache.filesystem(root / "opt/x", mounts) == "xfs"
     assert len(time_triton_cache.VARIANTS) == 12  # bf16 mode skips 16-bit inputs
 
 
@@ -1633,6 +1636,13 @@ echo "local_left=$left"
     return result.stdout
 
 
+def _gnu_mv() -> bool:
+    """Whether mv has GNU's -T, as on the Linux nodes the kit runs on (BSD mv hasn't)."""
+    result = subprocess.run(["mv", "--version"], capture_output=True, text=True)
+    return result.returncode == 0 and "GNU" in result.stdout
+
+
+@pytest.mark.skipif(not _gnu_mv(), reason="triton_cache_end renames with GNU mv -T")
 def test_a_job_builds_triton_kernels_in_a_node_local_cache_kept_in_the_store(tmp_path):
     store = tmp_path / "store"
     (store / "oldkernel").mkdir(parents=True)

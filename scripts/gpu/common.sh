@@ -173,7 +173,8 @@ triton_cache_begin() {
     local entry
     for entry in "$TRITON_CACHE_STORE"/*/; do
         [ -d "$entry" ] || continue
-        [ -e "$dir/$(basename "$entry")" ] || cp -a "$entry" "$dir/" 2>/dev/null || true
+        # Without the trailing slash, which BSD cp reads as "the directory's contents".
+        [ -e "$dir/$(basename "$entry")" ] || cp -a "${entry%/}" "$dir/" 2>/dev/null || true
     done
     TRITON_CACHE_SAVE="$dir"
     export TRITON_CACHE_DIR="$dir"
