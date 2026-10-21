@@ -504,6 +504,31 @@ NIC once, so sends gather from it and receives are written into it with no host
 copy. A larger tensor replaces the buffer after its last copy back has passed,
 the old registration dropped first.
 
+**Staged, chunk by chunk** (`GPUBRIDGE_VERBS_STAGED_OVERLAP=1`; opt-in, off by
+default). For a two-leader all_reduce of more than one chunk the staged call
+overlaps its copies with its messages: every chunk's copy out is queued at once (the
+first after the last copy back, on the device); then per chunk the receive is
+posted, the host waits for that chunk's copy out and posts its send; then per
+chunk, once its send and receive have completed, it is reduced and its copy back
+queued. Each copy back queued is the one the next call's first copy out waits for.
+The messages are the same as a whole call's (the same buffers, registrations,
+tags and sizes), so leaders with it on and off interoperate. Broadcasts, more than
+two leaders and tensors of one chunk are staged whole; `last_gpu["staging"]` says
+`whole`, `overlapped`, or `whole (<why not>)` when it is on. Two differences: an
+observation's `duration_s` starts before the first chunk's copy out has passed, and
+a call that fails part way may already have copied some reduced chunks back into
+the caller's tensor. It still raises, and the bridge refuses later calls. Whatever
+fails, queueing a copy included, the worker is aborted first, then the host waits
+for every copy the call queued on the caller's stream (that stream only), so none
+still writes the caller's tensor or the staging buffer once the error is raised,
+async collectives included. If that wait fails too (on a GPU, a sticky error), the
+call's own error is still the one raised, with the wait's as its `__cause__`; its
+copies may then still be pending, so the staging buffer stays kept.
+SOFTWARE-VERIFIED (CPU tensors standing in, lazy copies,
+`tests/test_verbs_staged_overlap.py`); not validated on GPUs (the 2026-10-20
+staged results predate it), and no speedup is claimed: docs/verbs-perf-20261019.md, section 7, is the measurement that would show
+one.
+
 **Direct** (`direct`). The tensor's memory, and the reduction's scratch buffer,
 are registered with the NIC, and the NIC reads and writes them in place. Only
 when every check passes and both registrations succeed; otherwise the call is
@@ -651,11 +676,13 @@ adds `path` (`host`, `direct`, `direct+bounce`, `staged`) and `path_reason` of
 the last call, `last_gpu` (device, method, flush, stream waits and flushes,
 bounced receives and bytes), `paths`, `gpu_path_setting`, `gpus` (each GPU's
 direct-path support: driver, flush, capabilities or reason), operation counts by
-memory kind, `staged_phases` (for the staged calls that succeeded: `calls`
-and host seconds in `to_host_s`, the copy out queued and waited for, `bridge_s`,
-and inside it `post_s` and `wait_s`, the rest being reductions and Python, and
-`to_device_s`, queueing the copy back; host clocks only, no GPU time), and the
-observation emitter's counts. A remote key is never kept
+memory kind, `staged_phases` (for the staged calls that succeeded: `calls`, of
+them `overlapped_calls`, and host seconds in `to_host_s`, the copy out queued and
+waited for, `bridge_s`, and inside it `post_s` and `wait_s`, the rest being
+reductions and Python, and `to_device_s`, queueing the copy back; an overlapped
+call's are the same split of its host time, its waits for each chunk's copy out and
+its queueing of each copy back added up; host clocks only, no GPU time),
+`staged_overlap_setting`, and the observation emitter's counts. A remote key is never kept
 where telemetry reads, and the tests check no key-like name appears.
 
 ## Transport observations
@@ -743,6 +770,7 @@ copied through the slots. Chunks of `GPUBRIDGE_VERBS_CHUNK_BYTES` (4 MiB).
 | `GPUBRIDGE_VERBS_PROGRESS` | `economy` | native progress policy: `latency`, `balanced`, `economy`; local to each endpoint |
 | `GPUBRIDGE_VERBS_PROGRESS_CPU` | unset | optional latency-thread CPU, inside the inherited allowed set; Linux `ibverbs` only |
 | `GPUBRIDGE_VERBS_GPU_PATH` | `auto` | `auto`, `direct` (fail instead of staging) or `staged` |
+| `GPUBRIDGE_VERBS_STAGED_OVERLAP` | `0` | `1`: a staged two-leader all_reduce overlaps its copies with its messages, chunk by chunk ("GPU memory"); local to each leader |
 | `GPUBRIDGE_VERBS_DMABUF`, `GPUBRIDGE_VERBS_PEER_MEMORY` | `1` | `0` keeps the direct path from trying that method |
 | `GPUBRIDGE_VERBS_DEVICE_CACHE_BYTES` | 8G | bound on GPU memory registered at once |
 | `GPUBRIDGE_VERBS_OBSERVE`, `_OBSERVE_QUEUE`, `GPUBRIDGE_JOB_ID` | off, 10000 | transport observations |
@@ -922,7 +950,24 @@ the buffer, the buffer registered and written by grant; and the observations
 those runs wrote, checked field by field against the detector's schema, plus
 key-like names refused at any depth, the NIC identity from sysfs fixtures, the
 job id from the environment or the store, and an emitter that can't write
-dropping and counting.
+dropping and counting. `tests/test_verbs_staged_overlap.py`: with
+`GPUBRIDGE_VERBS_STAGED_OVERLAP` off (unset or `0`) the staged call step for step as
+before; on, against a fake wire that plays the peer, each chunk's copy out waited
+for before its send is posted (the send sees the copied bytes), each copy back
+queued only after its chunk is reduced, the first copy out after the last copy back
+on another stream, a bigger tensor's buffer replaced only after it, the same
+messages (buffers, offsets, sizes, tags, per-direction order) and results as off for
+sum, max and min from one element to 3.5 chunks, broadcasts, three leaders and one
+chunk staged whole with the reason, a failed wait part way (the last copy back
+queued stays the one waited for, the chunks before it copied back, the rest
+untouched, later calls refused), every copy of a failed call passed when it raises
+(a caller reusing the tensor at once keeps what it wrote), a copy out that can't be
+queued (the worker aborted, the copies queued before it drained, later calls on
+another stream refused), a wait for those copies that fails too (the call's own
+error raised, the wait's chained, the buffer kept, later calls refused) and a failed
+post (no copy back), and the phases
+splitting the call; on the test fabric, exact with it on, off and on one leader
+only, under every progress policy, with equal wire counts and observations.
 
 `shim/gpu_abi_check.c` (compile-only): every constant and signature `gpu.rs` takes
 from cuda.h, HIP's runtime API and ROCr's headers.

@@ -323,6 +323,13 @@ hardware.
   A/B, compares arms against the predeclared rules and decides the plan's copy
   overlap trigger. Measurement only; CPU/MOCK cost checked, not
   validated on GPUs or RDMA hardware. (PR pending)
+- `GPUBRIDGE_VERBS_STAGED_OVERLAP=1` (opt-in, off by default): a staged two-leader
+  verbs all_reduce of more than one chunk overlaps its copies out and back with its
+  messages, chunk by chunk, with the same messages on the wire
+  (docs/VERBS_TRANSPORT.md, "GPU memory"). `last_gpu["staging"]` and
+  `staged_phases["overlapped_calls"]` say when it ran. A conditional candidate: no
+  speedup is claimed; docs/verbs-perf-20261019.md, section 7, is its A/B. Not
+  validated on GPUs. (PR pending)
 - A bounded numerical gate for native NCCL, Gloo islands and staged verbs checks
   exact collectives, gradients, independent optimizer updates/state and parameters;
   includes bad-reduction/scale/data controls and actual endpoint/source attestation.

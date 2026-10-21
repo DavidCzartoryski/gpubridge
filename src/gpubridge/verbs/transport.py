@@ -41,6 +41,21 @@ it on the stream), the bridge step, inside it the posts and the library's waits 
 rest is the reductions and Python), and queueing the copy back (not the copy itself,
 which the host doesn't wait for). Host clocks only: no GPU time.
 
+``GPUBRIDGE_VERBS_STAGED_OVERLAP=1`` (opt-in; off by default) overlaps a staged
+two-leader all_reduce of more than one chunk chunk by chunk: every chunk's copy out is
+queued at once; then per chunk the receive is posted, the host waits for that chunk's
+copy out and posts its send; then per chunk, once both have completed, the chunk is
+reduced and its copy back queued. The messages are the same as without it (buffers,
+registrations, tags, sizes), so leaders with and without it interoperate. Broadcasts,
+more than two leaders and tensors of one chunk run as without it; ``last_gpu["staging"]``
+says which ran and why. Differences: an observation's ``duration_s`` starts before the
+first chunk's copy out has passed, and a call that fails part way may already have
+copied some reduced chunks back into the caller's tensor. It still raises its own
+error, after the worker is aborted and after waiting for every copy it queued on the
+caller's stream, and the transport refuses later calls. If that wait fails too (on a
+GPU, a sticky error), its copies may still be pending: the call's error is raised with
+the wait's as its ``__cause__``, and the staging buffer is kept. Not validated on GPUs.
+
 Not validated on RDMA hardware or GPUs. ``GPUBRIDGE_VERBS_TEST_FABRIC`` runs it on
 a MOCK fabric for tests (see :mod:`gpubridge.verbs`).
 """
@@ -60,10 +75,10 @@ from torch.distributed import ReduceOp
 
 from gpubridge import verbs
 from gpubridge.config import parse_size
-from gpubridge.tagged import TaggedBridge
+from gpubridge.tagged import TaggedBridge, _pieces
 from gpubridge.transport import register_transport
 from gpubridge.ucx import gdr
-from gpubridge.ucx.transport import _segments, _wait_for
+from gpubridge.ucx.transport import _REDUCE, _segments, _wait_for, tag
 from gpubridge.verbs import observe
 from gpubridge.verbs.gpu import (
     DeviceSpan,
@@ -102,6 +117,9 @@ DMABUF_ENV = "GPUBRIDGE_VERBS_DMABUF"
 PEER_MEMORY_ENV = "GPUBRIDGE_VERBS_PEER_MEMORY"
 #: Bound on GPU memory registered at once (registrations are cached).
 DEVICE_CACHE_BYTES_ENV = "GPUBRIDGE_VERBS_DEVICE_CACHE_BYTES"
+#: ``1`` overlaps a staged two-leader all_reduce's copies with its messages, chunk by
+#: chunk (module docs); ``0`` or unset: off. Local to each leader: the wire is the same.
+STAGED_OVERLAP_ENV = "GPUBRIDGE_VERBS_STAGED_OVERLAP"
 
 
 def chunk_bytes_setting() -> int:
@@ -142,6 +160,10 @@ def gpu_path_setting() -> str:
     if raw not in GPU_PATHS:
         raise ValueError(f"{GPU_PATH_ENV}={raw!r} must be one of {', '.join(GPU_PATHS)}")
     return raw
+
+
+def staged_overlap_setting() -> bool:
+    return _flag(STAGED_OVERLAP_ENV) == 1
 
 
 def endpoint_settings() -> dict[str, object]:
@@ -194,6 +216,10 @@ class Plan:
     scratch: torch.Tensor | None = None
     sync: Callable[[], None] | None = None
     run_flush: Callable[[], None] | None = None
+    #: Staged only: ``whole`` (the whole tensor copied out, then the collective, then
+    #: the copy back) or ``overlapped`` (chunk by chunk); with the reason when
+    #: GPUBRIDGE_VERBS_STAGED_OVERLAP is on but the call can't overlap.
+    staging: str | None = None
 
 
 @register_transport
@@ -212,6 +238,7 @@ class VerbsTransport(TaggedBridge):
                  peer_nics: dict[int, dict] | None = None) -> None:
         super().__init__(worker, members, rank, timeout, chunk_bytes)
         self.gpu_path = gpu_path_setting()
+        self.staged_overlap = staged_overlap_setting()
         self.emitter = emitter
         self.base_record = base_record or {}
         self.peer_nics = peer_nics or {}
@@ -229,8 +256,9 @@ class VerbsTransport(TaggedBridge):
         #: Memory of calls that failed: the library may hold it registered until close.
         self._keep: list = []
         #: Host seconds in each phase of the staged calls that succeeded (module docs).
-        self.staged_phases = {"calls": 0, "to_host_s": 0.0, "bridge_s": 0.0, "post_s": 0.0,
-                              "wait_s": 0.0, "to_device_s": 0.0}
+        self.staged_phases = {"calls": 0, "overlapped_calls": 0, "to_host_s": 0.0,
+                              "bridge_s": 0.0, "post_s": 0.0, "wait_s": 0.0,
+                              "to_device_s": 0.0}
         worker.bounce = pinned
 
     @classmethod
@@ -238,6 +266,7 @@ class VerbsTransport(TaggedBridge):
                  deadline: float) -> VerbsTransport:
         chunk, settings = chunk_bytes_setting(), endpoint_settings()
         gpu_path_setting()  # a bad value fails setup, not the first collective
+        staged_overlap_setting()
         index = members.index(rank)
         endpoint = verbs.Endpoint(len(members), index, settings)
         emitter = None
@@ -397,7 +426,8 @@ class VerbsTransport(TaggedBridge):
         size = len(self.members)
         scratch = tensor.numel() if size == 2 else \
             max(length for _, length in _segments(tensor.numel(), size))
-        self._call(tensor, scratch, lambda t: self._all_reduce(t, op))
+        self._call(tensor, scratch, lambda t: self._all_reduce(t, op),
+                   overlap_op=op if size == 2 else None)
 
     def broadcast(self, tensor: torch.Tensor, src: int) -> None:
         if len(self.members) == 1:
@@ -405,7 +435,11 @@ class VerbsTransport(TaggedBridge):
         self._check(tensor)
         self._call(tensor, 0, lambda t: self._broadcast(t, src))
 
-    def _call(self, tensor: torch.Tensor, scratch_numel: int, run) -> None:
+    def _call(self, tensor: torch.Tensor, scratch_numel: int, run,
+              overlap_op: ReduceOp.RedOpType | None = None) -> None:
+        """``run`` on the tensor where it lies, direct or staged. ``overlap_op``: a
+        two-leader all_reduce's operation, which GPUBRIDGE_VERBS_STAGED_OVERLAP may
+        overlap with its copies (:meth:`_overlapped`)."""
         if not self._is_device(tensor):
             self._run("host", None, tensor, run)
             return
@@ -414,6 +448,16 @@ class VerbsTransport(TaggedBridge):
             self._run("direct", plan, tensor, run)
             return
         staging = self._staging_for(tensor)
+        plan.staging = "whole"
+        if self.staged_overlap:
+            pieces = _pieces(tensor.numel(), max(1, self.chunk_bytes // tensor.element_size()))
+            if overlap_op is not None and len(pieces) > 1:
+                plan.staging = "overlapped"
+                self._overlapped(tensor, plan, staging, pieces, overlap_op)
+                return
+            why = ("one chunk" if overlap_op is not None else
+                   "more than two leaders" if len(self.members) > 2 else "not an all_reduce")
+            plan.staging = f"whole ({why})"
         router = self.worker
         t0 = time.perf_counter()
         host = staging.to_host(tensor)  # once the copy out has passed
@@ -434,6 +478,82 @@ class VerbsTransport(TaggedBridge):
         phases["post_s"] += router.post_s - post
         phases["wait_s"] += router.wait_s - wait
         phases["to_device_s"] += t3 - t2
+
+    def _overlapped(self, tensor: torch.Tensor, plan: Plan, staging: RegisteredStaging,
+                    pieces: list[tuple[int, int]], op: ReduceOp.RedOpType) -> None:
+        """A staged two-leader all_reduce, chunk by chunk (module docs). The same
+        messages as TaggedBridge._all_reduce's: the same buffers, tags and pieces. The
+        phases are the same partition of the call's host time as a whole call's: copy
+        out (queued, then the host's waits for each chunk), copy back (queueing each
+        chunk's), and the bridge step (the rest: posts, library waits, reductions).
+
+        If anything fails, queueing the copies included, the worker is aborted (so the
+        NIC no longer touches the buffers) and then every copy queued on the caller's
+        stream is waited for, before the error propagates: none still writes the
+        caller's tensor or the staging buffer after the caller has seen the failure.
+        If that wait fails too, that is not known: the call's error propagates with the
+        wait's as its ``__cause__``, the buffer stays kept and later calls are refused."""
+        router = self.worker
+        times = {"to_host_s": 0.0, "to_device_s": 0.0}
+        t0 = time.perf_counter()
+        host = staging.host_for(tensor)
+        times["to_host_s"] += time.perf_counter() - t0
+        post, wait = router.post_s, router.wait_s
+        router.timed = True
+        try:
+            self._run("staged", plan, host,
+                      lambda h: self._exchange(h, tensor, staging, pieces, op, times))
+        except BaseException as exc:
+            try:
+                staging.drain()
+            except BaseException as drain_error:
+                # On a GPU a sticky error fails the drain too: the caller still sees
+                # the call's own error, the drain's chained to it. The buffer stays
+                # kept and the aborted worker refuses later calls, as on any failure.
+                raise exc from drain_error
+            raise
+        finally:
+            router.timed = False
+        total = time.perf_counter() - t0
+        phases = self.staged_phases
+        phases["calls"] += 1
+        phases["overlapped_calls"] += 1
+        phases["to_host_s"] += times["to_host_s"]
+        phases["bridge_s"] += total - times["to_host_s"] - times["to_device_s"]
+        phases["post_s"] += router.post_s - post
+        phases["wait_s"] += router.wait_s - wait
+        phases["to_device_s"] += times["to_device_s"]
+
+    def _exchange(self, host: torch.Tensor, tensor: torch.Tensor, staging: RegisteredStaging,
+                  pieces: list[tuple[int, int]], op: ReduceOp.RedOpType,
+                  times: dict[str, float]) -> None:
+        t = time.perf_counter()
+        ready = staging.to_host_chunks(tensor, host, pieces)  # queued, not waited for
+        times["to_host_s"] += time.perf_counter() - t
+        seq, deadline, _ = self._start(host)
+        (peer,) = self._peers()
+        reduce, worker = _REDUCE[op], self.worker
+        flat, out = host.view(-1), tensor.view(-1)
+        scratch = self._scratch(flat.numel(), flat)
+        size = flat.element_size()
+        ids = []
+        for i, ((start, length), event) in enumerate(zip(pieces, ready, strict=True)):
+            got = worker.recv(peer, scratch.data_ptr() + start * size, length * size,
+                              tag(seq, 0, peer, i))
+            t = time.perf_counter()
+            staging.wait_chunk(event)  # chunk i's copy out has passed: the send may read it
+            times["to_host_s"] += time.perf_counter() - t
+            sent = worker.send(peer, flat.data_ptr() + start * size, length * size,
+                               tag(seq, 0, self.index, i))
+            ids.append((got, sent))
+        # As in TaggedBridge: chunk i is reduced once it has arrived and gone out; then
+        # its copy back is queued, while later chunks are still in flight.
+        for (start, length), (got, sent) in zip(pieces, ids, strict=True):
+            worker.wait([got, sent], deadline)
+            reduce(flat[start:start + length], scratch[start:start + length])
+            t = time.perf_counter()
+            staging.chunk_to_device(out[start:start + length], flat[start:start + length])
+            times["to_device_s"] += time.perf_counter() - t
 
     def _run(self, path: str, plan: Plan | None, tensor: torch.Tensor, run) -> None:
         router = self.worker
@@ -482,7 +602,7 @@ class VerbsTransport(TaggedBridge):
             self.last = {"path": path, "path_reason": reason,
                          "gpu": None if plan is None else {
                              "device": plan.device, "method": plan.method,
-                             "flush": plan.flush, "syncs": call.syncs,
+                             "flush": plan.flush, "staging": plan.staging, "syncs": call.syncs,
                              "flushes": call.flushes, "bounced_ops": call.bounced_ops,
                              "bounced_bytes": call.bounced_bytes}}
             self._observe(call, path, status, error)
@@ -510,8 +630,9 @@ class VerbsTransport(TaggedBridge):
         operations, failure, counts (copied and in-place bytes, rendezvous messages), the
         registrations (``direct``, with the time spent making and releasing write
         windows); then the last call's ``path`` (``host``, ``direct``, ``direct+bounce``,
-        ``staged``) and ``path_reason``, ``last_gpu`` (with the call's bounced receives),
-        per-path counts, the staged calls' phase times (``staged_phases``, module docs),
+        ``staged``) and ``path_reason``, ``last_gpu`` (with the call's bounced receives
+        and, staged, its ``staging``), per-path counts, ``staged_overlap_setting``, the
+        staged calls' phase times (``staged_phases``, module docs),
         each GPU's direct-path support and the observation emitter's counts. Never a remote key."""
         router = self.worker
         gpus = {str(i): {"direct": s.ok, "reason": s.reason or None, "driver": s.driver,
@@ -521,7 +642,8 @@ class VerbsTransport(TaggedBridge):
         return {**router.telemetry(), "chunk_bytes": self.chunk_bytes,
                 "failed": router.failed, "path": self.last["path"] or "host",
                 "path_reason": self.last["path_reason"], "last_gpu": self.last["gpu"],
-                "paths": dict(self.paths), "gpu_path_setting": self.gpu_path, "gpus": gpus,
+                "paths": dict(self.paths), "gpu_path_setting": self.gpu_path,
+                "staged_overlap_setting": self.staged_overlap, "gpus": gpus,
                 "in_place_ops": router.in_place_ops, "plain_ops": router.plain_ops,
                 "bounced_ops": router.bounced_ops,
                 "staged_phases": dict(self.staged_phases),
