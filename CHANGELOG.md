@@ -253,6 +253,15 @@ hardware.
 
 ## [Unreleased]
 
+- Point-to-point store polling optimization: replaced the historical 2 ms polling
+  loop in `Engine.match` with cancellation-aware blocking notification/wait on
+  `TCPStore`/`HashStore` and sub-millisecond adaptive backoff on `FileStore`.
+  The background health thread backs off when no P2P operations are pending,
+  eliminating idle store contention. On matched CPU handshake benchmarks
+  (`bench_p2p.py`), 1 KiB bridge one-way latency improved from 3,801 us to 546 us
+  (6.95x speedup, -85.6% latency reduction). Tested and qualified across missing peer,
+  late peer, cancellation/timeout, close races, concurrent ordering, and both store backends.
+
 ### Hardware validation
 
 - **2026-10-20: one node with 4x Tesla V100-SXM2-32GB, driver 545.23.08,
