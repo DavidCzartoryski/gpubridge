@@ -31,6 +31,17 @@ from gpubridge.staging import make_staging
 
 CHUNK_BYTES_ENV = "GPUBRIDGE_P2P_CHUNK_BYTES"
 
+#: How long ``Engine.match`` pauses between looks for the peer's descriptor: from
+#: ``MATCH_POLL_FIRST`` seconds, doubling up to ``MATCH_POLL_MAX``, the fixed interval it
+#: used to have, so a long wait costs the Store no more calls than before. Each look is one
+#: short Store call: a lane never holds the Store client that every lane shares while it
+#: waits, as a blocking ``store.wait`` would (TCPStore serializes a client's requests).
+MATCH_POLL_FIRST = 50e-6
+MATCH_POLL_MAX = 0.002
+#: How often the health watcher asks the Store for a published failure while operations
+#: are pending. With none pending it asks nothing: ``submit`` wakes it again.
+WATCH_INTERVAL = 0.05
+
 
 def chunk_bytes_setting() -> int:
     """Zero means one whole message; a positive setting uses two staging slots."""
@@ -173,12 +184,31 @@ class Engine:
         self._failed: BaseException | None = None
         self._completer = _Completer()
         self._stop = threading.Event()
+        #: Set by submit() and close(): wakes a watcher parked with nothing pending.
+        self._wake = threading.Event()
         self._watcher = threading.Thread(target=self._watch, name="gpubridge-p2p-health",
                                          daemon=True)
         self._watcher.start()
 
     def _watch(self) -> None:
-        while not self._stop.wait(0.05):
+        """While operations are pending, look for a failure every WATCH_INTERVAL seconds;
+        with none, park until submit() or close(). A request already posted to the link
+        learns of a remote failure only from here."""
+        while not self._stop.is_set():
+            with self._lock:  # the lock submit() adds under: no wake-up is lost
+                if self._closed or self._stop.is_set():
+                    return
+                idle = not self._pending
+                if idle:
+                    self._wake.clear()
+            if idle:
+                self._wake.wait()
+                continue
+            # On a fixed grid of the monotonic clock, not from the wake-up: a failure
+            # published right after submit() is seen as soon as it was when this thread
+            # polled all the time, at most WATCH_INTERVAL later.
+            if self._stop.wait(WATCH_INTERVAL - time.monotonic() % WATCH_INTERVAL):
+                return
             try:
                 self.check()
             except BaseException as exc:  # noqa: BLE001 - fail pending handles on store loss too
@@ -213,6 +243,7 @@ class Engine:
             self._pending[work] = None
             self._lanes[key].queue.put((work, tensor, ready, time.monotonic() + self.timeout,
                                         sequence))
+        self._wake.set()  # an idle watcher starts watching this operation
         return work
 
     def _complete(self, works, error: BaseException | None) -> None:
@@ -252,13 +283,21 @@ class Engine:
                                  self.chunk_bytes])
         self.store.set(f"{prefix}/{mine}", descriptor)
         key = f"{prefix}/{theirs}"
+        timed_out = f"point-to-point {mine} with rank {peer}, tag {tag} timed out"
+        pause = MATCH_POLL_FIRST
         while not self.store.check([key]):
             self.check()
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"point-to-point {mine} with rank {peer}, tag {tag} timed out")
-            time.sleep(0.002)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(timed_out)
+            # time.sleep, not an Event wait, which costs about twice the CPU per pause;
+            # check() sees close() one pause later, as before.
+            time.sleep(min(pause, remaining))
+            pause = min(2 * pause, MATCH_POLL_MAX)
         other = self.store.get(key).decode()
         self.store.delete_key(key)
+        if time.monotonic() >= deadline:  # Store calls can block (a slow or busy server)
+            raise TimeoutError(timed_out)
         if descriptor != other:
             raise ValueError(f"point-to-point payload mismatch with rank {peer}, tag {tag}: "
                              f"local {descriptor}, peer {other}")
@@ -274,6 +313,7 @@ class Engine:
                 return
             self._closed = True
             self._stop.set()
+            self._wake.set()
             pending = list(self._pending)
             self._pending.clear()
             lanes = list(self._lanes.values())

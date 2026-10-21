@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import collections
 import gc
+import json
 import os
 import threading
 import time
@@ -752,3 +754,171 @@ def test_a_batch_with_a_same_island_peer_completes(tmp_path):
     # A batch Work once waited a second time on the same-island Gloo send, which then
     # waited for a transfer that never came, until the group's timeout.
     run(["nvidia", "nvidia", "amd"], _batch_with_a_same_island_peer, tmp_path, seconds=15)
+
+
+# ---- the descriptor handshake on a shared Store ---------------------------------------------
+
+class _InstantLink:
+    """Transfers that complete at once: what is left to time is the Store handshake."""
+
+    def post(self, tensor, peer, tag, sending):
+        return self
+
+    def wait(self, timeout):
+        pass
+
+    def close(self):
+        pass
+
+
+def _two_clients(kind, tmp_path):
+    """Two clients of one Store, one per engine, as each rank has its own."""
+    if kind == "tcp":
+        server = dist.TCPStore("127.0.0.1", 0, 1, True, timedelta(seconds=10))
+        return server, dist.TCPStore("127.0.0.1", server.port, 1, False, timedelta(seconds=10))
+    return dist.FileStore(str(tmp_path / "store"), 2), dist.FileStore(str(tmp_path / "store"), 2)
+
+
+@pytest.mark.parametrize("kind", ["tcp", "file"])
+def test_waiting_lanes_do_not_hold_up_ready_ones_and_every_wait_ends(kind, tmp_path, capfd):
+    # Every lane of an engine shares its Store client. Lanes waiting for peers that never
+    # come (there is no rank 2) or come late must not delay pairs that are ready, on
+    # either Store; then each wait ends by its deadline, and no Store timeout is logged.
+    mine, theirs = _two_clients(kind, tmp_path)
+    a = p2p.Engine(_InstantLink(), torch.device("cpu"), 0, mine, timedelta(seconds=3))
+    b = p2p.Engine(_InstantLink(), torch.device("cpu"), 1, theirs, timedelta(seconds=3))
+    try:
+        missing = [a.submit(torch.ones(1), 2, tag, tag % 2 == 0) for tag in range(8)]
+        late = a.submit(torch.ones(3), 1, 20, True)
+        time.sleep(0.05)  # the missing and late lanes are waiting
+        start = time.monotonic()
+        ready = [a.submit(torch.ones(2), 1, 10 + i, i % 2 == 0) for i in range(4)]
+        peers = [b.submit(torch.empty(2), 0, 10 + i, i % 2 == 1) for i in range(4)]
+        for work in ready + peers:
+            assert work.wait(timedelta(seconds=2))
+        elapsed = time.monotonic() - start
+        assert elapsed < 1, f"ready pairs took {elapsed:.2f} s behind waiting lanes"
+        b.submit(torch.empty(3), 0, 20, False).wait(timedelta(seconds=2))  # a late peer
+        assert late.wait(timedelta(seconds=2))
+        assert not any(work.is_completed() for work in missing)
+        for work in missing:  # rank 2 never comes: each fails by its deadline
+            with pytest.raises(RuntimeError, match="timed out"):
+                work.wait(timedelta(seconds=4))
+        assert time.monotonic() - start < 4.5
+    finally:
+        a.close()
+        b.close()
+    assert "waitForInput" not in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("kind", ["tcp", "file"])
+def test_close_ends_waiting_lanes_at_once(kind, tmp_path):
+    mine, _ = _two_clients(kind, tmp_path)
+    engine = p2p.Engine(_InstantLink(), torch.device("cpu"), 0, mine, timedelta(seconds=30))
+    works = [engine.submit(torch.ones(1), 1, tag, True) for tag in range(4)]
+    time.sleep(0.05)
+    lanes = list(engine._lanes.values())
+    assert len(lanes) == 4
+    start = time.monotonic()
+    engine.close(timeout=0.5)
+    for work in works:
+        with pytest.raises(RuntimeError, match="destroyed"):
+            work.wait(timedelta(seconds=1))
+    assert not any(lane.thread.is_alive() for lane in lanes), "a waiting lane outlived close()"
+    assert time.monotonic() - start < 0.5
+
+
+class _SlowGet:
+    """A Store whose get() takes ``delay`` seconds, like a busy server."""
+
+    def __init__(self, store, delay):
+        self.store, self.delay = store, delay
+
+    def get(self, key):
+        time.sleep(self.delay)
+        return self.store.get(key)
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
+
+def test_a_deadline_passed_in_a_store_call_fails_even_when_the_peer_was_ready():
+    store = dist.HashStore()
+    engine = p2p.Engine(_InstantLink(), torch.device("cpu"), 0, _SlowGet(store, 0.2),
+                        timedelta(seconds=5))
+    try:
+        store.set("0/1/7/0/recv", json.dumps([4, str(torch.float32), 0]))  # the peer is ready
+        with pytest.raises(TimeoutError, match="timed out"):
+            engine.match(torch.ones(1), 1, 7, 0, True, time.monotonic() + 0.1)
+    finally:
+        engine.close()
+
+
+class _Counted:
+    """A Store that counts each method's calls."""
+
+    def __init__(self, store):
+        self.store, self.calls = store, collections.Counter()
+
+    def __getattr__(self, name):
+        method = getattr(self.store, name)
+
+        def counted(*args, **kwargs):
+            self.calls[name] += 1
+            return method(*args, **kwargs)
+
+        return counted
+
+
+def test_an_idle_watcher_asks_nothing_and_wakes_for_a_posted_request(monkeypatch):
+    # With nothing pending the health watcher makes no Store call. A request submitted
+    # then, already posted to the link, still learns of a remote failure within the
+    # watch interval: submit() wakes the watcher.
+    store = _Counted(dist.HashStore())
+    link = _BlockedLink()
+    engine = p2p.Engine(link, torch.device("cpu"), 0, store, timedelta(seconds=5))
+    try:
+        time.sleep(0.55)  # eleven of the 50 ms intervals at which the watcher used to poll
+        assert store.calls["check"] == 0, "an idle watcher polled the Store"
+        monkeypatch.setattr(engine, "match", lambda *args: None)
+        work = engine.submit(torch.ones(1), 1, 0, True)
+        assert link.entered.wait(2)  # the transfer is posted and blocks
+        store.store.set("failure", "remote failure")
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match="remote failure"):
+            work.wait(timedelta(seconds=2))
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.3, f"the watcher noticed the failure only after {elapsed:.2f} s"
+    finally:
+        link.release.set()
+        engine.close()
+
+
+def test_watcher_exits_when_closed_between_stop_check_and_lock():
+    # If close() runs after the watcher has evaluated _stop.is_set() outside the lock,
+    # the watcher must check for stop/closed under the lock before clearing _wake,
+    # exiting cleanly without clearing close()'s wake or leaking the daemon thread.
+    engine = p2p.Engine(_InstantLink(), torch.device("cpu"), 0, dist.HashStore(),
+                        timedelta(seconds=2))
+    entered = threading.Event()
+    release = threading.Event()
+    original_is_set = engine._stop.is_set
+    paused = False
+
+    def paused_is_set():
+        nonlocal paused
+        value = original_is_set()
+        if threading.current_thread() is engine._watcher and not value and not paused:
+            paused = True
+            entered.set()
+            assert release.wait(2), "test timed out waiting to release watcher"
+        return value
+
+    engine._stop.is_set = paused_is_set
+    engine._wake.set()
+    assert entered.wait(2), "watcher did not reach between stop check and lock"
+    engine.close()
+    release.set()
+    engine._watcher.join(0.5)
+    assert not engine._watcher.is_alive(), "watcher thread leaked after close()"
+    assert engine._wake.is_set(), "close()'s wake signal was cleared by watcher"

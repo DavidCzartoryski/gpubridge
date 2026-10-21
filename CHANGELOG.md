@@ -686,6 +686,23 @@ hardware.
 
 ### Changed
 
+- Cross-island point-to-point (the torch backend's `send` and `recv` between islands)
+  looks for the peer's descriptor after pauses that start at 50 µs and double up to the
+  2 ms it always paused, instead of 2 ms from the first look. Each look is still one short
+  Store call, so a lane waiting for its peer holds the Store client that every lane shares
+  only for that call and doesn't delay pairs that are ready. The exchange also times out
+  when a Store call itself ran past the
+  deadline. The health thread makes no Store call while nothing is pending; `submit()`
+  wakes it, and it then checks on the same 50 ms grid as before. On CPU (two ranks on one
+  machine, Gloo bridge, `scripts/gpu/bench_p2p.py`, 3 alternating runs per arm): one way
+  3.9 ms → 0.63 ms at 1 KiB, 4.4 ms → 0.38 ms at 16 KiB. With transfers stubbed out
+  (`scripts/bench_p2p_handshake.py`, 5 runs): the same Store calls per message, 30% (TCPStore)
+  and 63% (FileStore) less CPU per ping-pong, 2 Store calls instead of about 70 over 2 s idle,
+  and the same Store calls and CPU while lanes wait for a missing peer (equal over a 5 s
+  wait, 7 runs; within run-to-run spread over 1 s). A blocking
+  `store.wait` was tried and rejected: TCPStore serializes a client's requests, so one
+  lane's wait held up the others past their deadlines and logged every timed-out slice.
+  CPU evidence only, not GPU, RDMA or cross-node. On teardown, Engine._watch rechecks stop/closed state under lock before clearing the idle wake, preventing a concurrent close() wake from being cleared.
 - `import gpubridge` no longer imports the opt-in bridges (`ucx`, `multitcp`,
   `verbs`): each registers itself when a job first names it (`init(bridge=...)`,
   `GPUBRIDGE_BRIDGE`, `resolve_transport`). The default Gloo job loads 15 gpubridge
