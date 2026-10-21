@@ -314,6 +314,15 @@ hardware.
 
 ### Added
 
+- The staged verbs path's costs are measured (docs/verbs-perf-20261019.md): the
+  library times its write windows' registration and release
+  (`direct.write_window_register_ns`, `write_windows_released`,
+  `write_window_release_ns`), the bridge splits each staged call's host time into
+  copy out, bridge step (posts, library waits, the rest) and copy back
+  (`staged_phases`), and `scripts/gpu/verbs_staged_ab.py` runs one arm of a one-node
+  A/B, compares arms against the predeclared rules and decides the plan's copy
+  overlap trigger. Measurement only; CPU/MOCK cost checked, not
+  validated on GPUs or RDMA hardware. (PR pending)
 - A bounded numerical gate for native NCCL, Gloo islands and staged verbs checks
   exact collectives, gradients, independent optimizer updates/state and parameters;
   includes bad-reduction/scale/data controls and actual endpoint/source attestation.

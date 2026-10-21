@@ -35,6 +35,7 @@ with its buffer registered, so the bridge moves it without another host copy.
 from __future__ import annotations
 
 import itertools
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -103,6 +104,14 @@ class Router:
         self.in_place_ops = 0
         self.plain_ops = 0
         self.bounced_ops = 0
+        #: Whether to add up post and wait times: on only for staged calls
+        #: (:class:`gpubridge.verbs.transport.VerbsTransport`), so other calls don't pay
+        #: for the clock reads.
+        self.timed = False
+        #: Host seconds spent posting sends and receives, and in the library's waits (not
+        #: the flushes and bounce copies after them), failed ones too, while ``timed``.
+        self.post_s = 0.0
+        self.wait_s = 0.0
 
     # ---- the worker interface TaggedBridge uses ---------------------------------------
 
@@ -136,12 +145,16 @@ class Router:
         return op
 
     def send(self, member: int, pointer: int, nbytes: int, tag: int) -> int:
+        start = time.perf_counter() if self.timed else 0.0
         try:
             return self._send(member, pointer, nbytes, tag)
         except TransportError as exc:
             if self.call is not None:
                 self.call.log.failed_post(member, "send", nbytes, exc)
             raise
+        finally:
+            if self.timed:
+                self.post_s += time.perf_counter() - start
 
     def _send(self, member: int, pointer: int, nbytes: int, tag: int) -> int:
         span = self._device(pointer, nbytes) if nbytes else None
@@ -158,12 +171,16 @@ class Router:
         return self._log(op, member, "send", nbytes)
 
     def recv(self, member: int, pointer: int, nbytes: int, tag: int) -> int:
+        start = time.perf_counter() if self.timed else 0.0
         try:
             return self._recv(member, pointer, nbytes, tag)
         except TransportError as exc:
             if self.call is not None:
                 self.call.log.failed_post(member, "recv", nbytes, exc)
             raise
+        finally:
+            if self.timed:
+                self.post_s += time.perf_counter() - start
 
     def _recv(self, member: int, pointer: int, nbytes: int, tag: int) -> int:
         span = self._device(pointer, nbytes) if nbytes else None
@@ -195,7 +212,12 @@ class Router:
         return self._log(op, member, "recv", nbytes)
 
     def wait(self, ids, deadline: float) -> None:
-        self.endpoint.wait(ids, deadline)
+        start = time.perf_counter() if self.timed else 0.0
+        try:
+            self.endpoint.wait(ids, deadline)
+        finally:
+            if self.timed:
+                self.wait_s += time.perf_counter() - start
         call = self.call
         if call is None:
             return

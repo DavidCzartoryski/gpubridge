@@ -39,11 +39,13 @@
 //! peer's "written" message has arrived (or, if the receive failed, once the peer's queue
 //! pair is closed). The cost is one registration per such receive (a dma-buf export too,
 //! for dma-buf memory); memory windows (`ibv_bind_mw`) would make it cheaper and are not
-//! used.
+//! used. Its cost is measured: the time spent making windows and releasing them once
+//! written is in the telemetry (`write_window_register_ns`, `write_window_release_ns`).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use crate::cache::{CacheConfig, CacheKey, CacheStats, Invalidated, MrCache};
 use crate::error::{Error, Result};
@@ -183,6 +185,14 @@ struct Counts {
     /// Write windows made, and their bytes.
     windows: u64,
     window_bytes: u64,
+    /// Nanoseconds spent making them, failed attempts included (not one refused because
+    /// its GPU allocation changed), on the posting thread.
+    window_register_ns: u64,
+    /// Write windows released once written ([`Registrar::release`]), and the nanoseconds
+    /// that took on the completion thread. Windows of failed receives, dropped when their
+    /// queue pair closes, aren't in these.
+    windows_released: u64,
+    window_release_ns: u64,
 }
 
 /// The GPU driver this registrar uses, once loaded.
@@ -507,6 +517,7 @@ impl Registrar {
             )));
         }
         let addr = reg.addr() + offset;
+        let start = Instant::now();
         if reg.method == Method::PeerMemory {
             self.window_allocation(reg, addr as u64)?;
         }
@@ -525,17 +536,20 @@ impl Registrar {
             }
             Method::DmaBuf => self.expose_dmabuf(reg, addr as u64, len as u64),
         };
+        let ns = elapsed_ns(start);
         match made {
             Ok(region) => {
                 let mut c = lock(&self.counts);
                 c.windows += 1;
                 c.window_bytes += len as u64;
+                c.window_register_ns += ns;
                 Ok(Window {
                     region,
                     _base: reg.clone(),
                 })
             }
             Err(e) => {
+                lock(&self.counts).window_register_ns += ns;
                 let why = self.failed(format!(
                     "registering a write window of {len} bytes for a receive ({}): {e}",
                     reg.method.name()
@@ -543,6 +557,21 @@ impl Registrar {
                 Err(Error::Unsupported(why))
             }
         }
+    }
+
+    /// Releases written windows (deregisters them, then lets go of the registrations they
+    /// lie in), counting them and the time it took. Nothing is timed for an empty list.
+    pub fn release(&self, windows: Vec<Window>) {
+        if windows.is_empty() {
+            return;
+        }
+        let n = windows.len() as u64;
+        let start = Instant::now();
+        drop(windows);
+        let ns = elapsed_ns(start);
+        let mut c = lock(&self.counts);
+        c.windows_released += n;
+        c.window_release_ns += ns;
     }
 
     fn window_allocation(
@@ -618,8 +647,9 @@ impl Registrar {
             "\"gpu_driver\":{},\"gpu_driver_error\":{},\"dmabuf_enabled\":{},\
              \"peer_memory_enabled\":{},\"registered\":{{\"dmabuf\":{},\"peer_memory\":{},\
              \"host\":{}}},\"cached_access\":\"local\",\"write_windows\":{},\
-             \"write_window_bytes\":{},\"registration_failures\":{},\
-             \"last_registration_failure\":{},",
+             \"write_window_bytes\":{},\"write_window_register_ns\":{},\
+             \"write_windows_released\":{},\"write_window_release_ns\":{},\
+             \"registration_failures\":{},\"last_registration_failure\":{},",
             driver.as_deref().map_or("null".into(), json_str),
             lock(&self.load_error)
                 .as_deref()
@@ -631,6 +661,9 @@ impl Registrar {
             c.host,
             c.windows,
             c.window_bytes,
+            c.window_register_ns,
+            c.windows_released,
+            c.window_release_ns,
             c.failures,
             c.last_failure.as_deref().map_or("null".into(), json_str),
         );
@@ -657,6 +690,10 @@ impl Registrar {
         o.push('}');
         o
     }
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// A JSON string literal.

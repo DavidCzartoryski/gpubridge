@@ -35,6 +35,12 @@ and the transport refuses later calls.
 ``GPUBRIDGE_VERBS_OBSERVE=<file>`` emits transport observations for the straggler
 detector (:mod:`gpubridge.verbs.observe`: one record per call, per peer and direction).
 
+``telemetry()["staged_phases"]`` splits the host time of the staged calls that
+succeeded: the copy out (queued, then waited for: it includes the work queued before
+it on the stream), the bridge step, inside it the posts and the library's waits (the
+rest is the reductions and Python), and queueing the copy back (not the copy itself,
+which the host doesn't wait for). Host clocks only: no GPU time.
+
 Not validated on RDMA hardware or GPUs. ``GPUBRIDGE_VERBS_TEST_FABRIC`` runs it on
 a MOCK fabric for tests (see :mod:`gpubridge.verbs`).
 """
@@ -222,6 +228,9 @@ class VerbsTransport(TaggedBridge):
         self._device_scratch: torch.Tensor | None = None
         #: Memory of calls that failed: the library may hold it registered until close.
         self._keep: list = []
+        #: Host seconds in each phase of the staged calls that succeeded (module docs).
+        self.staged_phases = {"calls": 0, "to_host_s": 0.0, "bridge_s": 0.0, "post_s": 0.0,
+                              "wait_s": 0.0, "to_device_s": 0.0}
         worker.bounce = pinned
 
     @classmethod
@@ -405,9 +414,26 @@ class VerbsTransport(TaggedBridge):
             self._run("direct", plan, tensor, run)
             return
         staging = self._staging_for(tensor)
+        router = self.worker
+        t0 = time.perf_counter()
         host = staging.to_host(tensor)  # once the copy out has passed
-        self._run("staged", plan, host, run)
+        t1 = time.perf_counter()
+        post, wait = router.post_s, router.wait_s
+        router.timed = True
+        try:
+            self._run("staged", plan, host, run)
+        finally:
+            router.timed = False
+        t2 = time.perf_counter()
         staging.to_device(tensor, host)  # queued on the caller's stream
+        t3 = time.perf_counter()
+        phases = self.staged_phases
+        phases["calls"] += 1
+        phases["to_host_s"] += t1 - t0
+        phases["bridge_s"] += t2 - t1
+        phases["post_s"] += router.post_s - post
+        phases["wait_s"] += router.wait_s - wait
+        phases["to_device_s"] += t3 - t2
 
     def _run(self, path: str, plan: Plan | None, tensor: torch.Tensor, run) -> None:
         router = self.worker
@@ -482,10 +508,11 @@ class VerbsTransport(TaggedBridge):
         """The endpoint's state for telemetry correlation: provider (MOCK or libibverbs
         and its file), device, port, link layer, GID, MTUs, protocol version and
         operations, failure, counts (copied and in-place bytes, rendezvous messages), the
-        registrations (``direct``); then the last call's ``path`` (``host``, ``direct``,
-        ``direct+bounce``, ``staged``) and ``path_reason``, ``last_gpu`` (with the call's
-        bounced receives), per-path counts, each GPU's direct-path support and the
-        observation emitter's counts. Never a remote key."""
+        registrations (``direct``, with the time spent making and releasing write
+        windows); then the last call's ``path`` (``host``, ``direct``, ``direct+bounce``,
+        ``staged``) and ``path_reason``, ``last_gpu`` (with the call's bounced receives),
+        per-path counts, the staged calls' phase times (``staged_phases``, module docs),
+        each GPU's direct-path support and the observation emitter's counts. Never a remote key."""
         router = self.worker
         gpus = {str(i): {"direct": s.ok, "reason": s.reason or None, "driver": s.driver,
                          "flush": s.flush.method if s.flush else None,
@@ -497,6 +524,7 @@ class VerbsTransport(TaggedBridge):
                 "paths": dict(self.paths), "gpu_path_setting": self.gpu_path, "gpus": gpus,
                 "in_place_ops": router.in_place_ops, "plain_ops": router.plain_ops,
                 "bounced_ops": router.bounced_ops,
+                "staged_phases": dict(self.staged_phases),
                 "observations": self.emitter.stats() if self.emitter else None}
 
     @property

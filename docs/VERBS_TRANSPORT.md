@@ -642,15 +642,20 @@ writes and their bytes, "written" messages, bytes moved in place from registered
 host and device memory, bytes the CPU copied, write windows deregistered once
 written and kept after a failure), `direct` (the GPU driver and its version or why
 it didn't load, which methods are enabled, registrations by method,
-`cached_access` (`local`), write windows made and their bytes, failures and the
-last reason, both caches' entries, bytes, hits, misses,
+`cached_access` (`local`), write windows made, their bytes and the nanoseconds
+spent making them, windows released once written and the nanoseconds that took
+(on the completion thread), failures and the last reason, both caches' entries, bytes, hits, misses,
 evictions, stale entries, invalidations, refusals), and per peer its queue pair
 number, path MTU, whether it said goodbye and why it was lost. The Python bridge
 adds `path` (`host`, `direct`, `direct+bounce`, `staged`) and `path_reason` of
 the last call, `last_gpu` (device, method, flush, stream waits and flushes,
 bounced receives and bytes), `paths`, `gpu_path_setting`, `gpus` (each GPU's
 direct-path support: driver, flush, capabilities or reason), operation counts by
-memory kind, and the observation emitter's counts. A remote key is never kept
+memory kind, `staged_phases` (for the staged calls that succeeded: `calls`
+and host seconds in `to_host_s`, the copy out queued and waited for, `bridge_s`,
+and inside it `post_s` and `wait_s`, the rest being reductions and Python, and
+`to_device_s`, queueing the copy back; host clocks only, no GPU time), and the
+observation emitter's counts. A remote key is never kept
 where telemetry reads, and the tests check no key-like name appears.
 
 ## Transport observations
