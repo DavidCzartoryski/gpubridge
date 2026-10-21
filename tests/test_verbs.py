@@ -21,6 +21,7 @@ import tempfile
 import time
 from datetime import timedelta
 from functools import partial
+from pathlib import Path
 
 import pytest
 import torch
@@ -108,6 +109,22 @@ def test_the_test_build_and_the_real_build_are_different_libraries():
     assert verbs.features(True) == ["test-fabric"]
     assert verbs.features(False) == ["ibverbs"]
     assert verbs.library_path(test_fabric=True) != verbs.library_path(test_fabric=False)
+
+
+def test_the_linker_directory_is_not_where_the_library_goes(monkeypatch, tmp_path):
+    # GPUBRIDGE_VERBS_LIB_DIR is where libibverbs.so.1 is (build.rs, VERBS_TRANSPORT.md):
+    # it reaches the build and its cache key, never the cache directory itself.
+    rdma = tmp_path / "rdma-core" / "lib"
+    monkeypatch.delenv(verbs.CACHE_DIR_ENV, raising=False)
+    monkeypatch.delenv(verbs.LINK_DIR_ENV, raising=False)
+    default = verbs.library_path()
+    monkeypatch.setenv(verbs.LINK_DIR_ENV, str(rdma))
+    linked = verbs.library_path()
+    assert linked.parent == default.parent == Path.home() / ".cache" / "gpubridge"
+    assert linked != default  # another library to link against: another build
+    monkeypatch.setenv(verbs.CACHE_DIR_ENV, str(tmp_path / "cache"))
+    assert verbs.library_path().parent == tmp_path / "cache"
+    assert verbs.library_path(test_fabric=True).parent == tmp_path / "cache"
 
 
 @pytest.mark.skipif(sys.platform.startswith("linux"), reason="the refusal is for other systems")

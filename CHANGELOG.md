@@ -292,6 +292,11 @@ hardware.
 
 ### Fixed
 
+- The verbs library's build cache has its own variable, `GPUBRIDGE_VERBS_CACHE_DIR`.
+  `GPUBRIDGE_VERBS_LIB_DIR` keeps the meaning the crate's build script and
+  docs/VERBS_TRANSPORT.md give it, the directory of `libibverbs.so.1`; the Python side
+  also used it as the cache, so setting it as documented put the built library (and
+  its temporary build directories) into the libibverbs directory. The crate is unchanged.
 - The verbs kit's host collectives configure CPU/Gloo islands before init, record that mode, and refuse contradictory inherited CPU-only settings.
 - Host mode selects CPU-only operation before runtime imports. The verbs kit excludes
   same-host non-loopback TCP only for host/Gloo islands, marks co-resident or unknown
